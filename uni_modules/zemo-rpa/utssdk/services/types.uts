@@ -1,0 +1,41 @@
+export type SkillSubGroup = {
+  id: string
+  name: string
+}
+
+export type SkillGroup = {
+  id: string
+  name: string
+  subGroups: SkillSubGroup[]
+}
+
+/**
+ * 技能元数据 (用于列表展示)
+ */
+export type SkillMeta = {
+  id: string
+  name: string
+  description: string
+  groupId: string
+  type: string          // 'skill' | 'tool' | 'action'
+  stepCount: number     // 步骤数量
+  appPackage: string    // 关联应用包名
+  appName: string       // 关联应用名称
+  createdAt: number
+  updatedAt: number
+}
+
+/**
+ * 执行记录
+ */
+export type ExecutionRecord = {
+  skillId: string
+  skillName: string
+  startTime: number
+  endTime: number
+  success: boolean
+  stepsExecuted: number
+  stepsTotal: number
+  mode: string          // 'FOREGROUND' | 'BACKGROUND'
+  errorMessage: string
+}

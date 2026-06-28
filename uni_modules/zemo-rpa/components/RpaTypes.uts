@@ -1,0 +1,39 @@
+export class MinimapUpdateEvent {
+  dx: number;
+  dy: number;
+  minOffsetX: number;
+  maxOffsetX: number;
+  minOffsetY: number;
+  maxOffsetY: number;
+
+  constructor(dx: number, dy: number, minOffsetX: number, maxOffsetX: number, minOffsetY: number, maxOffsetY: number) {
+    this.dx = dx;
+    this.dy = dy;
+    this.minOffsetX = minOffsetX;
+    this.maxOffsetX = maxOffsetX;
+    this.minOffsetY = minOffsetY;
+    this.maxOffsetY = maxOffsetY;
+  }
+}
+
+export class RpaMinimapNode {
+  id: string;
+  x: number;
+  y: number;
+  type: string;
+  width: number;
+  height: number;
+  
+  // Original positions for view restoration
+  ox: number = 0;
+  oy: number = 0;
+
+  constructor(id: string, x: number, y: number, type: string, width: number = 220, height: number = 150) {
+    this.id = id;
+    this.x = x;
+    this.y = y;
+    this.type = type;
+    this.width = width;
+    this.height = height;
+  }
+}

@@ -1,0 +1,93 @@
+<template>
+	<scroll-view class="ui-island" direction="horizontal" :show-scrollbar="false">
+		<view class="island-row">
+			<view 
+				v-for="(item, index) in items" 
+				:key="index" 
+				class="island-pill" 
+				:class="{'island-pill-active': activeId == item.id}"
+				@click="handleClick(item)"
+			>
+				<text class="island-icon" v-if="item.icon">{{ item.icon }}</text>
+				<text class="island-text">{{ item.label }}</text>
+			</view>
+			<!-- Spacer for better scrolling experience -->
+			<view style="width: 20px; height: 10px;"></view>
+		</view>
+	</scroll-view>
+</template>
+
+<script lang="uts">
+	import { PropType } from 'vue';
+
+	export type IslandItem = {
+		id : string
+		label : string
+		icon : string | null
+	}
+
+	export default {
+		name: "UIIsland",
+		props: {
+			items: {
+				type: Array as PropType<IslandItem[]>,
+				required: true
+			},
+			activeId: {
+				type: String,
+				default: ""
+			}
+		},
+		emits: ['select'],
+		methods: {
+			handleClick(item: IslandItem) {
+				this.$emit('select', item)
+			}
+		}
+	}
+</script>
+
+<style scoped>
+	.ui-island {
+		flex-direction: row;
+		height: 48px;
+		width: 100%;
+	}
+	.island-row {
+		flex-direction: row; 
+		align-items: center;
+		padding: 6px 15px 2px 15px;
+	}
+	.island-pill {
+		flex-direction: row;
+		align-items: center;
+		background-color: #fff;
+		border: 1px solid #eee;
+		padding: 6px 12px;
+		margin-right: 10px;
+		border-radius: 20px;
+		box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+		transition-property: background-color, transform;
+		transition-duration: 0.2s;
+		
+		/* Ensure items don't shrink in scroll view */
+		flex-shrink: 0;
+	}
+	.island-pill:active {
+		transform: scale(0.95);
+		background-color: #f5f5f5;
+	}
+	.island-pill-active {
+		background-color: #e6f7ff;
+		border-color: #1890ff;
+	}
+	.island-icon {
+		font-size: 14px;
+		margin-right: 4px;
+	}
+	.island-text {
+		font-size: 12px;
+		color: #555;
+		font-weight: bold;
+	}
+</style>

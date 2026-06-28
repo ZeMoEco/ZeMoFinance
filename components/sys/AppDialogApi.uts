@@ -1,0 +1,163 @@
+export type SelectionItem = {
+    id: string;
+    title: string;
+    data?: any;
+};
+export type SelectionSubmitResult = any;
+export type ZemoPreviewImageOptions = {
+    urls: string[];
+    current?: number;
+};
+export type SelectionModalMode = string;
+export type SelectionQuickScene = string;
+export type SelectionModalOptions = {
+    title: string;
+    mode?: string;
+    initialScene?: string;
+    items?: SelectionItem[];
+    onSelect?: (item: SelectionItem) => void;
+    onSubmit?: (result: any) => void;
+};
+
+export class AppDialogApi {
+    static isPreviewOpenGlobal = false;
+    static isSelectionOpenGlobal = false;
+    static isRecordOpenGlobal = false;
+    static readonly FINANCE_RECORD_EDIT_ID_KEY: string = 'zemo_finance_record_edit_id';
+
+    static currentPreviewOptions: ZemoPreviewImageOptions | null = null;
+    static currentSelectionOptions: SelectionModalOptions | null = null;
+
+    private static normalizeRecordQuery(query: string = ''): string {
+        const raw = (query ?? '').toString().trim();
+        if (raw == '') return '';
+        return raw.startsWith('?') ? raw.substring(1) : raw;
+    }
+
+    private static resetDialogFlags(): void {
+        AppDialogApi.isPreviewOpenGlobal = false;
+        AppDialogApi.isSelectionOpenGlobal = false;
+        AppDialogApi.isRecordOpenGlobal = false;
+        AppDialogApi.currentSelectionOptions = null;
+        uni.removeStorageSync(AppDialogApi.FINANCE_RECORD_EDIT_ID_KEY);
+    }
+
+    static previewImage(options: ZemoPreviewImageOptions) {
+        if (AppDialogApi.isPreviewOpenGlobal) return;
+        AppDialogApi.isPreviewOpenGlobal = true;
+        
+        AppDialogApi.currentPreviewOptions = options;
+        
+        
+        uni.openDialogPage({
+            url: `/components/sys/image-preview`,
+            success: (_res) => {},
+            fail: (err) => {
+                AppDialogApi.isPreviewOpenGlobal = false;
+                console.error('Failed to open ImagePreview Dialog Page', err);
+            }
+        });
+    }
+
+    static showSelection(options: SelectionModalOptions) {
+        if (AppDialogApi.isSelectionOpenGlobal) return;
+        AppDialogApi.isSelectionOpenGlobal = true;
+        AppDialogApi.currentSelectionOptions = options;
+
+        uni.openDialogPage({
+            url: `/components/sys/SelectionModal`,
+            fail: (err) => {
+                AppDialogApi.isSelectionOpenGlobal = false;
+                console.error('Failed to open Selection Dialog Page', err);
+            }
+        });
+    }
+
+    static openFinanceRecord(query: string = '') {
+        if (AppDialogApi.isRecordOpenGlobal) return;
+        AppDialogApi.isRecordOpenGlobal = true;
+        uni.removeStorageSync(AppDialogApi.FINANCE_RECORD_EDIT_ID_KEY);
+        const payload = AppDialogApi.normalizeRecordQuery(query);
+        const suffix = payload == '' ? '' : `?${payload}`;
+
+        uni.openDialogPage({
+            url: `/pages/finance/record${suffix}`,
+            fail: (err) => {
+                AppDialogApi.isRecordOpenGlobal = false;
+                uni.removeStorageSync(AppDialogApi.FINANCE_RECORD_EDIT_ID_KEY);
+                console.error('Failed to open FinanceRecord Dialog Page', err);
+            }
+        });
+    }
+
+    static openFinanceRecordForEdit(transactionId: string) {
+        if (AppDialogApi.isRecordOpenGlobal) return;
+        const id = (transactionId ?? '').toString();
+        if (id == '') return;
+        AppDialogApi.isRecordOpenGlobal = true;
+        uni.setStorageSync(AppDialogApi.FINANCE_RECORD_EDIT_ID_KEY, id);
+        uni.openDialogPage({
+            url: `/pages/finance/record?editTransactionId=${encodeURIComponent(id)}`,
+            fail: (err) => {
+                AppDialogApi.isRecordOpenGlobal = false;
+                uni.removeStorageSync(AppDialogApi.FINANCE_RECORD_EDIT_ID_KEY);
+                console.error('Failed to open FinanceRecord Dialog Page', err);
+            }
+        });
+    }
+
+    static openFinanceRecordOnHome(query: string = '') {
+        const payload = AppDialogApi.normalizeRecordQuery(query);
+        const targetUrl = payload == ''
+            ? '/pages/finance/home?openRecordDialog=1'
+            : `/pages/finance/home?openRecordDialog=1&recordDialogQuery=${encodeURIComponent(payload)}`;
+        uni.reLaunch({
+            url: targetUrl,
+            fail: (err) => {
+                console.error('Failed to relaunch finance home for record dialog', err);
+                AppDialogApi.openFinanceRecord(payload);
+            }
+        });
+    }
+
+    static handleSelectionConfirm(item: SelectionItem) {
+        const options = AppDialogApi.currentSelectionOptions;
+        if (options != null && options.onSelect != null) {
+            options.onSelect(item);
+        }
+        AppDialogApi.tryCloseDialog();
+    }
+
+    static handleSelectionSubmit(result: any) {
+        const options = AppDialogApi.currentSelectionOptions;
+        if (options != null && options.onSubmit != null) {
+            options.onSubmit(result);
+        }
+        AppDialogApi.tryCloseDialog();
+    }
+    
+    static tryCloseDialog(): boolean {
+        if (AppDialogApi.isPreviewOpenGlobal || AppDialogApi.isSelectionOpenGlobal || AppDialogApi.isRecordOpenGlobal) {
+            const pages = getCurrentPages();
+            if (pages.length > 0) {
+                const topPage = pages[pages.length - 1];
+                const dialogs = topPage.getDialogPages();
+                if (dialogs.length > 0) {
+                    uni.closeDialogPage({
+                        dialogPage: dialogs[dialogs.length - 1],
+                        success: () => {
+                            AppDialogApi.resetDialogFlags();
+                        },
+                        fail: (_err) => {
+                            AppDialogApi.resetDialogFlags();
+                        }
+                    });
+                    return true;
+                }
+            }
+            AppDialogApi.resetDialogFlags();
+            return false;
+        }
+        return false;
+    }
+}

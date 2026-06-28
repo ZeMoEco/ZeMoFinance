@@ -1,0 +1,45 @@
+// #ifdef APP-ANDROID
+import { UTSAndroid } from 'io.dcloud.uts'
+// #endif
+
+type ZemoAskRuntime = {
+  moveFinanceAppToBackground(): void
+}
+
+export class AppBackgroundService {
+  private static zemoAskRuntimePromise: Promise<ZemoAskRuntime> | null = null
+
+  static moveToBackground(): void {
+    // #ifdef APP-HARMONY
+    void AppBackgroundService.getZemoAskRuntime().then((runtime: ZemoAskRuntime): void => {
+      runtime.moveFinanceAppToBackground()
+    }).catch((e: Error): void => {
+      console.warn('[AppBackgroundService] Harmony moveAbilityToBackground failed', e)
+    })
+    return
+    // #endif
+
+    // #ifdef APP-ANDROID
+    try {
+      const activity = UTSAndroid.getUniActivity()
+      if (activity != null) activity.moveTaskToBack(true)
+      return
+    } catch (e) {
+      console.warn('[AppBackgroundService] Android moveTaskToBack failed', e)
+    }
+    // #endif
+  }
+
+  private static async getZemoAskRuntime(): Promise<ZemoAskRuntime> {
+    if (AppBackgroundService.zemoAskRuntimePromise == null) {
+      AppBackgroundService.zemoAskRuntimePromise = new Promise<ZemoAskRuntime>((resolve, reject) => {
+        void import('@/uni_modules/zemo-ask').then((module: Object): void => {
+          resolve(module as ZemoAskRuntime)
+        }).catch((e: Error): void => {
+          reject(e)
+        })
+      })
+    }
+    return AppBackgroundService.zemoAskRuntimePromise as Promise<ZemoAskRuntime>
+  }
+}

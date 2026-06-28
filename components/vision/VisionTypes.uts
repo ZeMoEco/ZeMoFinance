@@ -1,0 +1,86 @@
+// Remove imports to avoid circular dependencies or path issues during type resolution
+
+// VisionTypes.uts 完整定义
+export class MinimapUpdateEvent {
+  dx: number;
+  dy: number;
+  minOffsetX: number;
+  maxOffsetX: number;
+  minOffsetY: number;
+  maxOffsetY: number;
+
+  constructor(dx: number, dy: number, minOffsetX: number, maxOffsetX: number, minOffsetY: number, maxOffsetY: number) {
+    this.dx = dx;
+    this.dy = dy;
+    this.minOffsetX = minOffsetX;
+    this.maxOffsetX = maxOffsetX;
+    this.minOffsetY = minOffsetY;
+    this.maxOffsetY = maxOffsetY;
+  }
+}
+
+/**
+ * 视觉节点基础类型
+ */
+export class VisionNode {
+  id: string;
+  x: number;
+  y: number;
+  type: string;
+  width: number;
+  height: number;
+  
+  // Original positions for view restoration
+  ox: number = 0;
+  oy: number = 0;
+
+  constructor(id: string, x: number, y: number, type: string, width: number = 220, height: number = 150) {
+    this.id = id;
+    this.x = x;
+    this.y = y;
+    this.type = type;
+    this.width = width;
+    this.height = height;
+  }
+}
+
+export class EntityNode extends VisionNode {
+  subtype: string;
+  data: any; 
+  style: any; 
+
+  constructor(id: string, x: number, y: number, subtype: string, data: any, style: any, width: number = 220, height: number = 150) {
+    super(id, x, y, 'entity', width, height);
+    this.subtype = subtype;
+    this.data = data;
+    this.style = style;
+  }
+}
+
+export class KineticNode extends VisionNode {
+    subtype: string;
+    skill_id: string;
+    config: any;
+    style: any;
+
+    constructor(id: string, x: number, y: number, subtype: string, skill_id: string, config: any, style: any) {
+        super(id, x, y, 'kinetic', 180, 60);
+        this.subtype = subtype;
+        this.skill_id = skill_id;
+        this.config = config;
+        this.style = style;
+    }
+}
+
+export class GroupNode extends VisionNode {
+    label: string;
+    style: any;
+    children: string[] = [];
+
+    constructor(id: string, x: number, y: number, label: string, width: number, height: number, style: any) {
+        super(id, x, y, 'group', width, height);
+        this.label = label;
+        this.style = style;
+        this.children = [];
+    }
+}

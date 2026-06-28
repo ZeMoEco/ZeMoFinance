@@ -1,0 +1,185 @@
+﻿<template>
+	<view class="header-container">
+		<view class="title-row">
+			<view class="back-btn" @click="$emit('back')">
+				<text class="back-icon">❮</text>
+			</view>
+			<!-- 标题 -->
+			<text class="task-title" @click="$emit('settings')">{{ task?.title ?? '加载中...' }}</text>
+			<view class="more-btn" @click="$emit('settings')">
+				<text class="icon-text">⋯</text>
+			</view>
+		</view>
+		
+		<view class="tags-row">
+			<!-- 1. 优先级标签 -->
+			<view class="tag priority-tag" v-if="task != null" :class="'p-' + task!.priority" @click="$emit('priority')">
+				<text class="tag-text">{{ getPriorityText(task!.priority) }}</text>
+			</view>
+
+			<!-- 2. 属性领域标签 -->
+			<view class="tag domain-tag" v-if="domainName != ''">
+				<text class="tag-icon">🏷️</text>
+				<text class="tag-text">{{ domainName }}</text>
+			</view>
+
+			<!-- 3. 时间标签 -->
+			<view class="tag repeat-tag" v-if="timeDisplayStr != ''" @click="$emit('repeat')">
+				<text class="tag-icon">{{ timeIcon }}</text>
+				<text class="tag-text">{{ timeDisplayStr }}</text>
+			</view>
+		</view>
+	</view>
+</template>
+
+<script lang="uts">
+	import { Task } from '@/services/biz/TaskBiz.uts';
+
+	export default {
+		emits: ['back', 'settings', 'priority', 'repeat', 'reminder'],
+		props: {
+			task: { type: Object as PropType<Task | null>, required: false },
+			repeatType: { type: String, default: '' },
+			repeatTime: { type: String, default: '' }
+		},
+		computed: {
+			// 获取属性领域（tags 的第一个）
+			domainName(): string {
+				if (this.task != null && this.task!.tags.length > 0) {
+					return this.task!.tags[0];
+				}
+				return "";
+			},
+			isRepeat(): boolean {
+				return this.repeatType != '' && this.repeatType != '不重复';
+			},
+			timeIcon(): string {
+				if (this.isRepeat) return '🔁';
+				if (this.task != null && this.task!.end_at > 0) return '⏰'; 
+				return '📅'; 
+			},
+			timeDisplayStr(): string {
+				if (this.isRepeat) {
+					const t = this.repeatType;
+					let typeName = '循环';
+					if (t == 'daily') typeName = '每天';
+					else if (t == 'weekly') typeName = '每周';
+					else if (t == 'monthly') typeName = '每月';
+					
+					if (this.repeatTime == '') return typeName;
+					return `${typeName} ${this.repeatTime}`;
+				}
+				
+				if (this.task != null) {
+					if (this.task!.end_at > 0) return "截止 " + this.formatDate(this.task!.end_at);
+					if (this.task!.start_at > 0) return "开始 " + this.formatDate(this.task!.start_at);
+					if (this.task!.created_at > 0) return "创建 " + this.formatDate(this.task!.created_at);
+				}
+				return "";
+			}
+		},
+		methods: {
+			getPriorityText(p: number): string {
+				if (p == 3) return 'P3';
+				if (p == 2) return 'P2';
+				if (p == 1) return 'P1';
+				return 'P0';
+			},
+			formatDate(ts: number): string {
+				const date = new Date(ts);
+				const m = (date.getMonth() + 1).toString().padStart(2, '0');
+				const d = date.getDate().toString().padStart(2, '0');
+				const h = date.getHours().toString().padStart(2, '0');
+				const min = date.getMinutes().toString().padStart(2, '0');
+				return `${m}-${d} ${h}:${min}`;
+			}
+		}
+	}
+</script>
+
+<style scoped>
+	.header-container {
+		padding: 0 16px 10px 16px;
+		padding-top: var(--status-bar-height);
+		background-color: transparent;
+	}
+
+	.title-row {
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		margin-top: 8px;
+		margin-bottom: 12px;
+	}
+
+	.back-btn {
+		width: 34px;
+		height: 34px;
+		border-radius: 17px;
+		margin-right: 10px;
+		justify-content: center;
+		align-items: center;
+		background-color: rgba(255, 255, 255, 0.92);
+		border-width: 1px;
+		border-color: rgba(0, 0, 0, 0.12);
+	}
+	.back-icon {
+		font-size: 18px;
+		color: #111111;
+		font-weight: bold;
+	}
+
+	.task-title {
+		flex: 1;
+		font-size: 20px;
+		font-weight: bold;
+		color: #1a1a1a;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.more-btn { padding: 8px 0 8px 12px; }
+	.icon-text { font-size: 20px; }
+
+	.tags-row {
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.tag {
+		flex-direction: row;
+		align-items: center;
+		padding: 4px 10px;
+		border-radius: 6px;
+		margin-right: 8px;
+	}
+
+	.tag-icon { font-size: 12px; margin-right: 4px; color: #555; }
+	.tag-text { font-size: 12px; font-weight: bold; }
+
+	/* 优先级配色 */
+	.priority-tag { background-color: #f0f0f0; }
+	.p-0 { background-color: #ffebee; } .p-0 .tag-text { color: #d32f2f; }
+	.p-1 { background-color: #fff3e0; } .p-1 .tag-text { color: #f57c00; }
+	.p-2 { background-color: #e3f2fd; } .p-2 .tag-text { color: #1976d2; }
+	.p-3 { background-color: #f5f5f5; } .p-3 .tag-text { color: #757575; }
+
+	/* 属性领域标签配色 */
+	.domain-tag {
+		background-color: #f3e5f5; /* 淡紫背景 */
+		border: 1px solid rgba(156, 39, 176, 0.1);
+	}
+	.domain-tag .tag-text {
+		color: #7b1fa2; /* 深紫文字 */
+	}
+
+	/* 时间标签配色 */
+	.repeat-tag {
+		background-color: rgba(255, 255, 255, 0.6);
+		border: 1px solid rgba(0,0,0,0.05);
+	}
+	.repeat-tag .tag-text {
+		color: #444;
+	}
+</style>

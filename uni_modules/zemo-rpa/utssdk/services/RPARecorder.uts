@@ -1,0 +1,521 @@
+import { RPAStep, RPAActionType, RPARect, RPANodeDetail, RPAPageSignature, RPABranchCondition, RPAScript, RPACanvasGroup, RPACanvasEdge, StepInputMode } from '../utils/RPAStep.uts';
+import { ScreenCaptureUtils } from '../utils/ScreenCaptureUtils.uts';
+import { RpaServiceBridge } from './RpaService.uts';
+
+// #ifdef APP-ANDROID
+import { RPARecorderImpl } from '../app-android/services/RPARecorderImpl.uts';
+import { rpaScriptToJSON } from '../app-android/utils/RPAStepParser.uts';
+// #endif
+
+/**
+ * 录制会话状态
+ */
+export enum RecordingState {
+	IDLE = "IDLE",           // 未录制
+	RECORDING = "RECORDING", // 正在录制
+	PAUSED = "PAUSED"        // 暂停 (等待用户输入描述)
+}
+
+/**
+ * RPARecorder — 核心录制服务
+ * 
+ * 录制逻辑:
+ * 1. 选择应用 → 记录并跳转
+ * 2. 无障碍检测并记录操作控件、位置、节点详情
+ * 3. 暂停/输入描述/保存 (相同页面自动合并分支)
+ * 4. 录制完成 → 进入 Map 编辑 (切换 HID/无障碍)
+ * 5. 每步可设置描述/AI 标签
+ * 6. Canvas 关联、建组
+ */
+export class RPARecorder {
+	static isRecording : boolean = false;
+	static script : RPAStep[] = [];
+	/** 当前录制状态 */
+	static state: RecordingState = RecordingState.IDLE;
+	/** 完整脚本数据 (包含步骤、分组、连接线) */
+	static currentScript: RPAScript = new RPAScript();
+	
+	private static context : any | null = null;
+	private static sessionAppPkg: string = "";
+	private static sessionAppName: string = "";
+	private static lastActionAt: number = 0;
+	private static debounceMs: number = 250;
+	private static rawClickTimer: number = -1;
+	/** 已知页面签名缓存 — 用于检测重复页面并自动添加分支 */
+	private static pageSignatureCache: Map<string, string[]> = new Map();
+	/** 当前的 Activity 名称 */
+	private static currentActivityName: string = "";
+	/** 步骤计数器 */
+	private static stepCounter: number = 0;
+
+	/**
+	 * 检查录制所需权限
+	 */
+	static checkPermissions() : boolean {
+		// #ifdef APP-ANDROID
+		return RPARecorderImpl.checkPermissions();
+		// #endif
+		return false;
+	}
+
+	/**
+	 * 开始录制流程
+	 */
+	static start(context: any, appPackageName: string = "", appName: string = "") {
+		RPARecorder.context = context;
+		RPARecorder.script = [];
+		RPARecorder.isRecording = true;
+		RPARecorder.state = RecordingState.RECORDING;
+		RPARecorder.sessionAppPkg = appPackageName;
+		RPARecorder.sessionAppName = appName;
+		RPARecorder.lastActionAt = 0;
+		RPARecorder.stepCounter = 0;
+		RPARecorder.pageSignatureCache = new Map();
+		RPARecorder.currentActivityName = "";
+		
+		// 初始化脚本对象
+		RPARecorder.currentScript = new RPAScript();
+		RPARecorder.currentScript.appPackage = appPackageName;
+		RPARecorder.currentScript.appName = appName;
+		
+		// #ifdef APP-ANDROID
+		if (context != null) {
+			RPARecorderImpl.init(context as any);
+		}
+		// #endif
+
+		if (appPackageName != "") {
+			const openStep = new RPAStep();
+			openStep.id = `${Date.now()}_open_app`;
+			openStep.actionType = RPAActionType.OPEN_APP;
+			openStep.index = RPARecorder.stepCounter;
+			RPARecorder.stepCounter++;
+			openStep.timestamp = Date.now();
+			openStep.x = 0;
+			openStep.y = 0;
+			openStep.duration = 300;
+			openStep.appPackage = appPackageName;
+			openStep.accessibilityId = appPackageName;
+			openStep.widgetText = appName != "" ? appName : appPackageName;
+			openStep.description = "启动应用: " + (appName != "" ? appName : appPackageName);
+			openStep.aiLabel = "launch_app";
+			RPARecorder.script.push(openStep);
+			RPARecorder.currentScript.steps = RPARecorder.script;
+			console.log("[RPARecorder] first step added for app:", appPackageName);
+		}
+
+		console.log("[RPARecorder] started");
+	}
+
+	/**
+	 * 暂停录制 — 等待用户输入描述
+	 */
+	static pause() {
+		if (RPARecorder.state == RecordingState.RECORDING) {
+			RPARecorder.state = RecordingState.PAUSED;
+			RPARecorder.isRecording = false;
+			console.log("[RPARecorder] paused, waiting for description");
+		}
+	}
+
+	/**
+	 * 恢复录制 — 用户完成描述输入后
+	 */
+	static resume() {
+		if (RPARecorder.state == RecordingState.PAUSED) {
+			RPARecorder.state = RecordingState.RECORDING;
+			RPARecorder.isRecording = true;
+			console.log("[RPARecorder] resumed recording");
+		}
+	}
+
+	/**
+	 * 初始化屏幕录制 (需要在 Activity result 中调用)
+	 */
+	static initScreenCapture(resultCode: number, resultData: any | null) {
+		const ctx = RPARecorder.context;
+		if (ctx != null) {
+			ScreenCaptureUtils.init(ctx, resultCode, resultData);
+		}
+	}
+
+	static stop() {
+		RPARecorder.isRecording = false;
+		RPARecorder.state = RecordingState.IDLE;
+		ScreenCaptureUtils.stop();
+		
+		// 同步步骤到脚本
+		RPARecorder.currentScript.steps = RPARecorder.script;
+		RPARecorder.currentScript.updatedAt = Date.now();
+		
+		// 自动生成默认连接线 (线性流)
+		RPARecorder.generateDefaultEdges();
+		
+		console.log("[RPARecorder] stopped, total steps: " + RPARecorder.script.length);
+	}
+
+	/**
+	 * 自动生成默认连接线 (i → i+1 的线性顺序)
+	 */
+	private static generateDefaultEdges() {
+		const edges: RPACanvasEdge[] = [];
+		for (let i = 0; i < RPARecorder.script.length - 1; i++) {
+			const from = RPARecorder.script[i];
+			const to = RPARecorder.script[i + 1];
+			const edge = new RPACanvasEdge(
+				`edge_${from.id}_${to.id}`,
+				from.id,
+				to.id
+			);
+			edge.type = "default";
+			edges.push(edge);
+			
+			// 同时设置步骤的 nextStepId
+			from.nextStepId = to.id;
+		}
+		RPARecorder.currentScript.edges = edges;
+	}
+
+	/**
+	 * 仅保存（录制已经停止后调用）
+	 */
+	static async saveOnly(skillName: string, description: string, groupId: string): Promise<string> {
+		const finalName = skillName != "" ? skillName : (RPARecorder.sessionAppName != "" ? RPARecorder.sessionAppName : "新技能");
+		
+		// 构建完整脚本 JSON (v2 格式，包含 Canvas 数据)
+		RPARecorder.currentScript.name = finalName;
+		RPARecorder.currentScript.description = description;
+		RPARecorder.currentScript.steps = RPARecorder.script;
+		RPARecorder.currentScript.updatedAt = Date.now();
+		
+		let content = "";
+		// #ifdef APP-ANDROID
+		content = rpaScriptToJSON(RPARecorder.currentScript);
+		// #endif
+		// #ifndef APP-ANDROID
+		content = JSON.stringify(RPARecorder.currentScript);
+		// #endif
+		
+		const id = await RpaServiceBridge.createItem(groupId, finalName, description, content, 'skill', '');
+		if (id != "") {
+			console.log("[RPARecorder] saved item id=", id, "group=", groupId, "steps=", RPARecorder.script.length);
+		} else {
+			console.error("[RPARecorder] save failed, group=", groupId);
+		}
+		return id;
+	}
+
+	static async stopAndSave(skillName: string, description: string, groupId: string): Promise<string> {
+		RPARecorder.stop();
+		return await RPARecorder.saveOnly(skillName, description, groupId);
+	}
+
+	/**
+	 * 更新当前 Activity 名称 (由 GlobalInputListener 调用)
+	 */
+	static updateCurrentActivity(activityName: string) {
+		RPARecorder.currentActivityName = activityName;
+	}
+
+	/**
+	 * 生成页面签名 — 用于检测是否进入了已录制的页面
+	 */
+	private static generatePageSignature(appPackage: string, activityName: string): RPAPageSignature {
+		const sig: RPAPageSignature = {
+			appPackage: appPackage,
+			activityName: activityName,
+			pageTitle: "",
+			fingerprint: `${appPackage}/${activityName}`
+		};
+		return sig;
+	}
+
+	/**
+	 * 检查当前页面是否已经录制过
+	 * 如果是，返回该页面的最后一个步骤 ID (用于添加分支)
+	 */
+	private static findExistingPageStepId(pageFingerprint: string): string {
+		const existingStepIds = RPARecorder.pageSignatureCache.get(pageFingerprint);
+		if (existingStepIds != null && existingStepIds.length > 0) {
+			// 返回该页面最后记录的步骤 ID
+			return existingStepIds[existingStepIds.length - 1];
+		}
+		return "";
+	}
+
+	/**
+	 * 处理动作 (核心方法) — 增强版
+	 * 支持完整的无障碍节点信息、页面签名、分支检测
+	 */
+	static processAction(
+		actionType: RPAActionType, 
+		x: number, 
+		y: number, 
+		accessibilityId: string = "", 
+		widgetText: string = "", 
+		bounds: RPARect | null = null,
+		nodeDetail: RPANodeDetail | null = null,
+		appPackage: string = "",
+		activityName: string = ""
+	) {
+		if (RPARecorder.rawClickTimer != -1) {
+			clearTimeout(RPARecorder.rawClickTimer);
+			RPARecorder.rawClickTimer = -1;
+		}
+
+		if (!RPARecorder.isRecording) return;
+		const now = Date.now();
+		
+		// 检查是否与上一个步骤是同一类型的操作，且时间间隔很短（例如 500ms 内）
+		// 并且坐标相近，这通常意味着手势和 UI 事件同时触发了
+		if (RPARecorder.script.length > 0) {
+			const lastStep = RPARecorder.script[RPARecorder.script.length - 1];
+			if (lastStep.actionType == actionType && (now - lastStep.timestamp < 500)) {
+				// 如果上一个步骤是 RAW_CLICK，而当前是 UI 事件，则用 UI 事件覆盖它
+				if (lastStep.widgetText == "RAW_CLICK" || lastStep.widgetText == "VISUAL_CLICK") {
+					console.log("[RPARecorder] overriding raw click with UI event", actionType);
+					RPARecorder.script.pop();
+					RPARecorder.stepCounter--;
+				} else if (widgetText == "RAW_CLICK" || widgetText == "VISUAL_CLICK") {
+					// 如果当前是 RAW_CLICK，而上一个是 UI 事件，则忽略当前的 RAW_CLICK
+					console.log("[RPARecorder] ignoring raw click because UI event already recorded", actionType);
+					return;
+				} else {
+					// 如果两个都是 UI 事件，且坐标相近，则忽略当前的
+					const dx = Math.abs(lastStep.x - x);
+					const dy = Math.abs(lastStep.y - y);
+					if (dx < 50 && dy < 50) {
+						console.log("[RPARecorder] debounce ignored duplicate UI action", actionType);
+						return;
+					}
+				}
+			}
+		}
+
+		if (now - RPARecorder.lastActionAt < RPARecorder.debounceMs) {
+			console.log("[RPARecorder] debounce ignored action", actionType);
+			return;
+		}
+		RPARecorder.lastActionAt = now;
+
+		// 获取当前应用/页面上下文
+		const currentPkg = appPackage != "" ? appPackage : RPARecorder.sessionAppPkg;
+		const currentActivity = activityName != "" ? activityName : RPARecorder.currentActivityName;
+
+		// 检查页面签名 — 是否需要添加为分支而非线性步骤
+		const pageFingerprint = `${currentPkg}/${currentActivity}`;
+		const existingParentStepId = RPARecorder.findExistingPageStepId(pageFingerprint);
+
+		const step = new RPAStep();
+		step.id = `${now}_${RPARecorder.stepCounter}`;
+		step.actionType = actionType;
+		step.index = RPARecorder.stepCounter;
+		RPARecorder.stepCounter++;
+		step.timestamp = now;
+		step.x = x;
+		step.y = y;
+		step.screenWidth = 0;
+		step.screenHeight = 0;
+		step.accessibilityId = accessibilityId;
+		step.widgetText = widgetText;
+		step.bounds = bounds;
+		step.nodeDetail = nodeDetail;
+		step.appPackage = currentPkg;
+		step.activityName = currentActivity;
+		
+		// 生成页面签名
+		if (currentPkg != "" && currentActivity != "") {
+			step.pageSignature = RPARecorder.generatePageSignature(currentPkg, currentActivity);
+		}
+		
+		// 如果该页面已有录制步骤，设置为分支关系
+		if (existingParentStepId != "") {
+			step.parentStepId = existingParentStepId;
+			// 找到父步骤，添加子步骤引用
+			const parentStep = RPARecorder.script.find((s: RPAStep): boolean => s.id == existingParentStepId);
+			if (parentStep != null) {
+				parentStep.childStepIds.push(step.id);
+				console.log("[RPARecorder] branch added: parent=", existingParentStepId, "child=", step.id);
+			}
+		}
+
+		// 记录页面签名到缓存
+		if (pageFingerprint != "/") {
+			let stepIds = RPARecorder.pageSignatureCache.get(pageFingerprint);
+			if (stepIds == null) {
+				stepIds = [];
+			}
+			stepIds.push(step.id);
+			RPARecorder.pageSignatureCache.set(pageFingerprint, stepIds);
+		}
+
+		// 截图
+		const snapshot = ScreenCaptureUtils.takeSnapshot(bounds);
+		if (snapshot != null) {
+			step.templateImage = snapshot;
+		}
+
+		RPARecorder.script.push(step);
+		RPARecorder.currentScript.steps = RPARecorder.script;
+		console.log(`[RPARecorder] step ${RPARecorder.script.length}: ${actionType} (${x}, ${y}) id=${accessibilityId} text=${widgetText} activity=${currentActivity}`);
+	}
+
+	/**
+	 * 为步骤设置描述和 AI 标签
+	 */
+	static setStepDescription(stepId: string, description: string, aiLabel: string = "") {
+		const step = RPARecorder.script.find((s: RPAStep): boolean => s.id == stepId);
+		if (step != null) {
+			step.description = description;
+			if (aiLabel != "") {
+				step.aiLabel = aiLabel;
+			}
+			console.log("[RPARecorder] step description set:", stepId, description);
+		}
+	}
+
+	/**
+	 * 切换步骤的执行输入方式 (HID / 无障碍)
+	 */
+	static setStepInputMode(stepId: string, mode: StepInputMode) {
+		const step = RPARecorder.script.find((s: RPAStep): boolean => s.id == stepId);
+		if (step != null) {
+			step.stepInputMode = mode;
+			console.log("[RPARecorder] step input mode changed:", stepId, mode);
+		}
+	}
+
+	/**
+	 * 添加分支条件到指定步骤
+	 */
+	static addBranchCondition(stepId: string, condition: RPABranchCondition) {
+		const step = RPARecorder.script.find((s: RPAStep): boolean => s.id == stepId);
+		if (step != null) {
+			step.branches.push(condition);
+			
+			// 同时添加 Canvas 连接线
+			const edge = new RPACanvasEdge(
+				`edge_branch_${stepId}_${condition.targetStepId}`,
+				stepId,
+				condition.targetStepId
+			);
+			edge.type = "branch";
+			edge.label = condition.description;
+			edge.color = "#FF9800";
+			RPARecorder.currentScript.edges.push(edge);
+			
+			console.log("[RPARecorder] branch condition added:", stepId, "->", condition.targetStepId);
+		}
+	}
+
+	/**
+	 * 创建 Canvas 分组
+	 */
+	static createCanvasGroup(name: string, stepIds: string[]): RPACanvasGroup {
+		const group = new RPACanvasGroup(`group_${Date.now()}`, name);
+		group.stepIds = stepIds;
+		RPARecorder.currentScript.groups.push(group);
+		
+		// 更新步骤的分组 ID
+		stepIds.forEach((sid: string) => {
+			const step = RPARecorder.script.find((s: RPAStep): boolean => s.id == sid);
+			if (step != null) {
+				step.canvasGroupId = group.id;
+			}
+		});
+		
+		console.log("[RPARecorder] canvas group created:", group.id, name, "steps:", stepIds.length);
+		return group;
+	}
+
+	/**
+	 * 添加自定义 Canvas 连接线
+	 */
+	static addCanvasEdge(fromStepId: string, toStepId: string, label: string = "", edgeType: string = "default"): RPACanvasEdge {
+		const edge = new RPACanvasEdge(
+			`edge_custom_${Date.now()}`,
+			fromStepId,
+			toStepId
+		);
+		edge.label = label;
+		edge.type = edgeType;
+		RPARecorder.currentScript.edges.push(edge);
+		
+		console.log("[RPARecorder] canvas edge added:", fromStepId, "->", toStepId);
+		return edge;
+	}
+    
+    /**
+     * 获取当前脚本 JSON
+     */
+    static getScriptJSON() : string {
+		// #ifdef APP-ANDROID
+		return rpaScriptToJSON(RPARecorder.currentScript);
+		// #endif
+		// #ifndef APP-ANDROID
+        return JSON.stringify(RPARecorder.currentScript);
+		// #endif
+    }
+
+	/**
+	 * 获取当前录制的完整脚本对象
+	 */
+	static buildScript(): RPAScript {
+		RPARecorder.currentScript.steps = RPARecorder.script;
+		RPARecorder.currentScript.updatedAt = Date.now();
+		return RPARecorder.currentScript;
+	}
+	
+	/**
+	 * 处理原始点击 (当无障碍服务没有捕获到事件时作为后备)
+	 * 延迟执行，如果在此期间收到真实无障碍事件，则取消此操作
+	 */
+	static processRawClick(x: number, y: number) {
+		if (!RPARecorder.isRecording) return;
+		
+		// 如果最近刚发生过动作，忽略此次触摸
+		if (Date.now() - RPARecorder.lastActionAt < 500) return;
+
+		// 检查是否有现有计时器
+		if (RPARecorder.rawClickTimer != -1) {
+			clearTimeout(RPARecorder.rawClickTimer);
+		}
+
+		// 设置延时，如果300ms内无真实点击事件，则记录为RAW_CLICK
+		RPARecorder.rawClickTimer = setTimeout(() => {
+			const isUnknownLocation = (x == 0 && y == 0);
+			const logMsg = isUnknownLocation ? "RPARecorder processing fallback VISUAL_CLICK (No Coords)" : ("RPARecorder processing fallback RAW_CLICK at " + x + "," + y);
+			console.log(logMsg);
+			
+			const step = new RPAStep();
+			const now = Date.now();
+			step.id = `${now}_raw`;
+			step.actionType = RPAActionType.CLICK;
+			step.index = RPARecorder.stepCounter;
+			RPARecorder.stepCounter++;
+			step.timestamp = now;
+			step.x = x;
+			step.y = y;
+			step.screenWidth = 0;
+			step.screenHeight = 0;
+			step.accessibilityId = isUnknownLocation ? "VISUAL_FALLBACK" : "";
+			step.widgetText = isUnknownLocation ? "VISUAL_CLICK" : "RAW_CLICK"; 
+			step.bounds = null;
+			
+			// 截图
+			const snapshot = ScreenCaptureUtils.takeSnapshot(null);
+			if (snapshot != null) {
+				step.templateImage = snapshot;
+			}
+			
+			RPARecorder.script.push(step);
+			RPARecorder.currentScript.steps = RPARecorder.script;
+			RPARecorder.lastActionAt = now;
+			RPARecorder.rawClickTimer = -1;
+		}, 300);
+	}
+
+	static get isRawClickPending(): boolean {
+		return RPARecorder.rawClickTimer != -1;
+	}
+}

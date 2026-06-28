@@ -1,0 +1,265 @@
+// services/AlarmReceiver.uts
+// #ifdef APP-ANDROID
+import BroadcastReceiver from "android.content.BroadcastReceiver";
+import Context from "android.content.Context";
+import Intent from "android.content.Intent";
+import NotificationManager from "android.app.NotificationManager";
+import NotificationChannel from "android.app.NotificationChannel";
+import Notification from "android.app.Notification";
+import PendingIntent from "android.app.PendingIntent";
+import Build from "android.os.Build";
+import PowerManager from "android.os.PowerManager";
+import MediaPlayer from "android.media.MediaPlayer";
+import RingtoneManager from "android.media.RingtoneManager";
+import AudioAttributes from "android.media.AudioAttributes";
+import AudioManager from "android.media.AudioManager";
+import Uri from "android.net.Uri";
+import ComponentName from "android.content.ComponentName";
+import UTSAndroid from "io.dcloud.uts.UTSAndroid";
+// #endif
+export class AlarmReceiver extends BroadcastReceiver {
+    private static mediaPlayer: MediaPlayer | null = null;
+
+    constructor() { super(); }
+
+    override onReceive(context: Context, intent: Intent) {
+        console.log("[AlarmReceiver] 闹钟触发");
+
+        let receiverClass = "";
+        try {
+            receiverClass = (this as java.lang.Object).getClass().getName();
+        } catch (_eCls) {}
+        let pkg = "";
+        try { pkg = context.getPackageName(); } catch (_ePkg) {}
+
+        const taskIdRaw = intent.getStringExtra("TASK_ID") ?? "";
+        const taskId = taskIdRaw != null && taskIdRaw != "" ? taskIdRaw : (intent.getIntExtra("TASK_ID", 0).toString());
+        const title = intent.getStringExtra("TASK_TITLE") ?? "任务提醒";
+
+        // 1. 写入“正在响铃 / 待处理”状态，供 App 侧检测（必须尽早写入，避免冷启动竞态）
+        try {
+            const now = java.lang.System.currentTimeMillis();
+
+            // 有些设备/场景会在 DeviceProtected 与普通存储之间出现读写不一致；这里双写更稳。
+            let deviceCtx: Context | null = null;
+            try { deviceCtx = context.createDeviceProtectedStorageContext(); } catch (_e0) {}
+
+            const writeTo = (c: Context): boolean => {
+                const sp = c.getSharedPreferences("zemo_alarm", Context.MODE_PRIVATE);
+                const prevCount = sp.getInt("alarm_receive_count", 0);
+                const ed = sp.edit();
+                ed.putString("alarm_last_event", "onReceive");
+                ed.putLong("alarm_last_event_ts", now);
+                ed.putString("alarm_receiver_class", receiverClass);
+                ed.putString("alarm_receiver_pkg", pkg);
+                ed.putInt("alarm_receive_count", (prevCount + 1).toInt());
+                // 更稳定的“兜底信号”：App 冷启动可根据 pending_alarm 跳转
+                ed.putBoolean("pending_alarm", true);
+                ed.putLong("pending_alarm_ts", now);
+                ed.putString("pending_alarm_taskId", taskId);
+                ed.putString("pending_alarm_title", title);
+                ed.putBoolean("alarm_ringing", true);
+                ed.putLong("alarm_ringing_ts", now);
+                ed.putString("alarm_ringing_taskId", taskId);
+                ed.putString("alarm_ringing_title", title);
+                return ed.commit();
+            };
+
+            let ok1 = false;
+            let ok2 = false;
+            try { ok1 = writeTo(context); } catch (_e1) {}
+            if (deviceCtx != null) {
+                try { ok2 = writeTo(deviceCtx!); } catch (_e2) {}
+            }
+            console.log("[AlarmReceiver] write pending_alarm+alarm_ringing commit(normal=" + ok1 + ", device=" + ok2 + ")");
+        } catch (_e) {}
+
+        // 2. 立即点亮屏幕 (关键：在发送通知前执行)
+        this.wakeUpScreen(context);
+
+        // 3. 播放声音
+        this.playAlarmSound(context);
+
+        // 4. 发送全屏通知
+        this.showFullScreenAlarm(context, taskId, title);
+    }
+
+    playAlarmSound(context: Context) {
+        try {
+            if (AlarmReceiver.mediaPlayer != null) {
+                AlarmReceiver.mediaPlayer!.release();
+            }
+            const player = new MediaPlayer();
+            AlarmReceiver.mediaPlayer = player;
+
+            let uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM);
+            if (uri == null) uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE);
+            
+            player.setDataSource(context, uri);
+
+            if (Build.VERSION.SDK_INT >= 21) {
+                const attr = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ALARM)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build();
+                player.setAudioAttributes(attr);
+            } else {
+                player.setAudioStreamType(AudioManager.STREAM_ALARM);
+            }
+
+            player.setLooping(true);
+            player.prepare();
+            player.start();
+        } catch (e) {
+            console.error("播放失败", e);
+        }
+    }
+
+    static stopSound() {
+        if (AlarmReceiver.mediaPlayer != null) {
+            if (AlarmReceiver.mediaPlayer!.isPlaying()) {
+                AlarmReceiver.mediaPlayer!.stop();
+            }
+            AlarmReceiver.mediaPlayer!.release();
+            AlarmReceiver.mediaPlayer = null;
+        }
+
+        // 清除“正在响铃 / 待处理”状态
+        try {
+            const ctx = UTSAndroid.getAppContext();
+            if (ctx != null) {
+                const now = java.lang.System.currentTimeMillis();
+                let deviceCtx: Context | null = null;
+                try { deviceCtx = (ctx as Context).createDeviceProtectedStorageContext(); } catch (_e0) {}
+
+                const clearIn = (c: Context): boolean => {
+                    const sp = c.getSharedPreferences("zemo_alarm", Context.MODE_PRIVATE);
+                    const ed = sp.edit();
+                    ed.putString("alarm_last_event", "stopSound");
+                    ed.putLong("alarm_last_event_ts", now);
+                    ed.putBoolean("pending_alarm", false);
+                    ed.remove("pending_alarm_ts");
+                    ed.remove("pending_alarm_taskId");
+                    ed.remove("pending_alarm_title");
+                    ed.putBoolean("alarm_ringing", false);
+                    ed.remove("alarm_ringing_ts");
+                    ed.remove("alarm_ringing_taskId");
+                    ed.remove("alarm_ringing_title");
+                    return ed.commit();
+                };
+
+                let ok1 = false;
+                let ok2 = false;
+                try { ok1 = clearIn(ctx as Context); } catch (_e1) {}
+                if (deviceCtx != null) {
+                    try { ok2 = clearIn(deviceCtx!); } catch (_e2) {}
+                }
+                console.log("[AlarmReceiver] clear pending_alarm+alarm_ringing commit(normal=" + ok1 + ", device=" + ok2 + ")");
+            }
+        } catch (_e) {}
+    }
+
+    showFullScreenAlarm(context: Context, taskId: string, title: string) {
+        const CHANNEL_ID = "ZEMO_ALARM_CHANNEL_V2"; // 修改ID以确保新配置生效
+        const nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager;
+
+        // 1. 创建高优先级渠道
+        if (Build.VERSION.SDK_INT >= 26) {
+            const channel = new NotificationChannel(
+                CHANNEL_ID, 
+                "重要任务闹钟", 
+                NotificationManager.IMPORTANCE_HIGH // 必须是 HIGH 或 MAX
+            );
+            channel.setDescription("用于全屏显示闹钟提醒");
+            channel.setSound(null, null); // 静音，因为我们手动播放了
+            channel.enableVibration(true);
+            channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+            // 尝试绕过免打扰 (需要权限，通常不强制)
+            // channel.setBypassDnd(true); 
+            nm.createNotificationChannel(channel);
+        }
+
+        // 2. 构建跳转 Intent
+        // 说明：不要用 pm.getLaunchIntentForPackage()（ACTION_MAIN/LAUNCHER），很多 ROM 会丢弃 data/extras。
+        // 改用 ACTION_VIEW + 自定义 scheme，并绑定到本包，保证 data URI 能到达 Activity。
+        let targetUrl = "/pages/settings/alarm-trigger?taskId=" + taskId;
+        try {
+            targetUrl = "/pages/settings/alarm-trigger?taskId=" + taskId + "&title=" + encodeURIComponent(title);
+        } catch (_eEnc) {}
+        const deepLink = "zemo://navigate?url=" + encodeURIComponent(targetUrl);
+
+        // 显式指向主 Activity（不依赖 intent-filter），同时携带 ACTION_VIEW + data
+        let mainComponent: ComponentName | null = null;
+        try {
+            const pm = context.getPackageManager();
+            const li = pm.getLaunchIntentForPackage(context.getPackageName());
+            if (li != null) {
+                const comp = li!.getComponent();
+                if (comp != null) mainComponent = comp as ComponentName;
+            }
+        } catch (_eComp) {}
+
+        const launchIntent = new Intent(Intent.ACTION_VIEW);
+        launchIntent.setData(Uri.parse(deepLink));
+        if (mainComponent != null) {
+            try {
+                launchIntent.setClassName(mainComponent!.getPackageName(), mainComponent!.getClassName());
+            } catch (_eSet) {
+                try { launchIntent.setPackage(context.getPackageName()); } catch (_ePkg) {}
+            }
+        } else {
+            launchIntent.setPackage(context.getPackageName());
+        }
+        launchIntent.setFlags(
+            Intent.FLAG_ACTIVITY_NEW_TASK |
+            Intent.FLAG_ACTIVITY_CLEAR_TOP |
+            Intent.FLAG_ACTIVITY_SINGLE_TOP
+        );
+
+        try {
+            console.log("[AlarmReceiver] fullScreen deepLink=" + deepLink + ", hasComponent=" + (mainComponent != null));
+        } catch (_eLog) {}
+
+        launchIntent!.putExtra("IS_RINGING", true); 
+        launchIntent!.putExtra("TASK_ID", taskId);
+        launchIntent!.putExtra("TASK_TITLE", title);
+
+        const fullScreenPendingIntent = PendingIntent.getActivity(
+            context,
+            taskId.toInt(), // 确保 requestCode 唯一
+            launchIntent!,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
+
+        // 3. 构建通知
+        // 使用 App 自身图标，避免 android.R.drawable 可能的问题
+        const appIcon = context.getApplicationInfo().icon;
+        
+        const builder = new Notification.Builder(context, CHANNEL_ID)
+            .setSmallIcon(appIcon) 
+            .setContentTitle(title)
+            .setContentText("点击关闭闹钟")
+            .setPriority(Notification.PRIORITY_MAX) // 兼容旧版本
+            .setCategory(Notification.CATEGORY_ALARM)
+            .setVisibility(Notification.VISIBILITY_PUBLIC) // 锁屏显示关键
+            .setOngoing(true) // 防止侧滑删除
+            .setAutoCancel(true)
+            .setContentIntent(fullScreenPendingIntent)
+            .setFullScreenIntent(fullScreenPendingIntent, true); // true = 尝试直接打开 Activity
+
+        // 4. 发送
+        nm.notify(taskId.toInt(), builder.build());
+    }
+
+    wakeUpScreen(context: Context) {
+        try {
+            const pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager;
+            // ACQUIRE_CAUSES_WAKEUP 是点亮屏幕的关键
+            const wl = pm.newWakeLock(
+                PowerManager.FULL_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP | PowerManager.ON_AFTER_RELEASE, 
+                "ZeMo:AlarmWakeUp"
+            );
+            wl.acquire(10000); // 点亮 10 秒
+        } catch(e) { console.error(e); }
+    }
+}

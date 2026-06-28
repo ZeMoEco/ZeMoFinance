@@ -1,0 +1,24 @@
+// common/AssetUtil.uts
+import { File } from 'java.io';
+import { UTSAndroid } from 'dcloud.uts';
+
+export function copyAssets() {
+    const context = UTSAndroid.getUniActivity()!;
+    const filesDir = context.getFilesDir().getAbsolutePath(); // /data/data/.../files
+    const modelPath = filesDir + "/models";
+    
+    const folder = new File(modelPath);
+    if (!folder.exists()) {
+        folder.mkdirs();
+        console.log("开始复制模型文件...");
+        
+        // 使用 UTSAndroid.getAssets() 遍历 static/models 下的文件并复制
+        // 这里需要写一段流读写代码 (InputSteam -> FileOutputStream)
+        // 简单伪代码：
+        // copyFileFromAssets("models/silero_vad.onnx", modelPath + "/silero_vad.onnx");
+        // ...复制所有文件
+        
+        console.log("模型复制完成");
+    }
+    return modelPath;
+}

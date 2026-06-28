@@ -1,0 +1,123 @@
+﻿import { DBManager } from '@/utils/DBManager.uts'
+import { DB } from '@/utils/DB/DB.uts'
+import { Task } from './TaskService.uts'
+
+/**
+ * 浠诲姟鍏宠仈涓庨珮绾ф煡璇?鍘熺敓 SQL 灏佽鏈嶅姟
+ * 鐩殑锛?
+ * 1. 灏嗗浘鍏崇郴锛堢埗瀛愭爲銆佷緷璧栫幆锛変笅娌夊埌 SQLite 灞傞潰澶勭悊锛堝埄鐢?WITH RECURSIVE 鍏叡琛ㄨ〃杈惧紡 CTE锛夛紝閬垮厤鍦ㄤ笟鍔″眰鍐呭瓨涓叏閲忛亶鍘?
+ * 2. 閬垮厤 JSON 瀛楁鐨?LIKE 鎵〃锛屼娇鐢?SQLite 鍐呯疆鐨?json_extract 鍘熺敓鍑芥暟杩涜鏌ヨ杩囨护
+ */
+export class TaskNativeSqlService {
+
+    /**
+     * 鍔ㄦ€侀€掑綊鏌ヨ鎸囧畾浠诲姟鐨勬墍鏈夊瓙浠诲姟鑺傜偣锛堜笉闄愬眰绾э級
+     * 鍐呴儴浣跨敤 WITH RECURSIVE 鍦?SQLite 寮曟搸鍐呭畬鎴愰€掑綊锛屽交搴曡В鍐冲唴瀛樼垎鐐稿拰 N+1 鏌ヨ闂銆?
+     * 
+     * @param rootTaskId 鏍逛换鍔?ID
+     * @returns 鎵佸钩鍖栦絾鍖呭惈灞傜骇娣卞害(depth)鐨勬墍鏈夊瓙瀛欎换鍔″垪琛?
+     */
+    static async getSubTaskTree(rootTaskId: number): Promise<any[]> {
+        if (!DB.isReady) return []
+
+        // 浣跨敤 WITH RECURSIVE CTE 杩涜閫掑綊涓嬮捇锛屾煡鍑鸿繖涓埗鑺傜偣涓嬬殑鎵€鏈夊瓙瀛欒妭鐐?
+        // 杩欓噷涓轰簡婕旂ず锛屾垜浠煡璇?Task 琛ㄤ腑鎵€鏈夌殑鐩稿叧瀛楁
+        const sql = `
+            WITH RECURSIVE task_tree AS (
+                -- 1. 鍒濆闆?(鍩哄噯鏌ヨ): 閫夊嚭鎸囧畾鐨勬牴鑺傜偣
+                SELECT n.id, n.content as title, n.properties, 0 AS depth 
+                FROM nodes n WHERE n.id = ? AND UPPER(n.type) = 'TASK'
+                
+                UNION ALL
+                
+                -- 2. 閫掑綊闆? 灏嗕笂涓€灞傜殑缁撴灉 (task_tree) 涓庡師濮嬭〃 (tasks) 缁撳悎
+                SELECT t.id, t.content as title, t.properties, tt.depth + 1 AS depth
+                FROM nodes t INNER JOIN edges e ON t.id = e.target_id AND UPPER(e.relation_type) IN ('CONTAINS_TASK_TREE', 'CONTAINS') INNER JOIN task_tree tt ON e.source_id = tt.id WHERE UPPER(t.type) = 'TASK'
+            )
+            -- 杩斿洖甯︽繁搴︾殑缁撴灉锛屾帓闄よ嚜韬嵆杩斿洖绾瓙瀛欒妭鐐?
+            SELECT * FROM task_tree WHERE id != ?
+        `
+        
+        try {
+            // 鍙傛暟鍖栨煡璇紝鍘熺敓璋冪敤闃叉敞鍏?
+            const res = await DB.query(sql, [rootTaskId, rootTaskId])
+            // 杩欓噷鏍规嵁瀹為檯骞冲彴杩斿洖鏍煎紡锛屽皢鍏舵媶绠变负鏁扮粍
+            return res as any[]
+        } catch(e) {
+            console.error("SQL閫掑綊鏌ヨ瀛愪换鍔″け璐? ", e)
+            return []
+        }
+    }
+
+    /**
+     * 妫€娴嬪苟鏌ユ壘褰撳墠浠诲姟鏍戜腑鏄惁瀛樺湪鐢变簬鑴忔暟鎹鑷寸殑鈥滄寰幆/鐜姸渚濊禆鈥?
+     * 渚濋潬娣卞害闄愬埗(depth limit)鍜?path 鍥炴函鏉ユ帓鏌ャ€?
+     * 
+     * @param rootTaskId 妫€鏌ヨ捣濮嬭妭鐐?
+     */
+    static async detectCyclicDependency(rootTaskId: string): Promise<any[]> {
+        if (!DB.isReady) return []
+
+        // 鍒╃敤 SQLite 鍘熺敓 JSON/String 绱姞璺緞骞跺湪 CTE 涓鏌ユ槸鍚﹀寘鍚簡鑷韩
+        const sql = `
+            WITH RECURSIVE cycle_check AS (
+                SELECT n.id, n.content as title, ',' || n.id || ',' AS path
+                FROM nodes n WHERE n.id = ? AND n.type = 'task'
+
+                UNION ALL
+
+                SELECT t.id, t.content as title, cc.path || t.id || ',' AS path
+                FROM nodes t
+                INNER JOIN cycle_check cc ON t.parent_id = cc.id
+                -- 闃叉姝诲惊鐜紝鍙戠幇寰幆灏变笉鍐嶅悜涓嬪睍寮€
+                WHERE instr(cc.path, ',' || t.parent_id || ',') = 0
+            )
+            -- 绛涢€夊嚭鏋勬垚鐜矾鐨勮妭鐐瑰叧绯伙紙濡傛灉 t.id 宸茬粡鍑虹幇鍦ㄤ簡鐖剁骇閾炬潯閲岋紝璇存槑瀛樺湪鐜級
+            SELECT * FROM cycle_check 
+            WHERE instr(path, ',' || id || ',') > 0
+            
+        `
+        
+        try {
+            return await DB.query(sql, [rootTaskId]) as any[]
+        } catch(e) {
+            console.error("鐜矾妫€娴嬪け璐? ", e)
+            return []
+        }
+    }
+
+    /**
+     * 鏇夸唬鐢变簬婊ョ敤 properties LIKE '%xxx%' 寮曞彂鐨勫叏琛ㄦ壂榛戞礊銆?
+     * 鍦?SQLite 绔洿鎺ヤ娇鐢ㄥ師鐢?json_extract (鎴栬€呭湪 SQLite 涓娇鐢?-> / ->> 鎿嶄綔绗? 
+     * 浠庤€屽皢 JSON 鏉′欢杩囨护宸ヤ綔鐣欏湪鏁版嵁搴撳紩鎿庢墽琛屻€?
+     * 
+     * @param jsonKey JSON 涓墿灞曞瓧娈电殑 Key
+     * @param jsonValue 闇€瑕佸尮閰嶇殑鍊?
+     */
+    static async queryTasksByJsonProp(jsonKey: string, jsonValue: string): Promise<any[]> {
+        if (!DB.isReady) return []
+
+        // 浣跨敤 json_extract(properties, '$.key') = value
+        // 鎴栬€?SQLite 3.38.0+ 寮曞叆鐨勫揩鎹疯繍绠楃 properties->>'$.key'
+        const sql = `
+            SELECT id, content as title, properties
+            FROM nodes WHERE type = 'task' AND json_extract(properties, '$.' || ?) = ?
+               OR properties LIKE '%"' || ? || '":"' || ? || '"%' -- 鍏滃簳锛氬鏋滆€佺増鏈?SQLite 娌℃湁 json1 鎵╁睍鏃剁殑鍥為€€绛栫暐(鏋佸皯瑙?
+        `
+        try {
+            return await DB.query(sql, [jsonKey, jsonValue, jsonKey, jsonValue]) as any[]
+        } catch (e) {
+            // 濡傛灉鎶ラ敊锛堥€氬父鏄洜涓烘煇浜涙棫骞冲彴绯荤粺 SQLite 榛樿绂佺敤浜?json1 鎵╁睍锛?
+            // 杩欓噷閫€鍥炰紶缁熸煡璇綔涓哄悗澶囷紝浣嗘瑙勫寲寮€鍙戝繀椤诲紑鍚?JSON1
+            console.warn("JSON1 鎵╁睍鎵ц澶辫触锛屽洖閫€鍘熺敓 LIKE", e)
+            const fallbackSql = `
+                SELECT id, content as title, properties 
+                FROM nodes 
+                WHERE properties LIKE '%"' || ? || '":"' || ? || '"%'
+            `
+            return await DB.query(fallbackSql, [jsonKey, jsonValue]) as any[]
+        }
+    }
+}
+
+

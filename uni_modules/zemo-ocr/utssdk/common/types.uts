@@ -1,0 +1,19 @@
+export type OcrBox = {
+	left: number
+	top: number
+	right: number
+	bottom: number
+}
+
+export type OcrItem = {
+    text: string
+    confidence: number
+    box: OcrBox
+}
+
+export type OcrResult = {
+	ok: boolean
+	items: OcrItem[]
+	fullText: string
+	message?: string
+}

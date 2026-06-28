@@ -1,0 +1,143 @@
+<template>
+  <view v-if="modelValue" class="gm-mask" :class="[mode == 'bottom' ? 'gm-mask-bottom' : 'gm-mask-center']" @click="onOverlayClick">
+    <view class="gm-panel" :class="[mode == 'bottom' ? 'gm-panel-bottom' : 'gm-panel-center']" @click.stop="">
+      <view class="gm-header" v-if="title != ''">
+        <text class="gm-title">{{ title }}</text>
+        <view v-if="mode == 'bottom'" class="gm-close" @click="onCancel">
+           <text class="gm-close-icon">✕</text>
+        </view>
+      </view>
+
+      <view class="gm-body">
+        <slot />
+      </view>
+
+      <view class="gm-footer" v-if="showFooter">
+        <button v-if="showCancel" class="gm-btn gm-btn-cancel" @click="onCancel">{{ cancelText }}</button>
+        <button class="gm-btn gm-btn-confirm" @click="onConfirm">{{ confirmText }}</button>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script lang="uts">
+export default {
+  name: 'GenericModal',
+  props: {
+    modelValue: { type: Boolean, default: false },
+    title: { type: String, default: '' },
+    confirmText: { type: String, default: '确定' },
+    cancelText: { type: String, default: '取消' },
+    showCancel: { type: Boolean, default: true },
+    showFooter: { type: Boolean, default: true },
+    mode: { type: String, default: 'center' }, // center | bottom
+    maskClosable: { type: Boolean, default: true },
+  },
+  emits: ['update:modelValue', 'confirm', 'cancel', 'close'],
+  methods: {
+    onOverlayClick() {
+        if (this.maskClosable) {
+            this.onCancel();
+        }
+    },
+    onCancel() {
+      this.$emit('update:modelValue', false)
+      this.$emit('cancel')
+      this.$emit('close')
+    },
+    onConfirm() {
+      this.$emit('confirm')
+    },
+  }
+}
+</script>
+
+<style scoped>
+.gm-mask {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  z-index: 9999;
+}
+.gm-mask-center {
+  justify-content: center;
+  align-items: center;
+}
+.gm-mask-bottom {
+  justify-content: flex-end;
+}
+
+.gm-panel {
+  background-color: #fff;
+  overflow: hidden;
+}
+
+.gm-panel-center {
+  width: 86%;
+  border-radius: 16px;
+}
+  .gm-panel-bottom {
+  width: 100%;
+  border-top-left-radius: 16px;
+  border-top-right-radius: 16px;
+  padding-bottom: 20px; /* Safe area fallback */
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.gm-header {
+  padding: 16px 20px;
+  border-bottom: 1px solid #f0f0f0;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.gm-title {
+  font-size: 17px;
+  font-weight: bold;
+  color: #333;
+}
+
+.gm-close {
+    padding: 4px;
+}
+.gm-close-icon {
+    font-size: 20px;
+    color: #999;
+}
+
+.gm-body {
+  padding: 20px;
+}
+
+.gm-footer {
+  padding: 10px 20px 20px 20px;
+  display: flex;
+  flex-direction: row;
+  justify-content: flex-end;
+}
+
+.gm-btn {
+  padding: 6px 16px;
+  font-size: 14px;
+  border-radius: 6px;
+  border: none;
+  margin-left: 10px;
+}
+.gm-btn::after { border: none; }
+
+.gm-btn-cancel {
+  background-color: #f5f5f5;
+  color: #666;
+}
+.gm-btn-confirm {
+  background-color: #007aff;
+  color: #fff;
+}
+</style>

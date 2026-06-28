@@ -1,0 +1,141 @@
+// // 简易 WordPiece Tokenizer (BERT 兼容)
+// import { FileUtil } from '@/utils/file/file.uts';
+// import { ModelConfig } from './ModelConfig.uts';
+
+// // #ifdef APP-ANDROID
+// import UTSAndroid from 'io.dcloud.uts.UTSAndroid'
+// // #endif
+
+// export class Tokenizer {
+// 	private static vocab: Map<string, number> | null = null;
+// 	private static invVocab: string[] = [];
+
+// 	static async ensureLoaded(): Promise<void> {
+// 		if (Tokenizer.vocab != null) return;
+// 		const path = Tokenizer.resolveAssetPath(ModelConfig.TASK_VOCAB_ASSET_PATH);
+// 		const text = await FileUtil.readTextFile(path);
+// 		const map = new Map<string, number>();
+// 		const inv: string[] = [];
+// 		if (text != null) {
+// 			const lines = text.split('\n');
+// 			for (let i = 0; i < lines.length; i++) {
+// 				const token = lines[i].trim();
+// 				if (token == '') continue;
+// 				map.set(token, inv.length);
+// 				inv.push(token);
+// 			}
+// 		}
+// 		Tokenizer.vocab = map;
+// 		Tokenizer.invVocab = inv;
+// 	}
+
+// 	static tokenize(text: string, maxLen: number = 64): Tokenized {
+// 		const tokens: string[] = [];
+// 		const lower = text.toLowerCase();
+// 		const basic = Tokenizer.basicTokenize(lower);
+// 		for (let i = 0; i < basic.length; i++) {
+// 			const word = basic[i];
+// 			const wp = Tokenizer.wordPiece(word);
+// 			for (let j = 0; j < wp.length; j++) tokens.push(wp[j]);
+// 		}
+
+// 		const cls = '[CLS]';
+// 		const sep = '[SEP]';
+// 		const pad = '[PAD]';
+
+// 		const ids: number[] = [];
+// 		const mask: number[] = [];
+// 		const types: number[] = [];
+
+// 		ids.push(Tokenizer.tokenId(cls));
+// 		mask.push(1);
+// 		types.push(0);
+
+// 		for (let i = 0; i < tokens.length && ids.length < maxLen - 1; i++) {
+// 			ids.push(Tokenizer.tokenId(tokens[i]));
+// 			mask.push(1);
+// 			types.push(0);
+// 		}
+
+// 		ids.push(Tokenizer.tokenId(sep));
+// 		mask.push(1);
+// 		types.push(0);
+
+// 		while (ids.length < maxLen) {
+// 			ids.push(Tokenizer.tokenId(pad));
+// 			mask.push(0);
+// 			types.push(0);
+// 		}
+
+// 		return { inputIds: ids, attentionMask: mask, tokenTypeIds: types } as Tokenized;
+// 	}
+
+// 	private static tokenId(token: string): number {
+// 		if (Tokenizer.vocab == null) return 0;
+// 		const v = Tokenizer.vocab.get(token);
+// 		if (v != null) return v;
+// 		const unk = Tokenizer.vocab.get('[UNK]');
+// 		return unk != null ? unk : 0;
+// 	}
+
+// 	private static basicTokenize(text: string): string[] {
+// 		const res: string[] = [];
+// 		let buff = '';
+// 		for (let i = 0; i < text.length; i++) {
+// 			const ch = text.charAt(i);
+// 			const code = ch.charCodeAt(0) ?? 0;
+// 			const isSpace = ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
+// 			const isCJK = (code >= 0x4E00 && code <= 0x9FFF);
+// 			if (isSpace) {
+// 				if (buff != '') { res.push(buff); buff = ''; }
+// 				continue;
+// 			}
+// 			if (isCJK) {
+// 				if (buff != '') { res.push(buff); buff = ''; }
+// 				res.push(ch);
+// 				continue;
+// 			}
+// 			buff += ch;
+// 		}
+// 		if (buff != '') res.push(buff);
+// 		return res;
+// 	}
+
+// 	private static wordPiece(token: string): string[] {
+// 		if (Tokenizer.vocab == null) return ['[UNK]'];
+// 		if (Tokenizer.vocab.has(token)) return [token];
+
+// 		const chars = token.split('');
+// 		const subTokens: string[] = [];
+// 		let start = 0;
+// 		while (start < chars.length) {
+// 			let end = chars.length;
+// 			let cur: string | null = null;
+// 			while (start < end) {
+// 				let piece = chars.slice(start, end).join('');
+// 				if (start > 0) piece = '##' + piece;
+// 				if (Tokenizer.vocab.has(piece)) { cur = piece; break; }
+// 				end--;
+// 			}
+// 			if (cur == null) return ['[UNK]'];
+// 			subTokens.push(cur);
+// 			start = end;
+// 		}
+// 		return subTokens;
+// 	}
+
+// 	private static resolveAssetPath(path: string): string {
+// 		// #ifdef APP-ANDROID
+// 		return UTSAndroid.convert2AbsFullPath(path);
+// 		// #endif
+// 		// #ifndef APP-ANDROID
+// 		return path;
+// 		// #endif
+// 	}
+// }
+
+// export type Tokenized = {
+// 	inputIds: number[];
+// 	attentionMask: number[];
+// 	tokenTypeIds: number[];
+// }

@@ -1,0 +1,317 @@
+<template>
+	<view class="rich-text-compat" @click="onClick">
+		<view v-for="(line, idx) in displayLines" :key="idx" class="rt-line" :style="getLineStyle()">
+			<image v-if="line.kind == 'img' && line.image != ''" :src="line.image" mode="widthFix" class="rt-image"></image>
+			<view v-else-if="line.kind == 'code'" class="rt-code-wrap">
+				<text class="rt-code">{{ line.text }}</text>
+			</view>
+			<view v-else-if="line.kind == 'blank'" class="rt-blank"></view>
+			<text v-else class="rt-text" :style="getTextStyle(line.kind)">{{ line.text }}</text>
+		</view>
+	</view>
+</template>
+
+<script lang="uts">
+type CompatLine = {
+	kind: string
+	text: string
+	image: string
+}
+
+export default {
+	name: 'RichTextCompat',
+	emits: ['itemclick'],
+	props: {
+		nodes: {
+			type: String,
+			required: false,
+			default: ''
+		},
+		inline: {
+			type: Boolean,
+			required: false,
+			default: false
+		}
+	},
+	computed: {
+		displayLines(): CompatLine[] {
+			const raw = this.nodes == null ? '' : this.nodes.toString()
+			if (raw == '') return [] as CompatLine[]
+
+			if (raw.indexOf('<') >= 0 && raw.indexOf('>') >= 0) {
+				return this.buildHtmlLines(raw)
+			}
+			return this.buildMarkdownLines(raw)
+		}
+	},
+	methods: {
+		onClick(e: any) {
+			this.$emit('itemclick', e)
+		},
+		decodeHtmlEntities(input: string): string {
+			return input
+				.replace(/&nbsp;/g, ' ')
+				.replace(/&amp;/g, '&')
+				.replace(/&lt;/g, '<')
+				.replace(/&gt;/g, '>')
+				.replace(/&#39;/g, "'")
+				.replace(/&quot;/g, '"')
+		},
+		stripTags(input: string): string {
+			return this.decodeHtmlEntities(input.replace(/<[^>]*>/g, ''))
+		},
+		getLineStyle(): UTSJSONObject {
+			if (this.inline) {
+				return new UTSJSONObject({
+					marginBottom: 0
+				})
+			}
+			return new UTSJSONObject({
+				marginBottom: 4
+			})
+		},
+		getTextStyle(kind: string): UTSJSONObject {
+			if (this.inline) {
+				if (kind == 'h1' || kind == 'h2' || kind == 'h3') {
+					return new UTSJSONObject({
+						fontWeight: 'bold',
+						color: '#111827'
+					})
+				}
+				if (kind == 'quote') {
+					return new UTSJSONObject({
+						color: '#4b5563'
+					})
+				}
+				return new UTSJSONObject({
+					color: '#1f2937'
+				})
+			}
+
+			if (kind == 'h1') {
+				return new UTSJSONObject({
+					fontSize: 22,
+					lineHeight: 30,
+					fontWeight: 'bold',
+					color: '#111827'
+				})
+			}
+			if (kind == 'h2') {
+				return new UTSJSONObject({
+					fontSize: 19,
+					lineHeight: 27,
+					fontWeight: 'bold',
+					color: '#111827'
+				})
+			}
+			if (kind == 'h3') {
+				return new UTSJSONObject({
+					fontSize: 16,
+					lineHeight: 24,
+					fontWeight: 'bold',
+					color: '#111827'
+				})
+			}
+			if (kind == 'quote') {
+				return new UTSJSONObject({
+					color: '#4b5563'
+				})
+			}
+			return new UTSJSONObject({
+				color: '#1f2937'
+			})
+		},
+		normalizeInlineMarkdown(input: string): string {
+			let s = input
+			s = s.replace(/!\[([^\]]*)\]\(([^\)]+)\)/g, (_m, alt, _url, _i, _src) => {
+				const a = alt != null ? alt.toString() : ''
+				return a != '' ? `[图片:${a}]` : '[图片]'
+			})
+			s = s.replace(/\[([^\]]+)\]\(([^\)]+)\)/g, (_m, t, url, _i, _src) => {
+				const title = t != null ? t.toString() : ''
+				const link = url != null ? url.toString() : ''
+				return title != '' ? `${title} (${link})` : link
+			})
+			s = s.replace(/\*\*([^*]+)\*\*/g, '$1')
+			s = s.replace(/\*([^*]+)\*/g, '$1')
+			s = s.replace(/`([^`]+)`/g, '[$1]')
+			return s
+		},
+		buildMarkdownLines(markdown: string): CompatLine[] {
+			const src = markdown.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+			const rows = src.split('\n')
+			const out: CompatLine[] = []
+			for (let i = 0; i < rows.length; i++) {
+				const line = rows[i] != null ? rows[i].toString() : ''
+				const trimmed = line.trim()
+				if (trimmed == '') {
+					out.push({ kind: 'blank', text: '', image: '' } as CompatLine)
+					continue
+				}
+
+				const imgMatch = /^!\[[^\]]*\]\(([^\)]+)\)$/.exec(trimmed)
+				if (imgMatch != null && imgMatch.length > 1 && imgMatch[1] != null) {
+					out.push({ kind: 'img', text: '', image: imgMatch[1].toString() } as CompatLine)
+					continue
+				}
+
+				const heading = /^(#{1,3})\s+(.+)$/.exec(trimmed)
+				if (heading != null && heading.length > 2 && heading[1] != null && heading[2] != null) {
+					const marks = heading[1].toString()
+					const kind = marks.length == 1 ? 'h1' : (marks.length == 2 ? 'h2' : 'h3')
+					out.push({
+						kind,
+						text: this.normalizeInlineMarkdown(heading[2].toString()),
+						image: ''
+					} as CompatLine)
+					continue
+				}
+
+				const todoUnchecked = /^[-*]\s+\[\s\]\s+(.+)$/.exec(trimmed)
+				if (todoUnchecked != null && todoUnchecked.length > 1 && todoUnchecked[1] != null) {
+					out.push({
+						kind: 'li',
+						text: '☐ ' + this.normalizeInlineMarkdown(todoUnchecked[1].toString()),
+						image: ''
+					} as CompatLine)
+					continue
+				}
+
+				const todoChecked = /^[-*]\s+\[[xX]\]\s+(.+)$/.exec(trimmed)
+				if (todoChecked != null && todoChecked.length > 1 && todoChecked[1] != null) {
+					out.push({
+						kind: 'li',
+						text: '☑ ' + this.normalizeInlineMarkdown(todoChecked[1].toString()),
+						image: ''
+					} as CompatLine)
+					continue
+				}
+
+				const listItem = /^[-*]\s+(.+)$/.exec(trimmed)
+				if (listItem != null && listItem.length > 1 && listItem[1] != null) {
+					out.push({
+						kind: 'li',
+						text: '• ' + this.normalizeInlineMarkdown(listItem[1].toString()),
+						image: ''
+					} as CompatLine)
+					continue
+				}
+
+				const quote = /^>\s+(.+)$/.exec(trimmed)
+				if (quote != null && quote.length > 1 && quote[1] != null) {
+					out.push({
+						kind: 'quote',
+						text: '▎ ' + this.normalizeInlineMarkdown(quote[1].toString()),
+						image: ''
+					} as CompatLine)
+					continue
+				}
+
+				out.push({
+					kind: 'p',
+					text: this.normalizeInlineMarkdown(line),
+					image: ''
+				} as CompatLine)
+			}
+			return out
+		},
+		buildHtmlLines(html: string): CompatLine[] {
+			const source = html.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+			const blocks = source.match(/<h[1-6][^>]*>[\s\S]*?<\/h[1-6]>|<li[^>]*>[\s\S]*?<\/li>|<p[^>]*>[\s\S]*?<\/p>|<pre><code>[\s\S]*?<\/code><\/pre>|<img[^>]*>|<br\s*\/?\s*>/gi)
+			const out: CompatLine[] = []
+			if (blocks == null || blocks.length == 0) {
+				const text = this.stripTags(source)
+				if (text.trim() == '') return [] as CompatLine[]
+				out.push({ kind: 'p', text, image: '' } as CompatLine)
+				return out
+			}
+
+			for (let i = 0; i < blocks.length; i++) {
+				const b = blocks[i] != null ? blocks[i].toString() : ''
+				const lowered = b.toLowerCase()
+
+				if (lowered.startsWith('<br')) {
+					out.push({ kind: 'blank', text: '', image: '' } as CompatLine)
+					continue
+				}
+
+				if (lowered.startsWith('<img')) {
+					const m = /src="([^"]+)"/i.exec(b)
+					const src = m != null && m.length > 1 && m[1] != null ? m[1].toString() : ''
+					out.push({ kind: 'img', text: '', image: src } as CompatLine)
+					continue
+				}
+
+				if (lowered.startsWith('<pre><code>')) {
+					let t = b.replace(/<pre><code>/gi, '').replace(/<\/code><\/pre>/gi, '')
+					t = this.decodeHtmlEntities(t)
+					out.push({ kind: 'code', text: t, image: '' } as CompatLine)
+					continue
+				}
+
+				if (lowered.startsWith('<h1')) {
+					out.push({ kind: 'h1', text: this.stripTags(b), image: '' } as CompatLine)
+					continue
+				}
+				if (lowered.startsWith('<h2')) {
+					out.push({ kind: 'h2', text: this.stripTags(b), image: '' } as CompatLine)
+					continue
+				}
+				if (lowered.startsWith('<h3') || lowered.startsWith('<h4') || lowered.startsWith('<h5') || lowered.startsWith('<h6')) {
+					out.push({ kind: 'h3', text: this.stripTags(b), image: '' } as CompatLine)
+					continue
+				}
+
+				if (lowered.startsWith('<li')) {
+					out.push({ kind: 'li', text: '• ' + this.stripTags(b), image: '' } as CompatLine)
+					continue
+				}
+
+				out.push({ kind: 'p', text: this.stripTags(b), image: '' } as CompatLine)
+			}
+
+			return out
+		},
+		onItemClick(e: any) {
+			this.$emit('itemclick', e)
+		}
+	}
+}
+</script>
+
+<style scoped>
+.rich-text-compat {
+	width: 100%;
+}
+
+.rt-line {
+	margin-bottom: 4px;
+}
+
+.rt-text {
+	font-size: 14;
+	line-height: 22;
+	color: #1f2937;
+}
+
+.rt-code-wrap {
+	background-color: #f3f4f6;
+	padding: 6px 8px;
+	border-radius: 6px;
+}
+
+.rt-code {
+	font-size: 13;
+	line-height: 20;
+	color: #111827;
+}
+
+.rt-blank {
+	height: 8px;
+}
+
+.rt-image {
+	width: 100%;
+	border-radius: 8px;
+}
+</style>

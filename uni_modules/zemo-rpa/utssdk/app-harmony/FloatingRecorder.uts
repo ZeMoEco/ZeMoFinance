@@ -1,0 +1,62 @@
+// uni_modules/zemo-rpa/utssdk/app-harmony/FloatingRecorder.uts
+// #ifdef APP-HARMONY
+import window from '@ohos.window';
+import common from '@ohos.app.ability.common';
+import { BusinessError } from '@ohos.base';
+
+export class FloatingRecorder {
+    private static windowStage: window.WindowStage | null = null;
+    private static subWindow: window.Window | null = null;
+    private static isRecording: boolean = false;
+
+    // Must be called with a WindowStage (e.g., from UIAbility onWindowStageCreate)
+    // Or if inside a page, use getContext() but creating subwindows usually needs Stage.
+    static async show(context: any) {
+        if (FloatingRecorder.subWindow != null) return;
+
+        // In UTS/Harmony, context management is tricky. 
+        // We often rely on the main window stage which should be passed or stored globally.
+        // Assuming 'context' passed here is WindowStage or we find a way to get it.
+        
+        // For now, let's assume valid WindowStage is passed.
+        const stage = context as window.WindowStage;
+        if (!stage) {
+            console.error("FloatingRecorder requires WindowStage on Harmony");
+            return;
+        }
+
+        try {
+            // Create sub-window
+            const win = await stage.createSubWindow("FloatingRecorderWin");
+            FloatingRecorder.subWindow = win;
+            
+            await win.moveWindowTo(0, 100);
+            await win.resize(200, 100);
+            
+            // Load content
+            // We need a page or custom UI content. 
+            // Since this is native UTS, we might load a specific page path if it's an app window
+            // Or set UI content if this was pure ArkTS.
+            // In hybrid, we often just load a route.
+            await win.setUIContent("uni_modules/zemo-rpa/components/floating-recorder-page"); 
+            
+            await win.showWindow();
+            
+        } catch (exception) {
+            console.error('Failed to create subwindow. Cause: ' + JSON.stringify(exception));
+        }
+    }
+
+    static async hide() {
+        if (FloatingRecorder.subWindow) {
+            try {
+                await FloatingRecorder.subWindow.destroyWindow();
+                FloatingRecorder.subWindow = null;
+            } catch (e) {
+                console.error("Error destroying window: " + e);
+            }
+        }
+        FloatingRecorder.isRecording = false;
+    }
+}
+// #endif

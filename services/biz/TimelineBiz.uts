@@ -1,0 +1,1044 @@
+import { Log, Node, Attachment } from '../../utils/types/index.uts';
+import { NodeService } from '../graph/NodeService.uts';
+import { AttachmentService } from '../graph/AttachmentService.uts';
+import { LogService } from '../graph/LogService.uts';
+import { DB, SqlArgs } from '@/utils/DB/DB.uts';
+import { GraphService } from '@/utils/DB/GraphService.uts';
+import { genId } from '@/utils/common/id.uts';
+
+class UTSJSONObject {
+	private data : any;
+
+	constructor(data : any = null) {
+		this.data = data == null ? {} as any : data;
+	}
+
+	set(key : string, value : any) : void {
+		this.data[key] = value;
+	}
+
+	get(key : string) : any | null {
+		const value = this.data[key];
+		return value == null ? null : value;
+	}
+
+	getString(key : string) : string | null {
+		const value = this.get(key);
+		if (value == null) return null;
+		return value.toString();
+	}
+
+	getNumber(key : string) : number | null {
+		const value = this.get(key);
+		if (value == null) return null;
+		if (typeof value == 'number') return value;
+		const num = parseInt(value.toString());
+		return isNaN(num) ? null : num;
+	}
+
+	getBoolean(key : string) : boolean | null {
+		const value = this.get(key);
+		if (value == null) return null;
+		if (typeof value == 'boolean') return value;
+		const text = value.toString().trim().toLowerCase();
+		if (text == 'true' || text == '1') return true;
+		if (text == 'false' || text == '0') return false;
+		return null;
+	}
+
+	getArray(key : string) : any[] | null {
+		const value = this.get(key);
+		return value == null ? null : value as any[];
+	}
+
+	toJSON() : any {
+		return this.data;
+	}
+}
+
+export type TimelineMetadata = {
+	text : string | null;
+	images : string[];
+	files : string[];
+	videos : string[];
+}
+
+export type TimelineEntry = {
+	id : string;
+	start_time : number;
+	end_time : number | null;
+	content : string | null;
+	task_id : string | null;
+	task_title ?: string | null;
+	source : string;
+	metadata : TimelineMetadata | null;
+	created_at : number;
+	duration_display : string;
+	is_active : boolean;
+	source_type ?: string;
+	entity_id ?: string | null;
+}
+
+/**
+ * 呈现给前端视图层的时间线聚合对象 (DTO)
+ */
+export type TimelineItem = {
+	log : Log;                  // 当前发生的核心日志时序
+	targetNode : Node | null;   // 日志涉及的核心目标节点
+	attachments : Attachment[]; // 目标节点所挂靠的基础物理资产 (方便展示卡片上的图片/文档封面)
+	source_type ?: string;
+};
+
+/**
+ * 时间线业务逻辑 (TimelineBiz)
+ * 【核心职能】：对接时间线页面，负责聚合底层日志与各维度资源的流转记录。
+ */
+export class TimelineBiz {
+	private static isSystemLogAction(action : string) : boolean {
+		const a = (action ?? '').toString().trim().toUpperCase();
+		if (a == '') return false;
+		return a == 'CREATE'
+			|| a == 'UPDATE'
+			|| a == 'DELETE'
+			|| a == 'MOVE'
+			|| a == 'STATUS_CHANGE'
+			|| a == 'XP_UPDATE'
+			|| a == 'COINS_UPDATE'
+			|| a == 'PROFILE_UPDATE'
+			|| a == 'REWARD_CREATE'
+			|| a == 'REWARD_UPDATE'
+			|| a == 'REWARD_DELETE'
+			|| a == 'REWARD_REDEEM'
+			|| a == 'ATTRIBUTE_CREATE'
+			|| a == 'ATTRIBUTE_SEED';
+	}
+
+	private static looksLikeSystemPayload(content : string | null) : boolean {
+		const text = (content ?? '').toString().trim();
+		if (text == '') return false;
+		if (text == 'Task updated') return true;
+		if (text.startsWith('完成归档 ') || text.startsWith('放弃归档 ') || text.startsWith('自动归档 ')) return true;
+		if (text.startsWith('{') && text.endsWith('}')) return true;
+		return false;
+	}
+
+	private static shouldHideTimelineRow(sourceType : string, entityId : string | null, action : string, content : string | null) : boolean {
+		if (sourceType != 'log') return false;
+		const eid = (entityId ?? '').toString();
+		if (eid.startsWith('user_')) return true;
+		if (this.isSystemLogAction(action)) return true;
+		if (this.looksLikeSystemPayload(content)) return true;
+		return false;
+	}
+
+	private static parseBool(raw : any | null) : boolean {
+		if (raw == null) return false;
+		const text = raw.toString().toLowerCase();
+		return text == '1' || text == 'true';
+	}
+
+	private static parseNum(raw : any | null, fallback : number = 0) : number {
+		if (raw == null) return fallback;
+		const n = parseInt(raw.toString());
+		return isNaN(n) ? fallback : n;
+	}
+
+	private static parseJsonObject(raw : string | null) : UTSJSONObject {
+		if (raw != null && raw != '' && raw != 'null') {
+			try {
+				return new UTSJSONObject(JSON.parse(raw) as any);
+			} catch (_e) { }
+		}
+		return new UTSJSONObject();
+	}
+
+	private static parseEndTimeFromLogProperties(raw : string | null) : number | null {
+		if (raw == null || raw == '' || raw == 'null') return null;
+		try {
+			const obj = new UTSJSONObject(JSON.parse(raw) as any);
+			const endTime = obj.getNumber('end_time');
+			if (endTime != null && endTime > 0) return endTime;
+		} catch (_e) { }
+		return null;
+	}
+
+	private static formatClock(ts : number) : string {
+		const d = new Date(ts);
+		const hh = d.getHours().toString().padStart(2, '0');
+		const mm = d.getMinutes().toString().padStart(2, '0');
+		return `${hh}:${mm}`;
+	}
+
+	private static formatDuration(ms : number) : string {
+		if (ms <= 0) return '0m';
+		const seconds = Math.floor(ms / 1000);
+		if (seconds < 60) return `${seconds}s`;
+		const minutes = Math.floor(seconds / 60);
+		if (minutes < 60) return `${minutes}m`;
+		const hours = Math.floor(minutes / 60);
+		const remainingMins = minutes % 60;
+		if (remainingMins == 0) return `${hours}h`;
+		return `${hours}h ${remainingMins}m`;
+	}
+
+	private static pushUniqueText(list : string[], value : string) : void {
+		const v = value.toString().trim();
+		if (v == '') return;
+		for (let i = 0; i < list.length; i++) {
+			if (list[i] == v) return;
+		}
+		list.push(v);
+	}
+
+	private static inferMediaTypeFromPath(path : string) : string {
+		const lower = path.toLowerCase();
+		if (
+			lower.endsWith('.jpg') ||
+			lower.endsWith('.jpeg') ||
+			lower.endsWith('.png') ||
+			lower.endsWith('.gif') ||
+			lower.endsWith('.webp') ||
+			lower.endsWith('.bmp')
+		) return 'image';
+		if (
+			lower.endsWith('.mp4') ||
+			lower.endsWith('.mov') ||
+			lower.endsWith('.mkv') ||
+			lower.endsWith('.avi') ||
+			lower.endsWith('.webm')
+		) return 'video';
+		return 'file';
+	}
+
+	private static hasTimelineMedia(meta : TimelineMetadata | null) : boolean {
+		if (meta == null) return false;
+		const img = meta.images != null ? meta.images.length : 0;
+		const files = meta.files != null ? meta.files.length : 0;
+		const vids = meta.videos != null ? meta.videos.length : 0;
+		return img > 0 || files > 0 || vids > 0;
+	}
+
+	private static parseTimelineMediaFromLogProperties(raw : string | null) : TimelineMetadata | null {
+		if (raw == null || raw == '' || raw == 'null') return null;
+
+		const images = [] as string[];
+		const files = [] as string[];
+		const videos = [] as string[];
+
+		try {
+			const obj = new UTSJSONObject(JSON.parse(raw) as any);
+
+			const mediaArr = obj.getArray('media_paths');
+			if (mediaArr != null) {
+				for (let i = 0; i < mediaArr.length; i++) {
+					const item = mediaArr[i];
+					if (item == null) continue;
+					const p = item.toString();
+					const t = this.inferMediaTypeFromPath(p);
+					if (t == 'image') this.pushUniqueText(images, p);
+					else if (t == 'video') this.pushUniqueText(videos, p);
+					else this.pushUniqueText(files, p);
+				}
+			}
+
+			const metaStr = obj.getString('metadata');
+			if (metaStr != null && metaStr != '' && metaStr != 'null') {
+				try {
+					const m = new UTSJSONObject(JSON.parse(metaStr) as any);
+					const imgArr = m.getArray('images');
+					if (imgArr != null) {
+						for (let i = 0; i < imgArr.length; i++) {
+							const v = imgArr[i];
+							if (v != null) this.pushUniqueText(images, v.toString());
+						}
+					}
+					const fileArr = m.getArray('files');
+					if (fileArr != null) {
+						for (let i = 0; i < fileArr.length; i++) {
+							const v = fileArr[i];
+							if (v != null) this.pushUniqueText(files, v.toString());
+						}
+					}
+					const videoArr = m.getArray('videos');
+					if (videoArr != null) {
+						for (let i = 0; i < videoArr.length; i++) {
+							const v = videoArr[i];
+							if (v != null) this.pushUniqueText(videos, v.toString());
+						}
+					}
+				} catch (_e2) { }
+			}
+		} catch (_e) { }
+
+		const out = {
+			text: null,
+			images: images,
+			files: files,
+			videos: videos
+		} as TimelineMetadata;
+		return this.hasTimelineMedia(out) ? out : null;
+	}
+
+	private static extractAttachmentRefsFromLogProperties(raw : string | null) : string[] {
+		const refs = [] as string[];
+		if (raw == null || raw == '' || raw == 'null') return refs;
+		try {
+			const obj = new UTSJSONObject(JSON.parse(raw) as any);
+			const arr = obj.getArray('attachment_refs');
+			if (arr != null) {
+				for (let i = 0; i < arr.length; i++) {
+					const v = arr[i];
+					if (v == null) continue;
+					const id = v.toString();
+					if (id != '') refs.push(id);
+				}
+			}
+		} catch (_e) { }
+		return refs;
+	}
+
+	private static async collectAttachmentRefs(sourceEntityId : string, logProperties : string | null) : Promise<string[]> {
+		const refs = TimelineBiz.extractAttachmentRefsFromLogProperties(logProperties);
+		if (refs.length > 0) return refs;
+
+		const rows = await DB.query(
+			'SELECT id FROM attachments WHERE node_id = ? AND is_deleted = 0 ORDER BY created_at ASC',
+			[sourceEntityId]
+		);
+		for (let i = 0; i < rows.length; i++) {
+			const id = rows[i].get('id')?.toString() ?? '';
+			if (id != '') refs.push(id);
+		}
+		return refs;
+	}
+
+	private static async upsertSyncEdge(sourceId : string, targetId : string, relationType : string, rank : string, properties : string, now : number) : Promise<boolean> {
+		const existing = await DB.query(
+			'SELECT id, created_at FROM edges WHERE source_id = ? AND target_id = ? AND relation_type = ? LIMIT 1',
+			[sourceId, targetId, relationType]
+		);
+
+		const edgeId = existing.length > 0
+			? (existing[0].get('id')?.toString() ?? GraphService.generateId('edge'))
+			: GraphService.generateId('edge');
+		const createdAt = existing.length > 0
+			? TimelineBiz.parseNum(existing[0].get('created_at'), now)
+			: now;
+
+		return await DB.exec(
+			`INSERT OR REPLACE INTO edges
+			 (id, source_id, target_id, relation_type, rank, properties, created_at, updated_at, is_deleted)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+			[edgeId, sourceId, targetId, relationType, rank, properties, createdAt, now]
+		);
+	}
+
+	private static async ensureSyncBlockFromLogInternal(logId : string, now : number) : Promise<string | null> {
+		const logRows = await DB.query(
+			'SELECT id, owner_id, text, properties, sync_block_id, created_at, is_deleted FROM logs WHERE id = ? LIMIT 1',
+			[logId]
+		);
+		if (logRows.length == 0) return null;
+
+		const src = logRows[0];
+		if (TimelineBiz.parseBool(src.get('is_deleted'))) return null;
+
+		const sourceEntityId = src.get('owner_id')?.toString() ?? '';
+		if (sourceEntityId == '') return null;
+
+		const sourceText = src.get('text')?.toString() ?? '';
+		const sourceCreatedAt = TimelineBiz.parseNum(src.get('created_at'), now);
+		const existingSyncBlockId = src.get('sync_block_id')?.toString() ?? '';
+		if (existingSyncBlockId != '') {
+			const nodeRows = await DB.query('SELECT id FROM nodes WHERE id = ? AND is_deleted = 0 LIMIT 1', [existingSyncBlockId]);
+			if (nodeRows.length > 0) return existingSyncBlockId;
+		}
+
+		const syncBlockId = GraphService.generateId('syncblk');
+		const refs = await TimelineBiz.collectAttachmentRefs(sourceEntityId, src.get('properties')?.toString() ?? null);
+
+		const blockProps = new UTSJSONObject();
+		blockProps.set('source_log_id', logId);
+		blockProps.set('source_entity_id', sourceEntityId);
+		blockProps.set('source_type', 'log');
+		blockProps.set('sync_mode', 'mirror');
+		blockProps.set('version', 1);
+		blockProps.set('source_deleted', false);
+		blockProps.set('source_created_at', sourceCreatedAt);
+		blockProps.set('last_synced_at', now);
+		blockProps.set('attachment_refs', refs);
+
+		const created = await DB.exec(
+			"INSERT INTO nodes (id, type, status, content, properties, created_at, updated_at, is_deleted) VALUES (?, 'SYNC_BLOCK', NULL, ?, ?, ?, ?, 0)",
+			[syncBlockId, sourceText, JSON.stringify(blockProps), now, now]
+		);
+		if (!created) return null;
+
+		const rebound = await DB.exec('UPDATE logs SET sync_block_id = ?, updated_at = ? WHERE id = ?', [syncBlockId, now, logId]);
+		if (!rebound) return null;
+
+		return syncBlockId;
+	}
+
+	// Timeline APIs
+	public static async updateTimelineEntry(id : string, content : string) : Promise<boolean> {
+		const now = Date.now();
+		const logRes = await DB.query('SELECT id FROM logs WHERE id = ? AND is_deleted = 0 LIMIT 1', [id]);
+		if (logRes.length > 0) {
+			const args : SqlArgs = [content, now, id];
+			const ok = await DB.exec('UPDATE logs SET text = ?, updated_at = ? WHERE id = ?', args);
+			if (ok) await TimelineBiz.syncBlockFromSourceLog(id);
+			return ok;
+		}
+
+		return false;
+	}
+
+	public static async deleteTimelineEntry(id : string, deleteFiles : boolean = false) : Promise<boolean> {
+		void deleteFiles;
+		const now = Date.now();
+		const logRes = await DB.query('SELECT id FROM logs WHERE id = ? AND is_deleted = 0 LIMIT 1', [id]);
+		if (logRes.length > 0) {
+			const ok = await DB.exec('UPDATE logs SET is_deleted = 1, updated_at = ? WHERE id = ?', [now, id]);
+			if (ok) await TimelineBiz.syncBlockFromSourceLog(id);
+			return ok;
+		}
+		return false;
+	}
+
+	public static async ensureSyncBlockFromLog(logId : string) : Promise<string | null> {
+		if (logId == null || logId == '') return null;
+
+		try {
+			return await DB.tx(async () => {
+				const now = Date.now();
+				const syncBlockId = await TimelineBiz.ensureSyncBlockFromLogInternal(logId, now);
+				if (syncBlockId == null || syncBlockId == '') throw new Error('sync block unavailable');
+				return syncBlockId;
+			});
+		} catch (e) {
+			console.error('[TimelineBiz] ensureSyncBlockFromLog error:', e);
+			return null;
+		}
+	}
+
+	public static async importTimelineLogToTask(logId : string, taskId : string, parentLogId : string | null = null) : Promise<string | null> {
+		if (logId == '' || taskId == '') return null;
+
+		try {
+			return await DB.tx(async () => {
+				const now = Date.now();
+				const syncBlockId = await TimelineBiz.ensureSyncBlockFromLogInternal(logId, now);
+				if (syncBlockId == null || syncBlockId == '') throw new Error('sync block unavailable');
+
+				const existed = await DB.query(
+					"SELECT id FROM logs WHERE owner_type = 'node' AND owner_id = ? AND action = 'SYNC_BLOCK_REF' AND source_log_id = ? AND is_deleted = 0 LIMIT 1",
+					[taskId, logId]
+				);
+
+				const srcRows = await DB.query('SELECT text FROM logs WHERE id = ? LIMIT 1', [logId]);
+				const summary = srcRows.length > 0 ? (srcRows[0].get('text')?.toString() ?? '') : '';
+
+				let refLogId : string | null = null;
+				if (existed.length > 0) {
+					refLogId = existed[0].get('id')?.toString() ?? null;
+				} else {
+					const syncRefEventId = genId('evt');
+					refLogId = GraphService.generateId('log');
+					const props = new UTSJSONObject();
+					props.set('target_type', 'task');
+					props.set('sync_mode', 'mirror');
+					props.set('source_log_id', logId);
+
+					const inserted = await DB.exec(
+						"INSERT INTO logs (id, owner_type, owner_id, action, text, parent_log_id, sync_block_id, source_log_id, created_at, updated_at, properties, is_deleted, entity_version, last_event_id) VALUES (?, 'node', ?, 'SYNC_BLOCK_REF', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+						[refLogId, taskId, summary, (parentLogId != null && parentLogId != '' ? parentLogId : null), syncBlockId, logId, now, now, JSON.stringify(props), 1, syncRefEventId]
+					);
+					if (!inserted) throw new Error('insert sync ref task log failed');
+
+				}
+
+				const edgeProps = new UTSJSONObject();
+				edgeProps.set('block_kind', 'sync_ref');
+				edgeProps.set('source_log_id', logId);
+				const edgeOk = await TimelineBiz.upsertSyncEdge(taskId, syncBlockId, 'REFERENCES', '500', JSON.stringify(edgeProps), now);
+				if (!edgeOk) throw new Error('upsert task sync edge failed');
+
+				return refLogId;
+			});
+		} catch (e) {
+			console.error('[TimelineBiz] importTimelineLogToTask error:', e);
+			return null;
+		}
+	}
+
+	public static async importTimelineLogToNote(logId : string, noteId : string, rank : string = '500') : Promise<boolean> {
+		if (logId == '' || noteId == '') return false;
+
+		try {
+			return await DB.tx(async () => {
+				const now = Date.now();
+				const syncBlockId = await TimelineBiz.ensureSyncBlockFromLogInternal(logId, now);
+				if (syncBlockId == null || syncBlockId == '') throw new Error('sync block unavailable');
+
+				const edgeProps = new UTSJSONObject();
+				edgeProps.set('block_kind', 'sync_ref');
+				edgeProps.set('source_log_id', logId);
+				const edgeOk = await TimelineBiz.upsertSyncEdge(noteId, syncBlockId, 'CONTAINS_NOTE_BLOCK', rank, JSON.stringify(edgeProps), now);
+				if (!edgeOk) throw new Error('upsert note sync edge failed');
+
+				return true;
+			});
+		} catch (e) {
+			console.error('[TimelineBiz] importTimelineLogToNote error:', e);
+			return false;
+		}
+	}
+
+	public static async syncBlockFromSourceLog(logId : string) : Promise<boolean> {
+		if (logId == null || logId == '') return false;
+
+		const sourceRows = await DB.query(
+			'SELECT id, owner_id, text, properties, sync_block_id, is_deleted, created_at FROM logs WHERE id = ? LIMIT 1',
+			[logId]
+		);
+		if (sourceRows.length == 0) return false;
+
+		const source = sourceRows[0];
+		const syncBlockId = source.get('sync_block_id')?.toString() ?? '';
+		if (syncBlockId == '') return true;
+
+		const blockRows = await DB.query('SELECT id, content, properties FROM nodes WHERE id = ? AND is_deleted = 0 LIMIT 1', [syncBlockId]);
+		if (blockRows.length == 0) return false;
+
+		const now = Date.now();
+		const sourceDeleted = TimelineBiz.parseBool(source.get('is_deleted'));
+		const sourceText = source.get('text')?.toString() ?? '';
+		const sourceEntityId = source.get('owner_id')?.toString() ?? '';
+		const sourceCreatedAt = TimelineBiz.parseNum(source.get('created_at'), now);
+
+		const block = blockRows[0];
+		const props = TimelineBiz.parseJsonObject(block.get('properties')?.toString() ?? null);
+		const currentVersion = props.getNumber('version') ?? 1;
+
+		props.set('source_log_id', logId);
+		props.set('source_entity_id', sourceEntityId);
+		props.set('source_type', 'log');
+		props.set('version', currentVersion + 1);
+		props.set('last_synced_at', now);
+		props.set('source_created_at', sourceCreatedAt);
+		props.set('source_deleted', sourceDeleted);
+
+		const refs = await TimelineBiz.collectAttachmentRefs(sourceEntityId, source.get('properties')?.toString() ?? null);
+		props.set('attachment_refs', refs);
+
+		const nextContent = sourceDeleted
+			? (block.get('content')?.toString() ?? '')
+			: sourceText;
+
+		return await DB.exec(
+			'UPDATE nodes SET content = ?, properties = ?, updated_at = ? WHERE id = ? AND is_deleted = 0',
+			[nextContent, JSON.stringify(props), now, syncBlockId]
+		);
+	}
+
+	public static async listTimeline(limit : number = 20, offset : number = 0, excludeStorageEntities : boolean = false) : Promise<TimelineEntry[]> {
+		const safeLimit = limit > 0 ? limit : 20;
+		const safeOffset = offset > 0 ? offset : 0;
+		const fetchNeed = safeLimit + safeOffset;
+		const queryLimit = Math.min(Math.max(fetchNeed * 8, 80), 4000);
+		const storageFilterClause = excludeStorageEntities
+			? `
+			AND (
+				tn.id IS NULL
+				OR (
+					INSTR(COALESCE(tn.properties, ''), '"category:收纳"') = 0
+					AND INSTR(COALESCE(tn.properties, ''), '"category:整理"') = 0
+					AND INSTR(COALESCE(tn.properties, ''), '"scene:storage_item"') = 0
+					AND INSTR(COALESCE(tn.properties, ''), '"category:物品"') = 0
+					AND INSTR(REPLACE(COALESCE(tn.properties, ''), ' ', ''), '"source":"storage_item_node"') = 0
+				)
+			)`
+			: '';
+		const sql = `
+			SELECT f.source_type, f.source_id, f.entity_id, f.content, f.created_at, f.amount, f.txn_type, l.action AS log_action,
+				tn.id AS task_node_id, tn.content AS task_node_title
+			FROM vw_timeline_feed f
+			LEFT JOIN logs l ON f.source_type = 'log' AND l.id = f.source_id
+			LEFT JOIN nodes tn ON tn.id = f.entity_id AND tn.is_deleted = 0 AND UPPER(COALESCE(tn.type, '')) LIKE '%TASK%'
+			WHERE f.created_at IS NOT NULL
+			${storageFilterClause}
+			ORDER BY f.created_at DESC
+			LIMIT ? OFFSET ?
+		`;
+		const results = await DB.query(sql, [queryLimit, 0]);
+		if (results.length == 0) return [];
+
+		const entityIds = [] as string[];
+		const seenEntityIds = new Set<string>();
+		const logIds = [] as string[];
+		const seenLogIds = new Set<string>();
+		for (let i = 0; i < results.length; i++) {
+			const sourceType = results[i].get('source_type')?.toString() ?? '';
+			if (sourceType == 'log') {
+				const sourceId = results[i].get('source_id')?.toString() ?? '';
+				if (sourceId != '' && !seenLogIds.has(sourceId)) {
+					seenLogIds.add(sourceId);
+					logIds.push(sourceId);
+				}
+			}
+
+			const entityIdRaw = results[i].get('entity_id');
+			if (entityIdRaw == null) continue;
+			const entityId = entityIdRaw.toString();
+			if (entityId == '' || seenEntityIds.has(entityId)) continue;
+			seenEntityIds.add(entityId);
+			entityIds.push(entityId);
+		}
+
+		let placeholders = '';
+		const attachArgs : SqlArgs = [];
+		for (let i = 0; i < entityIds.length; i++) {
+			if (i > 0) placeholders += ',';
+			placeholders += '?';
+			attachArgs.push(entityIds[i]);
+		}
+
+		const attachRes = placeholders == ''
+			? [] as Array<Map<string, any | null>>
+			: await DB.query(`SELECT node_id, file_path, file_type FROM attachments WHERE node_id IN (${placeholders}) AND is_deleted = 0`, attachArgs);
+
+		let logIdPlaceholders = '';
+		const logArgs : SqlArgs = [];
+		for (let i = 0; i < logIds.length; i++) {
+			if (i > 0) logIdPlaceholders += ',';
+			logIdPlaceholders += '?';
+			logArgs.push(logIds[i]);
+		}
+
+		const logPropRows = logIdPlaceholders == ''
+			? [] as Array<Map<string, any | null>>
+			: await DB.query(`SELECT id, properties FROM logs WHERE id IN (${logIdPlaceholders}) AND is_deleted = 0`, logArgs);
+
+		const logEndTimeMap = new Map<string, number>();
+		const logMediaMap = new Map<string, TimelineMetadata>();
+		for (let i = 0; i < logPropRows.length; i++) {
+			const row = logPropRows[i];
+			const logId = row.get('id')?.toString() ?? '';
+			if (logId == '') continue;
+			const propsRaw = row.get('properties')?.toString() ?? null;
+			const endTime = TimelineBiz.parseEndTimeFromLogProperties(propsRaw);
+			if (endTime != null && endTime > 0) {
+				logEndTimeMap.set(logId, endTime);
+			}
+			const media = TimelineBiz.parseTimelineMediaFromLogProperties(propsRaw);
+			if (media != null) logMediaMap.set(logId, media);
+		}
+
+		const attachMap = new Map<string, UTSJSONObject>();
+		for (let i = 0; i < attachRes.length; i++) {
+			const row = attachRes[i];
+			const nodeId = row.get('node_id') as string;
+			const filePath = row.get('file_path') as string;
+			const fType = row.get('file_type') as string;
+			let fileTypeKey = 'files';
+			if (fType == 'image') fileTypeKey = 'images';
+			if (fType == 'video') fileTypeKey = 'videos';
+
+			if (!attachMap.has(nodeId)) {
+				const initObj = new UTSJSONObject();
+				initObj.set('images', [] as string[]);
+				initObj.set('files', [] as string[]);
+				initObj.set('videos', [] as string[]);
+				attachMap.set(nodeId, initObj);
+			}
+
+			const mapEntry = attachMap.get(nodeId)!;
+			const arr = mapEntry.get(fileTypeKey) as any[] | null;
+			if (arr == null) {
+				mapEntry.set(fileTypeKey, [filePath] as string[]);
+			} else {
+				arr.push(filePath);
+				mapEntry.set(fileTypeKey, arr);
+			}
+		}
+
+		const entries = [] as TimelineEntry[];
+		for (let ri = 0; ri < results.length; ri++) {
+			const row = results[ri];
+			const sourceType = row.get('source_type')?.toString() ?? 'log';
+			const sourceId = row.get('source_id')?.toString() ?? '';
+			const entityId = row.get('entity_id')?.toString() ?? null;
+			const taskNodeId = row.get('task_node_id')?.toString() ?? '';
+			const taskNodeTitle = row.get('task_node_title')?.toString() ?? '';
+			const createdAt = parseInt(row.get('created_at')?.toString() ?? '0');
+			const content = row.get('content')?.toString() ?? null;
+			const logAction = row.get('log_action')?.toString() ?? '';
+
+			if (TimelineBiz.shouldHideTimelineRow(sourceType, entityId, logAction, content)) {
+				continue;
+			}
+
+			let source = 'manual';
+			if (sourceType == 'transaction') source = 'transaction';
+			if (sourceType == 'task_done') source = 'task_done';
+
+			let endTime : number | null = null;
+			if (sourceType == 'log' && logEndTimeMap.has(sourceId)) {
+				endTime = logEndTimeMap.get(sourceId) ?? null;
+			}
+
+			let metadata : TimelineMetadata | null = null;
+			const actionUpper = logAction.toUpperCase();
+			if (sourceType == 'log' && logMediaMap.has(sourceId)) {
+				metadata = logMediaMap.get(sourceId) ?? null;
+			} else if (sourceType == 'log' && actionUpper == 'NOTE' && entityId != null && attachMap.has(entityId)) {
+				const attaches = attachMap.get(entityId)!;
+				const images = (attaches.get('images') as any[] | null) ?? [] as any[];
+				const files = (attaches.get('files') as any[] | null) ?? [] as any[];
+				const videos = (attaches.get('videos') as any[] | null) ?? [] as any[];
+
+				metadata = {
+					text: null,
+					images: images.map((i) : string => i as string),
+					files: files.map((i) : string => i as string),
+					videos: videos.map((i) : string => i as string)
+				} as TimelineMetadata;
+			}
+
+			const contentText = (content ?? '').toString().trim();
+			if (sourceType == 'log' && contentText == '' && !TimelineBiz.hasTimelineMedia(metadata)) {
+				continue;
+			}
+
+			let taskId : string | null = null;
+			let taskTitle : string | null = null;
+			if (sourceType == 'task_done') {
+				taskId = entityId;
+				taskTitle = taskNodeTitle != '' ? taskNodeTitle : null;
+			} else if (sourceType == 'log' && taskNodeId != '') {
+				taskId = taskNodeId;
+				taskTitle = taskNodeTitle != '' ? taskNodeTitle : null;
+			}
+
+			entries.push({
+				id: sourceId,
+				start_time: createdAt,
+				end_time: endTime,
+				content: content,
+				task_id: taskId,
+				task_title: taskTitle,
+				source: source,
+				metadata: metadata,
+				created_at: createdAt,
+				duration_display: '',
+				is_active: false,
+				source_type: sourceType,
+				entity_id: entityId
+			} as TimelineEntry);
+		}
+
+		const nowTs = Date.now();
+		for (let i = 0; i < entries.length; i++) {
+			const entry = entries[i];
+			let endTime = entry.end_time;
+
+			if ((endTime == null || endTime <= entry.start_time) && i > 0) {
+				const inferredEnd = entries[i - 1].start_time;
+				if (inferredEnd > entry.start_time) endTime = inferredEnd;
+			}
+
+			if (endTime != null && endTime > entry.start_time) {
+				entry.end_time = endTime;
+				entry.is_active = false;
+				const durationMs = endTime - entry.start_time;
+				entry.duration_display = TimelineBiz.formatDuration(durationMs);
+			} else {
+				entry.end_time = null;
+				entry.is_active = i == 0;
+				if (i == 0) {
+					const activeDurationMs = nowTs - entry.start_time;
+					const durationText = TimelineBiz.formatDuration(activeDurationMs > 0 ? activeDurationMs : 0);
+					entry.duration_display = `进行中 · 已持续 ${durationText}`;
+				} else {
+					entry.duration_display = '--';
+				}
+			}
+		}
+
+		const end = safeOffset + safeLimit;
+		if (safeOffset >= entries.length) return [] as TimelineEntry[];
+		return entries.slice(safeOffset, end);
+	}
+	// 记录时间线信息
+	public static async addTimelineEntry(
+		content : string | null,
+		taskId : string | null = null,
+		source : string = 'manual',
+		metadata : string | null = null
+		) : Promise<boolean> {
+		const now = Date.now();
+		try {
+			return await DB.tx(async () => {
+				const logEventId = genId('evt');
+				const hostNodeId = await TimelineBiz.resolveTimelineHostNode(taskId, content, source, now);
+				if (hostNodeId == null || hostNodeId == '') throw new Error('Failed to resolve timeline host node');
+
+				const updatedMeta = await TimelineBiz.handleAttachments(hostNodeId, metadata, now, logEventId);
+
+				const action = source == 'manual' ? 'NOTE' : source.toUpperCase();
+				const logId = GraphService.generateId('log');
+				const logProps = new UTSJSONObject();
+				logProps.set('source', source);
+				if (updatedMeta != null && updatedMeta != '' && updatedMeta != 'null') {
+					logProps.set('metadata', updatedMeta);
+				}
+
+				const inserted = await DB.exec(
+					"INSERT INTO logs (id, owner_type, owner_id, action, text, created_at, updated_at, properties, is_deleted, entity_version, last_event_id) VALUES (?, 'node', ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+					[logId, hostNodeId, action, (content ?? ''), now, now, JSON.stringify(logProps), 1, logEventId]
+				);
+				if (!inserted) throw new Error('insert timeline log failed');
+
+
+				return true;
+			});
+		} catch (e) {
+			console.error('[TimelineBiz] Add entry error:', e);
+			return false;
+		}
+	}
+
+	public static async addPastTimelineEntry(
+		content : string | null,
+		startTime : number,
+		endTime : number,
+		taskId : string | null = null,
+		source : string = 'manual',
+		metadata : string | null = null
+		) : Promise<boolean> {
+		const now = Date.now();
+		const eventTs = startTime > 0 ? startTime : now;
+		try {
+			return await DB.tx(async () => {
+				const logEventId = genId('evt');
+				const hostNodeId = await TimelineBiz.resolveTimelineHostNode(taskId, content, source, eventTs);
+				if (hostNodeId == null || hostNodeId == '') throw new Error('Failed to resolve timeline host node');
+
+				const updatedMeta = await TimelineBiz.handleAttachments(hostNodeId, metadata, now, logEventId);
+
+				const action = source == 'manual' ? 'NOTE' : source.toUpperCase();
+				const logId = GraphService.generateId('log');
+				const logProps = new UTSJSONObject();
+				logProps.set('source', source);
+				if (endTime > 0) logProps.set('end_time', endTime);
+				if (updatedMeta != null && updatedMeta != '' && updatedMeta != 'null') {
+					logProps.set('metadata', updatedMeta);
+				}
+
+				const inserted = await DB.exec(
+					"INSERT INTO logs (id, owner_type, owner_id, action, text, created_at, updated_at, properties, is_deleted, entity_version, last_event_id) VALUES (?, 'node', ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+					[logId, hostNodeId, action, (content ?? ''), eventTs, now, JSON.stringify(logProps), 1, logEventId]
+				);
+				if (!inserted) throw new Error('insert past timeline log failed');
+
+
+				return true;
+			});
+		} catch (e) {
+			console.error('[TimelineBiz] Add past entry error:', e);
+			return false;
+		}
+	}
+
+	private static async resolveTimelineHostNode(taskId : string | null, content : string | null, source : string, now : number) : Promise<string | null> {
+		if (taskId != null && taskId != '') {
+			return taskId;
+		}
+
+		const nodeId = GraphService.generateId('node');
+		const nodeProps = new UTSJSONObject();
+		nodeProps.set('timeline_source', source);
+
+		const created = await DB.exec(
+			"INSERT INTO nodes (id, type, status, content, properties, created_at, updated_at, is_deleted) VALUES (?, 'NOTE', NULL, ?, ?, ?, ?, 0)",
+			[nodeId, (content ?? ''), JSON.stringify(nodeProps), now, now]
+		);
+
+		return created ? nodeId : null;
+	}
+
+	private static async handleAttachments(hostNodeId : string, metadata : string | null, now : number, syncEventId : string | null = null) : Promise<string | null> {
+		let metaStr = metadata;
+		if (metadata != null && metadata != 'null' && metadata != '') {
+			try {
+				const metaVal = new UTSJSONObject(JSON.parse(metadata) as any);
+				let hasChanges = false;
+
+				const processList = async (arr : any[] | null, fType : string) : Promise<boolean> => {
+					if (arr == null) return false;
+					for (let i = 0; i < arr.length; i++) {
+						const path = arr[i] as string;
+
+						const hash = '';
+						const size = 0;
+						let finalPath = path;
+
+						if (hash != '') {
+							const existSql = 'SELECT file_path FROM attachments WHERE file_hash = ? LIMIT 1';
+							const existing = await DB.query(existSql, [hash]);
+							if (existing.length > 0) {
+								finalPath = existing[0].get('file_path') as string;
+							}
+
+							const dupCheck = await DB.query('SELECT id FROM attachments WHERE node_id = ? AND file_hash = ? LIMIT 1', [hostNodeId, hash]);
+							if (dupCheck.length > 0) continue;
+						} else {
+							const dupCheckPath = await DB.query('SELECT id FROM attachments WHERE node_id = ? AND file_path = ? LIMIT 1', [hostNodeId, finalPath]);
+							if (dupCheckPath.length > 0) continue;
+						}
+
+						const attId = GraphService.generateId('att');
+						await DB.exec(
+							'INSERT INTO attachments (id, node_id, file_path, file_type, file_hash, file_size, created_at, updated_at, is_deleted, entity_version, last_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)',
+							[attId, hostNodeId, finalPath, fType, (hash != '' ? hash : null), size, now, now, 1, (syncEventId != null && syncEventId != '' ? syncEventId : null)]
+						);
+					}
+					return true;
+				};
+
+				const imagesArr = metaVal.getArray('images') as any[] | null;
+				if (await processList(imagesArr, 'image')) {
+					metaVal.set('images', null);
+					hasChanges = true;
+				}
+
+				const docsArr = metaVal.getArray('files') as any[] | null;
+				if (await processList(docsArr, 'document')) {
+					metaVal.set('files', null);
+					hasChanges = true;
+				}
+
+				const videosArr = metaVal.getArray('videos') as any[] | null;
+				if (await processList(videosArr, 'video')) {
+					metaVal.set('videos', null);
+					hasChanges = true;
+				}
+
+				if (hasChanges) {
+					metaStr = JSON.stringify(metaVal);
+				}
+			} catch (_e) { }
+		}
+
+		return metaStr;
+	}
+
+	/**
+	 * 拉取全局时间线视图（首页 Feed 流 / 瀑布流）
+	 * 会自动拼接底层的纯净实体、以及目标身上的关联外接物理挂载。
+	 * 
+	 * @param limit 每页拉取数量
+	 * @param offset 游标偏移
+	 * @returns 聚合装配好的时间线 DTO 数组，前端拿到后可直接用于瀑布流渲染
+	 */
+	public static async getGlobalTimelineView(limit : number = 20, offset : number = 0, ownerMode : string = 'all') : Promise<TimelineItem[]> {
+		let whereSql = 'f.created_at IS NOT NULL';
+		if (ownerMode == 'edge') {
+			whereSql += " AND f.source_type = 'log' AND ("
+				+ "COALESCE(l.owner_type, 'node') = 'edge'"
+				+ " OR (COALESCE(l.owner_type, 'node') = 'node' AND EXISTS ("
+				+ "SELECT 1 FROM nodes n WHERE n.id = f.entity_id AND n.is_deleted = 0 AND UPPER(COALESCE(n.type, '')) LIKE '%TASK%'"
+				+ "))"
+				+ ")";
+		} else if (ownerMode == 'node') {
+			whereSql += " AND ((f.source_type = 'log' AND COALESCE(l.owner_type, 'node') = 'node' AND NOT EXISTS ("
+				+ "SELECT 1 FROM nodes n WHERE n.id = f.entity_id AND n.is_deleted = 0 AND UPPER(COALESCE(n.type, '')) LIKE '%TASK%'"
+				+ ")) OR f.source_type = 'task_done')";
+		}
+
+		const sql = `
+			SELECT f.source_type, f.source_id, f.entity_id, f.content, f.created_at, f.txn_type, l.action AS log_action, l.owner_type AS log_owner_type
+			FROM vw_timeline_feed f
+			LEFT JOIN logs l ON f.source_type = 'log' AND l.id = f.source_id
+			WHERE ${whereSql}
+			ORDER BY f.created_at DESC
+			LIMIT ? OFFSET ?
+		`;
+		const rows = await DB.query(sql, [limit, offset]);
+		const result : TimelineItem[] = [];
+
+		for (let i = 0; i < rows.length; i++) {
+			const row = rows[i];
+			const sourceType = row.get('source_type')?.toString() ?? 'log';
+			const sourceId = row.get('source_id')?.toString() ?? '';
+			const entityId = row.get('entity_id')?.toString() ?? '';
+			const createdAt = parseInt(row.get('created_at')?.toString() ?? '0');
+			const content = row.get('content')?.toString() ?? '';
+			const txnType = row.get('txn_type')?.toString() ?? 'transaction';
+			const logAction = row.get('log_action')?.toString();
+			const logOwnerType = row.get('log_owner_type')?.toString() ?? 'node';
+
+			let action = 'LOG';
+			if (sourceType == 'log') {
+				action = logAction ?? 'LOG';
+			} else if (sourceType == 'transaction') {
+				action = txnType.toUpperCase();
+			} else if (sourceType == 'task_done') {
+				action = 'TASK_DONE';
+			}
+
+			const log = {
+				id: sourceId,
+				owner_type: sourceType == 'log' ? logOwnerType : 'node',
+				owner_id: entityId,
+				action: action,
+				text: content,
+				created_at: createdAt,
+				updated_at: createdAt
+			} as Log;
+
+			const targetNode = entityId != '' ? await NodeService.getNodeAsync(entityId) : null;
+			let attachments : Attachment[] = [];
+			if (targetNode != null) {
+				attachments = await AttachmentService.getNodeAttachmentsAsync(targetNode.id);
+			}
+
+			result.push({
+				log: log,
+				targetNode: targetNode,
+				attachments: attachments,
+				source_type: sourceType
+			} as TimelineItem);
+		}
+
+		return result;
+	}
+
+	/**
+	 * 拉取特定实体（Node）内部的生命历程（用于在「节点详情页」或「任务底侧面板」展示它的修改足迹）
+	 * 
+	 * @param nodeId 目标节点 UUID
+	 * @returns 聚合装配好的 TimelineItem 数组
+	 */
+	public static async getNodeTimelineView(nodeId : string) : Promise<TimelineItem[]> {
+		// 1. 根据索引单点抽离该 Node 的时序足迹
+		const logs = await LogService.getNodeLogsAsync(nodeId);
+
+		// 对于单个实体的内部时间轴，其主体和附件是共用的
+		const targetNode = await NodeService.getNodeAsync(nodeId);
+		const attachments = targetNode != null ? await AttachmentService.getNodeAttachmentsAsync(nodeId) : [];
+
+		const result : TimelineItem[] = [];
+		for (let i = 0; i < logs.length; i++) {
+			result.push({
+				log: logs[i],
+				targetNode: targetNode,
+				attachments: attachments,
+				source_type: 'log'
+			} as TimelineItem);
+		}
+
+		return result;
+	}
+}

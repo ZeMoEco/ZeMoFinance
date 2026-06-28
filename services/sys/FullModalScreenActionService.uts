@@ -1,0 +1,899 @@
+import { DeskPetBillCaptureService, DeskPetBillPrefill, BillTextResult, RecordMode } from '@/services/sys/DeskPetBillCaptureService.uts'
+import { ScreenUnderstandingResult, ScreenUnderstandingAction, ScreenUnderstandingKind } from '@/services/sys/ScreenUnderstandingService.uts'
+import { ChatTodoExtractionService, ChatTodoCandidate, ChatTodoCreateResult } from '@/services/sys/ChatTodoExtractionService.uts'
+import { InvestmentOcrImportService, InvestmentOcrImportResult } from '@/services/sys/InvestmentOcrImportService.uts'
+import { OcrModelService } from '@/services/sys/office/OcrModelService.uts'
+import { TimelineBiz } from '@/services/biz/TimelineBiz.uts'
+import { DESK_PET_PENDING_BILL_CAPTURE_KEY } from '@/utils/constant.uts'
+// #ifdef APP-ANDROID
+import { UTSJSONObject } from 'io.dcloud.uts'
+// #endif
+
+type FullModalAction = 'create_transaction' | 'create_todos' | 'import_investment' | 'record_activity' | 'none'
+
+type FullModalTodo = {
+	title: string
+	description: string
+	dueTime: string
+	priority: number
+}
+
+type FullModalTransaction = {
+	amount: string
+	type: string
+	category: string
+	note: string
+	sourceApp: string
+	payMethod: string
+	transactionTime: string
+}
+
+type FullModalDecision = {
+	ok: boolean
+	action: FullModalAction
+	confidence: number
+	reason: string
+	transaction: FullModalTransaction | null
+	todos: FullModalTodo[]
+	activityTitle: string
+	activityCategory: string
+	rawJson: string
+	rawOutput: string
+	message: string
+}
+
+type ZemoAiRuntime = {
+	chatMultiModal(prompt: string, imagePath: string, callback: (text: string, done: boolean) => void): void
+	chatStream(prompt: string, callback: (text: string, done: boolean) => void): void
+	initModel(modelPath: string): boolean
+	registerInMemoryImageValues(values: Float32Array): string
+}
+
+type ZemoAskRuntime = {
+	consumePipMiniMindImageValues(): Float32Array | null
+}
+
+export type FullModalScreenActionAttempt = {
+	handled: boolean
+	ok: boolean
+	kind: string
+	message: string
+	screen: ScreenUnderstandingResult | null
+	taskResult: ChatTodoCreateResult | null
+	investmentResult: InvestmentOcrImportResult | null
+	transactionId: string
+	fallbackReason: string
+}
+
+export class FullModalScreenActionService {
+	private static readonly MIN_CONFIDENCE = 0.45
+	private static readonly MODEL_TIMEOUT_MS = 14000
+	private static readonly PIP_RETURN_PENDING_TTL_MS = 12000
+	private static zemoAiRuntimePromise: Promise<ZemoAiRuntime> | null = null
+	private static zemoAskRuntimePromise: Promise<ZemoAskRuntime> | null = null
+
+	static async handlePendingDeskPetCaptureAutoRecord(allowManualFallback: boolean = false): Promise<boolean> {
+		if (!FullModalScreenActionService.consumePendingPipReturn()) {
+			return false
+		}
+		console.log(`[全模态][PiP] 开始处理：手动兜底=${allowManualFallback ? '允许' : '禁止'}`)
+
+		let imagePath = ''
+		try {
+			const path = await DeskPetBillCaptureService.captureScreenImagePath()
+			imagePath = path == null ? '' : path
+		} catch (e) {
+			console.warn(`[全模态][PiP] 获取截图失败：${FullModalScreenActionService.errorMessage(e)}`)
+		}
+
+		const textResult = await DeskPetBillCaptureService.captureBillText(true, false)
+		console.log(`[全模态][PiP] 输入：OCR=${textResult.ok ? '成功' : '失败'}，文本长度=${textResult.text.length}，截图=${imagePath == '' ? '无' : imagePath}`)
+		const pipSource = `pip-${textResult.source}`
+		if (textResult.ok && textResult.text.trim() != '') {
+			const textAttempt = await FullModalScreenActionService.executeText(textResult.text, pipSource, imagePath, true)
+			if (textAttempt.handled) {
+				console.log(`[全模态][PiP] OCR 文本已处理：结果=${textAttempt.ok ? '成功' : '失败'}，类型=${textAttempt.kind}，消息=${textAttempt.message}`)
+				if (textAttempt.ok) DeskPetBillCaptureService.clearStoredBillCaptureText()
+				return true
+			}
+			console.log(`[全模态][PiP] OCR 文本未执行：${textAttempt.fallbackReason}`)
+			return await DeskPetBillCaptureService.handlePendingAutoConfirm(allowManualFallback)
+		}
+		if (imagePath.trim() == '') {
+			console.log('[全模态][PiP] 兜底：没有 OCR 文本，也没有内存截图')
+			return await DeskPetBillCaptureService.handlePendingAutoConfirm(allowManualFallback)
+		}
+		const attempt = await FullModalScreenActionService.executeImage(imagePath, pipSource)
+		if (attempt.handled) {
+			console.log(`[全模态][PiP] 已处理：结果=${attempt.ok ? '成功' : '失败'}，类型=${attempt.kind}，消息=${attempt.message}`)
+			if (attempt.ok) {
+				DeskPetBillCaptureService.clearStoredBillCaptureText()
+				if (allowManualFallback) uni.showToast({ title: attempt.message == '' ? '屏幕动作已执行' : attempt.message, icon: 'success', duration: 2400 })
+			}
+			return true
+		}
+
+		console.log(`[全模态][PiP] 图片模型未执行动作：${attempt.fallbackReason}`)
+		return false
+	}
+
+	static async executeCurrentScreen(skipLiveCapture: boolean = false): Promise<FullModalScreenActionAttempt> {
+		let imagePath = ''
+		try {
+			const path = await DeskPetBillCaptureService.captureScreenImagePath()
+			imagePath = path == null ? '' : path
+		} catch (e) {
+			console.warn(`[全模态] 获取截图失败：${FullModalScreenActionService.errorMessage(e)}`)
+		}
+		let captured: BillTextResult
+		try {
+			captured = await DeskPetBillCaptureService.captureBillText(skipLiveCapture, false)
+		} catch (e) {
+			return FullModalScreenActionService.skipped(`OCR 获取失败：${FullModalScreenActionService.errorMessage(e)}`)
+		}
+
+		if (!captured.ok || captured.text.trim() == '') {
+			if (imagePath.trim() != '') return await FullModalScreenActionService.executeImage(imagePath, captured.source)
+			const msg = captured.message == '' ? 'OCR 未识别到文本' : captured.message
+			return FullModalScreenActionService.skipped(msg)
+		}
+
+		const attempt = await FullModalScreenActionService.executeText(captured.text, captured.source, '')
+		if (attempt.handled && attempt.ok) DeskPetBillCaptureService.clearStoredBillCaptureText()
+		return attempt
+	}
+
+	static async executeText(text: string, source: string = 'manual', imagePath: string = '', diagnosticsLogged: boolean = false): Promise<FullModalScreenActionAttempt> {
+		const ocrText = (text ?? '').toString().trim()
+		if (ocrText == '') return FullModalScreenActionService.skipped('OCR 文本为空')
+		let modelImagePath = imagePath.trim()
+		if (modelImagePath == 'zemo://pip-memory-image') {
+			modelImagePath = await FullModalScreenActionService.registerPipMemoryImage()
+			if (modelImagePath == '') console.warn('[全模态] OCR 文本有图片令牌，但内存截图注册失败，改用文本端侧模型')
+		}
+
+		const prompt = FullModalScreenActionService.buildPrompt(ocrText, source)
+		console.log(`[全模态] 准备调用：来源=${source}，文本长度=${ocrText.length}，截图=${modelImagePath == '' ? '无，使用文本端侧模型' : modelImagePath}`)
+		const output = modelImagePath == ''
+			? await FullModalScreenActionService.callTextModel(prompt, source, ocrText.length)
+			: await FullModalScreenActionService.callModel(prompt, modelImagePath, source, ocrText.length)
+		const decision = FullModalScreenActionService.parseDecision(output)
+		console.log(`[全模态] 决策：动作=${decision.action}，置信度=${decision.confidence}，原因=${decision.reason}`)
+
+		if (!decision.ok) return FullModalScreenActionService.skipped(decision.message == '' ? '模型输出不可解析' : decision.message)
+		if (decision.action == 'none') return FullModalScreenActionService.skipped(decision.reason == '' ? '模型判断无需执行动作' : decision.reason)
+		if (decision.confidence < FullModalScreenActionService.MIN_CONFIDENCE) return FullModalScreenActionService.skipped(`模型置信度不足：${decision.confidence}`)
+
+		return await FullModalScreenActionService.executeDecision(decision, ocrText, source, modelImagePath)
+	}
+
+	private static async executeImage(imagePath: string, source: string): Promise<FullModalScreenActionAttempt> {
+		let modelImagePath = imagePath.trim()
+		if (modelImagePath == '') return FullModalScreenActionService.skipped('没有可用截图')
+		if (modelImagePath == 'zemo://pip-memory-image') {
+			modelImagePath = await FullModalScreenActionService.registerPipMemoryImage()
+			if (modelImagePath == '') return FullModalScreenActionService.skipped('内存截图注册失败')
+		}
+		const prompt = FullModalScreenActionService.buildImagePrompt(source)
+		const output = await FullModalScreenActionService.callModel(prompt, modelImagePath, source, 0)
+		const decision = FullModalScreenActionService.parseDecision(output)
+		console.log(`[全模态] 图片决策：动作=${decision.action}，置信度=${decision.confidence}，原因=${decision.reason}`)
+		if (!decision.ok) return FullModalScreenActionService.skipped(decision.message == '' ? '图片模型输出不可解析' : decision.message)
+		if (decision.action == 'none') return FullModalScreenActionService.skipped(decision.reason == '' ? '图片模型判断无需执行动作' : decision.reason)
+		if (decision.confidence < FullModalScreenActionService.MIN_CONFIDENCE) return FullModalScreenActionService.skipped(`图片模型置信度不足：${decision.confidence}`)
+		return await FullModalScreenActionService.executeDecision(decision, decision.rawOutput, source, modelImagePath)
+	}
+
+	private static async registerPipMemoryImage(): Promise<string> {
+		try {
+			const ask = await FullModalScreenActionService.getZemoAskRuntime()
+			const values = ask.consumePipMiniMindImageValues()
+			if (values == null || values.length == 0) return ''
+			const ai = await FullModalScreenActionService.getZemoAiRuntime()
+			return ai.registerInMemoryImageValues(values)
+		} catch (e) {
+			console.warn(`[全模态] 内存截图注册失败：${FullModalScreenActionService.errorMessage(e)}`)
+		}
+		return ''
+	}
+
+	private static async executeDecision(decision: FullModalDecision, ocrText: string, source: string, imagePath: string): Promise<FullModalScreenActionAttempt> {
+		if (decision.action == 'create_transaction') {
+			const prefill = await FullModalScreenActionService.buildPrefill(decision, ocrText)
+			const screen = FullModalScreenActionService.buildScreen(
+				'bill',
+				prefill.amount == '' ? '模型识别到账单' : `模型识别账单 ¥${prefill.amount}`,
+				FullModalScreenActionService.summaryFromDecision(decision, `账单 ${prefill.activeMode}`),
+				ocrText,
+				source,
+				[{ type: 'open_record', label: '打开记账确认', query: DeskPetBillCaptureService.buildRecordQuery(prefill) } as ScreenUnderstandingAction],
+				prefill
+			)
+			if (prefill.amount == '') return FullModalScreenActionService.skipped('模型识别到账单，但缺少金额')
+			const id = await DeskPetBillCaptureService.createTransactionFromPrefill(prefill, 'full_modal_screen_action')
+			if (id == null || id == '') return FullModalScreenActionService.skipped('模型账单字段未能创建交易')
+			return FullModalScreenActionService.handled(true, 'bill', `已按模型结果记账：${screen.summary}`, screen, null, null, id)
+		}
+
+		if (decision.action == 'create_todos') {
+			const candidates = FullModalScreenActionService.buildTodoCandidates(decision, ocrText)
+			if (candidates.length == 0) return FullModalScreenActionService.skipped('模型未返回可创建的待办')
+			const screen = FullModalScreenActionService.buildScreen(
+				'chat',
+				'模型识别待办',
+				FullModalScreenActionService.summaryFromDecision(decision, `待办 ${candidates.length} 个`),
+				ocrText,
+				source,
+				[{ type: 'create_todos', label: '创建待办', query: '' } as ScreenUnderstandingAction],
+				null
+			)
+			const tasks = await ChatTodoExtractionService.createTasks(candidates, '模型识别', 'full_modal_screen_action')
+			return FullModalScreenActionService.handled(tasks.ok, 'chat', tasks.message, screen, tasks, null, '')
+		}
+
+		if (decision.action == 'import_investment') {
+			const screen = FullModalScreenActionService.buildScreen(
+				'investment',
+				'模型识别理财/资产',
+				FullModalScreenActionService.summaryFromDecision(decision, '理财/资产导入'),
+				ocrText,
+				source,
+				[] as ScreenUnderstandingAction[],
+				null
+			)
+			const investment = await InvestmentOcrImportService.tryImportFromOcrText(ocrText)
+			if (!investment.matched) return FullModalScreenActionService.skipped('模型识别为理财页面，但 OCR 明细未匹配导入格式')
+			const ok = investment.imported + investment.updated > 0
+			return FullModalScreenActionService.handled(ok, 'investment', investment.message, screen, null, investment, '')
+		}
+
+		if (decision.action == 'record_activity') {
+			const title = decision.activityTitle == '' ? '屏幕活动' : decision.activityTitle
+			const category = decision.activityCategory == '' ? 'screen_activity' : decision.activityCategory
+			const screen = FullModalScreenActionService.buildScreen(
+				'activity',
+				title,
+				FullModalScreenActionService.summaryFromDecision(decision, `记录${title}`),
+				ocrText,
+				source,
+				[{ type: 'record_activity', label: '记录活动', query: category } as ScreenUnderstandingAction],
+				null
+			)
+			const content = FullModalScreenActionService.buildActivityContent(screen, category)
+			const metadata = JSON.stringify({
+				source: 'full_modal_screen_action',
+				screen_source: source,
+				image: imagePath,
+				category: category,
+				reason: decision.reason
+			})
+			const ok = await TimelineBiz.addTimelineEntry(content, null, 'screen_activity', metadata)
+			return FullModalScreenActionService.handled(ok, 'activity', ok ? `已记录：${title}` : '活动记录失败', screen, null, null, '')
+		}
+
+		return FullModalScreenActionService.skipped('模型动作未覆盖')
+	}
+
+	private static async executeScreenUnderstanding(screen: ScreenUnderstandingResult): Promise<FullModalScreenActionAttempt> {
+		if (!screen.ok) return FullModalScreenActionService.skipped(screen.message == '' ? '文本理解失败' : screen.message)
+		const billPrefill = screen.billPrefill
+		if (screen.kind == 'bill' && billPrefill != null) {
+			if (billPrefill.amount == '') return FullModalScreenActionService.skipped('识别到账单，但缺少金额')
+			const id = await DeskPetBillCaptureService.createTransactionFromPrefill(billPrefill, 'full_modal_ocr_text')
+			if (id == null || id == '') return FullModalScreenActionService.skipped('账单字段不足，未能自动记账')
+			return FullModalScreenActionService.handled(true, 'bill', `已记账：${screen.summary}`, screen, null, null, id)
+		}
+		if (screen.kind == 'investment') {
+			const investment = await InvestmentOcrImportService.tryImportFromOcrText(screen.ocrText)
+			if (!investment.matched) return FullModalScreenActionService.skipped('识别为理财页面，但未匹配到可导入明细')
+			const ok = investment.imported + investment.updated > 0
+			return FullModalScreenActionService.handled(ok, 'investment', investment.message, screen, null, investment, '')
+		}
+		if (screen.kind == 'chat' || ChatTodoExtractionService.looksLikeChatText(screen.ocrText) || ChatTodoExtractionService.extractCandidates(screen.ocrText).length > 0) {
+			const tasks = await ChatTodoExtractionService.createTasksFromText(screen.ocrText)
+			return FullModalScreenActionService.handled(tasks.ok, 'chat', tasks.message, screen, tasks, null, '')
+		}
+		if (screen.kind == 'activity') {
+			const category = screen.actions.length > 0 ? screen.actions[0].query : ''
+			const content = FullModalScreenActionService.buildActivityContent(screen, category)
+			const metadata = JSON.stringify({
+				source: 'full_modal_ocr_text',
+				screen_source: screen.source,
+				category,
+				summary: screen.summary
+			})
+			const ok = await TimelineBiz.addTimelineEntry(content, null, 'screen_activity', metadata)
+			return FullModalScreenActionService.handled(ok, 'activity', ok ? `已记录：${screen.title}` : '活动记录失败', screen, null, null, '')
+		}
+		return FullModalScreenActionService.skipped(screen.summary == '' ? '当前 OCR 文本没有可执行动作' : screen.summary)
+	}
+
+	private static buildPrompt(ocrText: string, source: string): string {
+		const now = FullModalScreenActionService.formatNow()
+		return [
+			'你是 ZeMo 本地全模态屏幕动作模型。根据 OCR 文本和可用截图先判断屏幕场景与关键内容，再决定是否要执行记账、创建待办、导入理财持仓或记录活动。',
+			'只输出一个 JSON 对象，不要输出解释、Markdown 或代码块。',
+			'JSON 结构：',
+			'{"action":"create_transaction|create_todos|import_investment|record_activity|none","confidence":0.0,"reason":"","transaction":{"amount":"","type":"expense|income|refund|transfer","category":"","note":"","sourceApp":"","payMethod":"","transactionTime":""},"todos":[{"title":"","description":"","dueTime":"","priority":0}],"activityTitle":"","activityCategory":""}',
+			'规则：',
+			'0. reason 必须用一句中文概括“场景 + 关键内容 + 执行动作依据”。',
+			'1. 支付、收款、退款、转账、银行交易、订单付款等用 create_transaction。',
+			'2. 聊天里出现安排、提醒、截止、开会、处理、跟进、还款、报销等明确任务，用 create_todos。',
+			'3. 基金、股票、证券、持仓、市值、盈亏、份额、净值页面用 import_investment。',
+			'4. 视频、音乐、购物浏览、网页浏览等用 record_activity；普通页面用 none。',
+			'5. 金额只填数字字符串；transactionTime 优先填 "YYYY-MM-DD HH:mm:ss"，没有就留空。',
+			`当前时间：${now}`,
+			`来源：${source}`,
+			'OCR 文本：',
+			FullModalScreenActionService.limitText(ocrText, 6000)
+		].join('\n')
+	}
+
+	private static buildImagePrompt(source: string): string {
+		const now = FullModalScreenActionService.formatNow()
+		return [
+			'你是 ZeMo 本地全模态屏幕动作模型。请直接读取截图内容，先判断屏幕场景与关键内容，再决定是否要执行记账、创建待办、导入理财持仓或记录活动。',
+			'只输出一个 JSON 对象，不要输出解释、Markdown 或代码块。',
+			'JSON 结构：',
+			'{"action":"create_transaction|create_todos|import_investment|record_activity|none","confidence":0.0,"reason":"","transaction":{"amount":"","type":"expense|income|refund|transfer","category":"","note":"","sourceApp":"","payMethod":"","transactionTime":""},"todos":[{"title":"","description":"","dueTime":"","priority":0}],"activityTitle":"","activityCategory":""}',
+			'reason 必须用一句中文概括“场景 + 关键内容 + 执行动作依据”。',
+			'规则：支付/收款/退款/转账用 create_transaction；聊天安排提醒用 create_todos；基金/股票/证券/持仓/市值/盈亏用 import_investment。',
+			`当前时间：${now}`,
+			`来源：${source}`
+		].join('\n')
+	}
+
+	private static async callModel(prompt: string, imagePath: string, source: string, textLength: number): Promise<string> {
+		await FullModalScreenActionService.prepareMiniMindOModel()
+		return new Promise((resolve) => {
+			let done = false
+			let timer = -1
+			let output = ''
+			const visualMode = FullModalScreenActionService.visualMode(imagePath)
+			console.log(`[全模态] 调用模型：来源=${source}，模式=${visualMode}，文本长度=${textLength}`)
+			if (imagePath.indexOf('zemo://') == 0) {
+				console.log(`[全模态] 使用屏幕令牌：${imagePath}`)
+			}
+			const finish = () => {
+				if (done) return
+				done = true
+				if (timer != -1) {
+					clearTimeout(timer as number)
+					timer = -1
+				}
+				// console.log(`[全模态] 模型返回：长度=${output.length}`) 
+				console.log(`[全模态] 模型返回1：${output}`) 
+				resolve(output.trim())
+			}
+			timer = (setTimeout(() => {
+				console.warn('[全模态] 模型调用超时')
+				finish()
+			}, FullModalScreenActionService.MODEL_TIMEOUT_MS) as any) as number
+
+			const callback = (text: string, complete: boolean) => {
+				if (text != null && text != '') output += text
+				if (complete) finish()
+			}
+			void FullModalScreenActionService.getZemoAiRuntime().then((ai: ZemoAiRuntime): void => {
+				try {
+						console.log(`[zemo-o] prompt=${prompt}，imagePath=${imagePath}，callback=${callback}`) 
+					ai.chatMultiModal(prompt, imagePath, callback)
+				} catch (e) {
+					console.warn(`[全模态] 模型调用异常：${FullModalScreenActionService.errorMessage(e)}`)
+					finish()
+				}
+			}).catch((e: Error): void => {
+				console.warn(`[全模态] zemo-ai 加载失败：${FullModalScreenActionService.errorMessage(e)}`)
+				finish()
+			})
+		})
+	}
+
+	private static async callTextModel(prompt: string, source: string, textLength: number): Promise<string> {
+		await FullModalScreenActionService.prepareMiniMindOModel()
+		return new Promise((resolve) => {
+			let done = false
+			let timer = -1
+			const finish = (value: string) => {
+				if (done) return
+				done = true
+				if (timer != -1) {
+					clearTimeout(timer as number)
+					timer = -1
+				}
+				resolve(value)
+			}
+			timer = setTimeout(() => {
+				finish('{"action":"none","confidence":0,"reason":"MiniMind-O 文本模型调用超时"}')
+			}, FullModalScreenActionService.MODEL_TIMEOUT_MS) as number
+			try {
+				console.log(`[全模态] 调用模型：来源=${source}，模式=ocr_text，文本长度=${textLength}`)
+				const callback = (text: string, finished: boolean): void => {
+					if (!finished) return
+					const value = (text ?? '').toString()
+					console.log(`[全模态] 文本模型返回：长度=${value.length}`)
+					finish(value)
+				}
+				void FullModalScreenActionService.getZemoAiRuntime().then((ai: ZemoAiRuntime): void => {
+					ai.chatStream(prompt, callback)
+				}).catch((e: Error): void => {
+					finish(`{"action":"none","confidence":0,"reason":"zemo-ai 加载失败：${FullModalScreenActionService.escapeJson(FullModalScreenActionService.errorMessage(e))}"}`)
+				})
+			} catch (e) {
+				finish(`{"action":"none","confidence":0,"reason":"MiniMind-O 文本调用异常：${FullModalScreenActionService.escapeJson(FullModalScreenActionService.errorMessage(e))}"}`)
+			}
+		})
+	}
+
+	private static async prepareMiniMindOModel(): Promise<void> {
+		try {
+			const status = await OcrModelService.getStatus()
+			if (status.miniMindOModelPath != '') {
+				console.log(`[全模态] 准备 MiniMind-O：${status.miniMindOModelMessage}，路径=${status.miniMindOModelPath}`)
+				const ai = await FullModalScreenActionService.getZemoAiRuntime()
+				ai.initModel(status.miniMindOModelPath)
+			} else {
+				console.warn('[全模态] MiniMind-O 未配置：请在设置页选择 zemo_screen_minimind_o_prefill_s192.ms')
+			}
+		} catch (e) {
+			console.warn(`[全模态] MiniMind-O 路径准备失败：${FullModalScreenActionService.errorMessage(e)}`)
+		}
+	}
+
+	private static async getZemoAiRuntime(): Promise<ZemoAiRuntime> {
+		if (FullModalScreenActionService.zemoAiRuntimePromise == null) {
+			FullModalScreenActionService.zemoAiRuntimePromise = new Promise<ZemoAiRuntime>((resolve, reject) => {
+				void import('@/uni_modules/zemo-ai').then((module: Object): void => {
+					resolve(module as ZemoAiRuntime)
+				}).catch((e: Error): void => {
+					reject(e)
+				})
+			})
+		}
+		return FullModalScreenActionService.zemoAiRuntimePromise as Promise<ZemoAiRuntime>
+	}
+
+	private static async getZemoAskRuntime(): Promise<ZemoAskRuntime> {
+		if (FullModalScreenActionService.zemoAskRuntimePromise == null) {
+			FullModalScreenActionService.zemoAskRuntimePromise = new Promise<ZemoAskRuntime>((resolve, reject) => {
+				void import('@/uni_modules/zemo-ask').then((module: Object): void => {
+					resolve(module as ZemoAskRuntime)
+				}).catch((e: Error): void => {
+					reject(e)
+				})
+			})
+		}
+		return FullModalScreenActionService.zemoAskRuntimePromise as Promise<ZemoAskRuntime>
+	}
+
+	private static parseDecision(output: string): FullModalDecision {
+		const raw = (output ?? '').toString().trim()
+		if (raw == '') return FullModalScreenActionService.emptyDecision(raw, '模型未返回内容')
+		if (raw.indexOf('simulated response') >= 0 || raw.indexOf('Real implementation requires') >= 0) {
+			console.warn('[全模态] 模型输出仍是占位内容')
+		}
+		const json = FullModalScreenActionService.extractJson(raw)
+		if (json == '') return FullModalScreenActionService.emptyDecision(raw, '未找到 JSON 对象')
+		try {
+			const obj = JSON.parse(json) as any
+			const action = FullModalScreenActionService.normalizeAction(FullModalScreenActionService.readString(obj, ['action', 'intent', 'cmd']))
+			const confidence = FullModalScreenActionService.readNumber(obj, ['confidence', 'score'], 0.8)
+			const txRaw = FullModalScreenActionService.readObject(obj, ['transaction', 'bill', 'params'])
+			const todosRaw = FullModalScreenActionService.readArray(obj, ['todos', 'tasks'])
+			const todos = [] as FullModalTodo[]
+			for (let i = 0; i < todosRaw.length; i++) {
+				const item = todosRaw[i]
+				if (item == null) continue
+				const title = FullModalScreenActionService.readString(item, ['title', 'name'])
+				if (title == '') continue
+				todos.push({
+					title: title,
+					description: FullModalScreenActionService.readString(item, ['description', 'desc', 'detail']),
+					dueTime: FullModalScreenActionService.readString(item, ['dueTime', 'due_time', 'time', 'datetime']),
+					priority: Math.floor(FullModalScreenActionService.readNumber(item, ['priority'], 0))
+				} as FullModalTodo)
+			}
+			return {
+				ok: action != 'none' || FullModalScreenActionService.readString(obj, ['action', 'intent', 'cmd']) != '',
+				action,
+				confidence,
+				reason: FullModalScreenActionService.readString(obj, ['reason', 'summary']),
+				transaction: FullModalScreenActionService.buildTransaction(txRaw),
+				todos: todos,
+				activityTitle: FullModalScreenActionService.readString(obj, ['activityTitle', 'activity_title', 'title']),
+				activityCategory: FullModalScreenActionService.readString(obj, ['activityCategory', 'activity_category', 'category']),
+				rawJson: json,
+				rawOutput: raw,
+				message: ''
+			} as FullModalDecision
+		} catch (e) {
+			return FullModalScreenActionService.emptyDecision(raw, `JSON 解析失败：${FullModalScreenActionService.errorMessage(e)}`)
+		}
+	}
+
+	private static buildTransaction(raw: any | null): FullModalTransaction | null {
+		if (raw == null) return null
+		return {
+			amount: FullModalScreenActionService.readString(raw, ['amount', 'money']),
+			type: FullModalScreenActionService.readString(raw, ['type', 'mode']),
+			category: FullModalScreenActionService.readString(raw, ['category']),
+			note: FullModalScreenActionService.readString(raw, ['note', 'merchant', 'counterparty', 'description', 'desc']),
+			sourceApp: FullModalScreenActionService.readString(raw, ['sourceApp', 'source_app', 'app']),
+			payMethod: FullModalScreenActionService.readString(raw, ['payMethod', 'pay_method', 'paymentMethod', 'payment_method']),
+			transactionTime: FullModalScreenActionService.readString(raw, ['transactionTime', 'transaction_time', 'time', 'datetime'])
+		} as FullModalTransaction
+	}
+
+	private static async buildPrefill(decision: FullModalDecision, ocrText: string): Promise<DeskPetBillPrefill> {
+		let prefill = DeskPetBillCaptureService.parseBillText(ocrText)
+		const tx = decision.transaction
+		if (tx != null) {
+			const amount = FullModalScreenActionService.cleanAmount(tx.amount)
+			if (amount != '') prefill.amount = amount
+			const mode = FullModalScreenActionService.normalizeRecordMode(tx.type)
+			if (mode != '') prefill.activeMode = mode as RecordMode
+			if (tx.category != '') prefill.category = tx.category
+			if (tx.note != '') prefill.note = tx.note
+			if (tx.sourceApp != '') prefill.sourceApp = tx.sourceApp
+			if (tx.payMethod != '') prefill.payMethod = tx.payMethod
+			const time = FullModalScreenActionService.parseTimeMs(tx.transactionTime)
+			if (time > 0) prefill.transactionTime = time
+		}
+		if (prefill.rawText == '') prefill.rawText = FullModalScreenActionService.stripOcrMeta(ocrText)
+		prefill = await DeskPetBillCaptureService.resolvePrefillTarget(prefill)
+		return prefill
+	}
+
+	private static buildTodoCandidates(decision: FullModalDecision, ocrText: string): ChatTodoCandidate[] {
+		const result = [] as ChatTodoCandidate[]
+		for (let i = 0; i < decision.todos.length; i++) {
+			const item = decision.todos[i]
+			const title = item.title.trim()
+			if (title == '') continue
+			const due = FullModalScreenActionService.parseTimeMs(item.dueTime)
+			result.push({
+				title: FullModalScreenActionService.limitText(title, 42),
+				description: item.description == '' ? `来自屏幕 OCR：${FullModalScreenActionService.limitText(FullModalScreenActionService.stripOcrMeta(ocrText), 240)}` : item.description,
+				startAt: due,
+				endAt: due,
+				priority: item.priority,
+				sourceText: item.description == '' ? title : item.description
+			} as ChatTodoCandidate)
+			if (result.length >= 8) break
+		}
+		return result
+	}
+
+	private static buildScreen(
+		kind: ScreenUnderstandingKind,
+		title: string,
+		summary: string,
+		ocrText: string,
+		source: string,
+		actions: ScreenUnderstandingAction[],
+		billPrefill: DeskPetBillPrefill | null
+	): ScreenUnderstandingResult {
+		return {
+			ok: true,
+			kind: kind,
+			source: source,
+			title: title,
+			summary: summary,
+			content: FullModalScreenActionService.buildContent(ocrText, 24),
+			message: '',
+			ocrText: ocrText,
+			actions: actions,
+			billPrefill: billPrefill
+		} as ScreenUnderstandingResult
+	}
+
+	private static buildContent(text: string, maxLines: number): string {
+		const lines = FullModalScreenActionService.stripOcrMeta(text).split('\n')
+		const picked = [] as string[]
+		for (let i = 0; i < lines.length && picked.length < maxLines; i++) {
+			const line = lines[i].trim()
+			if (line != '') picked.push(line)
+		}
+		if (lines.length > picked.length) picked.push(`... 还有 ${lines.length - picked.length} 行`)
+		return picked.join('\n')
+	}
+
+	private static buildActivityContent(screen: ScreenUnderstandingResult, category: string): string {
+		const lines = [] as string[]
+		lines.push(`屏幕活动：${screen.title}`)
+		if (category != '') lines.push(`分类：${category}`)
+		if (screen.summary != '') lines.push(screen.summary)
+		if (screen.content != '') lines.push(screen.content)
+		return lines.join('\n')
+	}
+
+	private static summaryFromDecision(decision: FullModalDecision, fallback: string): string {
+		const parts = [] as string[]
+		parts.push('全模态模型')
+		parts.push(fallback)
+		if (decision.reason != '') parts.push(decision.reason)
+		parts.push(`置信度 ${decision.confidence}`)
+		return parts.join('，')
+	}
+
+	private static stripOcrMeta(text: string): string {
+		const rawLines = (text ?? '').toString().replace(/\r\n/g, '\n').split('\n')
+		const result = [] as string[]
+		const metaPattern = /^\[\[ocr:([0-9.\-]+),([0-9.\-]+),([0-9.\-]+),([0-9.\-]+)\]\](.*)$/
+		for (let i = 0; i < rawLines.length; i++) {
+			let value = rawLines[i].trim()
+			const m = metaPattern.exec(value)
+			if (m != null && m.length >= 6) value = m[5].trim()
+			if (value != '') result.push(value)
+		}
+		return result.join('\n')
+	}
+
+	private static extractJson(text: string): string {
+		let value = text.trim()
+		if (value.indexOf('```') >= 0) value = value.replace(/```json/g, '').replace(/```/g, '').trim()
+		const start = value.indexOf('{')
+		const end = value.lastIndexOf('}')
+		if (start < 0 || end <= start) return ''
+		return value.substring(start, end + 1)
+	}
+
+	private static readString(obj: any, keys: string[]): string {
+		if (obj == null) return ''
+		for (let i = 0; i < keys.length; i++) {
+			const v = FullModalScreenActionService.readValue(obj, keys[i])
+			if (v == null) continue
+			const value = v.toString().trim()
+			if (value != '' && value != 'null' && value != 'undefined') return value
+		}
+		return ''
+	}
+
+	private static readNumber(obj: any, keys: string[], fallback: number): number {
+		const value = FullModalScreenActionService.readString(obj, keys)
+		if (value == '') return fallback
+		const n = parseFloat(value)
+		return isNaN(n) ? fallback : n
+	}
+
+	private static readObject(obj: any, keys: string[]): any | null {
+		if (obj == null) return null
+		for (let i = 0; i < keys.length; i++) {
+			const v = FullModalScreenActionService.readValue(obj, keys[i])
+			if (v != null) return v
+		}
+		return null
+	}
+
+	private static readValue(obj: any, key: string): any | null {
+		if (obj == null) return null
+		// #ifdef APP-ANDROID
+		if (obj instanceof UTSJSONObject) return (obj as UTSJSONObject).get(key)
+		// #endif
+		return obj[key]
+	}
+
+	private static readArray(obj: any, keys: string[]): any[] {
+		const v = FullModalScreenActionService.readObject(obj, keys)
+		if (v instanceof Array) return v as any[]
+		return [] as any[]
+	}
+
+	private static consumePendingPipReturn(): boolean {
+		const raw = FullModalScreenActionService.readStoredText(DESK_PET_PENDING_BILL_CAPTURE_KEY)
+		if (raw == '') return false
+		FullModalScreenActionService.clearPendingPipReturn()
+		if (!raw.startsWith('pip-return:')) {
+			console.log(`[全模态][PiP] 丢弃旧返回事件：${raw}`)
+			DeskPetBillCaptureService.clearStoredBillCaptureText()
+			return false
+		}
+		const ts = parseFloat(raw.substring('pip-return:'.length))
+		if (isNaN(ts)) {
+			DeskPetBillCaptureService.clearStoredBillCaptureText()
+			return false
+		}
+		const age = Date.now() - ts
+		if (age > FullModalScreenActionService.PIP_RETURN_PENDING_TTL_MS) {
+			console.log(`[全模态][PiP] 丢弃过期返回事件：${age}ms`)
+			DeskPetBillCaptureService.clearStoredBillCaptureText()
+			return false
+		}
+		console.log(`[全模态][PiP] 消费返回事件：${age}ms`)
+		return true
+	}
+
+	private static readStoredText(key: string): string {
+		try {
+			const value = uni.getStorageSync(key)
+			return value == null ? '' : value.toString()
+		} catch (_e) {
+			return ''
+		}
+	}
+
+	private static clearPendingPipReturn(): void {
+		try {
+			uni.removeStorageSync(DESK_PET_PENDING_BILL_CAPTURE_KEY)
+		} catch (_e) {}
+	}
+
+	private static visualMode(imagePath: string): string {
+		const value = (imagePath ?? '').toString().trim()
+		if (value == '') return 'text_only'
+		if (value.indexOf('zemo://') == 0) return 'current_screen_token'
+		return 'image_file'
+	}
+
+	private static normalizeAction(value: string): FullModalAction {
+		const v = value.trim().toLowerCase()
+		if (v == 'create_transaction' || v == 'createtransaction' || v == 'bill_record' || v == 'record_bill' || v == '记账') return 'create_transaction'
+		if (v == 'create_todos' || v == 'createtodos' || v == 'create_task' || v == 'createtask' || v == 'chat_todo' || v == 'todo' || v == '待办') return 'create_todos'
+		if (v == 'import_investment' || v == 'investment_import' || v == '投资' || v == '理财') return 'import_investment'
+		if (v == 'record_activity' || v == 'activity' || v == 'screen_activity' || v == '活动') return 'record_activity'
+		return 'none'
+	}
+
+	private static normalizeRecordMode(value: string): string {
+		const v = value.trim().toLowerCase()
+		if (v == 'income' || v == '收入' || v == '收款') return 'income'
+		if (v == 'refund' || v == '退款' || v == '退回') return 'refund'
+		if (v == 'transfer' || v == '转账' || v == '转入' || v == '转出') return 'transfer'
+		if (v == 'expense' || v == '支出' || v == '付款' || v == '消费') return 'expense'
+		return ''
+	}
+
+	private static cleanAmount(value: string): string {
+		let out = (value ?? '').toString().trim()
+		out = out.replace(/[,，]/g, '')
+		out = out.replace(/[¥￥元\s]/g, '')
+		if (out.startsWith('+')) out = out.substring(1)
+		if (out.startsWith('-')) out = out.substring(1)
+		const n = parseFloat(out)
+		if (isNaN(n) || n <= 0) return ''
+		return n.toString()
+	}
+
+	private static parseTimeMs(value: string): number {
+		const raw = (value ?? '').toString().trim()
+		if (raw == '') return 0
+		const numeric = parseFloat(raw)
+		if (!isNaN(numeric) && numeric > 1000000000) {
+			return numeric < 100000000000 ? numeric * 1000 : numeric
+		}
+		if (raw.indexOf('今天') >= 0 || raw.indexOf('今晚') >= 0 || raw.indexOf('明天') >= 0 || raw.indexOf('后天') >= 0) {
+			const now = new Date()
+			let offset = 0
+			if (raw.indexOf('明天') >= 0) offset = 1
+			if (raw.indexOf('后天') >= 0) offset = 2
+			const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + offset)
+			let hour = raw.indexOf('今晚') >= 0 || raw.indexOf('晚上') >= 0 || raw.indexOf('下午') >= 0 ? 18 : 9
+			let minute = 0
+			const timeMatch = /(\d{1,2})[:：](\d{2})/.exec(raw)
+			if (timeMatch != null && timeMatch.length >= 3) {
+				hour = parseInt(timeMatch[1])
+				minute = parseInt(timeMatch[2])
+				if ((raw.indexOf('晚上') >= 0 || raw.indexOf('下午') >= 0 || raw.indexOf('今晚') >= 0) && hour < 12) hour += 12
+			}
+			return new Date(d.getFullYear(), d.getMonth(), d.getDate(), hour, minute, 0).getTime()
+		}
+		const full = /(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})[日\sT]*(\d{1,2})?:?(\d{1,2})?:?(\d{1,2})?/.exec(raw)
+		if (full != null && full.length >= 4) {
+			const year = parseInt(full[1])
+			const month = parseInt(full[2])
+			const day = parseInt(full[3])
+			const hour = full[4] == null || full[4] == '' ? 9 : parseInt(full[4])
+			const minute = full[5] == null || full[5] == '' ? 0 : parseInt(full[5])
+			const second = full[6] == null || full[6] == '' ? 0 : parseInt(full[6])
+			return new Date(year, month - 1, day, hour, minute, second).getTime()
+		}
+		const short = /(\d{1,2})[-/月](\d{1,2})[日\s]*(\d{1,2})?:?(\d{1,2})?/.exec(raw)
+		if (short != null && short.length >= 3) {
+			const now = new Date()
+			const month = parseInt(short[1])
+			const day = parseInt(short[2])
+			const hour = short[3] == null || short[3] == '' ? 9 : parseInt(short[3])
+			const minute = short[4] == null || short[4] == '' ? 0 : parseInt(short[4])
+			return new Date(now.getFullYear(), month - 1, day, hour, minute, 0).getTime()
+		}
+		return 0
+	}
+
+	private static emptyDecision(rawOutput: string, message: string): FullModalDecision {
+		return {
+			ok: false,
+			action: 'none',
+			confidence: 0.0,
+			reason: '',
+			transaction: null,
+			todos: [] as FullModalTodo[],
+			activityTitle: '',
+			activityCategory: '',
+			rawJson: '',
+			rawOutput: rawOutput,
+			message: message
+		} as FullModalDecision
+	}
+
+	private static handled(
+		ok: boolean,
+		kind: string,
+		message: string,
+		screen: ScreenUnderstandingResult,
+		taskResult: ChatTodoCreateResult | null,
+		investmentResult: InvestmentOcrImportResult | null,
+		transactionId: string
+	): FullModalScreenActionAttempt {
+		return {
+			handled: true,
+			ok: ok,
+			kind: kind,
+			message: message,
+			screen: screen,
+			taskResult: taskResult,
+			investmentResult: investmentResult,
+			transactionId: transactionId,
+			fallbackReason: ''
+		} as FullModalScreenActionAttempt
+	}
+
+	private static skipped(reason: string): FullModalScreenActionAttempt {
+		return {
+			handled: false,
+			ok: false,
+			kind: '',
+			message: '',
+			screen: null,
+			taskResult: null,
+			investmentResult: null,
+			transactionId: '',
+			fallbackReason: reason
+		} as FullModalScreenActionAttempt
+	}
+
+	private static limitText(text: string, limit: number): string {
+		const value = (text ?? '').toString()
+		if (value.length <= limit) return value
+		return `${value.substring(0, limit)}...(len=${value.length})`
+	}
+
+	private static safeJson(value: any): string {
+		try {
+			return JSON.stringify(value)
+		} catch (_e) {
+			try {
+				return value == null ? 'null' : value.toString()
+			} catch (_e2) {
+				return '[unserializable]'
+			}
+		}
+	}
+
+	private static escapeJson(value: string): string {
+		return (value ?? '').toString()
+			.replace(/\\/g, '\\\\')
+			.replace(/"/g, '\\"')
+			.replace(/\r/g, '\\r')
+			.replace(/\n/g, '\\n')
+	}
+
+	private static formatNow(): string {
+		const d = new Date()
+		const y = d.getFullYear()
+		const m = `${d.getMonth() + 1}`.padStart(2, '0')
+		const day = `${d.getDate()}`.padStart(2, '0')
+		const hh = `${d.getHours()}`.padStart(2, '0')
+		const mm = `${d.getMinutes()}`.padStart(2, '0')
+		const ss = `${d.getSeconds()}`.padStart(2, '0')
+		return `${y}-${m}-${day} ${hh}:${mm}:${ss}`
+	}
+
+	private static errorMessage(e: any): string {
+		if (e == null) return 'unknown'
+		try {
+			const msg = (e as Error).message
+			if (msg != null && msg != '') return msg
+		} catch (_e0) {}
+		return e.toString()
+	}
+}

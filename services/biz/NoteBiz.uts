@@ -1,0 +1,419 @@
+import { Node, NodeType, RelationalEdgeType, LogAction } from '../../utils/types/index.uts';
+import { NodeService } from '../graph/NodeService.uts';
+import { EdgeService } from '../graph/EdgeService.uts';
+import { LogService } from '../graph/LogService.uts';
+import { DB } from '../../utils/DB/DB.uts';
+import { GraphService } from '@/utils/DB/GraphService.uts';
+import { genId } from '@/utils/common/id.uts';
+
+export type NoteItem = {
+  node: Node;
+  related_task_id: string | null;
+};
+
+export type AttributeNote = {
+  id: string;
+  title: string;
+  content: string;
+  created_at: number;
+};
+
+export type NoteBlockItem = {
+  block_id: string;
+  block_type: string;
+  content: string | null;
+  rank: string;
+  is_sync_ref: boolean;
+  source_log_id: string | null;
+  source_deleted: boolean;
+};
+
+export type CreateNotePayload = {
+  title: string;
+  content: string;
+  tags?: string[];
+};
+
+/**
+ * 知识与笔记业务逻辑 (NoteBiz)
+ * 【核心职能】：对接笔记页面与富文本展示，处理纯文本节点、内容块的关系图谱编织、引用分析。
+ */
+export class NoteBiz {
+
+  private static getJsonStringField(obj: any, key: string): string | null {
+    if (obj == null) return null;
+    const value = obj[key];
+    if (value == null) return null;
+    return value.toString();
+  }
+
+  private static getJsonBooleanField(obj: any, key: string): boolean | null {
+    if (obj == null) return null;
+    const value = obj[key];
+    if (value == null) return null;
+    const text = value.toString().trim().toLowerCase();
+    if (text == 'true' || text == '1') return true;
+    if (text == 'false' || text == '0') return false;
+    return null;
+  }
+
+  private static mapRowToNode(row: Map<string, any | null>): Node {
+    const rawType = row.get('type')?.toString().toUpperCase() ?? '';
+    const nodeType = rawType.indexOf('NOTE') >= 0 ? NodeType.Note : NodeType.Task;
+    return {
+      id: row.get('id')?.toString() ?? '',
+      type: nodeType,
+      status: row.get('status')?.toString() ?? '',
+      content: row.get('content')?.toString() ?? '',
+      properties: row.get('properties')?.toString() ?? '',
+      created_at: parseInt(row.get('created_at')?.toString() ?? '0'),
+      updated_at: parseInt(row.get('updated_at')?.toString() ?? '0')
+    } as Node;
+  }
+  
+  public static async createNote(payload: CreateNotePayload): Promise<string | null> {
+    const title = payload.title == null ? '' : payload.title.toString().trim();
+    const content = payload.content == null ? '' : payload.content.toString();
+    const noteTitle = title == '' ? '未命名笔记' : title;
+    const created = await this.saveNoteAndLinkAsync(noteTitle, content, null);
+    if (created == null) return null;
+    return created.node.id;
+  }
+
+  public static async referenceNoteToNode(nodeId: string, noteId: string, syncEventId: string | null = null): Promise<string | null> {
+    if (nodeId == null || nodeId == '') return null;
+    if (noteId == null || noteId == '') return null;
+
+    const existing = await DB.query(
+      `SELECT id, is_deleted
+       FROM edges
+       WHERE source_id = ?
+         AND target_id = ?
+         AND relation_type = 'REFERENCES'
+       LIMIT 1`,
+      [nodeId, noteId]
+    );
+    if (existing.length > 0) {
+      const existingId = existing[0].get('id')?.toString() ?? '';
+      if (existingId == '') return null;
+      const now = Date.now();
+      const reviveOk = syncEventId != null && syncEventId != ''
+        ? await DB.exec(
+          `UPDATE edges
+           SET status = ?, rank = ?, properties = ?, updated_at = ?, is_deleted = 0, entity_version = COALESCE(entity_version, 0) + 1, last_event_id = ?
+           WHERE id = ?`,
+          ['', '500', '', now, syncEventId, existingId]
+        )
+        : await DB.exec(
+          `UPDATE edges
+           SET status = ?, rank = ?, properties = ?, updated_at = ?, is_deleted = 0
+           WHERE id = ?`,
+          ['', '500', '', now, existingId]
+        );
+      return reviveOk ? existingId : null;
+    }
+
+    const now = Date.now();
+    const edgeId = GraphService.generateId('edge');
+    const ok = await DB.exec(
+      `INSERT INTO edges (id, source_id, target_id, relation_type, status, rank, properties, created_at, updated_at, is_deleted, entity_version, last_event_id)
+       VALUES (?, ?, ?, 'REFERENCES', ?, ?, ?, ?, ?, 0, ?, ?)`,
+      [edgeId, nodeId, noteId, '', '500', '', now, now, 1, (syncEventId != null && syncEventId != '' ? syncEventId : null)]
+    );
+    return ok ? edgeId : null;
+  }
+
+  public static async createNoteBlock(parentNoteId: string, content: string): Promise<string | null> {
+    if (parentNoteId == null || parentNoteId == '') return null;
+    const note = await NodeService.getNodeAsync(parentNoteId);
+    if (note == null || note.type != NodeType.Note) return null;
+
+    const blockNode = await NodeService.createNodeAsync(NodeType.SyncBlock, content == null ? '' : content.toString());
+    if (blockNode == null) return null;
+
+    const edgeId = GraphService.generateId('edge');
+    const now = Date.now();
+    const ok = await DB.exec(
+      `INSERT INTO edges (id, source_id, target_id, relation_type, rank, properties, created_at, updated_at, is_deleted)
+       VALUES (?, ?, ?, 'CONTAINS_NOTE_BLOCK', ?, ?, ?, ?, 0)`,
+      [edgeId, parentNoteId, blockNode.id, '500', '', now, now]
+    );
+    if (!ok) return null;
+    return blockNode.id;
+  }
+
+  public static async saveNoteAndLinkAsync(title: string, content: string, relatedTaskId: string | null = null): Promise<NoteItem | null> {
+    const payload = JSON.stringify({ title, content });
+    try {
+      return await DB.tx(async () => {
+        const now = Date.now();
+        const noteEventId = genId('evt');
+        const logEventId = genId('evt');
+        const node = await NodeService.createNodeAsync(NodeType.Note, payload, {
+          createdAt: now,
+          updatedAt: now,
+          entityVersion: 1,
+          lastEventId: noteEventId,
+        });
+        if (node == null) throw new Error('create note failed');
+
+        const log = await LogService.recordLogAsync(node.id, LogAction.Create, `Created note: ${title}`, {
+          entityVersion: 1,
+          syncEventId: logEventId,
+        });
+        if (log == null) throw new Error('create note log failed');
+
+        let linkedTaskId: string | null = null;
+        let linkedEdgeId: string | null = null;
+        if (relatedTaskId != null && relatedTaskId != '') {
+          linkedEdgeId = await this.referenceNoteToNode(relatedTaskId, node.id, noteEventId);
+          if (linkedEdgeId != null && linkedEdgeId != '') linkedTaskId = relatedTaskId;
+        }
+
+
+        return { node, related_task_id: linkedTaskId } as NoteItem;
+      });
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  public static async updateNoteContentAsync(noteId: string, title: string, content: string): Promise<boolean> {
+    const payload = JSON.stringify({ title, content });
+    try {
+      return await DB.tx(async () => {
+        const now = Date.now();
+        const noteEventId = genId('evt');
+        const logEventId = genId('evt');
+        const success = await NodeService.updateNodeContentAsync(noteId, payload, {
+          updatedAt: now,
+          lastEventId: noteEventId,
+        });
+        if (!success) throw new Error('update note content failed');
+
+        const versionRows = await DB.query('SELECT entity_version FROM nodes WHERE id = ? LIMIT 1', [noteId]);
+        const noteEntityVersion = versionRows.length > 0
+          ? Math.max(1, parseInt(versionRows[0].get('entity_version')?.toString() ?? '1'))
+          : 1;
+
+        const log = await LogService.recordLogAsync(noteId, LogAction.Update, `Updated note content`, {
+          entityVersion: 1,
+          syncEventId: logEventId,
+        });
+        if (log == null) throw new Error('create note update log failed');
+
+
+        return true;
+      });
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  public static async getNotesByTaskAsync(taskId: string): Promise<NoteItem[]> {
+    const rows = await DB.query(
+      `SELECT n.*
+       FROM nodes n
+       INNER JOIN edges e ON n.id = e.target_id
+       WHERE e.source_id = ?
+         AND e.relation_type = 'REFERENCES'
+         AND e.is_deleted = 0
+         AND n.is_deleted = 0
+         AND UPPER(COALESCE(n.type, '')) LIKE '%NOTE%'
+       ORDER BY e.created_at DESC, n.updated_at DESC`,
+      [taskId]
+    );
+    const result = [] as NoteItem[];
+    for (let i = 0; i < rows.length; i++) {
+      result.push({ node: this.mapRowToNode(rows[i]), related_task_id: taskId } as NoteItem);
+    }
+    return result;
+  }
+
+  public static async getAllNotesAsync(): Promise<NoteItem[]> {
+    const rows = await DB.query(`SELECT * FROM nodes WHERE type = 'NOTE' AND is_deleted = 0 ORDER BY updated_at DESC`);
+    const result = [] as NoteItem[];
+    for (let i = 0; i < rows.length; i++) {
+      const n = this.mapRowToNode(rows[i]);
+      const sources = await EdgeService.getSourceNodesAsync(n.id, RelationalEdgeType.References);
+      const related = sources.length > 0 ? sources[0].id : null;
+      result.push({ node: n, related_task_id: related } as NoteItem);
+    }
+    return result;
+  }
+
+  public static async getNoteAsync(noteId: string): Promise<NoteItem | null> {
+    const n = await NodeService.getNodeAsync(noteId);
+    if (n == null || n.type != NodeType.Note) return null;
+
+    const sources = await EdgeService.getSourceNodesAsync(n.id, RelationalEdgeType.References);
+    const related = sources.length > 0 ? sources[0].id : null;
+    return { node: n, related_task_id: related } as NoteItem;
+  }
+
+  public static async deleteNoteAsync(noteId: string): Promise<boolean> {
+    return await NodeService.deleteNodeAsync(noteId);
+  }
+
+    /**
+     * 按属性查询笔记（nodes + edges + properties）。
+     */
+    public static async getNotesByAttribute(attributeId: string): Promise<AttributeNote[]> {
+      const sql = `
+        SELECT DISTINCT n.id, n.content, n.properties, n.created_at
+        FROM nodes n
+        LEFT JOIN edges e
+          ON e.target_id = n.id
+         AND e.source_id = ?
+         AND e.relation_type IN ('REFERENCES', 'CONTAINS_NOTE_BLOCK', 'CONTAINS')
+         AND e.is_deleted = 0
+        WHERE n.type = 'NOTE'
+          AND n.is_deleted = 0
+          AND (
+            e.id IS NOT NULL
+            OR json_extract(COALESCE(n.properties, '{}'), '$.attribute_id') = ?
+            OR n.properties LIKE ?
+          )
+        ORDER BY n.updated_at DESC, n.created_at DESC
+      `;
+      const rows = await DB.query(sql, [attributeId, attributeId, `%\"attribute_id\":\"${attributeId}\"%`]);
+      const list = [] as AttributeNote[];
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const rawContent = row.get('content')?.toString() ?? '';
+        let title = rawContent;
+        let content = rawContent;
+
+        if (rawContent != '' && rawContent.startsWith('{')) {
+          try {
+            const obj = JSON.parse(rawContent) as any;
+            const t = NoteBiz.getJsonStringField(obj, 'title');
+            const c = NoteBiz.getJsonStringField(obj, 'content');
+            if (t != null && t != '') title = t;
+            if (c != null && c != '') content = c;
+          } catch (_e) {}
+        }
+
+        list.push({
+          id: row.get('id')?.toString() ?? '',
+          title: title,
+          content: content,
+          created_at: parseInt(row.get('created_at')?.toString() ?? '0')
+        } as AttributeNote);
+      }
+      return list;
+    }
+
+    public static async insertSyncBlock(noteId: string, syncBlockId: string, rank: string = '500'): Promise<boolean> {
+      if (noteId == '' || syncBlockId == '') return false;
+
+      const now = Date.now();
+      let sourceLogId: string | null = null;
+      const blockRows = await DB.query('SELECT properties FROM nodes WHERE id = ? AND is_deleted = 0 LIMIT 1', [syncBlockId]);
+      if (blockRows.length > 0) {
+        const rawProps = blockRows[0].get('properties')?.toString() ?? '';
+        if (rawProps != '' && rawProps != 'null') {
+          try {
+            const obj = JSON.parse(rawProps) as any;
+            const s = NoteBiz.getJsonStringField(obj, 'source_log_id');
+            if (s != null && s != '') sourceLogId = s;
+          } catch (_e) { }
+        }
+      }
+
+      const edgeProps = {
+        block_kind: 'sync_ref'
+      } as any;
+      if (sourceLogId != null && sourceLogId != '') edgeProps['source_log_id'] = sourceLogId;
+
+      const existing = await DB.query(
+        "SELECT id, created_at FROM edges WHERE source_id = ? AND target_id = ? AND relation_type = 'CONTAINS_NOTE_BLOCK' LIMIT 1",
+        [noteId, syncBlockId]
+      );
+
+      const edgeId = existing.length > 0
+        ? (existing[0].get('id')?.toString() ?? GraphService.generateId('edge'))
+        : GraphService.generateId('edge');
+      const createdAt = existing.length > 0
+        ? parseInt(existing[0].get('created_at')?.toString() ?? `${now}`)
+        : now;
+
+      return await DB.exec(
+        `INSERT OR REPLACE INTO edges
+         (id, source_id, target_id, relation_type, rank, properties, created_at, updated_at, is_deleted)
+         VALUES (?, ?, ?, 'CONTAINS_NOTE_BLOCK', ?, ?, ?, ?, 0)`,
+        [edgeId, noteId, syncBlockId, rank, JSON.stringify(edgeProps), createdAt, now]
+      );
+    }
+
+    public static async listNoteBlocks(noteId: string): Promise<NoteBlockItem[]> {
+      if (noteId == '') return [] as NoteBlockItem[];
+
+      const sql = `
+        SELECT
+          n.id,
+          n.type,
+          n.content,
+          n.properties,
+          e.rank,
+          e.properties AS edge_properties
+        FROM edges e
+        JOIN nodes n
+          ON n.id = e.target_id
+        WHERE e.source_id = ?
+          AND e.relation_type IN ('CONTAINS_NOTE_BLOCK', 'CONTAINS')
+          AND e.is_deleted = 0
+          AND n.is_deleted = 0
+        ORDER BY e.rank ASC, n.created_at ASC
+      `;
+
+      const rows = await DB.query(sql, [noteId]);
+      const blocks = [] as NoteBlockItem[];
+
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const nodeType = row.get('type')?.toString() ?? '';
+        const nodePropsRaw = row.get('properties')?.toString() ?? '';
+        const edgePropsRaw = row.get('edge_properties')?.toString() ?? '';
+
+        let sourceLogId: string | null = null;
+        let sourceDeleted = false;
+        if (nodePropsRaw != '' && nodePropsRaw != 'null') {
+          try {
+            const p = JSON.parse(nodePropsRaw) as any;
+            const sid = NoteBiz.getJsonStringField(p, 'source_log_id');
+            if (sid != null && sid != '') sourceLogId = sid;
+            const deletedVal = NoteBiz.getJsonBooleanField(p, 'source_deleted');
+            if (deletedVal != null && deletedVal == true) sourceDeleted = true;
+          } catch (_e) { }
+        }
+
+        let blockKind = '';
+        if (edgePropsRaw != '' && edgePropsRaw != 'null') {
+          try {
+            const ep = JSON.parse(edgePropsRaw) as any;
+            const k = NoteBiz.getJsonStringField(ep, 'block_kind');
+            if (k != null) blockKind = k;
+            if (sourceLogId == null || sourceLogId == '') {
+              const sid2 = NoteBiz.getJsonStringField(ep, 'source_log_id');
+              if (sid2 != null && sid2 != '') sourceLogId = sid2;
+            }
+          } catch (_e2) { }
+        }
+
+        const isSyncRef = nodeType == 'SYNC_BLOCK' || blockKind == 'sync_ref';
+        blocks.push({
+          block_id: row.get('id')?.toString() ?? '',
+          block_type: nodeType,
+          content: row.get('content')?.toString() ?? null,
+          rank: row.get('rank')?.toString() ?? '500',
+          is_sync_ref: isSyncRef,
+          source_log_id: sourceLogId,
+          source_deleted: sourceDeleted
+        } as NoteBlockItem);
+      }
+
+      return blocks;
+    }
+}
+

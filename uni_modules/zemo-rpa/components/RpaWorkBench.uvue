@@ -1,0 +1,677 @@
+<template>
+  <view class="rpa-workbench">
+    <!-- Background: Immersive Canvas -->
+    <view class="canvas-container">
+        <RpaCanvas ref="rpaCanvas" @bind="onBindClick" @export="onRpaExport"></RpaCanvas>
+    </view>
+
+    <!-- UI Overlay Controls - Direct Children for better interaction -->
+    
+    <!-- Control Bar Left (Map) -->
+    <view class="control-bar-left" :style="{ top: (statusBarHeight + 10) + 'px' }">
+        <view class="capsule-btn map-capsule" @click="onMapClick">
+             <text class="capsule-icon">🗺️</text>
+        </view>
+    </view>
+
+    <!-- Control Bar Right (Groups) -->
+    <view class="control-bar-row" :style="{ top: (statusBarHeight + 10) + 'px' }">
+        
+        <!-- Note: Bind Capsule removed from top bar, moved to RpaCanvas floating toolbar -->
+
+        <!-- Capsule 2: Group Selector -->
+        <view class="group-selector-container">
+            <view class="capsule-btn group-capsule">
+                <!-- Select Category Click -->
+                <view v-if="currentCategory != null" class="capsule-part" @click.stop="openCategoryMenu">
+                    <text class="capsule-text">{{ currentCategory?.name }}</text>
+                </view>
+                <view v-else class="capsule-part" @click.stop="toggleMenu">
+                    <text class="capsule-text">Select Group</text>
+                </view>
+
+                <!-- Separator -->
+                <text v-if="currentCategory != null && currentSubGroup != null" class="capsule-sep margin-sm">/</text>
+                
+                <!-- Select SubGroup Click -->
+                <view v-if="currentCategory != null && currentSubGroup != null" class="capsule-part" @click.stop="openSubGroupMenu">
+                    <text class="capsule-text">{{ currentSubGroup?.name }}</text>
+                </view>
+                
+                <!-- Toggle Menu Arrow -->
+                <view class="capsule-part margin-left-xs" @click.stop="toggleMenu">
+                   <text class="capsule-icon-small">▼</text>
+                </view>
+            </view>
+
+            <!-- Dropdown Menu (Anchored to capsule) -->
+            <view v-if="isMenuOpen" class="group-dropdown" @click.stop>
+                <!-- View 1: Categories -->
+                <template v-if="menuView === 0">
+                    <view class="menu-list-header">
+                        <text class="menu-title-text">Groups</text>
+                        <view class="close-icon-btn" @click.stop="closeMenu">
+                            <text class="close-icon-text">✕</text>
+                        </view>
+                    </view>
+                    <scroll-view class="menu-list" direction="vertical">
+                        <view 
+                            v-for="(group, index) in skillGroups" 
+                            :key="group.id" 
+                            class="menu-item" 
+                            @click="selectCategory(group)"
+                        >
+                            <text class="menu-text">{{ group.name }}</text>
+                            <view style="display: flex; flex-direction: row; align-items: center;">
+                                <text class="menu-text" style="color: #ff4444; margin-right: 10px; font-size: 14px;" @click.stop="onDeleteCategory(group)">✕</text>
+                                <text class="menu-arrow">></text>
+                            </view>
+                        </view>
+                    </scroll-view>
+                    <view class="menu-footer" @click="createNewCategory">
+                        <text class="footer-action">+ New Category</text>
+                    </view>
+                </template>
+
+                <!-- View 2: Sub-Groups -->
+                <template v-if="menuView === 1">
+                    <view class="menu-list-header">
+                        <view class="back-btn" @click="backToCategories">
+                            <text class="back-icon">❮</text>
+                        </view>
+                        <text class="menu-title-text">{{ tempSelectedCategory?.name }}</text>
+                        <view class="close-icon-btn" @click.stop="closeMenu">
+                            <text class="close-icon-text">✕</text>
+                        </view>
+                    </view>
+                    <scroll-view class="menu-list" direction="vertical">
+                        <view 
+                            v-for="(sub, index) in tempSelectedCategory?.subGroups" 
+                            :key="sub.id" 
+                            class="menu-item"
+                            :class="{'item-selected': currentSubGroup?.id === sub.id}"
+                            @click="confirmSubGroup(sub)"
+                        >
+                            <text class="menu-text">{{ sub.name }}</text>
+                            <text v-if="currentSubGroup?.id === sub.id" class="check-icon">✓</text>
+                        </view>
+                    </scroll-view>
+                    <view class="menu-footer" @click="createNewSubGroup">
+                        <text class="footer-action">+ New Sub-Group</text>
+                    </view>
+                </template>
+            </view>
+        </view>
+    </view>
+
+    <!-- App Selector Modal -->
+    <RpaAppSelector v-if="appSelectorVisible" @confirm="onAppSelected" @close="appSelectorVisible = false"></RpaAppSelector>
+  </view>
+</template>
+
+<script lang="uts">
+import RpaCanvas from './RpaCanvas.uvue';
+import RpaAppSelector from './RpaAppSelector.uvue';
+import { ZemoRpa, SkillGroup, SkillSubGroup } from '@/uni_modules/zemo-rpa';
+import { RPAStep, RPAScript, StepInputMode, RPABranchCondition } from '../utssdk/utils/RPAStep.uts';
+import { RPARecorder, RecordingState } from '../utssdk/services/RPARecorder.uts';
+import { RpaService } from '../services/RpaService.uts';
+// #ifdef APP-ANDROID
+import { rpaStepFromJSON, rpaScriptFromJSON } from '../utssdk/app-android/utils/RPAStepParser.uts';
+// #endif
+
+export default {
+    components: { RpaCanvas, RpaAppSelector },
+    props: {
+        menuData: {
+            type: Array as PropType<SkillGroup[]>,
+            default: () => [] as SkillGroup[]
+        }
+    },
+    data() {
+        return {
+            statusBarHeight: 20,
+            // UI State
+            appSelectorVisible: false,
+            isMenuOpen: false,
+            menuView: 0, // 0 = Categories, 1 = SubGroups
+            
+            // Selection Traversal State
+            tempSelectedCategory: null as SkillGroup | null,
+
+            // Active Selection
+            currentCategory: null as SkillGroup | null,
+            currentSubGroup: null as SkillSubGroup | null,
+
+            // Data
+            skillGroups: [] as SkillGroup[]
+        }
+    },
+    emits: ['bind', 'export', 'create-category', 'create-sub-category', 'delete-category'],
+    watch: {
+        menuData: {
+            handler(newVal: SkillGroup[]) {
+                 console.log("RpaWorkBench: menuData updated, count=", newVal.length);
+                 // Manual copy to strictly preserve types
+                 const list: SkillGroup[] = [];
+                 newVal.forEach((g: SkillGroup) => {
+                     const subs: SkillSubGroup[] = [];
+                     g.subGroups.forEach((s: SkillSubGroup) => {
+                         subs.push({ id: s.id, name: s.name } as SkillSubGroup);
+                     });
+                     list.push({ id: g.id, name: g.name, subGroups: subs } as SkillGroup);
+                 });
+                 this.skillGroups = list;
+                 this.initSelection();
+            },
+            immediate: true
+        }
+    },
+    computed: {
+    },
+    created() {
+        const sys = uni.getSystemInfoSync();
+        this.statusBarHeight = sys.statusBarHeight;
+    },
+    methods: {
+        initSelection() {
+             if (this.skillGroups.length > 0) {
+                 // Try to preserve current selection
+                 if (this.currentCategory != null) {
+                     const stillExists = this.skillGroups.find((g: SkillGroup): boolean => g.id == this.currentCategory!.id);
+                     if (stillExists != null) {
+                         this.currentCategory = stillExists;
+                         // Check SubGroup
+                         if (this.currentSubGroup != null) {
+                             const subExists = stillExists.subGroups.find((s: SkillSubGroup): boolean => s.id == this.currentSubGroup!.id);
+                             if (subExists != null) {
+                                 this.currentSubGroup = subExists;
+                             } else if (stillExists.subGroups.length > 0) {
+                                  this.currentSubGroup = stillExists.subGroups[0];
+                             } else {
+                                 this.currentSubGroup = null;
+                             }
+                         } else if (stillExists.subGroups.length > 0) {
+                             this.currentSubGroup = stillExists.subGroups[0];
+                         }
+                         return; // Preserved
+                     }
+                 }
+
+                 // Initialize Default Selection (Fallback)
+                const defaultGroup = this.skillGroups.find((g: SkillGroup): boolean => g.name == "ZeMo 泽墨");
+                if (defaultGroup != null) {
+                    this.currentCategory = defaultGroup;
+                    if (defaultGroup.subGroups.length > 0) {
+                        this.currentSubGroup = defaultGroup.subGroups.find((sg: SkillSubGroup): boolean => sg.name == "General") ?? defaultGroup.subGroups[0];
+                    }
+                } else {
+                     // Fallback to first
+                     this.currentCategory = this.skillGroups[0];
+                     if (this.currentCategory!.subGroups.length > 0) {
+                         this.currentSubGroup = this.currentCategory!.subGroups[0];
+                     }
+                }
+                // 【修复】初始化选择后自动加载技能列表
+                if (this.currentSubGroup != null) {
+                    this.loadGroupSkills(this.currentSubGroup!.id);
+                }
+             }
+        },
+        closeMenu() {
+            this.isMenuOpen = false;
+        },
+        // --- Menu Logic ---
+        openCategoryMenu() {
+            this.isMenuOpen = true;
+            this.menuView = 0;
+            this.tempSelectedCategory = null; 
+        },
+        openSubGroupMenu() {
+            if (this.currentCategory != null) {
+                this.isMenuOpen = true;
+                this.menuView = 1;
+                this.tempSelectedCategory = this.currentCategory;
+            }
+        },
+        toggleMenu() {
+            this.isMenuOpen = !this.isMenuOpen;
+            if (this.isMenuOpen) {
+                // Always start at top level unless we want to remember state
+                this.menuView = 0; 
+                this.tempSelectedCategory = null;
+            }
+        },
+        selectCategory(group: SkillGroup) {
+            this.tempSelectedCategory = group;
+            this.menuView = 1; // Go to SubGroup view
+        },
+        backToCategories() {
+            this.menuView = 0;
+            this.tempSelectedCategory = null;
+        },
+        confirmSubGroup(sub: SkillSubGroup) {
+            if (this.tempSelectedCategory != null) {
+                this.currentCategory = this.tempSelectedCategory;
+                this.currentSubGroup = sub;
+                this.isMenuOpen = false;
+                
+                console.log("Selected:", this.currentCategory?.name, this.currentSubGroup?.name);
+                // 【修复】切换分组后自动加载该分组下的技能列表
+                this.loadGroupSkills(sub.id);
+            }
+        },
+        createNewCategory() {
+            console.log("Action: Create New Category");
+            // Implement modal or inline add
+            uni.showModal({
+                title: "New Group",
+                editable: true,
+                placeholderText: "Group Name",
+                success: (res) => {
+                    const content = res.content
+                    if (res.confirm && content != null && content != "") {
+                         this.$emit("create-category", content);
+                    }
+                }
+            });
+        },
+        createNewSubGroup() {
+            if (this.tempSelectedCategory == null) return;
+            const parentId = this.tempSelectedCategory!.id;
+            uni.showModal({
+                title: "New Sub-Group",
+                content: "In " + this.tempSelectedCategory!.name,
+                editable: true,
+                placeholderText: "Sub-Group Name",
+                success: (res) => {
+                    const content = res.content
+                    if (res.confirm && content != null && content != "") {
+                         this.$emit("create-sub-category", {
+                             parentId: parentId,
+                             name: content
+                         });
+                    }
+                }
+            });
+        },
+
+        // --- FAB Logic ---
+        onMapClick() {
+            console.log("Action: Map/Toggle View");
+            const canvas = this.$refs['rpaCanvas'] as ComponentPublicInstance;
+            canvas.$callMethod('toggleMinimap');
+        },
+        onBindClick() {
+            // Check Accessibility Permission
+            const hasPermission = ZemoRpa.checkAccessibilityPermission();
+            if (!hasPermission) {
+                uni.showModal({
+                    title: "Permission Required",
+                    content: "Accessibility Service is required to use RPA features. Please enable it in settings.",
+                    confirmText: "Go to Settings",
+                    showCancel: true,
+                    success: (res) => {
+                        if (res.confirm) {
+                            ZemoRpa.openAccessibilitySettings();
+                        }
+                    }
+                });
+                return;
+            }
+            this.appSelectorVisible = true;
+        },
+
+        // --- Bind/Export Logic ---
+        onAppSelected(app: any) {
+             const json = JSON.stringify(app);
+             const appInfo = JSON.parse(json) as UTSJSONObject;
+             const pkg = appInfo.getString("packageName");
+             const appName = appInfo.getString("appName") ?? "";
+             
+             if (pkg != null) {
+                 console.log("[RpaWorkBench] app selected", pkg, appName);
+                 // 不在这里启动应用，由 FloatingRecorder 点击录制时启动
+                 // 流程: 选择应用 → 显示悬浮窗 → 用户点录制 → 跳转应用并开始捕捉
+                 const groupsJson = JSON.stringify(this.skillGroups);
+                 const selectedAppJson = JSON.stringify({ packageName: pkg, appName: appName });
+                 ZemoRpa.startRecording(null, groupsJson, selectedAppJson);
+                 this.appSelectorVisible = false;
+             }
+        },
+        onRpaExport(data: string) {
+            console.log("RPA Exported Data:", data);
+        },
+        onDeleteCategory(group: SkillGroup) {
+             uni.showModal({
+                title: 'Delete Group',
+                content: 'Delete group "' + group.name + '" and all permissions?',
+                success: (res) => {
+                    if (res.confirm) {
+                         this.$emit('delete-category', group.id);
+                    }
+                }
+             });
+        },
+
+        /**
+         * Load a saved skill by item ID and display its steps on the canvas
+         * Supports both v1 (steps array) and v2 (RPAScript) formats
+         */
+        async loadSavedSkill(itemId: string) {
+            console.log("[RpaWorkBench] loadSavedSkill id=", itemId);
+            const item = await RpaService.getItemById(itemId);
+            if (item == null) {
+                console.warn("[RpaWorkBench] item not found:", itemId);
+                return;
+            }
+            
+            const contentStr = item.get('content')?.toString() ?? "";
+            if (contentStr == "") {
+                console.warn("[RpaWorkBench] item has no content");
+                return;
+            }
+            
+            // #ifdef APP-ANDROID
+            try {
+                const contentObj = JSON.parse(contentStr) as UTSJSONObject;
+                if (contentObj == null) return;
+                
+                const version = contentObj.getNumber("version") ?? 1;
+                const canvas = this.$refs['rpaCanvas'] as ComponentPublicInstance;
+                
+                if (version >= 2) {
+                    // v2 RPAScript format: has groups, edges, etc
+                    const script = rpaScriptFromJSON(contentStr);
+                    if (script != null) {
+                        console.log("[RpaWorkBench] loaded v2 script:", script.steps.length, "steps");
+                        canvas.$callMethod('loadFromScript', script);
+                    }
+                } else {
+                    // v1 legacy format: simple steps array
+                    const stepsArr = contentObj.getArray("steps");
+                    if (stepsArr == null || stepsArr.length == 0) {
+                        console.warn("[RpaWorkBench] no steps in saved skill");
+                        return;
+                    }
+                    
+                    const steps: RPAStep[] = [];
+                    for (let i = 0; i < stepsArr.length; i++) {
+                        const stepJson = JSON.stringify(stepsArr[i]);
+                        const step = rpaStepFromJSON(stepJson);
+                        if (step != null) {
+                            steps.push(step);
+                        }
+                    }
+                    
+                    console.log("[RpaWorkBench] parsed", steps.length, "v1 steps");
+                    if (steps.length > 0) {
+                        canvas.$callMethod('loadSkillSteps', steps);
+                    }
+                }
+            } catch (e) {
+                console.error("[RpaWorkBench] parse saved skill error:", e);
+            }
+            // #endif
+        },
+
+        /**
+         * 加载指定分组下的所有技能并显示最近一个的步骤
+         */
+        async loadGroupSkills(groupId: string) {
+            console.log("[RpaWorkBench] loadGroupSkills groupId=", groupId);
+            const items = await RpaService.getItems(groupId);
+            if (items.length == 0) {
+                console.log("[RpaWorkBench] no skills in group", groupId);
+                const canvas = this.$refs['rpaCanvas'] as ComponentPublicInstance;
+                if (canvas != null) {
+                    canvas.$callMethod('clearScript');
+                }
+                return;
+            }
+            
+            const latestItem = items[0];
+            const itemId = latestItem.get('id')?.toString() ?? "";
+            if (itemId != "") {
+                this.loadSavedSkill(itemId);
+            }
+        },
+
+        /**
+         * Get the current canvas state as v2 RPAScript JSON
+         */
+        exportAsScript(): string {
+            const canvas = this.$refs['rpaCanvas'] as ComponentPublicInstance;
+            const script = canvas.$callMethod('toScript') as RPAScript | null;
+            if (script != null) {
+                return JSON.stringify(script);
+            }
+            return "";
+        },
+
+        /**
+         * Get current recording state
+         */
+        getRecordingState(): string {
+            const state = RPARecorder.state;
+            if (state == RecordingState.RECORDING) return "RECORDING";
+            if (state == RecordingState.PAUSED) return "PAUSED";
+            return "IDLE";
+        },
+
+        /**
+         * Pause recording to allow description input
+         */
+        pauseRecording() {
+            ZemoRpa.pauseRecording();
+        },
+
+        /**
+         * Resume recording after description input
+         */
+        resumeRecording() {
+            ZemoRpa.resumeRecording();
+        }
+    }
+}
+</script>
+
+<style>
+/* Layout */
+.rpa-workbench {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    background-color: #f5f5f5;
+    display: flex;
+    flex-direction: column;
+}
+
+.canvas-container {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    z-index: 1; /* Lowest level */
+}
+
+/* UI Overlay removed, children are now direct descendants */
+/* .ui-overlay { ... } */
+
+/* Allow interaction on specific UI elements */
+/* .header-container, ... (removed) */
+
+/* Control Bar (Top Right) */
+.control-bar-row {
+    position: absolute;
+    right: 20px;
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    /* gap not supported in UniApp X, use margin on children instead */
+    z-index: 210;
+    pointer-events: auto;
+}
+
+.control-bar-left {
+    position: absolute;
+    left: 20px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    z-index: 210;
+    pointer-events: auto;
+}
+
+.capsule-btn {
+    height: 36px;
+    background-color: rgba(255, 255, 255, 0.95);
+    border-radius: 18px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid rgba(0,0,0,0.05);
+}
+
+.map-capsule { width: 36px; }
+
+/* bind-capsule: 通过 :style 绑定 */
+
+.group-capsule {
+    padding: 0 14px;
+    min-width: 100px;
+    justify-content: flex-start;
+}
+
+.capsule-part {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+}
+
+.capsule-sep {
+    font-size: 13px;
+    color: #bbb;
+    margin: 0 4px; /* Space around separator */
+}
+
+.margin-sm { margin-left: 2px; margin-right: 2px; }
+.margin-left-xs { margin-left: 6px; }
+
+.capsule-text {
+    font-size: 13px;
+    font-weight: 600;
+    color: #222;
+    /* margin-right: 8px; Removed to control spacing via containers */
+}
+
+.capsule-icon { font-size: 16px; }
+.capsule-icon-small { font-size: 10px; color: #888; margin-top: 1px; }
+
+/* 2. Group Selector */
+.group-selector-container {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+}
+
+/* Dropdown Menu */
+.group-dropdown {
+    margin-top: 10px;
+    background-color: #ffffff;
+    width: 240px;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+    display: flex;
+    flex-direction: column;
+    border: 1px solid rgba(0,0,0,0.05);
+}
+
+.menu-list-header {
+    background-color: #f9f9f9;
+    padding: 12px;
+    border-bottom: 1px solid #f0f0f0;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+}
+
+.close-icon-btn {
+    padding: 4px 8px;
+}
+.close-icon-text {
+    font-size: 14px;
+    color: #999;
+}
+
+.menu-title-text {
+    font-size: 14px;
+    font-weight: bold;
+    color: #555555;
+    flex: 1;
+}
+
+.back-btn {
+    padding-right: 12px;
+}
+
+.back-icon {
+    font-size: 16px;
+    color: #007aff;
+}
+
+.menu-list {
+    max-height: 280px;
+    /* min-height: 100px; */
+}
+
+.menu-item {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid #f9f9f9;
+}
+
+/* :active pseudo-class not supported in UniApp X */
+
+.item-selected {
+    background-color: #f0f9ff;
+}
+
+.menu-text {
+    font-size: 14px;
+    color: #333333;
+}
+
+.menu-arrow {
+    font-size: 12px;
+    color: #cccccc;
+}
+
+.check-icon {
+    font-size: 12px;
+    color: #007aff;
+    font-weight: bold;
+}
+
+.menu-footer {
+    padding: 12px;
+    background-color: #fafafa;
+    border-top: 1px solid #f0f0f0;
+    align-items: center;
+    justify-content: center;
+    display: flex;
+}
+
+.footer-action {
+    font-size: 13px;
+    color: #007aff;
+    font-weight: 600;
+}
+
+/* fab 系列样式通过 :style 绑定 */
+</style>
+

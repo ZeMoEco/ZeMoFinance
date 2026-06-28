@@ -1,0 +1,171 @@
+// uni_modules/zemo-rpa/utssdk/app-android/utils/ScreenCaptureUtils.uts
+import Context from 'android.content.Context';
+import Intent from 'android.content.Intent';
+import MediaProjectionManager from 'android.media.projection.MediaProjectionManager';
+import MediaProjection from 'android.media.projection.MediaProjection';
+import VirtualDisplay from 'android.hardware.display.VirtualDisplay';
+import DisplayManager from 'android.hardware.display.DisplayManager';
+import ImageReader from 'android.media.ImageReader';
+import PixelFormat from 'android.graphics.PixelFormat';
+import Bitmap from 'android.graphics.Bitmap';
+import Base64 from 'android.util.Base64';
+import DisplayMetrics from 'android.util.DisplayMetrics';
+import WindowManager from 'android.view.WindowManager';
+import ByteArrayOutputStream from 'java.io.ByteArrayOutputStream';
+import { RPARect } from '../../utils/RPAStep.uts';
+
+export class ScreenCaptureUtils {
+	
+	private static mediaProjection : MediaProjection | null = null;
+	private static virtualDisplay : VirtualDisplay | null = null;
+	private static imageReader : ImageReader | null = null;
+	private static screenWidth : number = 0;
+	private static screenHeight : number = 0;
+	private static screenDensity : number = 0;
+
+	/**
+	 * 初始化截图工具 (Android)
+	 * @param context 
+	 * @param resultCode MediaProjection 权限请求结果码
+	 * @param resultData MediaProjection 权限请求返回数据
+	 */
+	static init(context: Context, resultCode: number, resultData: Intent) {
+		const mpManager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager;
+		ScreenCaptureUtils.mediaProjection = mpManager.getMediaProjection(resultCode.toInt(), resultData);
+		
+		// 获取屏幕参数
+		const wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager;
+		const metrics = new DisplayMetrics();
+		wm.getDefaultDisplay().getRealMetrics(metrics);
+		ScreenCaptureUtils.screenWidth = metrics.widthPixels;
+		ScreenCaptureUtils.screenHeight = metrics.heightPixels;
+		ScreenCaptureUtils.screenDensity = metrics.densityDpi;
+
+		ScreenCaptureUtils.setupVirtualDisplay();
+	}
+
+	private static setupVirtualDisplay() {
+		if (ScreenCaptureUtils.mediaProjection == null) return;
+		
+		// 保持 ImageReader 活跃
+		if (ScreenCaptureUtils.imageReader == null) {
+			// 使用 RGBA_8888 格式
+			ScreenCaptureUtils.imageReader = ImageReader.newInstance(
+				ScreenCaptureUtils.screenWidth.toInt(), 
+				ScreenCaptureUtils.screenHeight.toInt(), 
+				PixelFormat.RGBA_8888, 
+				2
+			);
+		}
+
+		ScreenCaptureUtils.virtualDisplay = ScreenCaptureUtils.mediaProjection!.createVirtualDisplay(
+			"ScreenCapture",
+			ScreenCaptureUtils.screenWidth.toInt(),
+			ScreenCaptureUtils.screenHeight.toInt(),
+			ScreenCaptureUtils.screenDensity.toInt(),
+			DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+			ScreenCaptureUtils.imageReader!.getSurface(),
+			null,
+			null
+		);
+	}
+
+	/**
+	 * 获取当前屏幕截图 (Base64)
+	 * @param cropRect 可选裁剪区域
+	 */
+	static takeSnapshot(cropRect: any | null = null) : string | null {
+		if (ScreenCaptureUtils.imageReader == null) return null;
+
+		const image = ScreenCaptureUtils.imageReader!.acquireLatestImage();
+		if (image == null) {
+			// 如果没有新图像，可能是屏幕未刷新，尝试获取上一帧或直接返回null (实际场景可能需重试)
+			return null;
+		}
+
+		try {
+			const planes = image.getPlanes();
+			const buffer = planes[0].getBuffer();
+			
+			const pixelStride = planes[0].getPixelStride();
+			const rowStride = planes[0].getRowStride();
+			const rowPadding = rowStride - pixelStride * ScreenCaptureUtils.screenWidth;
+
+			// 创建 Bitmap
+			// 注意：这里简单处理，实际可能需要处理 padding
+			let bitmap = Bitmap.createBitmap(
+				(ScreenCaptureUtils.screenWidth + rowPadding / pixelStride).toInt(),
+				ScreenCaptureUtils.screenHeight.toInt(),
+				Bitmap.Config.ARGB_8888
+			);
+			
+			bitmap.copyPixelsFromBuffer(buffer);
+			
+			// 如果有 padding 或需要裁剪，进行处理
+			let finalBitmap = bitmap;
+			
+			// 裁剪掉 padding 区域如果存在
+			if (rowPadding > 0 || cropRect != null) {
+				let cropX: Int = 0;
+				let cropY: Int = 0;
+				let cropW: Int = ScreenCaptureUtils.screenWidth.toInt();
+				let cropH: Int = ScreenCaptureUtils.screenHeight.toInt();
+
+				if (cropRect != null) {
+					// 假设 cropRect 是 RPARect 类型，包含 left, top, right, bottom
+					const rect = cropRect as RPARect;
+					cropX = Math.max(0, rect.left).toInt();
+					cropY = Math.max(0, rect.top).toInt();
+					cropW = Math.min(ScreenCaptureUtils.screenWidth.toInt() - cropX, (rect.right - rect.left)).toInt();
+					cropH = Math.min(ScreenCaptureUtils.screenHeight.toInt() - cropY, (rect.bottom - rect.top)).toInt();
+				}
+
+				if (cropW > 0 && cropH > 0) {
+					finalBitmap = Bitmap.createBitmap(bitmap, cropX, cropY, cropW, cropH);
+				} else {
+					finalBitmap = Bitmap.createBitmap(bitmap, 0, 0, ScreenCaptureUtils.screenWidth.toInt(), ScreenCaptureUtils.screenHeight.toInt());
+				}
+			}
+
+			// 转 Base64
+			const outputStream = new ByteArrayOutputStream();
+			finalBitmap.compress(Bitmap.CompressFormat.JPEG, 80, outputStream);
+			const byteArray = outputStream.toByteArray();
+			const base64String = Base64.encodeToString(byteArray, Base64.NO_WRAP);
+			
+			// 清理
+			if (finalBitmap != bitmap) {
+				finalBitmap.recycle();
+			}
+			bitmap.recycle();
+			
+			return base64String;
+
+		} catch (e) {
+			console.error("ScreenCaptureUtils takeSnapshot error: " + e);
+			return null;
+		} finally {
+			image.close();
+		}
+		
+		return null;
+	}
+
+	/**
+	 * 停止录制并释放资源
+	 */
+	static stop() {
+		if (ScreenCaptureUtils.virtualDisplay != null) {
+			ScreenCaptureUtils.virtualDisplay!.release();
+			ScreenCaptureUtils.virtualDisplay = null;
+		}
+		if (ScreenCaptureUtils.mediaProjection != null) {
+			ScreenCaptureUtils.mediaProjection!.stop();
+			ScreenCaptureUtils.mediaProjection = null;
+		}
+		if (ScreenCaptureUtils.imageReader != null) {
+			ScreenCaptureUtils.imageReader!.close();
+			ScreenCaptureUtils.imageReader = null;
+		}
+	}
+}

@@ -1,0 +1,34 @@
+
+export type OcrBox = {
+left: number
+top: number
+right: number
+bottom: number
+}
+
+export type OcrItem = {
+    text: string
+    confidence: number
+    box: OcrBox
+}
+
+export type OcrSuccess = {
+items: OcrItem[]
+fullText: string
+}
+
+export type OcrErrorCode = 900001 | 900002;
+
+export type OcrFail = IUniError;
+
+export type OcrEngine = 'native' | 'ppocrv6';
+
+export type RecognizeOptions = {
+imagePath: string
+engine?: OcrEngine
+success?: (res: OcrSuccess) => void
+fail?: (res: OcrFail) => void
+complete?: (res: any) => void
+}
+
+export type Recognize = (options: RecognizeOptions) => void;

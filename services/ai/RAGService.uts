@@ -1,0 +1,60 @@
+import { addKnowledge, clearKnowledge, findContext, getKnowledgeSize } from "@/uni_modules/zemo-ai";
+
+export type SkillDoc = {
+    name: string;
+    description: string;
+    keywords: string[];
+    examples: string[];
+}
+
+export type RAGSearchResult = {
+    id: string;
+    text: string;
+    score: number;
+    metadata: Map<string, string> | null;
+}
+
+export class RAGService {
+    
+    static addDocument(id: string, text: string, metadata: Map<string, string> | null): boolean {
+        return addKnowledge(text);
+    }
+
+    static removeDocument(id: string): void {
+        // Not implemented in native simple RAG
+    }
+    
+    static clear(): void {
+        clearKnowledge();
+    }
+    
+    static size(): number {
+        return getKnowledgeSize();
+    }
+    
+    static getContext(query: string, topK: number): string {
+        return findContext(query, topK);
+    }
+    
+    static initFromSkills(docs: SkillDoc[]): number {
+        let count = 0;
+        docs.forEach(doc => {
+             const text = `Tool: ${doc.name}\nDescription: ${doc.description}\nKeywords: ${doc.keywords.join(", ")}\nExamples: ${doc.examples.join("; ")}`;
+             if (addKnowledge(text)) {
+                 count++;
+             }
+        });
+        return count;
+    }
+
+    static addExperience(input: string, action: string, outcome: string, success: boolean): void {
+        const text = `Experience:\nUser: ${input}\nAction: ${action}\nResult: ${outcome}\nSuccess: ${success}`;
+        addKnowledge(text);
+    }
+    
+    static search(query: string, topK: number): RAGSearchResult[] {
+        // Native layer findContext returns string, not structured objects suitable for search result yet.
+        // Return empty array to verify signature compatibility.
+        return [];
+    }
+}

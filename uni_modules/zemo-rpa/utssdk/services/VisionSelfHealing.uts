@@ -1,0 +1,196 @@
+// VisionSelfHealing.uts
+// 注意: zemo-ocr 为可选依赖，如果模块不存在则视觉特征退化为纯文本匹配
+import { recognize, OcrSuccess, OcrItem, RecognizeOptions } from '../../../zemo-ocr/utssdk/index.uts'
+
+// 类型定义：视觉特征
+export type VisionFeature = {
+    signature: string // 简化版 ORB 特征指纹 (实际应为二进制描述子)
+    ocrText: string
+    bounds: { x: number, y: number, w: number, h: number }
+}
+
+// 类型定义：匹配候选
+export type MatchCandidate = {
+    nodeId?: string
+    bounds: { x: number, y: number, w: number, h: number }
+    orbScore: number
+    ocrScore: number
+    geoScore: number
+    totalScore: number
+}
+
+// 模拟 ORB 特征提取器 (实际需要引入 OpenCV 或类似库)
+// 在 UTS/Uniapp 环境下，我们可能需要通过 Native 扩展来实现真正的 ORB
+class MockORBExtractor {
+    static computeSignature(bitmap: any, rect: any): string {
+        // 这里只是一个占位符，模拟生成特征哈希
+        // 实际项目需要调用 Native 层 OpenCV computeORB
+        return "orb_sig_" + Math.floor(Math.random() * 100000);
+    }
+    
+    // 模拟汉明距离计算相似度 (0.01 - 1.0)
+    static compare(sig1: string, sig2: string): number {
+        if (sig1 === sig2) return 1.0;
+        return 0.5 + Math.random() * 0.5; // 随机模拟匹配度
+    }
+}
+
+export class VisionSelfHealing {
+
+    /**
+     * 1. 采集：提取目标特征
+     * 实际应从屏幕截图 + 目标区域 (rect) 中提取
+     */
+    static async captureFeature(bitmapPath: string, rect: { x: number, y: number, w: number, h: number }): Promise<VisionFeature> {
+        // 1. 提取 ORB
+        const orbSig = MockORBExtractor.computeSignature(null, rect);
+        
+        // 2. 提取 OCR
+        let detectedText = "";
+        
+        // 使用 Promise 包装 zemo-ocr 异步回调
+        const ocrPromise = new Promise<string>((resolve) => {
+             const opts: RecognizeOptions = {
+                 imagePath: bitmapPath,
+                 success: (res: OcrSuccess) => {
+                     // 简单地查找在 rect 范围内的文字，或者直接识别裁剪后的图
+                     // 这里简化为返回全部或特定区域文字
+                     let targetText = "";
+                     // 简单逻辑：找到中心点落在 rect 附近的文本
+                     const cx = rect.x + rect.w / 2;
+                     const cy = rect.y + rect.h / 2;
+                     
+                     let minDist = 10000;
+                     
+                     res.items.forEach((item: OcrItem) => {
+                         const itemCx = (item.box.left + item.box.right) / 2;
+                         const itemCy = (item.box.top + item.box.bottom) / 2;
+                         const dist = Math.sqrt(Math.pow(itemCx - cx, 2) + Math.pow(itemCy - cy, 2));
+                         
+                         // 假设距离足够近就算
+                         if (dist < minDist && dist < 100) { 
+                             minDist = dist;
+                             targetText = item.text;
+                         }
+                     });
+                     
+                     resolve(targetText);
+                 },
+                 fail: () => {
+                     resolve("");
+                 }
+             };
+             
+             // 容错：检测插件是否存在
+             try {
+                recognize(opts);
+             } catch (e) {
+                 console.log("[VisionHealing] zemo-ocr not found or error, using fallback");
+                 resolve("");
+             }
+        });
+        
+        detectedText = await ocrPromise;
+
+        return {
+            signature: orbSig,
+            ocrText: detectedText,
+            bounds: rect
+        } as VisionFeature;
+    }
+
+    /**
+     * 2. 自愈：寻找最佳匹配节点
+     * @param originalFeature 原始录制时的特征
+     * @param currentScreenBitmap 当前屏幕截图路径
+     * @param candidates 当前屏幕上检测到的所有潜在节点 (需要先扫描一遍当前屏幕的 OCR + 布局节点)
+     */
+    static async findBestMatchNode(
+        originalFeature: VisionFeature, 
+        currentScreenBitmap: string,
+        // 实际场景下，candidates 可能是当前屏幕的 AccessibilityNodeInfo 列表 或 OCR 结果集
+        // 这里简化为预先处理好的候选列表
+        candidates: { bounds: any, text?: string, bitmapFragment?: any }[] 
+    ): Promise<MatchCandidate | null> {
+        
+        let bestMatch: MatchCandidate | null = null;
+        let maxScore = 0;
+
+        for (const cand of candidates) {
+            // A. ORB Score (50%)
+            // 假设我们对每个候选区域提取了 ORB
+            const candSig = MockORBExtractor.computeSignature(cand.bitmapFragment, cand.bounds);
+            const orbScore = MockORBExtractor.compare(originalFeature.signature, candSig);
+            
+            // B. OCR Score (30%)
+            // 假设 candidates 已经有了 text (例如通过遍历 AccessibilityNode 或已有的全屏 OCR)
+            let ocrScore = 0;
+            if (originalFeature.ocrText && cand.text) {
+                ocrScore = VisionSelfHealing.levenshteinSimilarity(originalFeature.ocrText, cand.text);
+            }
+            
+            // C. Geo Score (20%) - 相对坐标
+            // 简单的欧氏距离归一化，离得越近分越高
+            // 假设屏幕尺寸固定或已归一化，这里简化计算
+            const dist = Math.sqrt(
+                Math.pow(originalFeature.bounds.x - cand.bounds.x, 2) + 
+                Math.pow(originalFeature.bounds.y - cand.bounds.y, 2)
+            );
+            // 假设最大距离为屏幕对角线 2000px，分数线性递减
+            const geoScore = Math.max(0, 1 - (dist / 1000)); 
+
+            // 总分计算
+            const totalScore = (orbScore * 0.5) + (ocrScore * 0.3) + (geoScore * 0.2);
+            
+            if (totalScore > maxScore) {
+                maxScore = totalScore;
+                bestMatch = {
+                    bounds: cand.bounds,
+                    orbScore,
+                    ocrScore,
+                    geoScore,
+                    totalScore
+                } as MatchCandidate;
+            }
+        }
+        
+        // 设定一个阈值，比如 0.6，低于此值认为没找到
+        if (maxScore > 0.6) {
+            return bestMatch;
+        }
+        
+        return null;
+    }
+    
+    // 工具：文本相似度 Levenshtein
+    private static levenshteinSimilarity(s1: string, s2: string): number {
+        if (!s1 || !s2) return 0;
+        const longer = s1.length > s2.length ? s1 : s2;
+        const shorter = s1.length > s2.length ? s2 : s1;
+        const longerLength = longer.length;
+        if (longerLength === 0) return 1.0;
+        
+        const dist = VisionSelfHealing.editDistance(longer, shorter);
+        return (longerLength - dist) / longerLength;
+    }
+    
+    private static editDistance(s1: string, s2: string): number {
+        const m = s1.length, n = s2.length;
+        const dp = Array(n + 1).fill(0).map((_, i) => i);
+        
+        for (let i = 1; i <= m; i++) {
+            let prev = dp[0];
+            dp[0] = i;
+            for (let j = 1; j <= n; j++) {
+                const temp = dp[j];
+                if (s1[i - 1] === s2[j - 1]) {
+                    dp[j] = prev;
+                } else {
+                    dp[j] = Math.min(prev, Math.min(dp[j], dp[j - 1])) + 1;
+                }
+                prev = temp;
+            }
+        }
+        return dp[n];
+    }
+}

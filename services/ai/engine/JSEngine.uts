@@ -1,0 +1,449 @@
+// #ifdef APP-ANDROID
+import { UTSJSONObject } from 'io.dcloud.uts';
+import WebView from 'android.webkit.WebView';
+import WebSettings from 'android.webkit.WebSettings';
+import ValueCallback from 'android.webkit.ValueCallback';
+import JavascriptInterface from 'android.webkit.JavascriptInterface';
+import Runnable from 'java.lang.Runnable';
+import View from 'android.view.View';
+import { UTSAndroid } from 'io.dcloud.uts';
+
+class AndroidBridge {
+    @JavascriptInterface
+    postMessage(msg: string) {
+        JSEngine.handleMessage(msg);
+    }
+}
+// #endif
+
+// #ifdef APP-IOS
+import { WKWebView, WKWebViewConfiguration, WKUserContentController, WKScriptMessage, WKScriptMessageHandler } from 'WebKit';
+import { NSObject } from 'ObjectiveC';
+
+class IOSBridge extends NSObject implements WKScriptMessageHandler {
+    userContentController(userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if (message.name == "nativeBridge") {
+             // iOS message body is already an object or string
+             let body = message.body;
+             let str = "";
+             if (typeof body == "string") {
+                 str = body as string;
+             } else {
+                 str = JSON.stringify(body);
+             }
+             JSEngine.handleMessage(str);
+        }
+    }
+}
+// #endif
+
+// #ifdef APP-HARMONY
+import web_webview from '@ohos.web.webview';
+class HarmonyBridge {
+    postMessage(msg: string) {
+        JSEngine.handleMessage(msg);
+    }
+}
+// #endif
+
+/**
+ * JSEngine - High Performance Native Engine Service
+ * 
+ * Architecture:
+ * - Uses System Core (V8 on Android, WebKit/JSC on iOS) for maximum JIT performance and WASM support.
+ * - Architecture: Headless (UI-less) Compute Node.
+ * - JSI: Implemented via Native Bridge Injection.
+ * 
+ * Why this is better than QuickJS for this case:
+ * 1. Native V8/WebKit has JIT (Just-In-Time) compilation (QuickJS is interpreted).
+ * 2. 100% Native WASM support (Critical for Agent/AI tasks).
+ * 3. Zero APK size increase (Uses OS components).
+ */
+export class JSEngine {
+    private static instance: JSEngine | null = null;
+    
+    // #ifdef APP-ANDROID
+    private webView: WebView | null = null;
+    // #endif
+    // #ifdef APP-IOS
+    private webView: WKWebView | null = null;
+    // #endif
+    // #ifdef APP-HARMONY
+    private controller: web_webview.WebviewController | null = null;
+    // #endif
+
+    private messageHandler: ((msg: any) => void) | null = null;
+    private listeners: Map<string, Array<(msg: any) => void>> = new Map();
+    private _isReady: boolean = false;
+
+    static getInstance(): JSEngine {
+        if (JSEngine.instance == null) {
+            JSEngine.instance = new JSEngine();
+        }
+        return JSEngine.instance as JSEngine;
+    }
+
+    /**
+     * Initialize the Engine
+     */
+    init() {
+        if (this._isReady) return;
+        
+        // #ifdef APP-ANDROID
+        this.initAndroid();
+        // #endif
+        
+        // #ifdef APP-IOS
+        this.initIOS();
+        // #endif
+
+        // #ifdef APP-HARMONY
+        this.initHarmony();
+        // #endif
+        
+        this._isReady = true;
+        console.log("[JSEngine] Native High-Perf Engine Initialized.");
+    }
+
+    // #ifdef APP-ANDROID
+    private initAndroid() {
+        const activity = UTSAndroid.getUniActivity();
+        if (activity == null) return;
+        
+        activity.runOnUiThread(new Runnable(() => {
+            this.webView = new WebView(activity);
+            
+            // Performance & Power Tuning
+            const settings = this.webView!.getSettings();
+            settings.setJavaScriptEnabled(true);
+            settings.setDomStorageEnabled(true); // Required for some WASM memory ops
+            
+            // Disable Rendering for Power Saving (Headless Mode)
+            this.webView!.setLayerType(View.LAYER_TYPE_NONE, null); 
+            settings.setBlockNetworkImage(true);
+            settings.setMediaPlaybackRequiresUserGesture(false);
+            
+            // Inject Bridge
+            this.webView!.addJavascriptInterface(new AndroidBridge(), "nativeBridge");
+            
+            // Boot Environment
+            this.injectPolyfills();
+        }));
+    }
+    // #endif
+
+    // #ifdef APP-IOS
+    private initIOS() {
+        const config = new WKWebViewConfiguration();
+        
+        // JSI Bridge
+        const controller = new WKUserContentController();
+        controller.add(new IOSBridge(), "nativeBridge");
+        config.userContentController = controller;
+        
+        // Initialize Headless
+        this.webView = new WKWebView();
+        this.webView!.configuration.userContentController = controller;
+        
+        this.injectPolyfills();
+    }
+    // #endif
+
+    // #ifdef APP-HARMONY
+    private initHarmony() {
+        try {
+            this.controller = new web_webview.WebviewController();
+            console.log("[JSEngine] Harmony Controller Initialized.");
+        } catch(e) {
+            console.error("[JSEngine] Harmony Init Failed", e);
+        }
+    }
+
+    getHarmonyController(): web_webview.WebviewController | null {
+        return this.controller;
+    }
+
+    onHarmonyWebReady() {
+        if (this.controller != null) {
+            try {
+                this.controller!.registerJavaScriptProxy(
+                    new HarmonyBridge(),
+                    "nativeBridge",
+                    ["postMessage"]
+                );
+                this.controller!.refresh();
+                this.injectPolyfills();
+            } catch(e) {
+                console.error("Harmony Bridge Inject Failed", e);
+            }
+        }
+    }
+    // #endif
+
+    /**
+     * Inject minimal environment polyfills to normalize APIs
+     */
+    private injectPolyfills() {
+        const code = `
+            window.native = {
+                // Compatible with standard JSI postMessage
+                postMessage: function(data) {
+                    var payload = (typeof data === 'string') ? data : JSON.stringify(data);
+                    // #ifdef APP-ANDROID
+                    if (window.nativeBridge) window.nativeBridge.postMessage(payload);
+                    // #endif
+                    // #ifdef APP-IOS
+                    if (window.webkit && window.webkit.messageHandlers.nativeBridge) {
+                        window.webkit.messageHandlers.nativeBridge.postMessage(payload);
+                    }
+                    // #endif
+                    // #ifdef APP-HARMONY
+                    if (window.nativeBridge && window.nativeBridge.postMessage) {
+                        window.nativeBridge.postMessage(payload);
+                    }
+                    // #endif
+                }
+            };
+            console.log("JSEngine Environment Ready");
+        `;
+        this.evaluate(code);
+    }
+
+    /**
+     * Fast Evaluation of JS Code
+     */
+    async evaluate(script: string): Promise<string> {
+        return new Promise((resolve, reject) => {
+             // #ifdef APP-ANDROID
+             UTSAndroid.getUniActivity()?.runOnUiThread(new Runnable(() => {
+                 this.webView?.evaluateJavascript(script, new ValueCallback<string>((res: string | null) => {
+                     resolve(this.parseResult(res));
+                 }));
+             }));
+             // #endif
+             
+             // #ifdef APP-IOS
+             this.webView?.evaluateJavaScript(script, (res: any | null, err: any | null) => {
+                 if (err) reject(JSON.stringify(err));
+                 else resolve(res != null ? JSON.stringify(res) : "");
+             });
+             // #endif
+
+             // #ifdef APP-HARMONY
+             if (this.controller != null) {
+                 try {
+                     this.controller!.runJavaScript(script, (error, result) => {
+                         if (error) {
+                             reject("Harmony RunJS Error: " + JSON.stringify(error));
+                         } else {
+                             resolve(this.parseResult(result));
+                         }
+                     });
+                 } catch(e) {
+                     reject("Harmony Engine Error: " + e);
+                 }
+             } else {
+                 // Pending initialization or Web component attachment
+             }
+             // #endif
+        });
+    }
+
+    private parseResult(res: string | null): string {
+        if (res == null) return "";
+        // Remove quotes added by evaluateJavascript
+        if (res.startsWith('"') && res.endsWith('"')) {
+            try {
+                const parsed = JSON.parse(res);
+                // Attempt to cast to string. If parsed is object/number/null, this throws.
+                // If successful (it was a quoted string), return the unquoted string.
+                return parsed as string;
+            } catch(e) {}
+        }
+        return res;
+    }
+
+    /**
+     * Load WebAssembly Module with Imports support
+     * @param moduleName Name to assign to the WASM instance in JS global scope
+     * @param filePath Absolute path to .wasm file
+     * @param importsGlobalName (Optional) Name of the global JS object to supply as imports (e.g. "env")
+     */
+    async loadWasm(moduleName: string, filePath: string, importsGlobalName: string | null = null): Promise<boolean> {
+        // Read file in Native
+        const fs = uni.getFileSystemManager();
+        try {
+            // Read as Base64 (Fastest transport to WV)
+            // Note: Use readFileSync to block current thread briefly is acceptable here as WASM load is heavy anyway
+            // Consider readFileAsync if blocking is an issue, but UTS async fs is improving.
+            const b64 = fs.readFileSync(filePath, "base64") as string;
+            
+            // Handle Imports
+            const importsRef = (importsGlobalName != null) ? `window['${importsGlobalName}']` : "{}";
+            
+            // Loading Script
+            const loaderScript = `
+                (async function() {
+                    try {
+                        // 1. Decode Base64
+                        const str = atob("${b64}");
+                        const bytes = new Uint8Array(str.length);
+                        for (let i=0; i<str.length; i++) bytes[i] = str.charCodeAt(i);
+                        
+                        // 2. Prepare Imports
+                        const imports = ${importsRef};
+                        
+                        // 3. Instantiate
+                        // WebAssembly.instantiate(bufferSource, importObject) returns { module, instance }
+                        const result = await WebAssembly.instantiate(bytes, imports);
+                        
+                        // 4. Export to Global
+                        window["${moduleName}"] = result.instance.exports;
+                        
+                        console.log("[JSEngine] WASM Loaded: ${moduleName}");
+                        return "OK";
+                    } catch(e) {
+                         console.error("[JSEngine] WASM Error:", e);
+                         return "ERROR: " + e.toString();
+                    }
+                })();
+            `;
+            
+            const res = await this.evaluate(loaderScript);
+            if (res.startsWith("ERROR")) {
+                console.error(res);
+                return false;
+            }
+            return res === "OK";
+        } catch(e) {
+            console.error("[JSEngine] WASM Load Failed", e);
+            return false;
+        }
+    }
+
+    /**
+     * Setup JS Environment (Pre-load scripts/variables)
+     * Helper to define imports objects before loading WASM
+     */
+    async injectGlobal(script: string): Promise<void> {
+        await this.evaluate(script);
+    }
+
+    /**
+     * Power Management: Suspend Engine
+     * Call when app enters background.
+     */
+    suspend() {
+        // #ifdef APP-ANDROID
+        UTSAndroid.getUniActivity()?.runOnUiThread(new Runnable(() => {
+            this.webView?.onPause();
+            this.webView?.pauseTimers(); 
+        }));
+        // #endif
+    }
+
+    /**
+     * Power Management: Resume Engine
+     * Call when app enters foreground.
+     */
+    resume() {
+        // #ifdef APP-ANDROID
+        UTSAndroid.getUniActivity()?.runOnUiThread(new Runnable(() => {
+            this.webView?.onResume();
+            this.webView?.resumeTimers(); 
+        }));
+        // #endif
+    }
+    
+    /**
+     * Add event listener for messages from JS
+     * @param type Message type (field "type" in JSON)
+     * @param handler Callback
+     */
+    onMessage(type: string, handler: (msg: any) => void) {
+        if (!this.listeners.has(type)) {
+            this.listeners.set(type, []);
+        }
+        this.listeners.get(type)!.push(handler);
+    }
+
+    /**
+     * Remove event listener
+     */
+    offMessage(type: string, handler: (msg: any) => void) {
+        if (this.listeners.has(type)) {
+            const arr = this.listeners.get(type)!;
+            const idx = arr.indexOf(handler);
+            if (idx >= 0) arr.splice(idx, 1);
+        }
+    }
+
+    /**
+     * Set a handler for messages coming from JS
+     */
+    setMessageHandler(handler: (msg: any) => void) {
+        this.messageHandler = handler;
+    }
+
+    static handleMessage(jsonStr: string) {
+        try {
+            const instance = JSEngine.getInstance();
+            let msgObj: any | null = null;
+            
+            // Parse if it looks like JSON
+            if (jsonStr.startsWith("{") || jsonStr.startsWith("[")) {
+                 try { msgObj = JSON.parse(jsonStr); } catch(e){}
+            }
+            if (msgObj == null) msgObj = jsonStr;
+            
+            // 1. Dispatch to global handler (Legacy/Debug)
+            if (instance.messageHandler != null) {
+                 instance.messageHandler!(msgObj);
+            }
+            
+            // 2. Dispatch to Listeners based on 'type'
+            // Check if it's an object structure (not the raw string)
+            const isParsedObj = (msgObj !== jsonStr);
+            
+            if (isParsedObj && msgObj != null) {
+                let typeVal = "";
+                // #ifdef APP-ANDROID
+                if (msgObj instanceof UTSJSONObject) {
+                    typeVal = (msgObj as UTSJSONObject).getString("type") ?? "";
+                }
+                // #endif
+                // #ifndef APP-ANDROID
+                try { typeVal = (msgObj as any)["type"] as string; } catch(e){}
+                // #endif
+                
+                if (typeVal != "") {
+                    const listeners = instance.listeners.get(typeVal);
+                    if (listeners != null) {
+                        listeners.forEach(fn => fn(msgObj));
+                    }
+                }
+            }
+        } catch(e) {
+            console.error("[JSEngine] Handle Message Error", e);
+        }
+    }
+    
+    /**
+     * Destroy engine resource
+     */
+    destroy() {
+        // #ifdef APP-ANDROID
+        UTSAndroid.getUniActivity()?.runOnUiThread(new Runnable(() => {
+            this.webView?.destroy();
+            this.webView = null;
+        }));
+        // #endif
+        // #ifdef APP-IOS
+        this.webView = null;
+        // #endif
+        // #ifdef APP-HARMONY
+        this.controller = null;
+        // #endif
+        this._isReady = false;
+    }
+}

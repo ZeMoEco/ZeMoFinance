@@ -1,0 +1,1727 @@
+import { OcrService, OcrResult } from '@/services/sys/office/OcrService.uts'
+import { OcrModelService } from '@/services/sys/office/OcrModelService.uts'
+import { ScreenCaptureUtils } from '@/uni_modules/zemo-rpa/utssdk/utils/ScreenCaptureUtils.uts'
+import { AppDialogApi } from '@/components/sys/AppDialogApi.uts'
+import { FinanceBiz, AccountNode, BookNode, CreateTransactionForNodesPayload } from '@/services/biz/FinanceBiz.uts'
+import { InvestmentOcrImportService, InvestmentOcrImportResult } from '@/services/sys/InvestmentOcrImportService.uts'
+import { FinanceFieldSlmService, FinanceFieldSlmPrediction } from '@/services/sys/FinanceFieldSlmService.uts'
+import { FinancePipSnapshotService } from '@/services/sys/FinancePipSnapshotService.uts'
+import { DESK_PET_BILL_DEBUG_STATUS_KEY, DESK_PET_BILL_DEBUG_TEXT_KEY, DESK_PET_CAPTURED_BILL_TEXT_KEY, DESK_PET_CAPTURED_SCREEN_IMAGE_KEY, DESK_PET_PENDING_BILL_CAPTURE_KEY, DESK_PET_PENDING_RECORD_AUTO_CONFIRM_KEY, DESK_PET_PENDING_RECORD_OPEN_KEY, DESK_PET_PENDING_RECORD_QUERY_KEY, DESK_PET_RECORD_AUTO_BACKGROUND_PARAM } from '@/utils/constant.uts'
+
+export type RecordMode = 'expense' | 'income' | 'transfer' | 'refund'
+
+export type DeskPetBillPrefill = {
+  amount: string
+  note: string
+  category: string
+  activeMode: RecordMode
+  accountId: string
+  bookId: string
+  sourceApp: string
+  payMethod: string
+  transactionTime: number
+  rawText: string
+}
+
+export type BillTextResult = {
+  ok: boolean
+  text: string
+  source: string
+  message: string
+}
+
+type BillOcrLine = {
+  raw: string
+  text: string
+  x: number
+  y: number
+  w: number
+  h: number
+  index: number
+}
+
+export class DeskPetBillCaptureService {
+  private static inFlight = false
+  private static inFlightStartedAt = 0
+  private static activeRunId = 0
+  private static nextRunId = 1
+  private static IN_FLIGHT_STALE_MS = 15000
+  private static OCR_TIMEOUT_MS = 8000
+  private static CLIPBOARD_TIMEOUT_MS = 1200
+  private static PIP_RETURN_PENDING_TTL_MS = 12000
+
+  static async handleDeskPetTap(skipLiveCapture: boolean = false): Promise<void> {
+    if (DeskPetBillCaptureService.inFlight) {
+      const age = Date.now() - DeskPetBillCaptureService.inFlightStartedAt
+      if (age <= DeskPetBillCaptureService.IN_FLIGHT_STALE_MS) {
+        console.log(`[账单识别] 忽略重复点击：${age}ms`)
+        uni.showToast({ title: '正在识别账单...', icon: 'none' })
+        return
+      }
+      console.warn(`[账单识别] 重置超时任务：${age}ms`)
+      DeskPetBillCaptureService.inFlight = false
+    }
+    DeskPetBillCaptureService.inFlight = true
+    DeskPetBillCaptureService.inFlightStartedAt = Date.now()
+    const runId = DeskPetBillCaptureService.nextRunId
+    DeskPetBillCaptureService.nextRunId += 1
+    DeskPetBillCaptureService.activeRunId = runId
+    DeskPetBillCaptureService.clearPendingDeskPetTap()
+    try {
+      console.log(`[账单识别] 开始：run=${runId}，跳过实时截图=${skipLiveCapture ? '是' : '否'}`)
+      uni.showLoading({ title: '识别账单...', mask: false })
+      const textResult = await DeskPetBillCaptureService.captureBillText(skipLiveCapture)
+      uni.hideLoading()
+      console.log(`[账单识别] OCR 结果：${textResult.ok ? '成功' : '失败'}，来源=${textResult.source}，长度=${textResult.text.length}，消息=${textResult.message}`)
+
+      if (!textResult.ok) {
+        uni.showToast({ title: textResult.message, icon: 'none', duration: 2600 })
+        DeskPetBillCaptureService.openRecordSheet(DeskPetBillCaptureService.emptyPrefill())
+        return
+      }
+      DeskPetBillCaptureService.logOcrTextForSlm(textResult.source, textResult.text)
+
+      const investmentImport = await InvestmentOcrImportService.tryImportFromOcrText(textResult.text)
+      if (investmentImport.matched) {
+        if (investmentImport.imported + investmentImport.updated > 0) await FinancePipSnapshotService.syncSnapshot()
+        DeskPetBillCaptureService.showInvestmentImportResult(investmentImport)
+        return
+      }
+
+      const slmPrefill = await DeskPetBillCaptureService.parseBillTextWithSlmDebug(textResult.text, textResult.source)
+      const prefill = await DeskPetBillCaptureService.resolvePrefillTarget(slmPrefill)
+      if (prefill.amount == '') {
+        uni.showToast({ title: '未识别到金额，可手动补充', icon: 'none' })
+      } else {
+        uni.showToast({ title: '账单已识别', icon: 'success' })
+      }
+      DeskPetBillCaptureService.openRecordSheet(prefill)
+    } catch (e) {
+      try { uni.hideLoading() } catch (_hideErr) {}
+      console.error('[账单识别] 处理失败', e)
+      uni.showToast({ title: '账单识别失败，已打开手动记账', icon: 'none' })
+      DeskPetBillCaptureService.openRecordSheet(DeskPetBillCaptureService.emptyPrefill())
+    } finally {
+      if (DeskPetBillCaptureService.activeRunId == runId) {
+        DeskPetBillCaptureService.inFlight = false
+        DeskPetBillCaptureService.inFlightStartedAt = 0
+        DeskPetBillCaptureService.activeRunId = 0
+      }
+    }
+  }
+
+  static async captureBillText(skipLiveCapture: boolean = false, consumeStored: boolean = true): Promise<BillTextResult> {
+    const pipOcrText = consumeStored ? DeskPetBillCaptureService.consumeStoredText(DESK_PET_CAPTURED_BILL_TEXT_KEY) : DeskPetBillCaptureService.readStoredText(DESK_PET_CAPTURED_BILL_TEXT_KEY)
+    const debugStatus = consumeStored ? DeskPetBillCaptureService.consumeStoredText(DESK_PET_BILL_DEBUG_STATUS_KEY) : DeskPetBillCaptureService.readStoredText(DESK_PET_BILL_DEBUG_STATUS_KEY)
+    const debugText = consumeStored ? DeskPetBillCaptureService.consumeStoredText(DESK_PET_BILL_DEBUG_TEXT_KEY) : DeskPetBillCaptureService.readStoredText(DESK_PET_BILL_DEBUG_TEXT_KEY)
+    if (debugStatus != '' || debugText != '') {
+      console.log(`[账单识别][PiP] 缓存输入：状态=${debugStatus == '' ? '无' : debugStatus}，OCR长度=${debugText.length}，预览=${DeskPetBillCaptureService.formatDebugPreview(debugText)}`)
+    }
+    if (pipOcrText.trim() != '') {
+      return { ok: true, text: pipOcrText, source: 'harmony-pip-ocr', message: '' } as BillTextResult
+    }
+    if (!skipLiveCapture && DeskPetBillCaptureService.looksLikeBillText(debugText)) {
+      return { ok: true, text: debugText, source: 'debug-storage', message: '' } as BillTextResult
+    }
+
+    if (skipLiveCapture) {
+      return {
+        ok: false,
+        text: '',
+        source: 'pending-without-pip-ocr',
+        message: '画中画未获取到账单文本，已打开手动记账'
+      } as BillTextResult
+    }
+
+    const clipboardText = await DeskPetBillCaptureService.readClipboardText()
+    if (DeskPetBillCaptureService.looksLikeBillText(clipboardText)) {
+      return { ok: true, text: clipboardText, source: 'clipboard', message: '' } as BillTextResult
+    }
+
+    if (!OcrModelService.isScreenOcrEnabled()) {
+      console.log('[OCR] 屏幕 OCR 已关闭，跳过文字识别')
+      return {
+        ok: false,
+        text: '',
+        source: 'screen-ocr-disabled',
+        message: '屏幕 OCR 已关闭；如有 PiP 内存截图，将交给多模态模型识别'
+      } as BillTextResult
+    }
+
+    let ocrMessage = ''
+    const imagePath = await DeskPetBillCaptureService.captureScreenImagePath()
+    if (imagePath != null && imagePath != '') {
+      const ocr = await DeskPetBillCaptureService.recognizeTextFromImageWithTimeout(imagePath, DeskPetBillCaptureService.OCR_TIMEOUT_MS)
+      if (ocr.ok && ocr.text != null && ocr.text!.trim() != '') {
+        return { ok: true, text: ocr.text!, source: 'screenshot-ocr', message: '' } as BillTextResult
+      }
+      ocrMessage = ocr.message != null ? ocr.message! : 'OCR 未返回文本'
+    }
+
+    const message = ocrMessage == '' ? '当前 Harmony 截屏/OCR能力未接入，已打开手动记账' : ocrMessage
+    return { ok: false, text: '', source: 'none', message: message } as BillTextResult
+  }
+
+  static async handlePendingDeskPetTap(): Promise<boolean> {
+    if (!DeskPetBillCaptureService.consumePendingDeskPetTap()) return false
+    console.log('[账单识别][PiP] 消费返回事件：跳过实时截图')
+    await DeskPetBillCaptureService.handleDeskPetTap(true)
+    return true
+  }
+
+  static async handlePendingDeskPetCaptureAutoRecord(allowManualFallback: boolean = false): Promise<boolean> {
+    if (!DeskPetBillCaptureService.consumePendingDeskPetTap()) return false
+    console.log('[账单识别][PiP] 消费自动记账事件')
+    return await DeskPetBillCaptureService.handlePendingAutoConfirm(allowManualFallback)
+  }
+
+  static async handlePendingDeskPetAction(): Promise<boolean> {
+    if (DeskPetBillCaptureService.consumePendingRecordAutoConfirm()) {
+      const confirmed = await DeskPetBillCaptureService.handlePendingAutoConfirm()
+      if (confirmed) return true
+    }
+    if (DeskPetBillCaptureService.consumePendingRecordOpen()) {
+      let query = DeskPetBillCaptureService.consumePendingRecordQuery()
+      const storedText = DeskPetBillCaptureService.readStoredText(DESK_PET_CAPTURED_BILL_TEXT_KEY)
+      if (storedText.trim() != '') {
+        DeskPetBillCaptureService.logOcrTextForSlm('stored-pip-ocr', storedText)
+        const investmentImport = await InvestmentOcrImportService.tryImportFromOcrText(storedText)
+        if (investmentImport.matched) {
+          DeskPetBillCaptureService.clearStoredBillCaptureText()
+          if (investmentImport.imported + investmentImport.updated > 0) await FinancePipSnapshotService.syncSnapshot()
+          DeskPetBillCaptureService.showInvestmentImportResult(investmentImport)
+          return true
+        }
+        const slmPrefill = await DeskPetBillCaptureService.parseBillTextWithSlmDebug(storedText, 'stored-pip-ocr')
+        const prefill = await DeskPetBillCaptureService.resolvePrefillTarget(slmPrefill)
+        query = DeskPetBillCaptureService.buildRecordQuery(prefill)
+      }
+      if (query.trim() == '') return false
+      AppDialogApi.openFinanceRecordOnHome(query)
+      return true
+    }
+    return await DeskPetBillCaptureService.handlePendingDeskPetTap()
+  }
+
+  static hasPendingRecordAutoConfirm(): boolean {
+    const raw = DeskPetBillCaptureService.readStoredText(DESK_PET_PENDING_RECORD_AUTO_CONFIRM_KEY)
+    if (raw == '') return false
+    const ts = parseFloat(raw)
+    if (isNaN(ts)) return true
+    return Date.now() - ts <= 60000
+  }
+
+  static async handlePendingAutoConfirmOnly(): Promise<boolean> {
+    if (!DeskPetBillCaptureService.consumePendingRecordAutoConfirm()) return false
+    return await DeskPetBillCaptureService.handlePendingAutoConfirm(false)
+  }
+
+  static async handlePendingAutoConfirm(allowManualFallback: boolean = true): Promise<boolean> {
+    const fallbackQuery = DeskPetBillCaptureService.readStoredText(DESK_PET_PENDING_RECORD_QUERY_KEY)
+    DeskPetBillCaptureService.clearPendingRecordOpen()
+    const textResult = await DeskPetBillCaptureService.captureBillText(true)
+    if (!textResult.ok && fallbackQuery.trim() == '') {
+      DeskPetBillCaptureService.clearStoredBillCaptureText()
+      if (allowManualFallback) {
+        uni.showToast({ title: textResult.message, icon: 'none', duration: 2600 })
+        DeskPetBillCaptureService.openRecordSheet(DeskPetBillCaptureService.emptyPrefill())
+      }
+      return false
+    }
+
+    let prefill = DeskPetBillCaptureService.emptyPrefill()
+    if (textResult.ok) {
+      DeskPetBillCaptureService.logOcrTextForSlm(textResult.source, textResult.text)
+      const investmentImport = await InvestmentOcrImportService.tryImportFromOcrText(textResult.text)
+      if (investmentImport.matched) {
+        DeskPetBillCaptureService.clearStoredBillCaptureText()
+        if (investmentImport.imported + investmentImport.updated > 0) await FinancePipSnapshotService.syncSnapshot()
+        DeskPetBillCaptureService.showInvestmentImportResult(investmentImport)
+        return true
+      }
+      prefill = await DeskPetBillCaptureService.parseBillTextWithSlmDebug(textResult.text, textResult.source)
+    }
+    if (!textResult.ok) prefill = DeskPetBillCaptureService.mergeQueryFallback(prefill, fallbackQuery)
+    prefill = await DeskPetBillCaptureService.resolvePrefillTarget(prefill)
+    const rawAmount = parseFloat(prefill.amount)
+    const amount = Math.abs(rawAmount)
+    if (isNaN(rawAmount) || amount <= 0) {
+      DeskPetBillCaptureService.clearStoredBillCaptureText()
+      if (allowManualFallback) {
+        uni.showToast({ title: '未识别到金额，可手动确认', icon: 'none' })
+        DeskPetBillCaptureService.openRecordSheet(prefill)
+      }
+      return false
+    }
+
+    const accountId = prefill.accountId
+    if (accountId == '') {
+      DeskPetBillCaptureService.clearStoredBillCaptureText()
+      if (allowManualFallback) {
+        uni.showToast({ title: '请先创建账户', icon: 'none' })
+        DeskPetBillCaptureService.openRecordSheet(prefill)
+      }
+      return false
+    }
+
+    const txnPayload = {
+      account_id: accountId,
+      amount: amount,
+      type: prefill.activeMode == 'income' || prefill.activeMode == 'refund' ? 'income' : 'expense',
+      category: DeskPetBillCaptureService.categoryLabel(prefill.category, prefill.activeMode),
+      description: prefill.note,
+      location: '',
+      transaction_time: prefill.transactionTime > 0 ? prefill.transactionTime : null,
+      properties: JSON.stringify({
+        source: 'desk_pet_pip_auto_confirm',
+        source_app: prefill.sourceApp,
+        pay_method: prefill.payMethod,
+        transaction_time: prefill.transactionTime,
+        raw_text: prefill.rawText
+      }),
+      receipt_paths: [] as string[]
+    } as CreateTransactionForNodesPayload
+    console.log(`[FinanceRecord][Debug] create_transaction_payload=${DeskPetBillCaptureService.safeJson(txnPayload)}`)
+    const txnId = await FinanceBiz.createTransactionForNodes(txnPayload)
+    console.log(`[FinanceRecord][Debug] create_transaction_result id=${txnId == null ? '' : txnId}`)
+
+    if (txnId == null || txnId == '') {
+      DeskPetBillCaptureService.clearStoredBillCaptureText()
+      if (allowManualFallback) {
+        uni.showToast({ title: '自动记账失败，可手动确认', icon: 'none' })
+        DeskPetBillCaptureService.openRecordSheet(prefill)
+      }
+      return false
+    }
+
+    DeskPetBillCaptureService.clearPendingRecordOpen()
+    DeskPetBillCaptureService.clearStoredBillCaptureText()
+    await FinancePipSnapshotService.syncSnapshot()
+    if (allowManualFallback) {
+      uni.showToast({ title: '已自动记账', icon: 'success' })
+    }
+    return true
+  }
+
+  static parseBillText(text: string): DeskPetBillPrefill {
+    const normalized = DeskPetBillCaptureService.normalizeText(text)
+    const plainText = DeskPetBillCaptureService.stripOcrMetaFromText(normalized)
+    const activeMode = DeskPetBillCaptureService.detectMode(plainText)
+    const amount = DeskPetBillCaptureService.extractAmount(plainText)
+    const note = DeskPetBillCaptureService.extractNote(normalized)
+    const category = DeskPetBillCaptureService.detectCategory(plainText, activeMode)
+    const transactionTime = DeskPetBillCaptureService.extractTransactionTime(plainText)
+    const result = {
+      amount: amount,
+      note: note == '' ? '桌宠识别账单' : note,
+      category: category,
+      activeMode: activeMode,
+      accountId: '',
+      bookId: '',
+      sourceApp: DeskPetBillCaptureService.detectSourceApp(plainText),
+      payMethod: DeskPetBillCaptureService.extractPayMethod(plainText),
+      transactionTime: transactionTime,
+      rawText: plainText
+    } as DeskPetBillPrefill
+    return result
+  }
+
+  static async parseBillTextWithSlmDebug(text: string, source: string): Promise<DeskPetBillPrefill> {
+    const result = DeskPetBillCaptureService.parseBillText(text)
+    console.log(`[FinanceRecord][Debug] bill_rule_result source=${source}, fieldSlm=removed, data=${DeskPetBillCaptureService.safeJson(DeskPetBillCaptureService.debugPrefill(result))}`)
+    return result
+  }
+
+  private static parseBillTextFromSlm(text: string, predictions: FinanceFieldSlmPrediction[]): DeskPetBillPrefill {
+    const rawText = DeskPetBillCaptureService.stripOcrMetaFromText(text)
+    const amountPred = DeskPetBillCaptureService.bestBillPrediction(predictions, ['income_amount', 'expense_amount', 'amount'], 0.22)
+    const merchantPred = DeskPetBillCaptureService.bestBillPrediction(predictions, ['merchant', 'counterparty'], 0.22)
+    const payPred = DeskPetBillCaptureService.bestBillPrediction(predictions, ['payment_method', 'bank_card'], 0.22)
+    const timePred = DeskPetBillCaptureService.bestBillPrediction(predictions, ['date_time'], 0.22)
+    const typePred = DeskPetBillCaptureService.bestBillPrediction(predictions, ['transaction_type'], 0.20)
+    const assetPred = DeskPetBillCaptureService.bestBillPrediction(predictions, ['asset_name', 'asset_code'], 0.22)
+
+    const amount = amountPred == null ? '' : DeskPetBillCaptureService.extractAmount(amountPred.text)
+    const activeMode = DeskPetBillCaptureService.resolveSlmMode(amountPred, typePred, assetPred)
+    let note = merchantPred == null ? '' : DeskPetBillCaptureService.cleanNote(merchantPred.text)
+    if (note == '' && assetPred != null) note = DeskPetBillCaptureService.cleanNote(assetPred.text)
+    let payMethod = payPred == null ? '' : DeskPetBillCaptureService.extractPayMethod(payPred.text)
+    if (payMethod == '' && payPred != null) payMethod = payPred.text
+    const transactionTime = timePred == null ? 0 : DeskPetBillCaptureService.extractTransactionTime(timePred.text)
+    const category = activeMode == 'transfer' && assetPred != null
+      ? DeskPetBillCaptureService.resolveSlmInvestmentCategory(typePred)
+      : DeskPetBillCaptureService.defaultSlmCategory(activeMode)
+    return {
+      amount: amount,
+      note: note == '' ? '桌宠识别账单' : note,
+      category: category,
+      activeMode: activeMode,
+      accountId: '',
+      bookId: '',
+      sourceApp: DeskPetBillCaptureService.resolveSlmSourceApp(predictions),
+      payMethod: payMethod,
+      transactionTime: transactionTime,
+      rawText: rawText
+    } as DeskPetBillPrefill
+  }
+
+  private static bestBillPrediction(predictions: FinanceFieldSlmPrediction[], labels: string[], minScore: number): FinanceFieldSlmPrediction | null {
+    return FinanceFieldSlmService.bestByLabels(predictions, labels, minScore)
+  }
+
+  private static resolveSlmMode(amountPred: FinanceFieldSlmPrediction | null, typePred: FinanceFieldSlmPrediction | null, assetPred: FinanceFieldSlmPrediction | null): RecordMode {
+    if (assetPred != null) return 'transfer'
+    if (amountPred != null) {
+      if (FinanceFieldSlmService.hasLabel(amountPred, ['income_amount'], 0.20)) return 'income'
+      if (FinanceFieldSlmService.hasLabel(amountPred, ['expense_amount'], 0.20)) return 'expense'
+      const value = amountPred.text.trim()
+      if (value.startsWith('+')) return 'income'
+      if (value.startsWith('-')) return 'expense'
+    }
+    if (typePred != null) {
+      const text = typePred.text
+      if (DeskPetBillCaptureService.containsAny(text, ['退款', '退回'])) return 'refund'
+      if (DeskPetBillCaptureService.containsAny(text, ['转账', '转入', '转出'])) return 'transfer'
+      if (DeskPetBillCaptureService.containsAny(text, ['收款', '入账', '收入'])) return 'income'
+    }
+    return 'expense'
+  }
+
+  private static resolveSlmInvestmentCategory(typePred: FinanceFieldSlmPrediction | null): string {
+    if (typePred != null) {
+      const text = typePred.text
+      if (DeskPetBillCaptureService.containsAny(text, ['卖出', '赎回', '减仓'])) return 'transfer_finance_reduce'
+      if (DeskPetBillCaptureService.containsAny(text, ['买入', '申购', '定投', '加仓'])) return 'transfer_finance_add'
+    }
+    return 'transfer_fund'
+  }
+
+  private static defaultSlmCategory(mode: RecordMode): string {
+    if (mode == 'income') return 'income_other'
+    if (mode == 'refund') return 'income_refund_extra'
+    if (mode == 'transfer') return 'transfer_general'
+    return 'expense_other'
+  }
+
+  private static resolveSlmSourceApp(predictions: FinanceFieldSlmPrediction[]): string {
+    const p = DeskPetBillCaptureService.bestBillPrediction(predictions, ['merchant', 'counterparty'], 0.18)
+    if (p == null) return ''
+    const text = p.text
+    if (DeskPetBillCaptureService.containsAny(text, ['微信', '微信支付'])) return '微信'
+    if (DeskPetBillCaptureService.containsAny(text, ['支付宝'])) return '支付宝'
+    if (DeskPetBillCaptureService.containsAny(text, ['云闪付', '银联'])) return '云闪付'
+    return ''
+  }
+
+  static openRecordSheet(prefill: DeskPetBillPrefill): void {
+    const query = DeskPetBillCaptureService.buildRecordQuery(prefill)
+    console.log(`[账单识别] 打开记账页：${query}`)
+    AppDialogApi.openFinanceRecordOnHome(query)
+  }
+
+  static buildRecordQuery(prefill: DeskPetBillPrefill): string {
+    const params = [] as string[]
+    if (prefill.amount != '') params.push(`amount=${encodeURIComponent(prefill.amount)}`)
+    if (prefill.note != '') params.push(`note=${encodeURIComponent(prefill.note)}`)
+    if (prefill.category != '') params.push(`category=${encodeURIComponent(prefill.category)}`)
+    if (prefill.accountId != '') params.push(`accountId=${encodeURIComponent(prefill.accountId)}`)
+    if (prefill.bookId != '') params.push(`bookId=${encodeURIComponent(prefill.bookId)}`)
+    if (prefill.transactionTime > 0) params.push(`transactionTime=${encodeURIComponent(prefill.transactionTime.toString())}`)
+    if (prefill.sourceApp != '') params.push(`sourceApp=${encodeURIComponent(prefill.sourceApp)}`)
+    if (prefill.payMethod != '') params.push(`payMethod=${encodeURIComponent(prefill.payMethod)}`)
+    params.push(`activeMode=${encodeURIComponent(prefill.activeMode)}`)
+    params.push(`${DESK_PET_RECORD_AUTO_BACKGROUND_PARAM}=1`)
+    return params.join('&')
+  }
+
+  static async createTransactionFromPrefill(prefill: DeskPetBillPrefill, source: string = 'screen_understanding_auto'): Promise<string | null> {
+    const resolved = await DeskPetBillCaptureService.resolvePrefillTarget(prefill)
+    console.log(`[FinanceRecord][Debug] create_from_prefill source=${source}, prefill=${DeskPetBillCaptureService.safeJson(DeskPetBillCaptureService.debugPrefill(resolved))}`)
+    const rawAmount = parseFloat(resolved.amount)
+    const amount = Math.abs(rawAmount)
+    if (isNaN(rawAmount) || amount <= 0) {
+      console.warn(`[FinanceRecord][Debug] create_from_prefill_skip source=${source}, reason=invalid_amount, amount=${resolved.amount}`)
+      return null
+    }
+    if (resolved.accountId == '') {
+      console.warn(`[FinanceRecord][Debug] create_from_prefill_skip source=${source}, reason=missing_account`)
+      return null
+    }
+
+    const txnPayload = {
+      account_id: resolved.accountId,
+      amount: amount,
+      type: resolved.activeMode == 'income' || resolved.activeMode == 'refund' ? 'income' : 'expense',
+      category: DeskPetBillCaptureService.categoryLabel(resolved.category, resolved.activeMode),
+      description: resolved.note == '' ? '屏幕识别记账' : resolved.note,
+      location: '',
+      transaction_time: resolved.transactionTime > 0 ? resolved.transactionTime : null,
+      properties: JSON.stringify({
+        source: source,
+        source_app: resolved.sourceApp,
+        pay_method: resolved.payMethod,
+        transaction_time: resolved.transactionTime,
+        raw_text: resolved.rawText
+      }),
+      receipt_paths: [] as string[]
+    } as CreateTransactionForNodesPayload
+    console.log(`[FinanceRecord][Debug] create_from_prefill_payload=${DeskPetBillCaptureService.safeJson(txnPayload)}`)
+    const id = await FinanceBiz.createTransactionForNodes(txnPayload)
+    console.log(`[FinanceRecord][Debug] create_from_prefill_result source=${source}, id=${id == null ? '' : id}`)
+    if (id != null && id != '') await FinancePipSnapshotService.syncSnapshot()
+    return id
+  }
+
+  private static showInvestmentImportResult(result: InvestmentOcrImportResult): void {
+    if (result.imported + result.updated > 0) {
+      uni.showToast({ title: result.message, icon: 'success', duration: 2600 })
+    } else {
+      uni.showToast({ title: result.message == '' ? '未识别到持仓明细' : result.message, icon: 'none', duration: 2600 })
+    }
+  }
+
+  static async resolvePrefillTarget(prefill: DeskPetBillPrefill): Promise<DeskPetBillPrefill> {
+    const books = await FinanceBiz.listBooks()
+    let targetBookId = DeskPetBillCaptureService.matchBookId(prefill.rawText, books)
+    const allAccounts = await FinanceBiz.listAccountNodes(null)
+    if (prefill.accountId != '') {
+      const existing = allAccounts.find((a : AccountNode) : boolean => a.id == prefill.accountId)
+      if (existing != null) {
+        prefill.bookId = existing.book_id
+        return prefill
+      }
+    }
+    const account = DeskPetBillCaptureService.matchAccount(prefill.rawText, prefill.payMethod, prefill.sourceApp, targetBookId, allAccounts)
+    if (account != null) {
+      prefill.accountId = account.id
+      prefill.bookId = account.book_id
+      return prefill
+    }
+
+    if (targetBookId == '' && books.length > 0) targetBookId = books[0].id
+    prefill.bookId = targetBookId
+    const scopedAccounts = targetBookId == '' ? allAccounts : allAccounts.filter((a : AccountNode) : boolean => a.book_id == targetBookId)
+    if (scopedAccounts.length > 0) prefill.accountId = scopedAccounts[0].id
+    return prefill
+  }
+
+  private static emptyPrefill(): DeskPetBillPrefill {
+    return { amount: '', note: '', category: 'expense_shopping', activeMode: 'expense', accountId: '', bookId: '', sourceApp: '', payMethod: '', transactionTime: 0, rawText: '' } as DeskPetBillPrefill
+  }
+
+  private static logOcrTextForSlm(source: string, text: string): void {
+    console.log(`[FinanceRecord][Debug] ocr_text source=${source}, fieldSlm=removed, length=${(text ?? '').toString().length}, text=${DeskPetBillCaptureService.safeJson(DeskPetBillCaptureService.limitDebugText(text, 4000))}`)
+  }
+
+  private static debugPrefill(prefill: DeskPetBillPrefill): any {
+    return {
+      amount: prefill.amount,
+      note: prefill.note,
+      category: prefill.category,
+      activeMode: prefill.activeMode,
+      accountId: prefill.accountId,
+      bookId: prefill.bookId,
+      sourceApp: prefill.sourceApp,
+      payMethod: prefill.payMethod,
+      transactionTime: prefill.transactionTime,
+      rawText: DeskPetBillCaptureService.limitDebugText(prefill.rawText, 2000)
+    }
+  }
+
+  private static safeJson(value: any): string {
+    try {
+      return JSON.stringify(value)
+    } catch (_e) {
+      try {
+        return value == null ? 'null' : value.toString()
+      } catch (_e2) {
+        return '[unserializable]'
+      }
+    }
+  }
+
+  private static limitDebugText(text: string, limit: number): string {
+    const value = (text ?? '').toString()
+    if (value.length <= limit) return value
+    return `${value.substring(0, limit)}...(len=${value.length})`
+  }
+
+  private static mergeQueryFallback(prefill: DeskPetBillPrefill, query: string): DeskPetBillPrefill {
+    const fallback = DeskPetBillCaptureService.prefillFromQuery(query)
+    if (prefill.amount == '' && fallback.amount != '') prefill.amount = fallback.amount
+    if ((prefill.note == '' || prefill.note == '桌宠识别账单') && fallback.note != '') prefill.note = fallback.note
+    if (fallback.category != '' && (prefill.category == '' || prefill.category == 'expense_shopping')) prefill.category = fallback.category
+    if (prefill.activeMode == 'expense' && fallback.activeMode != 'expense') prefill.activeMode = fallback.activeMode
+    if (prefill.accountId == '' && fallback.accountId != '') prefill.accountId = fallback.accountId
+    if (prefill.bookId == '' && fallback.bookId != '') prefill.bookId = fallback.bookId
+    if (prefill.sourceApp == '' && fallback.sourceApp != '') prefill.sourceApp = fallback.sourceApp
+    if (prefill.payMethod == '' && fallback.payMethod != '') prefill.payMethod = fallback.payMethod
+    if (prefill.transactionTime <= 0 && fallback.transactionTime > 0) prefill.transactionTime = fallback.transactionTime
+    if (prefill.rawText == '' && fallback.rawText != '') prefill.rawText = fallback.rawText
+    return prefill
+  }
+
+  private static prefillFromQuery(query: string): DeskPetBillPrefill {
+    const prefill = DeskPetBillCaptureService.emptyPrefill()
+    const raw = (query ?? '').toString().trim()
+    if (raw == '') return prefill
+    let normalized = raw
+    const qIndex = normalized.indexOf('?')
+    if (qIndex >= 0) normalized = normalized.substring(qIndex + 1)
+    if (normalized.startsWith('?')) normalized = normalized.substring(1)
+    const parts = normalized.split('&')
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i]
+      const eq = part.indexOf('=')
+      if (eq <= 0) continue
+      const key = part.substring(0, eq)
+      let value = part.substring(eq + 1)
+      try {
+        value = decodeURIComponent(value)
+      } catch (_decodeErr) {}
+      if (key == 'amount') {
+        const amountValue = parseFloat(value)
+        if (!isNaN(amountValue)) {
+          prefill.amount = Math.abs(amountValue).toString()
+          if (amountValue < 0) prefill.activeMode = 'expense'
+        } else {
+          prefill.amount = value
+        }
+      }
+      if (key == 'note') prefill.note = value
+      if (key == 'category') prefill.category = value
+      if (key == 'accountId') prefill.accountId = value
+      if (key == 'bookId') prefill.bookId = value
+      if (key == 'sourceApp') prefill.sourceApp = value
+      if (key == 'payMethod') prefill.payMethod = value
+      if (key == 'activeMode' && (value == 'expense' || value == 'income' || value == 'transfer' || value == 'refund')) prefill.activeMode = value as RecordMode
+      if (key == 'transactionTime') {
+        const ts = parseFloat(value)
+        if (!isNaN(ts) && ts > 0) prefill.transactionTime = ts
+      }
+    }
+    prefill.rawText = `${prefill.note}\n${prefill.sourceApp}\n${prefill.payMethod}`
+    return prefill
+  }
+
+  static async captureScreenImagePath(): Promise<string | null> {
+    const storedPipImage = DeskPetBillCaptureService.consumeStoredText(DESK_PET_CAPTURED_SCREEN_IMAGE_KEY).trim()
+    if (storedPipImage != '') {
+      console.log(`[截图] 使用 PiP 视觉输入：${storedPipImage}`)
+      return storedPipImage
+    }
+
+    // #ifdef APP-HARMONY
+    console.log('[截图] 没有 PiP 视觉输入，跳过 Harmony 二次截图')
+    return null
+    // #endif
+
+    try {
+      const snapshot = ScreenCaptureUtils.takeSnapshot(null)
+      if (snapshot == null || snapshot == '') return null
+      const value = snapshot.toString()
+      if (value.startsWith('unifile://') || value.startsWith('file://') || value.startsWith('/')) {
+        return value
+      }
+    } catch (e) {
+      console.warn('[截图] 系统截图不可用', e)
+    }
+    return null
+  }
+
+  private static recognizeTextFromImageWithTimeout(imagePath: string, timeoutMs: number): Promise<OcrResult> {
+    return new Promise((resolve) => {
+      let done = false
+      let timer = -1
+      const finish = (result: OcrResult) => {
+        if (done) return
+        done = true
+        if (timer != -1) {
+          clearTimeout(timer as number)
+          timer = -1
+        }
+        resolve(result)
+      }
+
+      timer = (setTimeout(() => {
+        console.warn(`[OCR] 识别超时：${timeoutMs}ms，图片=${imagePath}`)
+        finish({ ok: false, message: 'OCR 识别超时，已打开手动记账' } as OcrResult)
+      }, timeoutMs) as any) as number
+
+      OcrService.recognizeTextFromImages([imagePath])
+        .then((result: OcrResult) => {
+          finish(result)
+        })
+        .catch((err) => {
+          console.error('[OCR] 识别失败', err)
+          finish({ ok: false, message: 'OCR 识别失败，已打开手动记账' } as OcrResult)
+        })
+    })
+  }
+
+  private static readClipboardText(): Promise<string> {
+    return new Promise((resolve) => {
+      let done = false
+      let timer = -1
+      const finish = (value: string) => {
+        if (done) return
+        done = true
+        if (timer != -1) {
+          clearTimeout(timer as number)
+          timer = -1
+        }
+        resolve(value)
+      }
+
+      timer = (setTimeout(() => {
+        console.warn(`[剪贴板] 读取超时：${DeskPetBillCaptureService.CLIPBOARD_TIMEOUT_MS}ms`)
+        finish('')
+      }, DeskPetBillCaptureService.CLIPBOARD_TIMEOUT_MS) as any) as number
+
+      try {
+        uni.getClipboardData({
+          success: (res) => {
+            const data = res.data != null ? res.data.toString() : ''
+            finish(data)
+          },
+          fail: (_err) => {
+            finish('')
+          }
+        })
+      } catch (_e) {
+        finish('')
+      }
+    })
+  }
+
+  private static readStoredText(key: string): string {
+    try {
+      const value = uni.getStorageSync(key)
+      return value != null ? value.toString() : ''
+    } catch (_e) {
+      return ''
+    }
+  }
+
+  private static consumeStoredText(key: string): string {
+    const value = DeskPetBillCaptureService.readStoredText(key)
+    try {
+      uni.removeStorageSync(key)
+    } catch (_e) {}
+    return value
+  }
+
+  private static consumePendingDeskPetTap(): boolean {
+    const raw = DeskPetBillCaptureService.readStoredText(DESK_PET_PENDING_BILL_CAPTURE_KEY)
+    if (raw == '') return false
+    DeskPetBillCaptureService.clearPendingDeskPetTap()
+
+    if (!raw.startsWith('pip-return:')) {
+      console.log(`[账单识别][PiP] 丢弃旧事件：${raw}`)
+      DeskPetBillCaptureService.clearStoredBillCaptureText()
+      return false
+    }
+
+    const value = raw.substring('pip-return:'.length)
+    const ts = parseFloat(value)
+    if (isNaN(ts)) {
+      DeskPetBillCaptureService.clearStoredBillCaptureText()
+      return false
+    }
+    const age = Date.now() - ts
+    if (age > DeskPetBillCaptureService.PIP_RETURN_PENDING_TTL_MS) {
+      console.log(`[账单识别][PiP] 丢弃过期事件：${age}ms`)
+      DeskPetBillCaptureService.clearStoredBillCaptureText()
+      return false
+    }
+    return true
+  }
+
+  private static clearPendingDeskPetTap(): void {
+    try {
+      uni.removeStorageSync(DESK_PET_PENDING_BILL_CAPTURE_KEY)
+    } catch (_e) {}
+  }
+
+  static clearStoredBillCaptureText(): void {
+    try { uni.removeStorageSync(DESK_PET_CAPTURED_BILL_TEXT_KEY) } catch (_capturedErr) {}
+    try { uni.removeStorageSync(DESK_PET_CAPTURED_SCREEN_IMAGE_KEY) } catch (_imageErr) {}
+    try { uni.removeStorageSync(DESK_PET_BILL_DEBUG_TEXT_KEY) } catch (_debugTextErr) {}
+    try { uni.removeStorageSync(DESK_PET_BILL_DEBUG_STATUS_KEY) } catch (_debugStatusErr) {}
+  }
+
+  private static consumePendingRecordOpen(): boolean {
+    const raw = DeskPetBillCaptureService.readStoredText(DESK_PET_PENDING_RECORD_OPEN_KEY)
+    if (raw == '') return false
+    try {
+      uni.removeStorageSync(DESK_PET_PENDING_RECORD_OPEN_KEY)
+    } catch (_e) {}
+
+    const ts = parseFloat(raw)
+    if (isNaN(ts)) return true
+    return Date.now() - ts <= 60000
+  }
+
+  private static consumePendingRecordQuery(): string {
+    const query = DeskPetBillCaptureService.readStoredText(DESK_PET_PENDING_RECORD_QUERY_KEY)
+    try {
+      uni.removeStorageSync(DESK_PET_PENDING_RECORD_QUERY_KEY)
+    } catch (_e) {}
+    return query
+  }
+
+  private static queryHasValidAmount(query: string): boolean {
+    const raw = (query ?? '').toString().trim()
+    if (raw == '') return false
+    const normalized = raw.startsWith('?') ? raw.substring(1) : raw
+    const parts = normalized.split('&')
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i]
+      const eq = part.indexOf('=')
+      if (eq <= 0) continue
+      if (part.substring(0, eq) != 'amount') continue
+      let value = part.substring(eq + 1)
+      try {
+        value = decodeURIComponent(value)
+      } catch (_decodeErr) {}
+      const amount = parseFloat(value)
+      return !isNaN(amount) && Math.abs(amount) > 0
+    }
+    return false
+  }
+
+  private static looksLikeBillText(text: string): boolean {
+    const normalized = DeskPetBillCaptureService.stripOcrMetaFromText(DeskPetBillCaptureService.normalizeText(text))
+    if (normalized.length < 4) return false
+    const amount = DeskPetBillCaptureService.extractAmount(normalized)
+    if (amount == '') return false
+    return DeskPetBillCaptureService.containsAny(normalized, [
+      '账单', '付款', '支付', '收款', '收入', '支出', '交易', '订单', '商户', '商家',
+      '支付宝', '微信', '银联', '银行卡', '退款', '实付', '消费', '转账', '入账',
+      '红包', '零钱通'
+    ])
+  }
+
+  private static normalizeText(text: string): string {
+    const normalized = (text ?? '')
+      .toString()
+      .replace(/\r\n/g, '\n')
+      .replace(/[\t ]+/g, ' ')
+      .trim()
+    const positioned = DeskPetBillCaptureService.extractLatestBillBlockByPosition(normalized)
+    if (positioned != '') return positioned
+    return DeskPetBillCaptureService.extractLatestBillBlock(normalized)
+  }
+
+  private static extractLatestBillBlockByPosition(text: string): string {
+    const lines = DeskPetBillCaptureService.parseBillOcrLines(text)
+    if (lines.length == 0) return ''
+
+    const cleaned = [] as BillOcrLine[]
+    for (let i = 0; i < lines.length; i++) {
+      const item = lines[i]
+      const line = item.text
+      if (line == '') continue
+      if (DeskPetBillCaptureService.isStatusBarLine(line)) continue
+      if (DeskPetBillCaptureService.isDeskPetOverlayLine(line)) continue
+      cleaned.push(item)
+    }
+    if (cleaned.length == 0) return ''
+
+    const sourceContext = DeskPetBillCaptureService.findSourceContextLineFromOcr(cleaned)
+    const detailBlock = DeskPetBillCaptureService.extractPositionedDetailBlock(cleaned, sourceContext)
+    if (detailBlock != '') return detailBlock
+
+    const rowBlock = DeskPetBillCaptureService.extractPositionedListRowBlock(cleaned, sourceContext)
+    if (rowBlock != '') return rowBlock
+    return ''
+  }
+
+  private static extractPositionedDetailBlock(lines: BillOcrLine[], sourceContext: string): string {
+    let hasDetailSignal = false
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].text
+      if (line == '账单详情' || line == '交易详情' || DeskPetBillCaptureService.containsAny(line, ['付款方式', '支付方式', '交易单号', '订单号', '当前状态', '创建时间', '完成时间'])) {
+        hasDetailSignal = true
+        break
+      }
+    }
+    if (!hasDetailSignal) return ''
+
+    let amountIndex = -1
+    let bestScore = -9999
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      const amounts = DeskPetBillCaptureService.extractAmountCandidates(line.text)
+      if (amounts.length == 0) continue
+      const near = DeskPetBillCaptureService.nearbyOcrText(lines, line, 190)
+      let score = DeskPetBillCaptureService.scoreAmountCandidate(near, i, lines.length, DeskPetBillCaptureService.cleanAmount(line.text))
+      if (DeskPetBillCaptureService.containsAny(near, ['交易详情', '账单详情', '支付', '付款'])) score += 80
+      if (DeskPetBillCaptureService.containsAny(near, ['余额', '优惠', '订单号', '交易单号'])) score -= 120
+      if (amountIndex < 0 || score > bestScore || (score == bestScore && line.y > lines[amountIndex].y)) {
+        amountIndex = i
+        bestScore = score
+      }
+    }
+    if (amountIndex >= 0) {
+      const anchor = lines[amountIndex]
+      let startIndex = amountIndex
+      for (let i = amountIndex - 1; i >= 0; i--) {
+        const item = lines[i]
+        if (anchor.y - item.y > 760) break
+        const line = item.text
+        if (line == '' || DeskPetBillCaptureService.isLowValueLine(line)) continue
+        if (DeskPetBillCaptureService.extractAmountCandidates(line).length > 0) continue
+        if (DeskPetBillCaptureService.containsAny(line, ['使用', '付款方式', '支付方式', '扣款方式', '收款账户', '付款账户', '入账账户'])) continue
+        if (DeskPetBillCaptureService.containsAny(line, ['查看', '前往', '订单详情页', '账单详情', '交易详情'])) continue
+        startIndex = i
+        break
+      }
+
+      let endIndex = amountIndex
+      for (let i = amountIndex + 1; i < lines.length; i++) {
+        const line = lines[i].text
+        if (DeskPetBillCaptureService.isBillListTabLine(line)) break
+        endIndex = i
+        if (line == '账单详情' || line == '交易详情') break
+      }
+
+      const blockLines = [] as string[]
+      if (sourceContext != '') blockLines.push(sourceContext)
+      for (let i = startIndex; i <= endIndex && i < lines.length; i++) {
+        const line = lines[i].text
+        if (line == '' || DeskPetBillCaptureService.isBillListTabLine(line)) continue
+        if (blockLines.indexOf(lines[i].raw) < 0 && blockLines.indexOf(line) < 0) blockLines.push(lines[i].raw)
+      }
+      const block = blockLines.join('\n').trim()
+      const plain = DeskPetBillCaptureService.stripOcrMetaFromText(block)
+      if (DeskPetBillCaptureService.isCandidateBillBlock(plain)) return block
+    }
+
+    const blockLines = [] as string[]
+    if (sourceContext != '') blockLines.push(sourceContext)
+    for (let i = 0; i < lines.length; i++) {
+      if (DeskPetBillCaptureService.isBillListTabLine(lines[i].text)) break
+      if (blockLines.indexOf(lines[i].raw) < 0 && blockLines.indexOf(lines[i].text) < 0) blockLines.push(lines[i].raw)
+    }
+    const block = blockLines.join('\n').trim()
+    const plain = DeskPetBillCaptureService.stripOcrMetaFromText(block)
+    return DeskPetBillCaptureService.isCandidateBillBlock(plain) ? block : ''
+  }
+
+  private static extractPositionedListRowBlock(lines: BillOcrLine[], sourceContext: string): string {
+    let bestIndex = -1
+    let bestScore = -9999
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (DeskPetBillCaptureService.extractAmountCandidates(line.text).length == 0) continue
+      const near = DeskPetBillCaptureService.nearbyOcrText(lines, line, 72)
+      let score = DeskPetBillCaptureService.scoreAmountCandidate(near, i, lines.length, DeskPetBillCaptureService.cleanAmount(line.text))
+      if (line.x > 0) score += 10
+      if (DeskPetBillCaptureService.containsAny(near, ['收款金额', '付款金额', '你有一笔', '支付给商家'])) score += 120
+      if (DeskPetBillCaptureService.containsAny(near, ['余额', '优惠', '订单号', '交易单号', '时间'])) score -= 120
+      if (bestIndex < 0 || score > bestScore || (score == bestScore && line.y < lines[bestIndex].y)) {
+        bestIndex = i
+        bestScore = score
+      }
+    }
+    if (bestIndex < 0) return ''
+
+    const anchor = lines[bestIndex]
+    const row = [] as BillOcrLine[]
+    const rowY = DeskPetBillCaptureService.centerY(anchor)
+    const tolerance = Math.max(34, anchor.h * 2.8)
+    for (let i = 0; i < lines.length; i++) {
+      const item = lines[i]
+      const dy = Math.abs(DeskPetBillCaptureService.centerY(item) - rowY)
+      if (dy <= tolerance) row.push(item)
+      if (item.x < anchor.x && item.y < anchor.y && anchor.y - item.y <= 96 && !DeskPetBillCaptureService.isLowValueLine(item.text)) row.push(item)
+      if (item.x < anchor.x && item.y > anchor.y && item.y - anchor.y <= 46 && !DeskPetBillCaptureService.isLowValueLine(item.text)) row.push(item)
+    }
+    row.sort((a: BillOcrLine, b: BillOcrLine): number => {
+      const dy = a.y - b.y
+      if (Math.abs(dy) > 8) return dy
+      return a.x - b.x
+    })
+    const blockLines = [] as string[]
+    if (sourceContext != '') blockLines.push(sourceContext)
+    for (let i = 0; i < row.length; i++) {
+      const textLine = row[i].text
+      if (textLine == '' || DeskPetBillCaptureService.isNextBillDividerLine(textLine)) continue
+      if (blockLines.indexOf(row[i].raw) < 0 && blockLines.indexOf(textLine) < 0) blockLines.push(row[i].raw)
+    }
+    const block = blockLines.join('\n').trim()
+    const plain = DeskPetBillCaptureService.stripOcrMetaFromText(block)
+    return DeskPetBillCaptureService.extractAmountCandidates(plain).length > 0 ? block : ''
+  }
+
+  private static nearbyOcrText(lines: BillOcrLine[], anchor: BillOcrLine, tolerance: number): string {
+    const result = [] as string[]
+    const y = DeskPetBillCaptureService.centerY(anchor)
+    for (let i = 0; i < lines.length; i++) {
+      if (Math.abs(DeskPetBillCaptureService.centerY(lines[i]) - y) <= tolerance) result.push(lines[i].text)
+    }
+    return result.join('\n')
+  }
+
+  private static centerY(line: BillOcrLine): number {
+    return line.y + line.h / 2
+  }
+
+  private static parseBillOcrLines(text: string): BillOcrLine[] {
+    const rawLines = text.split('\n')
+    const result = [] as BillOcrLine[]
+    const reg = /^\[\[ocr:([0-9.\-]+),([0-9.\-]+),([0-9.\-]+),([0-9.\-]+)\]\](.*)$/
+    for (let i = 0; i < rawLines.length; i++) {
+      const raw = rawLines[i].trim()
+      const m = reg.exec(raw)
+      if (m == null || m.length < 6) continue
+      const value = m[5].trim()
+      if (value == '') continue
+      result.push({
+        raw: raw,
+        text: value,
+        x: parseFloat(m[1]),
+        y: parseFloat(m[2]),
+        w: parseFloat(m[3]),
+        h: parseFloat(m[4]),
+        index: i
+      } as BillOcrLine)
+    }
+    result.sort((a: BillOcrLine, b: BillOcrLine): number => {
+      const dy = a.y - b.y
+      if (Math.abs(dy) > 8) return dy
+      return a.x - b.x
+    })
+    return result
+  }
+
+  private static stripOcrMeta(line: string): string {
+    return (line ?? '').toString().replace(/^\[\[ocr:[0-9.\-]+,[0-9.\-]+,[0-9.\-]+,[0-9.\-]+\]\]/, '').trim()
+  }
+
+  private static stripOcrMetaFromText(text: string): string {
+    const lines = (text ?? '').toString().split('\n')
+    const result = [] as string[]
+    for (let i = 0; i < lines.length; i++) {
+      const line = DeskPetBillCaptureService.stripOcrMeta(lines[i])
+      if (line != '') result.push(line)
+    }
+    return result.join('\n')
+  }
+
+  private static extractLatestBillBlock(text: string): string {
+    const lines = text.split('\n')
+    const cleaned = [] as string[]
+    for (let i = 0; i < lines.length; i++) {
+      const line = DeskPetBillCaptureService.stripOcrMeta(lines[i])
+      if (line == '') continue
+      if (DeskPetBillCaptureService.isStatusBarLine(line)) continue
+      if (DeskPetBillCaptureService.isDeskPetOverlayLine(line)) continue
+      cleaned.push(line)
+    }
+    if (cleaned.length == 0) return ''
+    const sourceContext = DeskPetBillCaptureService.findSourceContextLine(cleaned)
+    const listCardBlock = DeskPetBillCaptureService.extractWeChatListCardBlock(cleaned, sourceContext)
+    if (listCardBlock != '') return listCardBlock
+
+    const candidates = [] as string[]
+    let current = [] as string[]
+    let inBlock = false
+    let seenAmount = false
+    for (let i = 0; i < cleaned.length; i++) {
+      const line = cleaned[i]
+      if (DeskPetBillCaptureService.isBillListTabLine(line)) break
+
+      if (DeskPetBillCaptureService.isNextBillDividerLine(line)) {
+        const pending = DeskPetBillCaptureService.withSourceContext(current.join('\n').trim(), sourceContext)
+        if (DeskPetBillCaptureService.isCandidateBillBlock(pending)) candidates.push(pending)
+        current = [] as string[]
+        inBlock = true
+        seenAmount = false
+        continue
+      }
+
+      if (!inBlock) {
+        if (!DeskPetBillCaptureService.isStrongBillStartLine(line)) continue
+        inBlock = true
+      }
+
+      current.push(line)
+      if (DeskPetBillCaptureService.extractAmountCandidates(line).length > 0) seenAmount = true
+      if (seenAmount && (line == '账单详情' || line == '交易详情')) {
+        const block = DeskPetBillCaptureService.withSourceContext(current.join('\n').trim(), sourceContext)
+        if (DeskPetBillCaptureService.isCandidateBillBlock(block)) candidates.push(block)
+        current = [] as string[]
+        inBlock = false
+        seenAmount = false
+      }
+    }
+    const tail = DeskPetBillCaptureService.withSourceContext(current.join('\n').trim(), sourceContext)
+    if (DeskPetBillCaptureService.isCandidateBillBlock(tail)) candidates.push(tail)
+    if (candidates.length > 0) return candidates[candidates.length - 1]
+
+    let start = 0
+    for (let i = 0; i < cleaned.length; i++) {
+      if (DeskPetBillCaptureService.isStrongBillStartLine(cleaned[i])) {
+        start = i
+        break
+      }
+    }
+
+    const result = [] as string[]
+    let fallbackSeenAmount = false
+    for (let i = start; i < cleaned.length; i++) {
+      const line = cleaned[i]
+      if (fallbackSeenAmount && DeskPetBillCaptureService.isBillListTabLine(line)) break
+      if (fallbackSeenAmount && (line == '账单详情' || line == '交易详情')) {
+        result.push(line)
+        break
+      }
+      result.push(line)
+      if (DeskPetBillCaptureService.extractAmountCandidates(line).length > 0) fallbackSeenAmount = true
+      if (fallbackSeenAmount && i > start && DeskPetBillCaptureService.isNextBillDividerLine(line)) break
+    }
+    return result.join('\n').trim()
+  }
+
+  private static extractWeChatListCardBlock(lines: string[], sourceContext: string): string {
+    let markerIndex = -1
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i]
+      if (DeskPetBillCaptureService.containsAny(line, ['你有一笔收款入账', '你有一笔付款', '收款金额', '付款金额', '零钱提现发起', '提现金额', '提现银行', '提现时间', '预计到账时间'])) {
+        markerIndex = i
+        break
+      }
+    }
+    if (markerIndex < 0) return ''
+
+    let start = markerIndex
+    for (let i = markerIndex - 1; i >= 0; i--) {
+      const line = lines[i]
+      if (DeskPetBillCaptureService.isNextBillDividerLine(line)) {
+        start = i + 1
+        break
+      }
+      if (DeskPetBillCaptureService.isBillListTabLine(line)) break
+      if (DeskPetBillCaptureService.isLikelyListMerchantLine(line)) start = i
+    }
+
+    let end = lines.length - 1
+    for (let i = markerIndex; i < lines.length; i++) {
+      const line = lines[i]
+      if (DeskPetBillCaptureService.isBillListTabLine(line)) {
+        end = i - 1
+        break
+      }
+      if (i > markerIndex && DeskPetBillCaptureService.isNextBillDividerLine(line)) {
+        end = i - 1
+        break
+      }
+      if (line == '账单详情' || line == '交易详情') {
+        end = i
+        break
+      }
+    }
+
+    const blockLines = [] as string[]
+    for (let i = start; i <= end && i < lines.length; i++) {
+      const line = lines[i]
+      if (line == '') continue
+      if (DeskPetBillCaptureService.isNextBillDividerLine(line)) continue
+      blockLines.push(line)
+    }
+    const block = DeskPetBillCaptureService.withSourceContext(blockLines.join('\n').trim(), sourceContext)
+    return DeskPetBillCaptureService.isCandidateBillBlock(block) ? block : ''
+  }
+
+  private static isLikelyListMerchantLine(line: string): boolean {
+    if (line == '') return false
+    if (DeskPetBillCaptureService.isStatusBarLine(line)) return false
+    if (DeskPetBillCaptureService.isLowValueLine(line)) return false
+    if (DeskPetBillCaptureService.extractAmountCandidates(line).length > 0) return false
+    if (DeskPetBillCaptureService.containsAny(line, ['微信支付', '支付宝', '云闪付', '账单详情', '交易详情'])) return false
+    return line.length <= 24
+  }
+
+  private static findSourceContextLine(lines: string[]): string {
+    for (let i = 0; i < lines.length; i++) {
+      const line = DeskPetBillCaptureService.stripOcrMeta(lines[i])
+      if (line == '微信支付' || line == '支付宝' || line == '云闪付') return line
+    }
+    return ''
+  }
+
+  private static findSourceContextLineFromOcr(lines: BillOcrLine[]): string {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].text
+      if (line == '微信支付' || line == '支付宝' || line == '云闪付') return line
+    }
+    return ''
+  }
+
+  private static withSourceContext(block: string, sourceContext: string): string {
+    const value = block.trim()
+    if (value == '') return ''
+    if (sourceContext == '') return value
+    if (value.indexOf(sourceContext) >= 0) return value
+    return `${sourceContext}\n${value}`
+  }
+
+  private static isCandidateBillBlock(text: string): boolean {
+    if (text.trim() == '') return false
+    if (DeskPetBillCaptureService.containsAny(text, ['零钱提现发起', '提现金额', '提现银行', '提现时间', '预计到账时间'])) return true
+    if (DeskPetBillCaptureService.extractAmountCandidates(text).length == 0) return false
+    return DeskPetBillCaptureService.containsAny(text, [
+      '账单详情', '交易详情', '收款金额', '付款金额', '订单', '商家', '商户',
+      '微信支付', '支付宝', '云闪付', '你有一笔收款入账', '支付给商家'
+    ])
+  }
+
+  private static isStrongBillStartLine(line: string): boolean {
+    if (line == '微信支付' || line == '支付宝' || line == '云闪付') return true
+    if (/^[+\-]?\s*[¥￥]\s*[0-9]+(?:\.[0-9]{1,2})?$/.test(line)) return true
+    if (DeskPetBillCaptureService.containsAny(line, ['支付成功', '收款成功', '付款成功', '你已收款', '你有一笔收款入账'])) return true
+    return false
+  }
+
+  private static isStatusBarLine(line: string): boolean {
+    if (/^\d{1,2}:\d{2}$/.test(line)) return true
+    if (/^\d{1,2}:\d{2}\s*[（(]?$/.test(line)) return true
+    if (/^\d{1,2}\s*k\/s$/i.test(line)) return true
+    if (/^(wifi|5g|4g|volte|hd)$/i.test(line)) return true
+    if (/^\d{1,3}%$/.test(line)) return true
+    return false
+  }
+
+  private static isDeskPetOverlayLine(line: string): boolean {
+    const normalized = line.replace(/\s+/g, '').toLowerCase()
+    if (normalized == '') return true
+    if (normalized.indexOf('zemofinance') >= 0) return true
+    if (normalized == 'cny' || normalized == 'asset' || normalized == '我的资产' || normalized == '净资产总览') return true
+    if (/^[0-9]{3,}(?:\.[0-9]{1,2})?$/.test(normalized)) return true
+    return false
+  }
+
+  private static isBillListTabLine(line: string): boolean {
+    return line == '我的账单' || line == '支付服务' || line == '摇优惠'
+  }
+
+  private static isNextBillDividerLine(line: string): boolean {
+    return /^(今天|昨天|前天)\s*\d{1,2}:\d{2}$/.test(line)
+      || /^\d{1,2}月\d{1,2}日\s*\d{1,2}:\d{2}$/.test(line)
+      || /^(周|星期)[一二三四五六日天]\s*\d{1,2}:\d{2}$/.test(line)
+  }
+
+  private static detectMode(text: string): RecordMode {
+    const signed = DeskPetBillCaptureService.extractPrimarySignedAmount(text)
+    if (DeskPetBillCaptureService.containsAny(text, ['退款成功', '已退款', '退回', '原路退', '退款金额'])) return 'refund'
+    if (DeskPetBillCaptureService.containsAny(text, ['零钱提现发起', '提现金额', '提现银行', '提现时间', '预计到账时间'])) return 'transfer'
+    if (DeskPetBillCaptureService.isWeChatOutgoingRedPacket(text)) return 'expense'
+    if (DeskPetBillCaptureService.isWeChatIncomingRedPacket(text)) return 'income'
+    if (DeskPetBillCaptureService.containsAny(text, ['你已收款', '资金正在转入零钱通'])) return 'income'
+    if (/待.+确认收款/.test(text) || DeskPetBillCaptureService.containsAny(text, ['等待对方领取'])) return 'expense'
+    if (text.indexOf('收款账户') >= 0 && text.indexOf('付款账户') < 0 && text.indexOf('付款方式') < 0) return 'income'
+    if (DeskPetBillCaptureService.containsAny(text, ['转账给', '转账到', '转出', '转入', '转账成功', '转账收款'])) {
+      if (signed.startsWith('+') || DeskPetBillCaptureService.containsAny(text, ['转入', '转账收款', '收到转账'])) return 'income'
+      return 'expense'
+    }
+    if (signed.startsWith('+')) return 'income'
+    if (signed.startsWith('-')) return 'expense'
+    let incomeScore = DeskPetBillCaptureService.scoreKeywords(text, [
+      '已收款', '收款成功', '收款金额', '收款账户', '收入', '入账', '到账', '工资', '薪资', '奖金', '报销到账', '+¥', '+￥'
+    ])
+    let expenseScore = DeskPetBillCaptureService.scoreKeywords(text, [
+      '付款成功', '支付成功', '实付', '付款金额', '消费', '支出', '扣款', '已付款', '支付给', '向商家付款', '未入账', '交易卡号', '银行交易类型', '-¥', '-￥'
+    ])
+    incomeScore += DeskPetBillCaptureService.countSignedAmountLines(text, '+') * 120
+    expenseScore += DeskPetBillCaptureService.countSignedAmountLines(text, '-') * 120
+    if (DeskPetBillCaptureService.containsAny(text, ['商家转账', '来自拼多多', '现金红包', '收款方式', '你已收款'])) incomeScore += 60
+    if (incomeScore > expenseScore) return 'income'
+    return 'expense'
+  }
+
+  private static isWeChatIncomingRedPacket(text: string): boolean {
+    return text.indexOf('发出的红包') >= 0
+      && text.indexOf('红包金额') < 0
+      && text.indexOf('等待对方领取') < 0
+  }
+
+  private static isWeChatOutgoingRedPacket(text: string): boolean {
+    return text.indexOf('红包金额') >= 0
+      || text.indexOf('等待对方领取') >= 0
+  }
+
+  private static detectCategory(text: string, mode: RecordMode): string {
+    if (mode == 'transfer') return 'transfer'
+    if (mode == 'refund') return 'income_reward'
+    if (mode == 'income') {
+      if (DeskPetBillCaptureService.containsAny(text, ['工资', '薪资', '薪水'])) return 'income_salary'
+      if (DeskPetBillCaptureService.containsAny(text, ['理财', '基金', '收益', '分红', '利息'])) return 'income_finance'
+      if (DeskPetBillCaptureService.containsAny(text, ['礼金', '红包', '转账'])) return 'income_gift'
+      if (DeskPetBillCaptureService.containsAny(text, ['奖金', '奖励', '补贴'])) return 'income_reward'
+      return 'income_salary'
+    }
+    if (DeskPetBillCaptureService.containsAny(text, ['税务', '个税', '增值税', '发票', '税费'])) return 'expense_tax'
+    if (DeskPetBillCaptureService.containsAny(text, ['打车', '滴滴', '高德打车', '公交', '地铁', '高铁', '火车', '机票', '航旅', '加油', '停车', '高速', 'etc'])) return 'expense_transport'
+    if (DeskPetBillCaptureService.containsAny(text, ['红包', '礼金', '份子钱', '转账给', '亲属卡', '[转账]', '确认收款'])) return 'expense_gift'
+    if (DeskPetBillCaptureService.containsAny(text, ['奖金', '奖励', '打赏'])) return 'expense_reward'
+    return 'expense_shopping'
+  }
+
+  private static extractAmount(text: string): string {
+    const normalized = text.replace(/,/g, '')
+    const signed = DeskPetBillCaptureService.extractPrimarySignedAmount(normalized)
+    if (signed != '') {
+      const signedAmount = DeskPetBillCaptureService.cleanAmount(signed)
+      if (signedAmount != '') return signedAmount
+    }
+    const lines = normalized.split('\n')
+    let bestAmount = ''
+    let bestScore = -999
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = DeskPetBillCaptureService.stripOcrMeta(lines[i])
+      if (line == '') continue
+      const candidates = DeskPetBillCaptureService.extractAmountCandidates(line)
+      for (let j = 0; j < candidates.length; j++) {
+        const amount = DeskPetBillCaptureService.cleanAmount(candidates[j])
+        if (amount == '') continue
+        const context = `${i > 0 ? DeskPetBillCaptureService.stripOcrMeta(lines[i - 1]) : ''}\n${line}\n${i < lines.length - 1 ? DeskPetBillCaptureService.stripOcrMeta(lines[i + 1]) : ''}`
+        const score = DeskPetBillCaptureService.scoreAmountCandidate(context, i, lines.length, amount)
+        if (score > bestScore) {
+          bestScore = score
+          bestAmount = amount
+        }
+      }
+    }
+
+    if (bestAmount != '') return bestAmount
+
+    const allCandidates = DeskPetBillCaptureService.extractAmountCandidates(normalized)
+    for (let i = 0; i < allCandidates.length; i++) {
+      const amount = DeskPetBillCaptureService.cleanAmount(allCandidates[i])
+      if (amount != '') return amount
+    }
+
+    return ''
+  }
+
+  private static cleanAmount(raw: string): string {
+    const value = parseFloat((raw ?? '').toString().replace(/[^0-9.]/g, ''))
+    if (isNaN(value) || value <= 0 || value > 100000000) return ''
+    return value.toFixed(2)
+  }
+
+  private static extractAmountCandidates(text: string): string[] {
+    text = DeskPetBillCaptureService.stripOcrMetaFromText(text)
+    const result = [] as string[]
+    const patterns = [
+      /(^|\s)[+\-]\s*(?:[¥￥$£€])\s*([0-9]+(?:\.[0-9]{1,2})?)(\s|$)/g,
+      /[+\-]?\s*[¥￥]\s*([0-9]+(?:\.[0-9]{1,2})?)/g,
+      /(?:实付|付款金额|支付金额|消费金额|支出金额|收款金额|收入金额|入账金额|退款金额|订单金额|合计|总计|金额)[^0-9¥￥]{0,12}[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)/g,
+      /([0-9]+(?:\.[0-9]{1,2})?)\s*元/g,
+      /(^|\s)([0-9]+\.[0-9]{2})(\s|$)/g,
+      /(^|\s)[+\-]\s*([0-9]+(?:\.[0-9]{1,2})?)(\s|$)/g
+    ]
+    for (let i = 0; i < patterns.length; i++) {
+      const reg = patterns[i]
+      let match = reg.exec(text)
+      while (match != null) {
+        if (match.length > 2 && (match[0].indexOf('+') >= 0 || match[0].indexOf('-') >= 0)) {
+          result.push(match[2])
+        } else if (match.length > 2 && /^[0-9]/.test(match[2])) {
+          result.push(match[2])
+        } else if (match.length > 1) {
+          result.push(match[1])
+        }
+        match = reg.exec(text)
+      }
+    }
+    return result
+  }
+
+  private static scoreAmountCandidate(line: string, lineIndex: number, lineCount: number, amount: string): number {
+    let score = 0
+    if (DeskPetBillCaptureService.containsAny(line, ['实付', '付款金额', '支付金额', '消费金额', '支出金额', '收款金额', '收入金额', '入账金额', '退款金额'])) score += 80
+    if (DeskPetBillCaptureService.containsAny(line, ['使用', '支付']) && line.indexOf('支付分先用后付') < 0) score += 90
+    if (DeskPetBillCaptureService.containsAny(line, ['实际支付', '已支付', '扣款成功'])) score += 80
+    if (DeskPetBillCaptureService.containsAny(line, ['预计扣费', '预计金额', '预计在', '预计', '不会超过', '自动确认收'])) score -= 180
+    if (/(^|\n)[+\-]\s*[0-9]+(?:\.[0-9]{1,2})?(\n|$)/.test(line)) score += 90
+    if (DeskPetBillCaptureService.containsAny(line, ['合计', '总计', '订单金额', '金额'])) score += 45
+    if (line.indexOf('¥') >= 0 || line.indexOf('￥') >= 0 || line.indexOf('元') >= 0) score += 20
+    if (DeskPetBillCaptureService.containsAny(line, ['余额', '优惠', '红包抵扣', '积分', '卡号', '订单号', '交易单号', '流水号', '商户单号'])) score -= 80
+    if (DeskPetBillCaptureService.containsAny(line, ['时间', '日期', '年', '月', '日'])) score -= 40
+    if (lineIndex <= 4) score += 10
+    if (lineCount > 0 && lineIndex >= lineCount - 3) score -= 5
+    const val = parseFloat(amount)
+    if (!isNaN(val) && val > 0 && val < 100000) score += 8
+    return score
+  }
+
+  private static extractPrimarySignedAmount(text: string): string {
+    const lines = text.split('\n')
+    const reg = /^[+\-]\s*[¥￥$£€]?\s*[0-9]+(?:\.[0-9]{1,2})?$/
+    for (let i = 0; i < lines.length; i++) {
+      const line = DeskPetBillCaptureService.stripOcrMeta(lines[i])
+      if (reg.test(line)) return line
+    }
+    return ''
+  }
+
+  private static extractNote(text: string): string {
+    const positionedNote = DeskPetBillCaptureService.extractNoteByPosition(text)
+    if (positionedNote != '') return positionedNote
+    const lines = text.split('\n')
+    const wechatNote = DeskPetBillCaptureService.extractWeChatNote(text)
+    if (wechatNote != '') return wechatNote
+
+    const labelPattern = /^(商户|商家|商户全称|店铺|收款方|付款方|对方|交易对象|商品|商品说明|商品名称|订单标题|交易说明|付款给|支付给|转账给|转账备注|备注|说明)[:：\s]+/
+    for (let i = 0; i < lines.length; i++) {
+      const line = DeskPetBillCaptureService.stripOcrMeta(lines[i])
+      if (line == '') continue
+      if (labelPattern.test(line)) {
+        const candidate = DeskPetBillCaptureService.cleanNote(line.replace(labelPattern, ''))
+        if (candidate != '') return candidate
+      }
+      if (/^(转账备注|备注|说明)$/.test(line) && i < lines.length - 1) {
+        const candidate = DeskPetBillCaptureService.cleanNote(DeskPetBillCaptureService.stripOcrMeta(lines[i + 1]))
+        if (candidate != '' && !DeskPetBillCaptureService.isLowValueLine(candidate)) return candidate
+      }
+    }
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = DeskPetBillCaptureService.stripOcrMeta(lines[i])
+      if (line == '') continue
+      if (DeskPetBillCaptureService.isLowValueLine(line)) continue
+      const candidate = DeskPetBillCaptureService.cleanNote(line)
+      if (candidate != '') return candidate
+    }
+    return ''
+  }
+
+  private static extractWeChatNote(text: string): string {
+    if (DeskPetBillCaptureService.containsAny(text, ['零钱提现发起', '提现金额', '提现银行'])) return '微信零钱提现'
+    const lines = text.split('\n')
+    for (let i = 0; i < lines.length; i++) {
+      const line = DeskPetBillCaptureService.stripOcrMeta(lines[i])
+      if (line.indexOf('发出的红包') >= 0) {
+        const sender = DeskPetBillCaptureService.cleanNote(line.replace('发出的红包', ''))
+        if (sender != '') return DeskPetBillCaptureService.isWeChatOutgoingRedPacket(text) ? '微信红包' : `${sender}的红包`
+        return '微信红包'
+      }
+      const pendingMatch = /待(.+)确认收款/.exec(line)
+      if (pendingMatch != null && pendingMatch.length > 1) {
+        const target = DeskPetBillCaptureService.cleanNote(pendingMatch[1])
+        if (target != '') return `转账给${target}`
+        return '微信转账'
+      }
+      if (line.indexOf('你已收款') >= 0) {
+        const payer = DeskPetBillCaptureService.findNearestWeChatName(lines, i)
+        return payer == '' ? '微信转账收款' : `${payer}转账`
+      }
+    }
+    return ''
+  }
+
+  private static findNearestWeChatName(lines: string[], anchor: number): string {
+    let i = anchor - 1
+    while (i >= 0 && anchor - i <= 4) {
+      const candidate = DeskPetBillCaptureService.cleanNote(DeskPetBillCaptureService.stripOcrMeta(lines[i]))
+      if (candidate != '' && !DeskPetBillCaptureService.isLowValueLine(candidate)) return candidate
+      i -= 1
+    }
+    return ''
+  }
+
+  private static extractNoteByPosition(text: string): string {
+    const lines = DeskPetBillCaptureService.parseBillOcrLines(text)
+    if (lines.length == 0) return ''
+    const labelPattern = /^(商户|商家|商户全称|店铺|收款方|付款方|对方|交易对象|商品|商品说明|商品名称|订单标题|交易说明|付款给|支付给|转账给|转账备注|备注|说明)[:：\s]*$/
+    const inlinePattern = /^(商户|商家|商户全称|店铺|收款方|付款方|对方|交易对象|商品|商品说明|商品名称|订单标题|交易说明|付款给|支付给|转账给|转账备注|备注|说明)[:：\s]+/
+    let best = ''
+    let bestScore = -9999
+
+    for (let i = 0; i < lines.length; i++) {
+      const label = lines[i]
+      if (inlinePattern.test(label.text)) {
+        const candidate = DeskPetBillCaptureService.cleanNote(label.text.replace(inlinePattern, ''))
+        if (candidate != '') return candidate
+      }
+      if (!labelPattern.test(label.text)) continue
+
+      for (let j = 0; j < lines.length; j++) {
+        if (i == j) continue
+        const item = lines[j]
+        const candidate = DeskPetBillCaptureService.cleanNote(item.text)
+        if (candidate == '' || DeskPetBillCaptureService.isLowValueLine(candidate)) continue
+        const sameRow = Math.abs(DeskPetBillCaptureService.centerY(item) - DeskPetBillCaptureService.centerY(label)) <= Math.max(24, label.h * 1.7)
+        const below = item.y >= label.y && item.y - label.y <= Math.max(72, label.h * 3.2)
+        if (!sameRow && !below) continue
+
+        let score = 0
+        if (sameRow && item.x > label.x) score += 120
+        if (below && Math.abs(item.x - label.x) <= 80) score += 95
+        if (label.text == '备注' || label.text == '说明' || label.text == '转账备注') score += 80
+        if (DeskPetBillCaptureService.containsAny(label.text, ['商品', '订单标题', '交易说明'])) score += 45
+        score -= Math.abs(DeskPetBillCaptureService.centerY(item) - DeskPetBillCaptureService.centerY(label))
+        if (score > bestScore) {
+          bestScore = score
+          best = candidate
+        }
+      }
+    }
+
+    if (best != '' && bestScore > 0) return best
+    return ''
+  }
+
+  private static cleanNote(raw: string): string {
+    let note = (raw ?? '').toString().trim()
+    note = note.replace(/[¥￥]\s*[0-9]+(?:\.[0-9]{1,2})?/g, '')
+    note = note.replace(/(^|[\s,，])([0-9]+(?:\.[0-9]{1,2})?)\s*元/g, '$1')
+    note = note.replace(/(^|[\s,，])([0-9]+\.[0-9]{1,2})(?=$|[\s,，])/g, '$1')
+    note = note.replace(/(实付|付款|支付|金额|合计|收款|退款|收入|支出)[:：\s]*/g, '')
+    note = note.replace(/\s+/g, ' ').trim()
+    if (/^[:：]+$/.test(note)) return ''
+    if (DeskPetBillCaptureService.isLikelyOcrNoise(note)) return ''
+    if (note.length > 60) note = note.substring(0, 60)
+    return note
+  }
+
+  private static isLowValueLine(line: string): boolean {
+    line = DeskPetBillCaptureService.stripOcrMeta(line)
+    if (DeskPetBillCaptureService.isLikelyOcrNoise(line)) return true
+    if (/^[\u4e00-\u9fa5]$/.test(line) && !DeskPetBillCaptureService.containsAny(line, ['收', '付'])) return true
+    if (line == '记录点什么…' || line == '记录点什么….' || line == 'Mo Finance') return true
+    if (/^\d{1,2}:\d{2}$/.test(line)) return true
+    if (/^[+\-]\s*[¥￥$£€]?\s*[0-9]+(?:\.[0-9]{1,2})?$/.test(line)) return true
+    if (/^(商户|商家|商户全称|店铺|收款方|付款方|对方|交易对象|商品|商品说明|商品名称|订单标题|交易说明|付款给|支付给|转账给|转账备注|收款账户|付款账户|备注|说明)[:：\s]*$/.test(line)) return true
+    if (/^[¥￥]?\s*[0-9]+(?:\.[0-9]{1,2})?\s*元?$/.test(line)) return true
+    if (/^\d{4}[-/]\d{1,2}[-/]\d{1,2}/.test(line)) return true
+    if (DeskPetBillCaptureService.containsAny(line, ['支付宝', '微信支付', '云闪付', '向商家付款', '交易成功', '支付成功', '付款成功', '收款成功', '账单详情', '交易详情', '未入账', '账单分类', '订单号', '交易单号', '付款方式', '支付方式', '当前状态', '创建时间', '完成时间', '交易卡号', '交易时间', '国家或地区', '原交易金额', '币种', '银行交易类型', '所属账本', '请选择', '分类', '消费', '封面由个人制作', '了解红包封面', '刚刚', '[转账]', '零钱'])) return true
+    return false
+  }
+
+  private static isLikelyOcrNoise(line: string): boolean {
+    const value = DeskPetBillCaptureService.stripOcrMeta((line ?? '').toString())
+    if (value == '') return true
+    if (/^[|!！:：;；'"`.,，。()（）\[\]{}<>《》\\\/=_\-+*~^]+$/.test(value)) return true
+    if (/^[A-Za-z]:[!！]+$/.test(value)) return true
+    if (/^[\u4e00-\u9fa5]{1,3}$/.test(value) && DeskPetBillCaptureService.containsAny(value, ['浓', '悶', '闷', '路'])) return true
+    return false
+  }
+
+  private static containsAny(text: string, keywords: string[]): boolean {
+    for (let i = 0; i < keywords.length; i++) {
+      if (text.indexOf(keywords[i]) >= 0) return true
+    }
+    return false
+  }
+
+  private static scoreKeywords(text: string, keywords: string[]): number {
+    let score = 0
+    for (let i = 0; i < keywords.length; i++) {
+      if (text.indexOf(keywords[i]) >= 0) score += keywords[i].length
+    }
+    return score
+  }
+
+  private static countSignedAmountLines(text: string, sign: string): number {
+    const lines = text.split('\n')
+    let count = 0
+    for (let i = 0; i < lines.length; i++) {
+      const line = DeskPetBillCaptureService.stripOcrMeta(lines[i])
+      if (line.startsWith(sign) && /^[+\-]\s*[¥￥$£€]?\s*[0-9]+(?:\.[0-9]{1,2})?$/.test(line)) count += 1
+    }
+    return count
+  }
+
+  private static detectSourceApp(text: string): string {
+    if (DeskPetBillCaptureService.containsAny(text, ['支付宝', '花呗', '余额宝'])) return '支付宝'
+    if (DeskPetBillCaptureService.containsAny(text, ['微信支付', '微信零钱', '微信收款', '零钱通', '发出的红包', '红包金额', '[转账]', '确认收款'])) return '微信'
+    if (DeskPetBillCaptureService.containsAny(text, ['云闪付', '银联'])) return '云闪付'
+    if (DeskPetBillCaptureService.containsAny(text, ['招商银行', '招行'])) return '招商银行'
+    if (DeskPetBillCaptureService.containsAny(text, ['工商银行', '工行'])) return '工商银行'
+    if (DeskPetBillCaptureService.containsAny(text, ['建设银行', '建行'])) return '建设银行'
+    if (DeskPetBillCaptureService.containsAny(text, ['农业银行', '农行'])) return '农业银行'
+    if (DeskPetBillCaptureService.containsAny(text, ['中国银行', '中行'])) return '中国银行'
+    if (DeskPetBillCaptureService.containsAny(text, ['交易卡号', '银行交易类型', '信用卡', '储蓄卡'])) return '银行卡'
+    return ''
+  }
+
+  private static extractPayMethod(text: string): string {
+    const lines = text.split('\n')
+    const labelPattern = /^(付款方式|支付方式|扣款方式|收款账户|入账账户|付款账户|银行卡|支付账户)[:：\s]+/
+    for (let i = 0; i < lines.length; i++) {
+      const line = DeskPetBillCaptureService.stripOcrMeta(lines[i])
+      if (line == '') continue
+      if (labelPattern.test(line)) {
+        return line.replace(labelPattern, '').trim()
+      }
+      if (DeskPetBillCaptureService.containsAny(line, ['零钱', '支付宝余额', '余额宝', '花呗', '银行卡', '储蓄卡', '信用卡']) && line.length <= 48) {
+        return line
+      }
+    }
+    return ''
+  }
+
+  private static extractTransactionTime(text: string): number {
+    const patterns = [
+      /(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})[日\s]+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/,
+      /(\d{1,2})[-/月](\d{1,2})[日\s]+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/
+    ]
+    for (let i = 0; i < patterns.length; i++) {
+      const m = patterns[i].exec(text)
+      if (m == null) continue
+      if (i == 0) {
+        const year = parseInt(m[1])
+        const month = parseInt(m[2])
+        const day = parseInt(m[3])
+        const hour = parseInt(m[4])
+        const minute = parseInt(m[5])
+        const second = m[6] != null ? parseInt(m[6]) : 0
+        return new Date(year, month - 1, day, hour, minute, second).getTime()
+      }
+      const now = new Date()
+      const month = parseInt(m[1])
+      const day = parseInt(m[2])
+      const hour = parseInt(m[3])
+      const minute = parseInt(m[4])
+      const second = m[5] != null ? parseInt(m[5]) : 0
+      return new Date(now.getFullYear(), month - 1, day, hour, minute, second).getTime()
+    }
+    return 0
+  }
+
+  private static matchBookId(text: string, books: BookNode[]): string {
+    let bestId = ''
+    let bestScore = 0
+    const normalizedText = DeskPetBillCaptureService.normalizeMatchText(text)
+    for (let i = 0; i < books.length; i++) {
+      const b = books[i]
+      const name = DeskPetBillCaptureService.normalizeMatchText(b.name)
+      if (name == '') continue
+      let score = 0
+      if (normalizedText.indexOf(name) >= 0) score += 100
+      if (b.is_default == 1) score += 5
+      if (score > bestScore) {
+        bestScore = score
+        bestId = b.id
+      }
+    }
+    return bestScore >= 50 ? bestId : ''
+  }
+
+  private static matchAccount(text: string, payMethod: string, sourceApp: string, bookId: string, accounts: AccountNode[]): AccountNode | null {
+    let best: AccountNode | null = null
+    let bestScore = -999
+    const haystack = DeskPetBillCaptureService.normalizeMatchText(`${text}\n${payMethod}\n${sourceApp}`)
+    const paymentText = DeskPetBillCaptureService.normalizeMatchText(`${payMethod}\n${sourceApp}`)
+    const tailDigits = DeskPetBillCaptureService.extractTailDigits(text + '\n' + payMethod)
+
+    for (let i = 0; i < accounts.length; i++) {
+      const acc = accounts[i]
+      let score = 0
+      if (bookId != '' && acc.book_id == bookId) score += 20
+      if (bookId != '' && acc.book_id != bookId) score -= 20
+
+      const name = DeskPetBillCaptureService.normalizeMatchText(acc.name)
+      const provider = DeskPetBillCaptureService.normalizeMatchText(acc.provider)
+      const type = DeskPetBillCaptureService.normalizeMatchText(acc.type)
+      const subType = DeskPetBillCaptureService.normalizeMatchText(acc.sub_type)
+      const code = DeskPetBillCaptureService.normalizeMatchText(acc.code)
+      const target = `${name} ${provider} ${type} ${subType} ${code}`
+
+      if (name != '' && haystack.indexOf(name) >= 0) score += 120
+      if (provider != '' && haystack.indexOf(provider) >= 0) score += 70
+      if (type != '' && paymentText.indexOf(type) >= 0) score += 40
+      if (subType != '' && paymentText.indexOf(subType) >= 0) score += 35
+      if (sourceApp != '' && target.indexOf(DeskPetBillCaptureService.normalizeMatchText(sourceApp)) >= 0) score += 60
+      if (payMethod != '' && DeskPetBillCaptureService.normalizeMatchText(payMethod).indexOf(name) >= 0) score += 80
+
+      if (paymentText.indexOf('微信') >= 0 && target.indexOf('微信') >= 0) score += 90
+      if (paymentText.indexOf('支付宝') >= 0 && target.indexOf('支付宝') >= 0) score += 90
+      if (paymentText.indexOf('花呗') >= 0 && target.indexOf('花呗') >= 0) score += 90
+      if (paymentText.indexOf('余额宝') >= 0 && target.indexOf('余额宝') >= 0) score += 80
+      if (paymentText.indexOf('零钱') >= 0 && target.indexOf('零钱') >= 0) score += 80
+      if (paymentText.indexOf('信用卡') >= 0 && (target.indexOf('信用') >= 0 || acc.category == FinanceBiz.CATEGORY_CREDIT)) score += 70
+      if (paymentText.indexOf('储蓄卡') >= 0 && (target.indexOf('储蓄') >= 0 || target.indexOf('现金') >= 0)) score += 40
+
+      for (let j = 0; j < tailDigits.length; j++) {
+        const tail = tailDigits[j]
+        if (tail != '' && target.indexOf(tail) >= 0) score += 120
+      }
+
+      if (score > bestScore) {
+        bestScore = score
+        best = acc
+      }
+    }
+
+    return bestScore >= 50 ? best : null
+  }
+
+  private static normalizeMatchText(text: string): string {
+    return (text ?? '').toString().toLowerCase().replace(/\s+/g, '').replace(/[()（）\-_*·]/g, '')
+  }
+
+  private static extractTailDigits(text: string): string[] {
+    const result = [] as string[]
+    const reg = /(?:尾号|末四位|卡号|账户)[^\n]*?([0-9]{3,6})(?!.*[0-9])/g
+    let match = reg.exec(text)
+    while (match != null) {
+      if (match.length > 1) result.push(match[1])
+      match = reg.exec(text)
+    }
+    const bracketReg = /[（(]([0-9]{3,6})[）)]/g
+    let bracketMatch = bracketReg.exec(text)
+    while (bracketMatch != null) {
+      if (bracketMatch.length > 1 && result.indexOf(bracketMatch[1]) < 0) result.push(bracketMatch[1])
+      bracketMatch = bracketReg.exec(text)
+    }
+    return result
+  }
+
+  private static clearPendingRecordOpen(): void {
+    try { uni.removeStorageSync(DESK_PET_PENDING_RECORD_OPEN_KEY) } catch (_openErr) {}
+    try { uni.removeStorageSync(DESK_PET_PENDING_RECORD_QUERY_KEY) } catch (_queryErr) {}
+  }
+
+  private static consumePendingRecordAutoConfirm(): boolean {
+    const raw = DeskPetBillCaptureService.readStoredText(DESK_PET_PENDING_RECORD_AUTO_CONFIRM_KEY)
+    if (raw == '') return false
+    try {
+      uni.removeStorageSync(DESK_PET_PENDING_RECORD_AUTO_CONFIRM_KEY)
+    } catch (_e) {}
+
+    const ts = parseFloat(raw)
+    if (isNaN(ts)) return true
+    return Date.now() - ts <= 60000
+  }
+
+  private static categoryLabel(category: string, mode: RecordMode): string {
+    if (mode == 'refund') return '退款'
+    if (mode == 'transfer') {
+      if (category == 'transfer_fund') return '基金'
+      if (category == 'transfer_finance_add') return '加仓'
+      if (category == 'transfer_finance_reduce') return '减仓'
+      if (category == 'transfer_stock') return '股票'
+      if (category == 'transfer_security') return '证券'
+      return '转账'
+    }
+    if (category == 'expense_tax' || category == 'income_tax') return '可抵税'
+    if (category == 'expense_transport') return '交通'
+    if (category == 'expense_gift' || category == 'income_gift') return '礼金'
+    if (category == 'expense_reward' || category == 'income_reward') return '奖金'
+    if (category == 'income_salary') return '工资'
+    if (category == 'income_finance') return '理财盈利'
+    return mode == 'income' ? '工资' : '购物'
+  }
+
+  private static formatDebugPreview(text: string): string {
+    let value = DeskPetBillCaptureService.normalizeText(text).replace(/\s+/g, ' / ').trim()
+    if (value.length > 240) value = value.substring(0, 240) + '...'
+    return value == '' ? '无' : value
+  }
+}

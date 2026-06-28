@@ -1,0 +1,482 @@
+﻿
+// =================================================================================================
+// 1. 跨平台通用模块导入
+// =================================================================================================
+import { AlarmScheduler } from '@/services/sys/alarm/AlarmScheduler.uts';
+import { Permission, type PermissionKey } from '@/services/sys/Permission.uts';
+// 新增导入
+import { TimelineBiz } from '../../biz/TimelineBiz.uts';
+import { TaskBiz } from '../../biz/TaskBiz.uts';
+
+
+// #ifdef APP-HARMONY
+import { common } from '@kit.AbilityKit';
+// #endif
+// =================================================================================================
+// 2. Android 原生模块导入（仅 Android 可用）
+// =================================================================================================
+// #ifdef APP-ANDROID
+import { UTSAndroid } from 'io.dcloud.uts';
+import Settings from "android.provider.Settings";
+import KeepAliveService from "@/nativeplugins/KeepAliveService/KeepAliveService.uts";
+import { FloatingTimer } from '../../../native/FloatingTimer.uts';
+import { NotificationService } from '@/services/sys/alarm/NotificationService.uts';
+// #endif
+// #ifdef APP-ANDROID
+// import { UTSJSONObject } from 'io.dcloud.uts';
+// #endif
+
+// =================================================================================================
+// 3. 类型定义
+// =================================================================================================
+export type TomatoMode = 'focus' | 'break';
+export type TimerType = 'countdown' | 'countup';
+
+class TomatoPendingStart {
+  kind: string = "";
+  taskId: string | null = null;
+  taskTitle: string = "";
+  timerType: TimerType = 'countdown';
+  durationSeconds: number = 0;
+}
+
+// 定义固定 ID 防止冲突
+// const ALARM_ID_BREAK = -100;
+// const ALARM_ID_FOCUS = -101;
+// 定义固定 ID（使用负数，AlarmScheduler 会自动转换为 100000+ 用于鸿蒙）
+const ALARM_ID_BREAK = "-1999";
+const ALARM_ID_FOCUS = "-2000";
+export class TomatoService {
+	
+  private static _instance: TomatoService | null = null;
+  private static _pendingStart: TomatoPendingStart | null = null
+  
+  static getInstance(): TomatoService {
+    if (TomatoService._instance == null) {
+      TomatoService._instance = new TomatoService();
+    }
+    return TomatoService._instance!;
+  }
+
+  isRunning: boolean = false;
+  mode: TomatoMode = 'focus';
+  timerType: TimerType = 'countup';
+  startTime: number = 0;
+  private expectedEndTimeMs: number = 0;
+  timeElapsed: number = 0; // seconds
+  timeLeft: number = 0; // seconds
+  taskId: string | null = null;
+  taskTitle: string = "";
+  focusDuration: number = 25 * 60;
+  
+  private timerId: number = -1;
+
+  private static getCountdownMissingPermissions(): PermissionKey[] {
+    try {
+	  const need: PermissionKey[] = ['notification', 'overlay', 'exactAlarm', 'autoStart']
+      const states = Permission.statuses(need)
+      const missing: PermissionKey[] = []
+      for (let i = 0; i < states.length; i++) {
+        if (!states[i].granted) missing.push(states[i].key)
+      }
+      return missing
+    } catch (_e) {
+      return []
+    }
+  }
+
+  private static promptCountdownPermissionsIfMissing(): boolean {
+    const missing = TomatoService.getCountdownMissingPermissions()
+    if (missing.length <= 0) return true
+
+    // 若权限不足，不仅不启动计时，也要清理可能残留的番茄钟兜底闹钟
+    try {
+      AlarmScheduler.cancelAlarm(ALARM_ID_FOCUS)
+      AlarmScheduler.cancelAlarm(ALARM_ID_BREAK)
+    } catch (_eCancel) { }
+
+    try {
+      const emitData = new Map<string, any>();
+      emitData.set('show', true);
+      emitData.set('permissions', missing);
+      uni.$emit('permission-modal', emitData);
+    } catch (_e2) { }
+    return false
+  }
+
+  static setPendingStart(p: TomatoPendingStart | null): void {
+    TomatoService._pendingStart = p
+  }
+
+  static tryResumePendingStart(): boolean {
+    const p = TomatoService._pendingStart
+    if (p == null) return false
+    // 不在这里重复弹窗，避免 onShow 反复打断
+    const missing = TomatoService.getCountdownMissingPermissions()
+    if (missing.length > 0) return false
+
+    TomatoService._pendingStart = null
+    
+    // Auto-close permission modal on success
+    try {
+      const emitData = new Map<string, any>();
+      emitData.set('show', false);
+      uni.$emit('permission-modal', emitData);
+    } catch (_e) { }
+
+    const svc = TomatoService.getInstance()
+    if (p.kind == 'focus') {
+      svc.startFocus(p.taskId, p.taskTitle, p.timerType, p.durationSeconds)
+      return true
+    }
+    svc.startBreak(p.durationSeconds)
+    return true
+  }
+  startFocus(taskId: string | null, taskTitle: string, timerType: TimerType = 'countup', duration: number = 25 * 60) {
+    console.log(`[TomatoService] startFocus requested. running=${this.isRunning}, type=${timerType}`)
+    if (this.isRunning) return;
+    
+  // 倒计时模式：权限未就绪则不启动，先弹出权限引导
+	if (timerType == 'countdown') {
+		const missing = TomatoService.getCountdownMissingPermissions()
+        console.log(`[TomatoService] Missing permissions: ${JSON.stringify(missing)}`)
+        
+        if (missing.length > 0) {
+          const p = new TomatoPendingStart()
+          p.kind = 'focus'
+          p.taskId = taskId
+          p.taskTitle = taskTitle
+          p.timerType = timerType
+          p.durationSeconds = duration
+          TomatoService.setPendingStart(p)
+          
+          console.log('[TomatoService] Emitting permission-modal event')
+          try {
+            const emitData = new Map<string, any>();
+            emitData.set('show', true);
+            emitData.set('permissions', missing);
+            uni.$emit('permission-modal', emitData);
+          } catch (err) {
+            console.error('[TomatoService] Failed to emit modal', err)
+          }
+          return
+        }
+	}
+  TomatoService.setPendingStart(null)
+  
+  console.log('[TomatoService] Starting timer logic...')
+
+    this.mode = 'focus';
+    this.taskId = taskId;
+    this.taskTitle = taskTitle;
+    this.timerType = timerType;
+    this.focusDuration = duration;
+    this.timeElapsed = 0;
+      // ---------------------------------------------------------
+        // [新增] 鸿蒙端预加载音振资源
+        // ---------------------------------------------------------
+        // #ifdef APP-HARMONY
+        try {
+            const context = this.getContext(); // 需要封装一个获取 UIContext 的方法，或通过参数传入
+            if (context) {
+
+            }
+        } catch(e) { console.error("Haptic init fail", e)}
+        // #endif
+        // ---------------------------------------------------------
+    
+        if (this.timerType == 'countdown') {
+          this.timeLeft = this.focusDuration;
+          const endTime = Date.now() + (this.timeLeft * 1000);
+          this.expectedEndTimeMs = endTime;
+          const alarmTitle = taskTitle != "" ? `专注结束: ${taskTitle}` : "专注结束";
+          
+		  // 设置系统兜底闹钟
+          AlarmScheduler.setAlarm(ALARM_ID_FOCUS, alarmTitle, endTime);
+        } else {
+          this.timeLeft = 0;
+          this.expectedEndTimeMs = 0;
+        }
+    
+        this.startTime = Date.now();
+        this.isRunning = true;
+        this.startInternalTimer();
+      }
+    // 辅助方法：获取 Context（简单实现，建议结合 UI 传入）
+		private getContext(): any | null {
+        // 在 Uni-app x 中获取 Host Context 可能需要技巧，
+        // 建议在页面的 onReady 中调用 TomatoService.getInstance().setContext(...)
+        // 这里仅为演示，假设你能获取到
+		    return null; 
+		}
+ 
+  //   if (this.timerType == 'countdown') {
+  //     this.timeLeft = this.focusDuration;
+	 //   console.log('TomatoService,startFocus',this.timeLeft)
+  //     const endTime = Date.now() + (this.timeLeft * 1000);
+  //     const alarmTitle = taskTitle != "" ? `涓撴敞缁撴潫: ${taskTitle}` : "涓撴敞缁撴潫";
+      
+  //     // [安全调用] AlarmScheduler 内部已做 try-catch，这里可直接调用
+  //     // 即使鸿蒙设置闹钟失败，也不会中断番茄钟
+    // // 问题在这
+  //     AlarmScheduler.setAlarm(ALARM_ID_FOCUS, alarmTitle, endTime);
+  //   } else {
+  //     this.timeLeft = 0;
+  //   }
+
+  //   this.startTime = Date.now();
+  //   this.isRunning = true;
+    
+  //   this.startInternalTimer();
+  // }
+  // startFocus(taskId: string | null, taskTitle: string, timerType: TimerType = 'countup', duration: number = 25 * 60) {
+  //   if (this.isRunning) return;
+    
+  //   this.mode = 'focus';
+  //   this.taskId = taskId;
+  //   this.taskTitle = taskTitle;
+  //   this.timerType = timerType;
+  //   this.focusDuration = duration;
+
+  //   this.timeElapsed = 0;
+  //   if (this.timerType == 'countdown') {
+  //     this.timeLeft = this.focusDuration;
+      
+  //     const endTime = Date.now() + this.timeLeft * 1000;
+  //     AlarmScheduler.setAlarm(ALARM_ID_FOCUS, "涓撴敞缁撴潫", endTime);
+  //   } else {
+  //     this.timeLeft = 0;
+  //   }
+
+  //   this.startTime = Date.now();
+  //   this.isRunning = true;
+    
+  //   this.startInternalTimer();
+  // }
+
+  startBreak(durationSeconds: number = 300) {
+    if (this.isRunning) return;
+
+  // 休息必然是倒计时：权限未就绪则不启动，先弹出权限引导
+	const ok = TomatoService.promptCountdownPermissionsIfMissing()
+  if (!ok) {
+    const p = new TomatoPendingStart()
+    p.kind = 'break'
+    p.durationSeconds = durationSeconds
+    TomatoService.setPendingStart(p)
+    return
+  }
+  TomatoService.setPendingStart(null)
+    
+    this.mode = 'break';
+    // Break is always countdown
+    this.timerType = 'countdown';
+    this.taskId = null;
+    this.taskTitle = '';
+    this.timeElapsed = 0;
+    this.timeLeft = durationSeconds;
+    this.startTime = Date.now();
+    const endTime = Date.now() + this.timeLeft * 1000;
+    this.expectedEndTimeMs = endTime;
+    this.isRunning = true;
+    
+    AlarmScheduler.setAlarm(ALARM_ID_BREAK, "休息结束", endTime);
+    
+    this.startInternalTimer();
+  }
+
+    stop(cancelAlarm: boolean = true) {
+      this.isRunning = false;
+      this.expectedEndTimeMs = 0;
+      if (this.timerId != -1) {
+        clearInterval(this.timerId);
+        this.timerId = -1;
+      }
+        // [新增] 停止并释放音振资源（防止内存泄漏）
+
+
+      // #ifdef APP-ANDROID
+      try {
+          NotificationService.cancelNotification();
+          // 防御性调用：防止 FloatingTimer 为空或无权限崩溃
+          FloatingTimer.hide();
+          // 防御性调用：防止 KeepAliveService 插件未打包导致崩溃
+          KeepAliveService.stop();
+      } catch (e) {
+          console.warn("停止服务时发生非致命错误（可能是基座缺失权限/插件）:", e);
+      }
+      // #endif
+      
+      if (cancelAlarm) {
+        AlarmScheduler.cancelAlarm(ALARM_ID_BREAK);
+        if (this.mode == 'focus' && this.timerType == 'countdown') {
+            AlarmScheduler.cancelAlarm(ALARM_ID_FOCUS);
+        }
+      }
+    }
+
+   private startInternalTimer() {
+     // #ifdef APP-ANDROID
+     const ctx = UTSAndroid.getAppContext();
+     
+     // 1. 尝试启动保活（如果没有插件，catch 住避免崩溃）
+     try {
+         KeepAliveService.start(this.focusDuration);
+     } catch (e) {
+       console.warn("KeepAliveService 启动失败（可能是标准基座缺失插件，将仅依赖前台服务运行）", e);
+     }
+     
+     // 2. 尝试显示悬浮窗（检查权限 + try-catch）
+     if (ctx != null) {
+         try {
+         // 只有有权限才显示，防止崩溃
+             if (Settings.canDrawOverlays(ctx)) {
+                 FloatingTimer.show(ctx, this.getTimeDisplay());
+                 FloatingTimer.setOnClickListener(() => {
+                   uni.navigateTo({ url: '/pages/tomato/tomato', fail: () => {} });
+                 });
+             } else {
+				 
+           console.log("无悬浮窗权限，跳过悬浮球显示");
+             }
+         } catch(e) {
+         console.warn("悬浮窗初始化失败:", e);
+         }
+     }
+     // #endif
+	
+ //     this.timerId = setInterval(() => {
+ //       if (!this.isRunning) {
+ //         clearInterval(this.timerId);
+ //         return;
+ //       }
+       
+ //       if (this.mode == 'focus') {
+ //         if (this.timerType == 'countup') {
+ //           this.timeElapsed++;
+ //         } else {
+ //           if (this.timeLeft > 0) {
+ //             this.timeLeft--;
+ //           } else {
+ //             this.stop(false); 
+ //             uni.$emit('tomato-finished', { mode: 'focus' });
+ //             return;
+ //           }
+ //         }
+ //       } else {
+ //         if (this.timeLeft > 0) {
+ //           this.timeLeft--;
+ //         } else {
+ //           this.stop(false); 
+ //           uni.$emit('tomato-finished', { mode: 'break' });
+ //           return;
+ //         }
+ //       }
+       this.timerId = setInterval(() => {
+	       if (!this.isRunning) {
+	         clearInterval(this.timerId);
+	         return;
+	       }
+
+         const nowMs = Date.now();
+	       
+	       if (this.mode == 'focus') {
+	         if (this.timerType == 'countup') {
+             if (this.startTime > 0) {
+               this.timeElapsed = Math.floor((nowMs - this.startTime) / 1000);
+             } else {
+               this.timeElapsed++;
+             }
+	         } else {
+             if (this.expectedEndTimeMs > 0) {
+               const left = Math.ceil((this.expectedEndTimeMs - nowMs) / 1000);
+               this.timeLeft = left > 0 ? left : 0;
+             }
+             if (this.timeLeft <= 0) {
+	             // ===================================================
+               // 倒计时结束，触发响铃
+	             // ===================================================
+	             this.triggerFinished(); // 鎶界缁撴潫閫昏緫
+	             return;
+	           }
+	         }
+	       } else {
+           if (this.expectedEndTimeMs > 0) {
+             const left = Math.ceil((this.expectedEndTimeMs - nowMs) / 1000);
+             this.timeLeft = left > 0 ? left : 0;
+           }
+           if (this.timeLeft <= 0) {
+	           // ===================================================
+             // 休息结束，触发响铃
+	           // ===================================================
+	           this.triggerFinished();
+	           return;
+	         }
+	       }
+       const display = this.getTimeDisplay();
+       
+       // #ifdef APP-ANDROID
+       try {
+           NotificationService.updateNotification(this.getStatusText(), display);
+            // 仅当有权限时更新
+           if (ctx != null && Settings.canDrawOverlays(ctx)) {
+              FloatingTimer.update(display);
+           }
+       } catch(e) {}
+       // #endif
+       
+     }, 1000);
+   }
+
+     // [新增] 统一处理结束逻辑
+       private triggerFinished() {
+       // Auto record (countdown focus only): even if UI page isn't open.
+       try {
+           if (this.timerType == 'countdown') {
+           const endTime = Date.now();
+             const startTime = this.startTime > 0 ? this.startTime : (endTime - (this.focusDuration * 1000));
+             const durationMs = endTime - startTime;
+             const mins = Math.floor(durationMs / 1000 / 60);
+
+             if (this.mode == 'focus') {
+               const title = (this.taskTitle == '' ? '无任务' : this.taskTitle);
+               const content = '番茄专注：' + title;
+               TimelineBiz.addPastTimelineEntry(content, startTime, endTime, this.taskId, 'tomato');
+               if (this.taskId != null) {
+                 TaskBiz.addTaskLog(this.taskId!, 'tomato', '完成了' + mins.toString() + ' 分钟专注', []);
+               }
+             } else {
+               // Break completion record
+               const content = '番茄休息：' + mins.toString() + ' 分钟';
+               TimelineBiz.addPastTimelineEntry(content, startTime, endTime, null, 'tomato');
+             }
+         }
+       } catch (_eRecord) { }
+
+       // 1. 播放高品质音振（如果 App 在前台）
+
+       
+       // 2. 发送事件供 UI 弹窗
+       const emitData = new Map<string, any>();
+       emitData.set('mode', this.mode);
+       uni.$emit('tomato-finished', emitData);
+       
+       // 3. 停止计时（但不取消刚才的系统 Alarm，因为系统 Alarm 可能已经响了或正要响，作为兜底）
+       this.stop(false); 
+   }
+  getTimeDisplay(): string {
+    let seconds = 0;
+    if (this.mode == 'focus') {
+      seconds = (this.timerType == 'countup') ? this.timeElapsed : this.timeLeft;
+    } else {
+      seconds = this.timeLeft;
+    }
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  }
+
+  getStatusText(): string {
+    return this.mode == 'focus' ? '专注中' : '休息中';
+  }
+}

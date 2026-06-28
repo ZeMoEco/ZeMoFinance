@@ -1,0 +1,636 @@
+<template>
+	<scroll-view class="finance-assets-scroll asset-page" scroll-y="true">
+		<view class="asset-total-card">
+			<text class="asset-total-label">资产总览</text>
+			<text class="asset-total-amount">{{ formatMoney(netWorth, false) }}</text>
+			<view class="asset-total-row">
+				<text class="asset-total-sub">理财 {{ formatMoney(investTotal, false) }}</text>
+				<text class="asset-total-sub">资金 {{ formatMoney(cashTotal, false) }}</text>
+				<text class="asset-total-sub asset-total-credit">欠款 {{ formatMoney(creditTotal, true) }} / 应收 {{ formatMoney(creditReceivableTotal, false) }}</text>
+			</view>
+		</view>
+
+		<view class="asset-tabs">
+			<view class="asset-tab" v-for="(tab, idx) in assetTabs" :key="tab.key"
+				:class="activeAssetTab == idx ? 'asset-tab-active' : ''" @click="switchAssetTab(idx)">
+				<text class="asset-tab-text" :class="activeAssetTab == idx ? 'asset-tab-text-active' : ''">{{ tab.label }}</text>
+			</view>
+		</view>
+
+		<view class="asset-deck-list">
+			<view class="asset-deck-block" v-for="deck in visibleAssetDecks()" :key="deck.key">
+				<view class="asset-deck-title-row">
+					<text class="asset-deck-title">{{ deck.label }}</text>
+					<view class="asset-deck-total-wrap" @click="toggleDeck(deck.key)">
+						<text class="asset-deck-total" :class="deck.key == 'credit' ? 'asset-deck-total-credit' : ''">{{ deckTotalText(deck.key) }}</text>
+						<text class="asset-deck-limit" v-if="deck.key == 'credit'">额度 {{ formatMoney(creditLimitTotal, false) }}</text>
+						<text class="asset-deck-arrow">{{ isDeckCollapsed(deck.key) ? '⌄' : '⌃' }}</text>
+					</view>
+				</view>
+				<scroll-view class="investment-asset-scroll" v-if="deck.key == 'investment' && !isDeckCollapsed(deck.key)"
+					scroll-x="true" show-scrollbar="false" direction="horizontal"
+					@touchstart="onInvestmentScrollStart" @touchmove="onInvestmentScrollMove"
+					@touchend="onInvestmentScrollEnd" @touchcancel="onInvestmentScrollEnd">
+					<view class="investment-asset-card" v-for="acc in investmentAccountCards()"
+						:key="acc.name" @click="onInvestmentAccountClick(acc)">
+						<view class="asset-card-icon">
+							<text class="asset-card-icon-text">📈</text>
+						</view>
+						<text class="investment-asset-name">{{ investmentAccountDisplayName(acc.name) }}</text>
+						<text class="investment-asset-sub">{{ investmentAccountSubtitle(acc) }}</text>
+						<text class="investment-asset-value">{{ formatMoney(acc.balance, false) }}</text>
+					</view>
+				</scroll-view>
+				<view class="asset-deck-frame" v-if="deck.key != 'investment' && !isDeckCollapsed(deck.key)">
+					<view class="asset-deck" :style="assetDeckBoxStyle(deck.key)"
+						@touchstart="onDeckStart(deck.key, $event)" @touchmove="onDeckMove(deck.key, $event)"
+						@touchend="onDeckEnd(deck.key, $event)" @touchcancel="onDeckEnd(deck.key, $event)">
+						<view class="asset-deck-card" v-for="(acc, idx) in assetAccountsByTab(deck.key)"
+							:key="acc.id" :style="assetDeckCardStyle(deck.key, idx)" @click="onAssetCardClick(acc)">
+							<view class="asset-card-rail">
+								<view class="asset-card-icon">
+									<text class="asset-card-icon-text">{{ getIconForCategory(acc) }}</text>
+								</view>
+								<text class="asset-card-vertical">{{ verticalCardText(acc) }}</text>
+							</view>
+							<view class="asset-card-main">
+								<text class="asset-card-name">{{ acc.name }}</text>
+								<text class="asset-card-sub">{{ accountSubtitle(acc) }}</text>
+							</view>
+							<view class="asset-card-right">
+								<text class="asset-card-value" :class="acc.category == 'credit' && !isReceivableCredit(acc) ? 'asset-card-value-credit' : ''">{{ formatMoney(acc.balance, acc.category == 'credit' && !isReceivableCredit(acc)) }}</text>
+								<text class="asset-card-tag">{{ assetAccountTag(acc) }}</text>
+							</view>
+						</view>
+					</view>
+				</view>
+			</view>
+		</view>
+		<view class="empty-tip" v-if="!hasAssetItems(assetTabs[activeAssetTab].key)">
+			<text class="empty-text">暂无资产</text>
+		</view>
+		<view class="list-bottom-spacer"></view>
+	</scroll-view>
+</template>
+
+<script lang="uts">
+	import { FinanceBiz, AccountNode } from '@/services/biz/FinanceBiz.uts';
+
+	type CategoryDef = {
+		key: string;
+		label: string;
+		icon: string;
+	};
+
+	type InvestAccountCard = {
+		name: string;
+		balance: number;
+		holdingCount: number;
+	};
+
+	export default {
+		emits: ['account', 'fund', 'invest-account', 'gesture-lock'],
+		props: {
+			accounts: { type: Array as PropType<AccountNode[]>, default: () => [] as AccountNode[] },
+			netWorth: { type: Number, default: 0.0 },
+			hideAmount: { type: Boolean, default: false }
+		},
+		data() {
+			return {
+				assetTabs: [
+					{ key: 'all', label: '所有', icon: '' },
+					{ key: 'investment', label: '理财', icon: '' },
+					{ key: 'cash', label: '资金', icon: '' },
+					{ key: 'credit', label: '信贷', icon: '' }
+				] as CategoryDef[],
+				assetDecks: [
+					{ key: 'investment', label: '理财', icon: '' },
+					{ key: 'cash', label: '资金', icon: '' },
+					{ key: 'credit', label: '信贷', icon: '' },
+					{ key: 'heavy', label: '重资产', icon: '' }
+				] as CategoryDef[],
+				activeAssetTab: 0,
+				investmentDeckIndex: 0,
+				cashDeckIndex: 0,
+				creditDeckIndex: 0,
+				heavyDeckIndex: 0,
+				deckStartX: 0.0,
+				deckStartY: 0.0,
+				deckDragX: 0.0,
+				deckDragY: 0.0,
+				deckActiveKey: '',
+				deckMoved: false,
+				deckHorizontalLocked: false,
+				deckSettling: false,
+				deckSettleToken: 0,
+				investTouchStartX: 0.0,
+				investTouchStartY: 0.0,
+				investHorizontalMoving: false,
+				collapsedDeckKeys: [] as string[]
+			}
+		},
+		mounted() {
+			this.loadPersistedDeckIndexes();
+		},
+		watch: {
+			accounts() {
+				this.normalizeDeckIndexes(true);
+			}
+		},
+		computed: {
+			investTotal() : number {
+				return this.categorySumForAsset('investment');
+			},
+			cashTotal() : number {
+				return this.categorySumForAsset('cash');
+			},
+			creditTotal() : number {
+				return this.categorySumForAsset('credit');
+			},
+			creditReceivableTotal() : number {
+				let sum = 0.0;
+				const list = this.assetAccountsByTab('credit');
+				for (let i = 0; i < list.length; i++) {
+					if (this.isReceivableCredit(list[i])) sum += Math.abs(list[i].balance);
+				}
+				return sum;
+			},
+			creditLimitTotal() : number {
+				let sum = 0.0;
+				const list = this.assetAccountsByTab('credit');
+				for (let i = 0; i < list.length; i++) sum += list[i].credit_limit;
+				return sum;
+			}
+		},
+		methods: {
+			switchAssetTab(idx : number) {
+				if (idx < 0 || idx >= this.assetTabs.length) return;
+				this.activeAssetTab = idx;
+			},
+			assetAccountsByTab(key : string) : AccountNode[] {
+				if (key == 'all') return this.accounts;
+				return this.accounts.filter((a : AccountNode) : boolean => a.category == key);
+			},
+			visibleAssetDecks() : CategoryDef[] {
+				const active = this.assetTabs[this.activeAssetTab].key;
+				if (active == 'all') {
+					return this.assetDecks.filter((d : CategoryDef) : boolean => this.hasAssetItems(d.key));
+				}
+				return this.assetDecks.filter((d : CategoryDef) : boolean => d.key == active && this.hasAssetItems(d.key));
+			},
+			hasAssetItems(key : string) : boolean {
+				if (key == 'all') {
+					for (let i = 0; i < this.assetDecks.length; i++) {
+						if (this.hasAssetItems(this.assetDecks[i].key)) return true;
+					}
+					return false;
+				}
+				if (key == 'investment') return this.investmentAccountCards().length > 0;
+				return this.assetAccountsByTab(key).length > 0;
+			},
+			isDeckCollapsed(key : string) : boolean {
+				return this.collapsedDeckKeys.indexOf(key) >= 0;
+			},
+			toggleDeck(key : string) {
+				const idx = this.collapsedDeckKeys.indexOf(key);
+				if (idx >= 0) {
+					this.collapsedDeckKeys.splice(idx, 1);
+					return;
+				}
+				this.collapsedDeckKeys.push(key);
+			},
+			categorySumForAsset(key : string) : number {
+				let sum = 0.0;
+				const list = this.assetAccountsByTab(key);
+				for (let i = 0; i < list.length; i++) {
+					if (key == 'credit' && this.isReceivableCredit(list[i])) continue;
+					sum += key == 'credit' ? Math.abs(list[i].balance) : list[i].balance;
+				}
+				return sum;
+			},
+			isReceivableCredit(acc : AccountNode) : boolean {
+				return FinanceBiz.isReceivableCreditAccount(acc);
+			},
+			investmentAccountCards() : InvestAccountCard[] {
+				const cards = [] as InvestAccountCard[];
+				const list = this.assetAccountsByTab('investment');
+				for (let i = 0; i < list.length; i++) {
+					const acc = list[i];
+					let name = (acc.provider ?? '').toString().trim();
+					if (name == '') name = '默认账户';
+					let found = false;
+					for (let j = 0; j < cards.length; j++) {
+						if (cards[j].name == name) {
+							cards[j].balance += acc.balance;
+							if (acc.sub_type != '账户现金') cards[j].holdingCount += 1;
+							found = true;
+							break;
+						}
+					}
+					if (!found) {
+						cards.push({
+							name: name,
+							balance: acc.balance,
+							holdingCount: acc.sub_type == '账户现金' ? 0 : 1
+						} as InvestAccountCard);
+					}
+				}
+				const customAccounts = this.customInvestAccountNames();
+				for (let k = 0; k < customAccounts.length; k++) {
+					const name = customAccounts[k];
+					let exists = false;
+					for (let m = 0; m < cards.length; m++) {
+						if (cards[m].name == name) {
+							exists = true;
+							break;
+						}
+					}
+					if (!exists) {
+						cards.push({
+							name: name,
+							balance: 0.0,
+							holdingCount: 0
+						} as InvestAccountCard);
+					}
+				}
+				return cards;
+			},
+			customInvestAccountNames() : string[] {
+				const names = [] as string[];
+				let raw = uni.getStorageSync('finance_invest_accounts');
+				if (raw == null || raw.toString() == '') raw = uni.getStorageSync('finance_invest_tabs');
+				if (raw == null || raw.toString() == '') return names;
+				try {
+					const parsed = JSON.parse(raw.toString()) as string[];
+					for (let i = 0; i < parsed.length; i++) {
+						const name = (parsed[i] ?? '').toString().trim();
+						if (name == '' || name == '全部' || name == '全部账户' || name == '默认') continue;
+						if (names.indexOf(name) < 0) names.push(name);
+					}
+				} catch (_e) {}
+				return names;
+			},
+			investmentAccountSubtitle(acc : InvestAccountCard) : string {
+				if (acc.holdingCount <= 0) return '暂无持仓';
+				return `${acc.holdingCount} 个持仓`;
+			},
+			investmentAccountTailFor(name : string) : string {
+				const target = name.trim() == '' ? '默认账户' : name.trim();
+				const raw = uni.getStorageSync('finance_invest_account_tails');
+				if (raw != null && raw.toString() != '') {
+					try {
+						const obj = JSON.parse(raw.toString()) as UTSJSONObject;
+						const saved = obj.get(target);
+						if (saved != null && saved.toString().trim() != '') return saved.toString().trim();
+					} catch (_e) {}
+				}
+				const list = this.assetAccountsByTab('investment');
+				for (let i = 0; i < list.length; i++) {
+					const acc = list[i];
+					if (acc.sub_type != '账户现金') continue;
+					const provider = acc.provider.trim() == '' ? '默认账户' : acc.provider.trim();
+					if (provider == target && acc.card_no.trim() != '') return acc.card_no.trim();
+				}
+				return '';
+			},
+			investmentAccountDisplayName(name : string) : string {
+				const target = name.trim() == '' ? '默认账户' : name.trim();
+				const tail = this.investmentAccountTailFor(target);
+				return tail == '' ? target : `${target}(${tail})`;
+			},
+			formatShort(val : number) : string {
+				if (val >= 10000) return `${(val / 10000).toFixed(1)}w`;
+				if (val >= 1000) return `${(val / 1000).toFixed(0)}k`;
+				return val.toFixed(0);
+			},
+			shortDate(ts : number) : string {
+				if (ts <= 0) return '';
+				const d = new Date(ts);
+				return `${(d.getMonth() + 1).toString().padStart(2, '0')}-${d.getDate().toString().padStart(2, '0')}`;
+			},
+			formatMoney(val : number, negative : boolean) : string {
+				if (this.hideAmount) return '¥ ****';
+				const prefix = (negative || val < 0) ? '-¥ ' : '¥ ';
+				return `${prefix}${Math.abs(val).toFixed(2)}`;
+			},
+			deckTotalText(key : string) : string {
+				return this.formatMoney(this.categorySumForAsset(key), key == 'credit');
+			},
+			accountSubtitle(acc : AccountNode) : string {
+				const tail = this.savedCardTailText(acc);
+				if (acc.category == 'investment') {
+					const parts: string[] = [];
+					if (acc.code != '') parts.push(acc.code);
+					if (acc.sub_type != '') parts.push(acc.sub_type);
+					if (tail != '') parts.push(tail);
+					return parts.length > 0 ? parts.join(' · ') : '投资';
+				}
+				if (acc.category == 'credit') {
+					const parts: string[] = [];
+					if (acc.sub_type != '') parts.push(acc.sub_type);
+					if (acc.provider != '') parts.push(acc.provider);
+					if (tail != '') parts.push(tail);
+					if (FinanceBiz.isInstallmentCreditAccount(acc)) {
+						const remain = acc.installment_count - acc.installment_paid;
+						if (remain > 0) parts.push(`剩${remain}期`);
+						if (acc.installment_next_due_at > 0) parts.push(this.shortDate(acc.installment_next_due_at));
+					}
+					if (acc.credit_limit > 0) parts.push(`额度 ¥${acc.credit_limit.toFixed(0)}`);
+					return parts.length > 0 ? parts.join(' · ') : '信贷';
+				}
+				const cashParts: string[] = [];
+				if (acc.provider != '') cashParts.push(acc.provider);
+				if (tail != '') cashParts.push(tail);
+				if (cashParts.length > 0) return cashParts.join(' · ');
+				return acc.type;
+			},
+			savedCardTailText(acc : AccountNode) : string {
+				const saved = (acc.card_no ?? '').toString().trim();
+				if (saved != '') {
+					const tail = saved.length > 4 ? saved.substring(saved.length - 4) : saved;
+					return `*${tail}`;
+				}
+				return '';
+			},
+			cardNoText(acc : AccountNode) : string {
+				const savedTail = this.savedCardTailText(acc);
+				if (savedTail != '') return savedTail;
+				if (acc.code != '') {
+					const c = acc.code;
+					return c.length > 4 ? `*${c.substring(c.length - 4)}` : c;
+				}
+				const raw = acc.id == '' ? acc.name : acc.id;
+				const tail = raw.length > 4 ? raw.substring(raw.length - 4) : raw;
+				return `*${tail}`;
+			},
+			verticalCardText(acc : AccountNode) : string {
+				let text = acc.provider != '' ? acc.provider : this.cardNoText(acc);
+				if (text.length > 5) text = text.substring(0, 5);
+				const chars = [] as string[];
+				for (let i = 0; i < text.length; i++) chars.push(text.substring(i, i + 1));
+				return chars.join('\n');
+			},
+			getIconForCategory(acc : AccountNode) : string {
+				if (acc.category == 'investment') return '📈';
+				if (acc.category == 'credit') return '💳';
+				if (acc.category == 'heavy') return '🏠';
+				const t = acc.type + acc.provider;
+				if (t.includes('微信')) return '💬';
+				if (t.includes('支付宝')) return '🅰️';
+				if (t.includes('银行') || t.includes('卡')) return '🏦';
+				if (t.includes('现金')) return '💵';
+				return '💰';
+			},
+			assetCategoryLabel(key : string) : string {
+				if (key == 'investment') return '理财';
+				if (key == 'cash') return '资金';
+				if (key == 'credit') return '信贷';
+				if (key == 'heavy') return '重资产';
+				return '资产';
+			},
+			assetAccountTag(acc : AccountNode) : string {
+				if (acc.category == 'credit') return this.isReceivableCredit(acc) ? '应收' : '欠款';
+				return this.assetCategoryLabel(acc.category);
+			},
+			assetDeckBoxStyle(key : string) : string {
+				const count = this.assetAccountsByTab(key).length;
+				const h = count <= 1 ? 148 : 158;
+				return `height: ${h}px`;
+			},
+			deckActiveIndex(key : string) : number {
+				if (key == 'investment') return this.investmentDeckIndex;
+				if (key == 'cash') return this.cashDeckIndex;
+				if (key == 'credit') return this.creditDeckIndex;
+				if (key == 'heavy') return this.heavyDeckIndex;
+				return 0;
+			},
+			deckStorageKey(key : string) : string {
+				return `finance_assets_deck_index_${key}`;
+			},
+			setDeckActiveIndex(key : string, idx : number, persist : boolean = true) {
+				let next = idx;
+				if (next < 0) next = 0;
+				const count = this.assetAccountsByTab(key).length;
+				if (count > 0 && next > count - 1) next = count - 1;
+				if (key == 'investment') this.investmentDeckIndex = next;
+				if (key == 'cash') this.cashDeckIndex = next;
+				if (key == 'credit') this.creditDeckIndex = next;
+				if (key == 'heavy') this.heavyDeckIndex = next;
+				if (persist && count > 0) {
+					uni.setStorageSync(this.deckStorageKey(key), next.toString());
+				}
+			},
+			loadPersistedDeckIndexes() {
+				const keys = ['cash', 'credit', 'heavy'] as string[];
+				for (let i = 0; i < keys.length; i++) {
+					const key = keys[i];
+					const raw = uni.getStorageSync(this.deckStorageKey(key));
+					if (raw == null || raw.toString().trim() == '') continue;
+					const idx = parseInt(raw.toString());
+					if (!isNaN(idx)) this.setDeckActiveIndex(key, idx, false);
+				}
+				this.normalizeDeckIndexes(false);
+			},
+			normalizeDeckIndexes(persist : boolean = true) {
+				this.setDeckActiveIndex('cash', this.cashDeckIndex, persist);
+				this.setDeckActiveIndex('credit', this.creditDeckIndex, persist);
+				this.setDeckActiveIndex('heavy', this.heavyDeckIndex, persist);
+			},
+			assetDeckCardStyle(key : string, idx : number) : string {
+				const count = this.assetAccountsByTab(key).length;
+				if (count == 0) return 'display: none';
+				let active = this.deckActiveIndex(key);
+				if (active < 0) active = 0;
+				if (active > count - 1) active = count - 1;
+				let progress = 0.0;
+				if (this.deckActiveKey == key) {
+					progress = -this.deckDragX / 110.0;
+					const forwardMaxRaw = count - active - 1;
+					const backwardMaxRaw = active;
+					const forwardMax = forwardMaxRaw > 2 ? 2.0 : parseFloat(forwardMaxRaw.toString());
+					const backwardMax = backwardMaxRaw > 2 ? 2.0 : parseFloat(backwardMaxRaw.toString());
+					if (progress > forwardMax) progress = forwardMax;
+					if (progress < -backwardMax) progress = -backwardMax;
+				}
+				const signedOffset = idx - active;
+				const slot = signedOffset - progress;
+				const absSlot = Math.abs(slot);
+				if (absSlot > 2.35) return 'display: none';
+				const visibleSlot = absSlot;
+				let distance = 0.0;
+				if (visibleSlot <= 1.0) {
+					distance = visibleSlot * 68.0;
+				} else if (visibleSlot <= 2.0) {
+					distance = 68.0 + (visibleSlot - 1.0) * 50.0;
+				} else {
+					distance = 118.0 + (visibleSlot - 2.0) * 36.0;
+				}
+				const translateX = slot < 0.0 ? -distance : distance;
+				const translateY = 0.0;
+				const scale = 1.0 - visibleSlot * 0.045;
+				const z = Math.round(100.0 - visibleSlot * 16.0);
+				const shadow = absSlot < 0.34 ? 'box-shadow: 0 18px 30px rgba(44,62,92,0.18);' : 'box-shadow: 0 8px 18px rgba(44,62,92,0.10);';
+				const moving = this.deckActiveKey == key && !this.deckSettling && (Math.abs(this.deckDragX) > 0 || Math.abs(this.deckDragY) > 0);
+				const transition = moving ? '' : 'transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);';
+				return `position: absolute; left: 50%; top: 0px; width: 225px; margin-left: -112.5px; z-index: ${z}; ${shadow} ${transition} transform: translate(${translateX}px, ${translateY}px) scale(${scale}); opacity: 1`;
+			},
+			onDeckStart(key : string, e : UniTouchEvent) {
+				if (this.deckSettling) return;
+				this.$emit('gesture-lock', true);
+				this.deckHorizontalLocked = true;
+				if (this.assetAccountsByTab(key).length <= 1) return;
+				this.deckActiveKey = key;
+				this.deckStartX = e.touches[0].clientX;
+				this.deckStartY = e.touches[0].clientY;
+				this.deckDragX = 0.0;
+				this.deckDragY = 0.0;
+				this.deckMoved = false;
+			},
+			onDeckMove(key : string, e : UniTouchEvent) {
+				if (this.deckSettling) return;
+				if (this.deckActiveKey != key) return;
+				const dx = e.touches[0].clientX - this.deckStartX;
+				const dy = e.touches[0].clientY - this.deckStartY;
+				if (Math.abs(dx) <= Math.abs(dy)) return;
+				if (!this.deckHorizontalLocked) {
+					this.deckHorizontalLocked = true;
+					this.$emit('gesture-lock', true);
+				}
+				e.stopPropagation();
+				e.preventDefault();
+				this.deckDragX = dx;
+				if (Math.abs(dx) > 8) this.deckMoved = true;
+			},
+			onDeckEnd(key : string, _e : UniTouchEvent) {
+				if (this.deckActiveKey != key) {
+					this.deckHorizontalLocked = false;
+					this.$emit('gesture-lock', false);
+					return;
+				}
+				const count = this.assetAccountsByTab(key).length;
+				const delta = this.deckDragX;
+				if (Math.abs(delta) < 1.0) {
+					this.deckActiveKey = '';
+					this.deckDragX = 0.0;
+					this.deckDragY = 0.0;
+					this.deckHorizontalLocked = false;
+					this.$emit('gesture-lock', false);
+					return;
+				}
+				const current = this.deckActiveIndex(key);
+				let targetIndex = current;
+				let targetDragX = 0.0;
+				if (Math.abs(delta) > 32 && count > 1) {
+					let steps = Math.round(Math.abs(delta) / 110.0);
+					if (steps < 1) steps = 1;
+					if (steps > 2) steps = 2;
+					if (delta > 0) {
+						if (steps > current) steps = current;
+						targetIndex = current - steps;
+						targetDragX = 110.0 * steps;
+					} else {
+						const forwardAvailable = count - current - 1;
+						if (steps > forwardAvailable) steps = forwardAvailable;
+						targetIndex = current + steps;
+						targetDragX = -110.0 * steps;
+					}
+				}
+				const settleToken = this.deckSettleToken + 1;
+				this.deckSettleToken = settleToken;
+				this.deckSettling = true;
+				this.deckDragY = 0.0;
+				setTimeout(() => {
+					if (this.deckSettleToken != settleToken) return;
+					this.deckDragX = targetDragX;
+				}, 0);
+				setTimeout(() => {
+					if (this.deckSettleToken != settleToken) return;
+					this.setDeckActiveIndex(key, targetIndex);
+					this.deckActiveKey = '';
+					this.deckDragX = 0.0;
+					this.deckDragY = 0.0;
+					this.deckSettling = false;
+					this.deckHorizontalLocked = false;
+					this.$emit('gesture-lock', false);
+				}, 200);
+			},
+			onInvestmentScrollStart(e : UniTouchEvent) {
+				this.investTouchStartX = e.touches[0].clientX;
+				this.investTouchStartY = e.touches[0].clientY;
+				this.investHorizontalMoving = true;
+				this.$emit('gesture-lock', true);
+			},
+			onInvestmentScrollMove(e : UniTouchEvent) {
+				const dx = e.touches[0].clientX - this.investTouchStartX;
+				const dy = e.touches[0].clientY - this.investTouchStartY;
+				if (Math.abs(dx) <= Math.abs(dy)) return;
+				e.stopPropagation();
+			},
+			onInvestmentScrollEnd(_e : UniTouchEvent) {
+				this.investHorizontalMoving = false;
+				this.$emit('gesture-lock', false);
+			},
+			onAssetCardClick(acc : AccountNode) {
+				if (this.deckMoved) {
+					this.deckMoved = false;
+					return;
+				}
+				if (acc.category == 'investment') {
+					this.$emit('fund', acc);
+					return;
+				}
+				this.$emit('account', acc);
+			},
+			onInvestmentAccountClick(acc : InvestAccountCard) {
+				this.$emit('invest-account', acc.name);
+			}
+		}
+	}
+</script>
+
+<style>
+	.finance-assets-scroll { flex: 1; width: 100%; height: 100%; padding: 10px 0 0 0; box-sizing: border-box; border-radius: 10px; overflow: visible; }
+	.asset-page { padding-top: 0; }
+	.asset-total-card { background-color: rgba(255,255,255,0.62); border-radius: 16px; padding: 16px; margin: 0 14px 12px 14px; border-width: 1px; border-color: rgba(255,255,255,0.72); box-shadow: 0 12px 28px rgba(44,62,92,0.10); }
+	.asset-total-label { font-size: 12px; color: #748097; margin-bottom: 6px; }
+	.asset-total-amount { font-size: 28px; font-weight: bold; color: #243152; }
+	.asset-total-row { flex-direction: row; margin-top: 12px; }
+	.asset-total-sub { font-size: 12px; color: #758097; margin-right: 16px; }
+	.asset-total-credit { color: #e05050; }
+	.asset-tabs { flex-direction: row; background-color: rgba(255,255,255,0.42); border-radius: 12px; padding: 4px; margin: 0 14px 14px 14px; border-width: 1px; border-color: rgba(255,255,255,0.58); }
+	.asset-tab { flex: 1; height: 32px; border-radius: 9px; justify-content: center; align-items: center; }
+	.asset-tab-active { background-color: rgba(255,255,255,0.72); box-shadow: 0 6px 14px rgba(44,62,92,0.08); }
+	.asset-tab-text { font-size: 13px; color: #758097; }
+	.asset-tab-text-active { color: #3b73d9; font-weight: bold; }
+	.asset-deck-list { flex-direction: column; }
+	.asset-deck-block { margin-bottom: 16px; }
+	.asset-deck-title-row { flex-direction: row; justify-content: space-between; align-items: center; padding: 0 18px; margin-bottom: 8px; }
+	.asset-deck-title { font-size: 16px; font-weight: bold; color: #1b2846; }
+	.asset-deck-total-wrap { flex-direction: row; align-items: center; padding-left: 12px; }
+	.asset-deck-total { font-size: 14px; font-weight: bold; color: #3b73d9; }
+	.asset-deck-total-credit { color: #e05050; }
+	.asset-deck-limit { font-size: 12px; color: #8a97a0; margin-left: 8px; }
+	.asset-deck-arrow { font-size: 16px; color: #3b73d9; margin-left: 6px; font-weight: bold; }
+	.asset-deck-frame { margin: 0; border-radius: 0; overflow: visible; background-color: transparent; }
+	.asset-deck { position: relative; overflow: visible; padding: 0; }
+	.asset-deck-card { flex-direction: row; justify-content: space-between; align-items: center; height: 143px; padding: 14px 14px 14px 11px; border-radius: 19px; background-color: #ffffff; border-width: 1px; border-color: #edf2f7; box-shadow: 0 14px 26px rgba(44,62,92,0.16); }
+	.asset-card-rail { width: 44px; height: 112px; justify-content: flex-start; align-items: center; margin-right: 12px; border-radius: 15px; background-color: #f5f8fc; border-width: 1px; border-color: #e8eef6; padding-top: 9px; }
+	.asset-card-icon { width: 30px; height: 30px; border-radius: 10px; background-color: #ffffff; border-width: 1px; border-color: #e7edf5; justify-content: center; align-items: center; margin-bottom: 7px; }
+	.asset-card-icon-text { font-size: 15px; }
+	.asset-card-vertical { font-size: 10px; line-height: 12px; color: #738099; font-weight: bold; text-align: center; }
+	.asset-card-main { flex: 1; min-width: 0; }
+	.asset-card-name { font-size: 14px; font-weight: bold; color: #1b2846; lines: 1; text-overflow: ellipsis; }
+	.asset-card-sub { font-size: 12px; color: #8a97a0; margin-top: 5px; }
+	.asset-card-right { align-items: flex-end; margin-left: 8px; }
+	.asset-card-value { font-size: 14px; font-weight: bold; color: #1b2846; }
+	.asset-card-value-credit { color: #e05050; }
+	.asset-card-tag { font-size: 11px; color: #3b73d9; margin-top: 5px; }
+	.investment-asset-scroll { width: 100%; height: 146px; flex-direction: row; white-space: nowrap; overflow: hidden; }
+	.investment-asset-card { width: 150px; height: 132px; flex-shrink: 0; margin-right: 12px; padding: 12px; border-radius: 14px; background-color: rgba(255,255,255,0.60); border-width: 1px; border-color: rgba(255,255,255,0.72); box-shadow: 0 10px 22px rgba(44,62,92,0.09); }
+	.investment-asset-name { font-size: 15px; font-weight: bold; color: #1b2846; lines: 1; text-overflow: ellipsis; margin-top: 8px; }
+	.investment-asset-sub { font-size: 12px; color: #8a97a0; lines: 1; text-overflow: ellipsis; margin-top: 4px; }
+	.investment-asset-value { font-size: 15px; font-weight: bold; color: #1b2846; margin-top: 8px; }
+	.empty-tip { align-items: center; padding: 20px; }
+	.empty-text { color: #9aa6ac; font-size: 13px; }
+	.list-bottom-spacer { height: 90px; }
+</style>

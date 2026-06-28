@@ -1,0 +1,11 @@
+// // uni_modules/zemo-ai/utssdk/app-android/build.gradle
+
+// apply plugin: 'com.android.library'
+
+// dependencies {
+//     // 强制引用 libs 目录下所有的 .aar 和 .jar
+
+//     implementation fileTree(dir: 'libs', include: ['*.aar', '*.jar']),
+// 	    implementation "com.airbnb.android:lottie:5.2.0",
+// 	    implementation "androidx.core:core:1.10.1"
+// }

@@ -1,0 +1,43 @@
+import { AppRuntimeProfile } from '@/utils/app/AppRuntime.uts'
+
+export const MAIN_APP_PROFILE = {
+  appId: 'zemo.main',
+  dbName: 'ZeMo.db',
+  displayName: '泽墨办',
+  domainKey: 'main',
+} as AppRuntimeProfile
+
+export const INSPIRE_APP_PROFILE = {
+  appId: 'zemo.inspire',
+  dbName: 'ZeMoInspire.db',
+  displayName: '泽墨记',
+  domainKey: 'inspire',
+} as AppRuntimeProfile
+
+export const FINANCE_APP_PROFILE = {
+  appId: 'zemo.finance',
+  dbName: 'ZeMoFinance.db',
+  displayName: '泽墨账',
+  domainKey: 'finance',
+} as AppRuntimeProfile
+
+export const STORAGE_APP_PROFILE = {
+  appId: 'zemo.storage',
+  dbName: 'ZeMoStorage.db',
+  displayName: '泽墨纳',
+  domainKey: 'storage',
+} as AppRuntimeProfile
+
+export const SHOPPING_APP_PROFILE = {
+  appId: 'zemo.shopping',
+  dbName: 'ZeMoShopping.db',
+  displayName: '泽墨买',
+  domainKey: 'shopping',
+} as AppRuntimeProfile
+
+export const COOKING_APP_PROFILE = {
+  appId: 'zemo.cooking',
+  dbName: 'ZeMoCooking.db',
+  displayName: '泽墨吃',
+  domainKey: 'cooking',
+} as AppRuntimeProfile

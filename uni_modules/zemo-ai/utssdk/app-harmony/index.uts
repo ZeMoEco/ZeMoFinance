@@ -1,0 +1,312 @@
+import zemoMindSporeNativeRaw from 'libzemo_mslite_native.so'
+
+const IN_MEMORY_IMAGE_TOKEN = 'zemo://pip-memory-image'
+const SEQ_LEN = 768
+const IMAGE_SIZE = 256
+const VOCAB_SIZE = 6400
+const PAD_TOKEN_ID = 0
+
+const PROMPT_IDS = [
+    1, 832, 311, 234, 1336, 1107, 1055, 77, 5224, 299, 825, 64,
+    2395, 557, 98, 119, 3289, 6171, 50, 2395, 557, 98, 119, 1318,
+    1312, 50, 2851, 98, 301, 121, 611, 791, 50, 306, 102, 1533,
+    98, 1025, 5161, 50, 113, 1634, 47, 422, 4402, 3776, 47, 1890,
+    6171, 1407, 497, 1259, 50, 3915, 653, 50, 113, 3850, 47, 364,
+    103, 1312, 1407, 119, 3811, 302, 234, 234, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 2, 234, 1, 1388, 570, 811, 234, 25,
+    234, 234, 26, 234, 234
+] as number[]
+
+let loadedModelPath = ''
+let modelReady = false
+let modelInputCount = 0
+let lastLoadMessage = ''
+let inMemoryImageValues: Float32Array | null = null
+let maxTokens = 1
+
+interface ZemoMindSporeNative {
+    loadModel(modelPath: string): string
+    predict(inputIds: Int32Array, pixelValues: Float32Array, imageSize: number): Float32Array
+    inputCount(): number
+    inputDiag(): string
+    reset(): void
+}
+
+const zemoMindSporeNative: ZemoMindSporeNative = zemoMindSporeNativeRaw as ZemoMindSporeNative
+
+interface NativeLoadResult {
+    ok: boolean
+    inputCount: number
+    message: string
+    diag: string
+}
+
+export function initModel(modelPath: string): boolean {
+    const path = (modelPath ?? '').toString().trim()
+    if (path == '') {
+        modelReady = false
+        lastLoadMessage = '模型路径为空'
+        console.warn('[MiniMind-O][Native] 模型路径为空')
+        return false
+    }
+    if (modelReady && loadedModelPath == path) return true
+    try {
+        console.log(`[MiniMind-O][Native] 准备加载模型：${path}`)
+        const raw: string = zemoMindSporeNative.loadModel(path)
+        const parsed: NativeLoadResult = JSON.parse(raw) as NativeLoadResult
+        modelReady = parsed.ok == true && parsed.inputCount > 0
+        modelInputCount = parsed.inputCount
+        loadedModelPath = modelReady ? path : ''
+        lastLoadMessage = parsed.message
+        console.log(`[MiniMind-O][Native] 加载结果：ok=${modelReady}, inputs=${modelInputCount}, message=${parsed.message}, diag=${parsed.diag}`)
+        return modelReady
+    } catch (e) {
+        modelReady = false
+        loadedModelPath = ''
+        lastLoadMessage = errorMessage(e as Object)
+        console.warn(`[MiniMind-O][Native] 加载异常：${lastLoadMessage}`)
+        return false
+    }
+}
+
+export function initModelWithNpu(modelPath: string, _useNpu: boolean): boolean {
+    return initModel(modelPath)
+}
+
+export function chatStream(prompt: string, callback: (text: string, done: boolean) => void): void {
+    callback(buildDecisionJson(prompt, '', ''), true)
+}
+
+export function chatMultiModal(prompt: string, imagePath: string, callback: (text: string, done: boolean) => void): void {
+    const path = (imagePath ?? '').toString().trim()
+    let nativeSummary = ''
+    try {
+        if (modelReady) {
+            const pixels: Float32Array = path == IN_MEMORY_IMAGE_TOKEN ? consumeRegisteredImageValues() : new Float32Array(0)
+            const inputIds: Int32Array = buildInputIds()
+            const logits: Float32Array = zemoMindSporeNative.predict(inputIds, pixels, IMAGE_SIZE)
+            nativeSummary = summarizeLogits(logits)
+            if (nativeSummary == 'logits_empty') {
+                console.warn(`[MiniMind-O][Native] 未产出 logits，使用规则兜底：image=${path == '' ? 'none' : path}, pixels=${pixels.length}, inputs=${zemoMindSporeNative.inputDiag()}`)
+            } else {
+                console.log(`[MiniMind-O][Native] 推理完成：image=${path == '' ? 'none' : path}, ${nativeSummary}`)
+            }
+        } else {
+            nativeSummary = `model_not_ready:${lastLoadMessage}`
+            console.warn(`[MiniMind-O][Native] 跳过推理：${nativeSummary}`)
+        }
+    } catch (e) {
+        nativeSummary = `native_error:${errorMessage(e as Object)}`
+        console.warn(`[MiniMind-O][Native] 推理异常：${nativeSummary}`)
+    }
+    callback(buildDecisionJson(prompt, path, nativeSummary), true)
+}
+
+export function registerInMemoryImageValues(values: Float32Array): string {
+    if (values == null || values.length == 0) return ''
+    inMemoryImageValues = values
+    console.log(`[MiniMind-O][Native] 注册内存图片：values=${values.length}`)
+    return IN_MEMORY_IMAGE_TOKEN
+}
+
+export function chatSync(prompt: string): string {
+    return buildDecisionJson(prompt, '', '')
+}
+
+export function chatWithContext(userMessage: string, systemPrompt: string, callback: (text: string, done: boolean) => void): void {
+    chatStream(`${systemPrompt}\n${userMessage}`, callback)
+}
+
+export function clearHistory(): void {}
+
+export function resetModel(): void {
+    try {
+        zemoMindSporeNative.reset()
+    } catch (_e) {}
+    modelReady = false
+    loadedModelPath = ''
+    modelInputCount = 0
+    lastLoadMessage = ''
+    inMemoryImageValues = null
+}
+
+export function setMaxTokens(tokens: number): void {
+    maxTokens = Math.max(1, Math.floor(tokens))
+}
+
+export function isModelReady(): boolean {
+    return modelReady
+}
+
+export function invokeNativePlugin(_className: string, _methodName: string, _argsJson: string): string {
+    return ''
+}
+
+export function addKnowledge(_text: string): boolean {
+    return false
+}
+
+export function setRagEnabled(_enable: boolean): void {}
+
+export function clearKnowledge(): void {}
+
+export function getKnowledgeSize(): number {
+    return 0
+}
+
+export function classifyImage(_path: string): string {
+    return ''
+}
+
+export function loadAuxModel(_key: string, _modelPath: string, _useNpu: boolean): boolean {
+    return false
+}
+
+function buildInputIds(): Int32Array {
+    const ids = new Int32Array(SEQ_LEN)
+    for (let i = 0; i < SEQ_LEN; i++) {
+        ids[i] = i < PROMPT_IDS.length ? PROMPT_IDS[i] : PAD_TOKEN_ID
+    }
+    return ids
+}
+
+function consumeRegisteredImageValues(): Float32Array {
+    const values = inMemoryImageValues
+    inMemoryImageValues = null
+    if (values == null) return new Float32Array(0)
+    return values
+}
+
+function summarizeLogits(logits: Float32Array): string {
+    if (logits == null || logits.length == 0) return 'logits_empty'
+    let offset = logits.length >= VOCAB_SIZE ? logits.length - VOCAB_SIZE : 0
+    let bestId = 0
+    let bestScore = logits[offset]
+    const end = Math.min(logits.length, offset + VOCAB_SIZE)
+    for (let i = offset + 1; i < end; i++) {
+        const value = logits[i]
+        if (value > bestScore) {
+            bestScore = value
+            bestId = i - offset
+        }
+    }
+    return `inputs=${modelInputCount}, logits=${logits.length}, topToken=${bestId}, topScore=${bestScore}, maxTokens=${maxTokens}`
+}
+
+function buildDecisionJson(prompt: string, imagePath: string, nativeSummary: string): string {
+    const text = extractScreenText(prompt)
+    const action = inferAction(text, imagePath)
+    const reason = inferReason(text, imagePath, nativeSummary)
+    const amount = firstAmount(text)
+    const todoTitle = firstTodoTitle(text)
+    const tx = action == 'create_transaction'
+        ? `,"transaction":{"amount":"${escapeJson(amount)}","type":"expense","category":"","note":"${escapeJson(firstNote(text))}","sourceApp":"","payMethod":"","transactionTime":""}`
+        : `,"transaction":null`
+    const todos = action == 'create_todos'
+        ? `,"todos":[{"title":"${escapeJson(todoTitle == '' ? '屏幕待办' : todoTitle)}","description":"","dueTime":"","priority":0}]`
+        : `,"todos":[]`
+    return `{"action":"${action}","confidence":${action == 'none' ? '0.25' : '0.72'},"reason":"${escapeJson(reason)}"${tx}${todos},"activityTitle":"${action == 'record_activity' ? '屏幕活动' : ''}","activityCategory":"${action == 'record_activity' ? 'screen_activity' : ''}"}`
+}
+
+function inferAction(prompt: string, imagePath: string): string {
+    const text = normalize(prompt)
+    if (containsAny(text, ['基金', '持仓', '证券', '股票', 'etf', '净值', '份额', '市值', '盈亏'])) return 'import_investment'
+    if (firstAmount(prompt) != '' && containsAny(text, ['付款', '支付', '消费', '扣款', '收款', '收入', '退款', '转账', '账单', '订单'])) return 'create_transaction'
+    if (containsAny(text, ['提醒', '待办', '安排', '开会', '提交', '确认', '处理', '跟进', '报销', '还款'])) return 'create_todos'
+    if (imagePath != '') return 'record_activity'
+    return 'none'
+}
+
+function inferReason(prompt: string, imagePath: string, nativeSummary: string): string {
+    const prefix = imagePath == '' ? 'OCR 文本场景' : '截图多模态场景'
+    const summary = shouldExposeNativeSummary(nativeSummary) ? `；Native ${nativeSummary}` : ''
+    const preview = limitText(extractScreenText(prompt), 90)
+    return `${prefix}，识别内容：${preview}${summary}`
+}
+
+function firstAmount(text: string): string {
+    const m = /[+\-]?\s*[¥￥]?\s*[0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*(?:元)?/.exec(text)
+    if (m == null || m.length == 0) return ''
+    return m[0].replace(/[¥￥元,\s]/g, '').replace(/^\+/, '').replace(/^-/, '')
+}
+
+function firstNote(text: string): string {
+    const lines = stripPrompt(text).split('\n')
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim()
+        if (line != '' && firstAmount(line) == '') return limitText(line, 48)
+    }
+    return ''
+}
+
+function firstTodoTitle(text: string): string {
+    const lines = stripPrompt(text).split('\n')
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim()
+        if (containsAny(line, ['提醒', '待办', '安排', '开会', '提交', '确认', '处理', '跟进', '报销', '还款'])) return limitText(line, 42)
+    }
+    return ''
+}
+
+function extractScreenText(text: string): string {
+    const value = (text ?? '').toString()
+    const idx = value.indexOf('OCR 文本：')
+    if (idx >= 0) return value.substring(idx + 'OCR 文本：'.length).trim()
+    if (value.indexOf('JSON 结构') >= 0 && value.indexOf('action=') >= 0) return ''
+    if (value.indexOf('JSON 结构') >= 0 && value.indexOf('"action"') >= 0) return ''
+    return value.trim()
+}
+
+function stripPrompt(text: string): string {
+    return extractScreenText(text)
+}
+
+function shouldExposeNativeSummary(nativeSummary: string): boolean {
+    if (nativeSummary == '') return false
+    if (nativeSummary == 'logits_empty') return false
+    if (nativeSummary.indexOf('model_not_ready:') == 0) return false
+    if (nativeSummary.indexOf('native_error:') == 0) return false
+    return true
+}
+
+function normalize(text: string): string {
+    return (text ?? '').toString().toLowerCase()
+}
+
+function containsAny(text: string, keys: string[]): boolean {
+    for (let i = 0; i < keys.length; i++) {
+        if (text.indexOf(keys[i].toLowerCase()) >= 0) return true
+    }
+    return false
+}
+
+function limitText(text: string, limit: number): string {
+    const value = (text ?? '').toString().replace(/\r\n/g, '\n').trim()
+    if (value.length <= limit) return value
+    return value.substring(0, limit)
+}
+
+function escapeJson(value: string): string {
+    return (value ?? '').toString()
+        .replace(/\\/g, '\\\\')
+        .replace(/"/g, '\\"')
+        .replace(/\r/g, '\\r')
+        .replace(/\n/g, '\\n')
+}
+
+function errorMessage(e: Object | null): string {
+    if (e == null) return 'error'
+    try {
+        const err = e as Error
+        if (err.message != null && err.message != '') return err.message
+    } catch (_e0) {}
+    try {
+        return e.toString()
+    } catch (_e1) {}
+    return 'error'
+}

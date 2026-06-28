@@ -1,0 +1,1079 @@
+<template>
+	<view class="footer-area" :style="footerAreaStyle">
+		<!-- 预览区域：选中的图片/文件 -->
+		<scroll-view class="image-preview-bar" direction="horizontal" v-if="selectedImages.length > 0 || selectedFiles.length > 0">
+			<view class="preview-container">
+				<view class="preview-item" v-for="(path, index) in selectedImages" :key="'img_'+index">
+					<image :src="path" mode="aspectFill" class="preview-img" @click="previewSelectedImage(index)" />
+					<view class="preview-delete" @click="removeSelectedImage(index)"><text class="delete-icon">✕</text></view>
+				</view>
+				<view class="preview-item" v-for="(path, index) in selectedFiles" :key="'file_'+index">
+					<view class="preview-file"><text class="preview-file-icon">📄</text><text class="preview-file-name">{{ getFileName(path) }}</text></view>
+					<view class="preview-delete" @click="removeSelectedFile(index)"><text class="delete-icon">✕</text></view>
+				</view>
+			</view>
+		</scroll-view>
+
+		<!-- 回复引用提示区域 -->
+		<view class="reply-context-bar" v-if="isReplying && replyContext != ''">
+			<view class="reply-decor"></view>
+			<text class="reply-label">回复:</text>
+			<text class="reply-content">{{ replyContext }}</text>
+			<view class="reply-close-btn" @click="onCancel">
+				<text class="reply-close-icon">✕</text>
+			</view>
+		</view>
+
+		<!-- 统一 UI 岛 (Unified UI Island) -->
+		<!-- 注意：组件注册名为 UiIsland，对应标签 <ui-island> -->
+		<ui-island :items="displayIslandItems" :activeId="activeIslandId" @select="handleIslandSelect"></ui-island>
+
+		<!-- 输入框区域  -->
+		<view class="input-area-modern" :style="showPanel ? 'padding-bottom: 2px;' : ''">
+			<view class="tool-btn" @click="togglePanel">
+				<!-- 切换图标状态 -->
+				<text class="plus-icon">{{ showPanel ? '×' : '⊕' }}</text>
+			</view>
+			
+			<!-- Removed old template button -->
+			
+			<view class="input-wrapper" :style="inputWrapperStyle">
+				<textarea
+					class="modern-textarea"
+					v-model="inputContent"
+					:placeholder="placeholderText"
+					:style="{ height: textareaHeightPx + 'px' }"
+					:cursor-spacing="30"
+					@input="onInput"
+				></textarea>
+				
+				<view class="input-cancel-btn" v-if="isEditing || isReplying" @click="onCancel">
+					<text class="cancel-icon">✕</text>
+				</view>
+			</view>
+			
+			<view class="send-btn-modern" @click="onSend">
+				<text class="send-text">{{ isEditing ? '更新' : '发送' }}</text>
+			</view>
+		</view>
+
+		<!-- 顶部功能面板 -->
+		<view class="bottom-panel" v-if="showPanel">
+			<scroll-view class="panel-scroll" scroll-y="true" @scrolltolower="loadMorePhotos">
+				<view class="panel-grid">
+					<view class="grid-item" @click="chooseImage('album')">
+						<view class="panel-tile">
+							<text class="tile-icon">🖼️</text>
+							<text class="tile-text">相册</text>
+						</view>
+					</view>
+					<view class="grid-item" @click="chooseImage('camera')">
+						<view class="panel-tile">
+							<text class="tile-icon">📷</text>
+							<text class="tile-text">拍照</text>
+						</view>
+					</view>
+					<view class="grid-item" @click="chooseFile">
+						<view class="panel-tile">
+							<text class="tile-icon">📄</text>
+							<text class="tile-text">文件</text>
+						</view>
+					</view>
+
+					<view class="grid-item" v-for="(photo, idx) in recentPhotos" :key="'p_'+idx" @click="selectRecentPhoto(photo)">
+						<view class="panel-tile photo-tile">
+							<image :src="photo" mode="aspectFill" class="tile-photo" />
+							<view class="photo-check" v-if="selectedImages.includes(photo)">
+								<text class="check-icon">✓</text>
+							</view>
+						</view>
+					</view>
+				</view>
+				<view class="loading-more" v-if="isLoadingPhotos">
+					<text class="loading-text">加载中...</text>
+				</view>
+				
+				<view style="height: 40px;"></view>
+			</scroll-view>
+		</view>
+
+		<!-- 模板弹窗 (使用 GenericModal 上弹窗) -->
+		<generic-modal 
+			:modelValue="activeTemplate != ''" 
+			@update:modelValue="onModalUpdate"
+			mode="bottom" 
+			:title="getTemplateTitle()" 
+			:showFooter="false"
+		>
+			<!-- 收纳模板表单 -->
+			<view v-if="activeTemplate == 'storage'" class="card-body">
+				<input class="form-input" v-model="tempForm.name" placeholder="📦 物品名称" />
+				<view class="form-row">
+					<input class="form-input flex-1" v-model="tempForm.location" placeholder="📍 存放位置" />
+					<view class="icon-btn" @click="quickLocation">
+						<text class="btn-icon">📍</text>
+					</view>
+				</view>
+				
+				<view class="photo-area" @click="quickCamera">
+					<image v-if="tempForm.imagePath != ''" :src="tempForm.imagePath" mode="aspectFill" class="form-img" />
+					<view v-else class="camera-placeholder">
+						<text class="cam-icon">📷</text>
+						<text class="cam-text">拍照存档</text>
+					</view>
+				</view>
+			</view>
+
+			<view class="card-footer">
+				<view class="submit-btn" @click="submitTemplate">
+					<text class="submit-text">确认并填入</text>
+				</view>
+			</view>
+		</generic-modal>
+	</view>
+</template>
+
+<script lang="uts">
+	import { PropType } from 'vue';
+
+	// #ifdef APP-ANDROID
+	import Intent from "android.content.Intent";
+	import UTSAndroid from "io.dcloud.uts.UTSAndroid";
+	import Activity from 'android.app.Activity';
+	import Uri from 'android.net.Uri';
+	import File from 'java.io.File';
+	import FileOutputStream from 'java.io.FileOutputStream';
+	import BufferedInputStream from 'java.io.BufferedInputStream';
+	import OpenableColumns from 'android.provider.OpenableColumns';
+	import InputStream from 'java.io.InputStream';
+	
+	// 相册读取相关
+	import MediaStore from 'android.provider.MediaStore';
+	import Cursor from 'android.database.Cursor';
+	import ContentUris from 'android.content.ContentUris';
+	import Build from 'android.os.Build';
+	// #endif
+
+
+	import GenericModal from '@/components/sys/GenericModal.uvue';
+	import UIIsland, { IslandItem } from '@/components/sys/UIIsland.uvue';
+	import { AppDialogApi, ZemoPreviewImageOptions, SelectionModalOptions } from '@/components/sys/AppDialogApi.uts';
+
+	export type SendPayload = {
+		content: string;
+		images: string[];
+		files: string[];
+	}
+
+	type TemplateForm = {
+		name: string;
+		location: string;
+		imagePath: string;
+		content: string;
+	}
+
+		export default {
+			components: { GenericModal, UiIsland: UIIsland },
+			emits: ['send', 'cancel', 'height-change', 'keyboard-height-change', 'island-action'],
+		props: {
+			placeholder: { type: String, default: "写点什么..." },
+			isEditing: { type: Boolean, default: false },
+			isReplying: { type: Boolean, default: false },
+			replyContext: { type: String, default: "" },
+			initialContent: { type: String, default: "" },
+			transparency: { type: Number, default: 0.9 },
+			useGlassStyle: { type: Boolean, default: false },
+			
+			// New props for dynamic island
+			islandMode: { type: String, default: "default" }, // default | task | timeline
+			customIslandItems: { type: Array as PropType<IslandItem[]>, default: () => [] as IslandItem[] },
+			activeIslandId: { type: String, default: "" },
+			initialImages: { type: Array as PropType<string[]>, default: () => [] as string[] },
+			initialFiles: { type: Array as PropType<string[]>, default: () => [] as string[] }
+		},
+		data() {
+			return {
+				inputContent: "",
+				showPanel: false,
+				selectedImages: [] as string[],
+				selectedFiles: [] as string[],
+					maxInputHeightPx: 300,
+					windowWidthPx: 0,
+					textareaHeightPx: 24,
+					keyboardHeightPx: 0,
+				
+				// 相册预加载相关
+				recentPhotos: [] as string[],
+				photoOffset: 0,
+				photoLimit: 20,
+				isLoadingPhotos: false,
+				hasMorePhotos: true,
+
+				// 模板相关
+				activeTemplate: "",
+				tempForm: {
+					name: "",
+					location: "",
+					imagePath: "",
+					content: ""
+				} as TemplateForm,
+				componentActive: true
+			}
+		},
+		unmounted() {
+			this.componentActive = false;
+		},
+		computed: {
+			clampedTransparency(): number {
+				let t = this.transparency;
+				if (t < 0) t = 0;
+				if (t > 1) t = 1;
+				return t;
+			},
+			footerAreaStyle(): string {
+				if (!this.useGlassStyle) return "";
+				const bgA = this.clampedTransparency;
+				let borderA = bgA + 0.08;
+				if (borderA > 1) borderA = 1;
+				return `background-color: rgba(255, 255, 255, ${bgA}); border: 1px solid rgba(255, 255, 255, ${borderA});`;
+			},
+			inputWrapperStyle(): string {
+				if (!this.useGlassStyle) return "";
+				let bgA = this.clampedTransparency * 0.75;
+				if (bgA < 0.12) bgA = 0.12;
+				let borderA = bgA * 0.65;
+				if (borderA > 1) borderA = 1;
+				return `background-color: rgba(255, 255, 255, ${bgA}); border: 1px solid rgba(255, 255, 255, ${borderA});`;
+			},
+			placeholderText(): string {
+				if (this.isEditing) return "修改记录...";
+				if (this.isReplying) return "补充进展...";
+				return this.placeholder;
+			},
+			displayIslandItems(): IslandItem[] {
+				// New item "项目 (Project)"
+				const visionItem = { id: 'vision', label: '项目', icon: '🗺️' } as IslandItem;
+
+				if (this.customIslandItems.length > 0) {
+					return [visionItem, ...this.customIslandItems];
+				}
+
+				const templates = [
+					{ id: 'storage', label: '收纳', icon: '📦' }
+				] as IslandItem[];
+
+				if (this.islandMode == 'task') {
+					// 任务详情岛 (包含模板)
+					return [
+						visionItem,
+						{ id: 'logs', label: '进展', icon: '📝' },
+						{ id: 'notes', label: '笔记', icon: '📓' },
+						{ id: 'map', label: '星系', icon: '🪐' },
+						{ id: 'archive', label: '归档', icon: '🕒' },
+						{ id: 'subtask', label: '子任务', icon: '➕' },
+						...templates
+					] as IslandItem[];
+				} else if (this.islandMode == 'timeline') {
+					// 时间线主题岛
+					return [
+						visionItem,
+						{ id: 'day', label: '今日', icon: '📅' },
+						{ id: 'week', label: '本周', icon: '📊' },
+						{ id: 'month', label: '本月', icon: '🗓️' },
+						{ id: 'filter', label: '筛选', icon: '🔍' },
+						...templates
+					] as IslandItem[];
+				} else {
+					// 默认模板岛
+					return [visionItem, ...templates];
+				}
+			}
+		},
+		watch: {
+			initialContent(val: string) {
+				this.inputContent = val;
+				// Fix: Auto-adjust height when content is pre-filled (e.g. editing progress)
+				this.textareaHeightPx = this.calcTextareaHeightPx(this.inputContent);
+				setTimeout(() => { this.emitHeightChange(); }, 0);
+			},
+			showPanel(val: boolean) {
+				if (val && this.recentPhotos.length == 0) {
+					// 打开面板时，如果没加载过照片，则加载
+					this.loadRecentPhotos();
+				}
+			},
+			initialImages(val: string[]) {
+				this.selectedImages = [...val];
+				setTimeout(() => { this.emitHeightChange(); }, 0);
+			},
+			initialFiles(val: string[]) {
+				this.selectedFiles = [...val];
+				setTimeout(() => { this.emitHeightChange(); }, 0);
+			}
+		},
+		mounted() {
+				try {
+					const sysAny = uni.getSystemInfoSync();
+					const sys = sysAny as UTSJSONObject;
+					const whVal = sys['windowHeight'];
+					const wwVal = sys['windowWidth'];
+					let wh = 0;
+					let ww = 0;
+					try { if (whVal != null) wh = parseInt(whVal.toString()); } catch (_e0) {}
+					try { if (wwVal != null) ww = parseInt(wwVal.toString()); } catch (_e1) {}
+					if (wh > 0) this.maxInputHeightPx = Math.floor(wh * 0.5);
+					if (ww > 0) this.windowWidthPx = ww;
+				} catch (_e) {}
+				this.textareaHeightPx = this.calcTextareaHeightPx(this.inputContent);
+				this.emitHeightChange();
+				// Fallback: listen keyboard height globally (more reliable than textarea event on some Android IMEs)
+				try {
+					uni.onKeyboardHeightChange((res: any) => {
+						let h = 0;
+						try {
+							const r = res as UTSJSONObject;
+							const hv = r['height'];
+							if (hv != null) h = parseInt(hv.toString());
+						} catch (_e0) { h = 0; }
+						if (h < 0) h = 0;
+						this.keyboardHeightPx = h;
+						this.$emit('keyboard-height-change', h);
+						setTimeout(() => { this.emitHeightChange(); }, 0);
+					});
+				} catch (_eK) {}
+
+			// #ifdef APP-ANDROID
+			UTSAndroid.onAppActivityResult((requestCode : number, resultCode : number, data : Intent | null) => {
+				if (!this.componentActive) return;
+				if (requestCode == 8765 && resultCode == Activity.RESULT_OK && data != null) {
+					const uri = data.getData();
+					if (uri != null) this.handleNativeFileSelection(uri);
+				}
+			});
+			// #endif
+
+		},
+		methods: {
+			openQuickTaskModal(scene: string) {
+				let title = '快速创建任务';
+				let mode = 'quick-create';
+				let initialScene = 'recipe';
+
+				if (scene == 'recipe') {
+					title = '快速导入食谱任务';
+					mode = 'recipe-import';
+					initialScene = 'recipe';
+				} else if (scene == 'courier') {
+					title = '快速创建日常任务';
+					mode = 'courier-pickup';
+					initialScene = 'courier';
+				} else if (scene == 'storage') {
+					title = '快速录入物品到储物箱';
+					mode = 'storage-item';
+					initialScene = 'storage';
+				}
+
+				const selectionOptions: SelectionModalOptions = {
+					title: title,
+					mode: mode,
+					initialScene: initialScene,
+					onSubmit: (_result: any) => {
+					uni.$emit('task-updated', { action: 'create', source: 'quick-modal', scene: scene });
+					}
+				};
+				AppDialogApi.showSelection(selectionOptions);
+			},
+				calcTextareaHeightPx(text: string): number {
+					// Heuristic: estimate wrapped lines based on screen width.
+					// Goal: grow with content up to half screen, then textarea scrolls.
+					const minH = 24;
+					const lineH = 20;
+					const verticalPadding = 0; // textarea itself has 0 padding in CSS
+					
+					let charsPerLine = 18;
+					if (this.windowWidthPx > 0) {
+						// Roughly subtract buttons & margins around the textarea area.
+						const usable = this.windowWidthPx - 160;
+						const estCharWidth = 16;
+						const cpl = Math.floor(usable / estCharWidth);
+						if (cpl > 8) charsPerLine = cpl;
+					}
+					
+					const raw = (text ?? '').toString();
+					if (raw.length == 0) return minH;
+					const lines = raw.split('\n');
+					let visualLines = 0;
+					for (let i = 0; i < lines.length; i++) {
+						const ln = lines[i];
+						const len = ln.length;
+						visualLines += Math.max(1, Math.ceil(len / charsPerLine));
+					}
+					let h = visualLines * lineH + verticalPadding;
+					if (h < minH) h = minH;
+					if (this.maxInputHeightPx > 0 && h > this.maxInputHeightPx) h = this.maxInputHeightPx;
+					return h;
+				},
+				emitHeightChange() {
+					// Let parent reserve space to avoid being covered when input grows.
+					try {
+						uni.createSelectorQuery().in(this).select('.footer-area').boundingClientRect((rect) => {
+							let h = 0;
+							try {
+								const r = rect as UTSJSONObject;
+								const hv = r['height'];
+								if (hv != null) h = parseInt(hv.toString());
+							} catch (_e0) {
+								h = 0;
+							}
+							if (h > 0) this.$emit('height-change', h);
+						}).exec();
+					} catch (_e) {}
+				},
+				onInput(_e: any) {
+				// v-model handles value sync; we only recalc height.
+				this.textareaHeightPx = this.calcTextareaHeightPx(this.inputContent);
+				setTimeout(() => { this.emitHeightChange(); }, 0);
+			},
+			onSend() {
+				if (this.inputContent.trim() == "" && this.selectedImages.length == 0 && this.selectedFiles.length == 0) return;
+				
+				const payload : SendPayload = {
+					content: this.inputContent,
+					images: [...this.selectedImages],
+					files: [...this.selectedFiles]
+				};
+				
+				this.$emit('send', payload);
+				// this.placeholderText= [];
+				this.inputContent = '';
+				this.selectedImages = [];
+				this.selectedFiles = [];
+					this.textareaHeightPx = this.calcTextareaHeightPx('');
+					setTimeout(() => { this.emitHeightChange(); }, 0);
+				// this.showPanel = false;
+			},
+			onVisionClick() {
+				this.$emit('island-action', 'vision');
+			},
+			onCancel() {
+				this.inputContent = "";
+				this.$emit('cancel');
+					this.textareaHeightPx = this.calcTextareaHeightPx('');
+					setTimeout(() => { this.emitHeightChange(); }, 0);
+			},
+			togglePanel() {
+				const next = !this.showPanel;
+				this.showPanel = next;
+				if (next) {
+					try { uni.hideKeyboard(); } catch (_e) {}
+				}
+					setTimeout(() => { this.emitHeightChange(); }, 0);
+			},
+			showTemplateSheet() {
+				const items = ['物品收纳 (防丢)', '位置变更', '通用清单'];
+				uni.showActionSheet({
+					itemList: items,
+					success: (res) => {
+						const taps = [
+							"物品名称：\n存放位置：\n特征描述：\n",
+							"原位置：\n新位置：\n变更原因：",
+							"- [ ] "
+						];
+						if (res.tapIndex >= 0 && res.tapIndex < taps.length) {
+							const text = taps[res.tapIndex];
+							if (this.inputContent.length > 0 && !this.inputContent.endsWith('\n')) {
+								this.inputContent += '\n' + text;
+							} else {
+								this.inputContent += text;
+							}
+							this.onInput({ detail: { value: this.inputContent } });
+						}
+					}
+				});
+			},
+			
+			chooseImage(sourceType : string) {
+				uni.chooseImage({
+					count: 9, 
+					sourceType: sourceType == 'camera' ? ['camera'] : ['album'],
+					success: (res) => {
+						this.selectedImages.push(...res.tempFilePaths);
+						// 拍照完不一定需要打开面板，看需求，这里保持打开
+						this.showPanel = true;
+							setTimeout(() => { this.emitHeightChange(); }, 0);
+					}
+				});
+			},
+
+			chooseFile() {
+				// #ifdef APP-ANDROID
+
+				try {
+					const intent = new Intent(Intent.ACTION_GET_CONTENT);
+					intent.setType("*/*");
+					intent.addCategory(Intent.CATEGORY_OPENABLE);
+					const chooser = Intent.createChooser(intent, "选择文件");
+					const activity = UTSAndroid.getUniActivity();
+					if (activity != null) activity.startActivityForResult(chooser, 8765);
+				} catch (e) {
+					uni.showToast({ title: '启动文件选择器失败', icon: 'none' });
+				}
+				// #endif
+
+				// #ifndef APP-ANDROID
+				uni.chooseFile({
+					count: 1,
+					success: (res) => {
+						if (res.tempFilePaths != null && res.tempFilePaths.length > 0) {
+							this.selectedFiles.push(...res.tempFilePaths);
+							this.showPanel = true;
+							setTimeout(() => { this.emitHeightChange(); }, 0);
+						}
+					},
+					fail: (_e: any) => {}
+				});
+				// #endif
+
+			},
+
+
+			handleNativeFileSelection(uri : Object | null) {
+				// #ifdef APP-ANDROID
+				const path = this.copyUriToCache(uri);
+				if (path != null) {
+					this.selectedFiles.push(path);
+					this.showPanel = true;
+					setTimeout(() => { this.emitHeightChange(); }, 0);
+				}
+				// #endif
+			},
+
+			
+			// 模板逻辑
+			onModalUpdate(val: boolean) {
+				if (!val) this.closeTemplate();
+			},
+			
+			handleIslandSelect(item: IslandItem) {
+				if (item.id == 'recipe') {
+					this.openQuickTaskModal('recipe');
+					return;
+				}
+
+				if (item.id == 'courier' || item.id == 'daily') {
+					this.openQuickTaskModal('courier');
+					return;
+				}
+
+				if (item.id == 'storage_task') {
+					this.openQuickTaskModal('storage');
+					return;
+				}
+
+				// customIslandItems 场景下，storage 作为快捷创建入口
+				if (item.id == 'storage' && this.customIslandItems.length > 0) {
+					this.openQuickTaskModal('storage');
+					return;
+				}
+
+				// 非 customIslandItems 场景下，保留本地模板行为
+				if (item.id == 'storage') {
+					this.openTemplate(item.id);
+					return;
+				}
+
+				// 发出通用事件让父组件处理（针对 task/timeline 模式）
+				// 注意：emit 只能传第一个参数，或者作为对象传
+				// 这里 item 是一个对象，父组件里接参是 handleIslandAction(id: string)
+				// 所以这里发出的应该是 item.id 而不是整个 item 对象！
+				this.$emit('island-action', item.id);
+			},
+			
+			openTemplate(type: string) {
+				this.activeTemplate = type;
+				// 重置表单
+				this.tempForm = { name: "", location: "", imagePath: "", content: "" };
+			},
+			closeTemplate() {
+				this.activeTemplate = "";
+			},
+			getTemplateTitle(): string {
+				if (this.activeTemplate == 'storage') return "收纳录入";
+				return "快捷模版";
+			},
+			quickLocation() {
+				uni.getLocation({
+					type: 'wgs84',
+					success: (res) => {
+						// 简单把坐标写进去，实际可接入逆地理编码
+						this.tempForm.location = `Loc: ${res.latitude.toFixed(4)}, ${res.longitude.toFixed(4)}`;
+					},
+					fail: () => {
+						uni.showToast({ title: '定位失败，请手动输入', icon: 'none' });
+					}
+				});
+			},
+			quickCamera() {
+				uni.chooseImage({
+					count: 1,
+					sourceType: ['camera'],
+					success: (res) => {
+						if (res.tempFilePaths.length > 0) {
+							this.tempForm.imagePath = res.tempFilePaths[0];
+						}
+					}
+				});
+			},
+			submitTemplate() {
+				let finalContent = "";
+				const images: string[] = [];
+				
+				if (this.activeTemplate == 'storage') {
+					if (this.tempForm.name == "") {
+						uni.showToast({ title: '请输入物品名称', icon: 'none' });
+						return;
+					}
+					finalContent = `📦 物品：${this.tempForm.name}\n📍 位置：${this.tempForm.location}`;
+					if (this.tempForm.imagePath != "") {
+						images.push(this.tempForm.imagePath);
+					}
+				}
+				
+				if (finalContent.trim() == "" && images.length == 0) return;
+				
+				// 自动发送改为自动填入到输入框
+				// this.$emit('send', {content: finalContent, images: images} as SendPayload);
+				
+				this.inputContent = finalContent;
+				if (images.length > 0) {
+					this.selectedImages.push(...images);
+				}
+				this.showPanel = true; // Show panel to reveal image if updated
+				
+				this.closeTemplate();
+			},
+			
+
+			copyUriToCache(uri : Object | null) : string | null {
+				// #ifdef APP-ANDROID
+				let inputStream: InputStream | null = null;
+				let bis: BufferedInputStream | null = null;
+				let fos: FileOutputStream | null = null;
+				try {
+					const androidUri = uri as Uri | null;
+					if (androidUri == null) return null;
+					const context = UTSAndroid.getUniActivity();
+					if (context == null) return null;
+					const contentResolver = context.getContentResolver();
+					let name = "file_" + Date.now();
+					
+					// 1. 获取文件名
+					let cursor : Cursor | null = null;
+					try {
+						const projectionCols = [OpenableColumns.DISPLAY_NAME]; 
+						const projectionArray = projectionCols.toTypedArray();
+						cursor = contentResolver.query(androidUri, projectionArray, null, null, null);
+						
+						if (cursor != null) {
+							if (cursor!.moveToFirst()) {
+								const nameIndex = cursor!.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+								if (nameIndex >= 0) {
+									const n = cursor!.getString(nameIndex);
+									if (n != null && n != "") name = n;
+								}
+							}
+						}
+					} catch(e) {
+						console.error("Cursor error", e);
+					} finally {
+						// 确保在这里关闭 cursor
+						if (cursor != null) cursor!.close();
+					}
+
+					const file = new File(context.getExternalCacheDir(), name);
+					inputStream = contentResolver.openInputStream(androidUri);
+					if (inputStream == null) return null;
+					
+					bis = new BufferedInputStream(inputStream);
+					fos = new FileOutputStream(file);
+					const buffer = new ByteArray(4096);
+					let bytesRead = bis.read(buffer);
+					while (bytesRead != -1) {
+						fos.write(buffer, 0, bytesRead);
+						bytesRead = bis.read(buffer);
+					}
+					fos.flush();
+					return file.getAbsolutePath();
+				} catch (e) { 
+					console.error("Copy file error", e);
+					return null; 
+				} 
+				finally {
+					try { if (fos != null) fos.close(); } catch(e) {}
+					try { if (bis != null) bis.close(); } catch(e) {}
+					try { if (inputStream != null) inputStream.close(); } catch(e) {}
+				}
+				// #endif
+				return null;
+			},
+
+			// === 核心：读取系统相册 (分页) ===
+			loadRecentPhotos() {
+				if (this.isLoadingPhotos || !this.hasMorePhotos) return;
+				this.isLoadingPhotos = true;
+
+				// #ifndef APP-ANDROID
+				this.hasMorePhotos = false;
+				this.isLoadingPhotos = false;
+				return;
+				// #endif
+
+				// 在 UTS 中执行耗时操作最好不要阻塞主线程，但在简单场景下直接调用 ContentResolver 
+				// 实际项目中建议封装到单独的线程或使用 Promise 包装
+				// #ifdef APP-ANDROID
+				try {
+					const context = UTSAndroid.getUniActivity();
+					if (context == null) return;
+
+					const uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI;
+					const projection = [MediaStore.Images.Media._ID, MediaStore.Images.Media.DATA];
+					// 按添加时间倒序
+					const sortOrder = MediaStore.Images.Media.DATE_ADDED + " DESC";
+					
+					// 分页逻辑 (Android Q 以上推荐使用 Bundle，这里使用 limit/offset 兼容写法)
+					// 注意：Android ContentResolver 的 query 不直接支持 LIMIT/OFFSET 字符串，
+					// 通常需要自己处理 Cursor 或者是构造特定的 sortOrder 字符串 (hacky)
+					// 或者在 Android R+ 使用 Bundle。为了兼容性，我们读取 Cursor 并手动跳过。
+					
+					// const cursor = context.getContentResolver().query(uri, projection, null, null, sortOrder);
+					
+					// if (cursor != null) {
+					// 	// 移动到当前 offset
+					// 	// if (cursor.moveToPosition(this.photoOffset)) {
+					// 		// 2. 将 Number 显式转换为 Int
+					// 		if (cursor.moveToPosition(this.photoOffset.toInt())) {
+						
+						// 1. 显式转换为原生数组
+						const projectionArray = projection.toTypedArray();
+						
+						// 2. 传入转换后的 projectionArray
+						const cursor = context.getContentResolver().query(uri, projectionArray, null, null, sortOrder);
+						
+						if (cursor != null) {
+						    // 3. 将 Number (photoOffset) 转换为 Int
+						    if (cursor.moveToPosition(this.photoOffset.toInt())) {
+							let count = 0;
+							// 循环读取 limit 个
+							do {
+								const dataIndex = cursor.getColumnIndex(MediaStore.Images.Media.DATA);
+								if (dataIndex >= 0) {
+									const path = cursor.getString(dataIndex);
+									if (path != null && path != "") {
+										// 转换为 file:// 协议以便 uni-app image 组件显示
+										this.recentPhotos.push("file://" + path);
+									}
+								}
+								count++;
+							} while (cursor.moveToNext() && count < this.photoLimit);
+							
+							this.photoOffset += count;
+							if (count < this.photoLimit) {
+								this.hasMorePhotos = false;
+							}
+						} else {
+							this.hasMorePhotos = false;
+						}
+						cursor.close();
+					}
+				} catch (e) {
+					console.error("Load photos error", e);
+				} finally {
+					this.isLoadingPhotos = false;
+				}
+				// #endif
+			},
+
+			
+
+
+
+
+
+
+			loadMorePhotos() {
+				this.loadRecentPhotos();
+			},
+
+			selectRecentPhoto(path: string) {
+				// 如果已选则取消，未选则添加
+				const index = this.selectedImages.indexOf(path);
+				if (index >= 0) {
+					this.selectedImages.splice(index, 1);
+				} else {
+					this.selectedImages.push(path);
+				}
+			},
+
+			removeSelectedImage(idx:number) { this.selectedImages.splice(idx, 1); },
+			removeSelectedFile(idx:number) { this.selectedFiles.splice(idx, 1); },
+			previewSelectedImage(index: number) { AppDialogApi.previewImage({ urls: this.selectedImages, current: index } as ZemoPreviewImageOptions); },
+			getFileName(path : string) : string { const parts = path.split('/'); return parts[parts.length - 1]; }
+		}
+	}
+</script>
+
+<style scoped>
+	/* 页面可通过 class="task-input-bar-glass" 触发更圆润的输入栏外观 */
+	.footer-area.task-input-bar-glass {
+		border-top-left-radius: 24px;
+		border-top-right-radius: 24px;
+		border-bottom-left-radius: 0;
+		border-bottom-right-radius: 0;
+		overflow: hidden;
+		background-color: transparent;
+		border-width: 0;
+	}
+
+	.footer-area.task-input-bar-glass .input-area-modern {
+		padding: 10px 12px 12px 12px;
+		background-color: transparent;
+		border-radius: 0;
+		border-width: 0;
+	}
+
+	.footer-area.task-input-bar-glass .input-wrapper {
+		border-top-left-radius: 18px;
+		border-top-right-radius: 18px;
+		border-bottom-left-radius: 18px;
+		border-bottom-right-radius: 18px;
+		background-color: transparent;
+		border: 1px solid transparent;
+	}
+
+	.footer-area.task-input-bar-glass .send-btn-modern {
+		height: 42px;
+		padding: 8px 14px;
+		border-radius: 14px;
+		margin-bottom: 5px;
+	}
+
+	.footer-area.task-input-bar-glass .tool-btn {
+		padding-bottom: 10px;
+	}
+
+	.footer-area.task-input-bar-glass .plus-icon {
+		font-size: 28px;
+		color: #2b3445;
+	}
+
+	/* 预览栏 */
+	.image-preview-bar { height: 90px; background-color: #fff; border-top: 1px solid #f0f0f0; }
+	.preview-container { flex-direction: row; padding: 10px 16px; }
+	.preview-item { position: relative; margin-right: 10px; width: 70px; height: 70px; }
+	.preview-img { width: 70px; height: 70px; border-radius: 8px; }
+	.preview-file { width: 70px; height: 70px; background-color: #f5f5f5; align-items: center; justify-content: center; border-radius: 8px; }
+	.preview-file-icon { font-size: 24px; margin-bottom: 2px; }
+	.preview-file-name { font-size: 9px; lines: 1; text-overflow: ellipsis; width: 60px; text-align: center; }
+	.preview-delete { position: absolute; top: -6px; right: -6px; background-color: rgba(0,0,0,0.5); width: 18px; height: 18px; border-radius: 9px; align-items: center; justify-content: center; }
+	.delete-icon { color: #fff; font-size: 10px; }
+
+	/* 输入栏 (仿微信, Glassmorphism adaptation) */
+	.input-area-modern {
+		flex-direction: row; 
+		align-items: flex-end; /* 底部对齐，适应 textarea 增高 */
+		background-color: transparent; 
+		padding: 8px 12px;
+		/* Removed border-radius as surrounding container handles shape if needed, 
+		   but kept logic for layout */
+		transition-property: padding-bottom; 
+		transition-duration: 0.2s;
+	}
+	
+	.tool-btn { padding: 0 8px 12px 8px; } /* 增加 padding-bottom */
+	.plus-icon { font-size: 26px; color: #333; }
+	
+	.input-wrapper { 
+		flex: 1; 
+		margin: 0 8px 6px 8px;
+		background-color: rgba(255, 255, 255, 0.5); /* Semi-transparent */
+		 
+		flex-direction: row; 
+		align-items: flex-end; 
+		padding: 8px 10px; 
+		min-height: 40px;
+		border-radius: 12px;
+		border: 1px solid rgba(255, 255, 255, 0.3); /* Glass border */
+	}
+	
+	.modern-textarea { 
+		flex: 1; 
+		font-size: 16px; 
+		background-color: transparent;
+		line-height: 20px;
+		min-height: 24px;
+		padding: 0;
+		/* 修正上下对齐 */
+		margin-bottom: 0;
+	}
+	
+	.input-cancel-btn { padding: 0 0 4px 6px; } 
+	.cancel-icon { font-size: 16px; color: #999; }
+	/* 发送按键 */
+	.send-btn-modern { 
+		background-color: #07c160; /* 微信绿 */
+		padding: 6px 12px; 
+		border-radius: 8px; 
+		margin-bottom: 6px; /* 对齐底部 */
+		height: 40px; 
+		justify-content: center;
+		align-items: center;
+		/* 统一高度，避免塌陷 */
+	}
+	.send-text { color: #fff; font-size: 13px; font-weight: bold; }
+
+	/* 底部面板 */
+	.bottom-panel { height: 300px; background-color: #f5f5f5; }
+	.panel-scroll { height: 100%; }
+
+	.panel-grid { flex-direction: row; flex-wrap: wrap; padding: 14px 14px 0 14px; }
+	.grid-item { width: 25%; padding: 6px; }
+	.panel-tile {
+		width: 100%;
+		height: 74px;
+		background-color: #fff;
+		border-radius: 14px;
+		align-items: center;
+		justify-content: center;
+		position: relative;
+		overflow: hidden;
+	}
+	.tile-icon { font-size: 28px; }
+	.tile-text { font-size: 12px; color: #666; margin-top: 6px; }
+	.photo-tile { background-color: #eee; }
+	.tile-photo { width: 100%; height: 100%; border-radius: 14px; }
+	
+	.photo-check {
+		position: absolute; top: 6px; right: 6px;
+		width: 22px; height: 22px;
+		background-color: #07c160;
+		border-radius: 11px;
+		align-items: center; justify-content: center;
+		border: 1px solid #fff;
+	}
+	.check-icon { color: #fff; font-size: 12px; font-weight: bold; }
+	
+	.loading-more { padding: 20px; align-items: center; }
+	.loading-text { color: #999; font-size: 12px; }
+
+	/* 回复引用条样式 */
+	.reply-context-bar {
+		flex-direction: row; align-items: center;
+		background-color: #f2fcf7; border-radius: 6px;
+		padding: 6px 10px; margin: 4px 12px 6px 12px;
+		border-left: 3px solid #2979ff;
+	}
+	.reply-decor { width: 0; }
+	.reply-label { font-size: 11px; color: #2979ff; margin-right: 6px; font-weight: bold; }
+	.reply-content { font-size: 11px; color: #666; flex: 1; overflow: hidden; text-overflow: ellipsis; lines: 1; margin-right: 8px; }
+	.reply-close-btn { padding: 4px; justify-content: center; align-items: center; }
+	.reply-close-icon { font-size: 11px; color: #999; }
+	
+	/* 模板岛样式移至 UIIsland.uvue，此处不再需要 */
+	
+	/* 模板弹窗内部样式 - 外层使用 GenericModal */
+	.card-body {
+		margin-bottom: 20px;
+	}
+	.form-input {
+		height: 44px;
+		background-color: #f5f5f5;
+		border-radius: 8px;
+		padding: 0 12px;
+		margin-bottom: 12px;
+		font-size: 15px;
+	}
+	.form-area {
+		height: 120px;
+		background-color: #f5f5f5;
+		border-radius: 8px;
+		padding: 12px;
+		margin-bottom: 12px;
+		font-size: 15px;
+	}
+	.form-row {
+		flex-direction: row;
+		align-items: center;
+		margin-bottom: 12px;
+	}
+	.flex-1 { flex: 1; margin-bottom: 0; }
+	.icon-btn {
+		width: 44px; height: 44px;
+		justify-content: center; align-items: center;
+		background-color: #eee;
+		border-radius: 8px;
+		margin-left: 8px;
+	}
+	.btn-icon { font-size: 18px; }
+	
+	.photo-area {
+		height: 120px;
+		background-color: #f9f9f9;
+		border-radius: 8px;
+		border: 1px dashed #ccc;
+		justify-content: center;
+		align-items: center;
+		overflow: hidden;
+	}
+	.form-img {
+		width: 100%; height: 100%;
+	}
+	.camera-placeholder {
+		align-items: center;
+	}
+	.cam-icon { font-size: 24px; color: #aaa; margin-bottom: 4px; }
+	.cam-text { font-size: 12px; color: #aaa; }
+	
+	.submit-btn {
+		background-color: #07c160;
+		height: 48px;
+		border-radius: 24px;
+		justify-content: center;
+		align-items: center;
+	}
+	.submit-text {
+		color: #fff;
+		font-weight: bold;
+		font-size: 16px;
+	}
+
+	/* Vision Trigger Bar Styles */
+	.vision-trigger-bar {
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		height: 36px;
+		margin: 0 12px 8px 12px;
+		padding: 0 12px;
+		background-color: rgba(255, 255, 255, 0.85); /* Slightly more opaque for better visibility */
+		border-radius: 18px;
+		border: 1px solid rgba(0, 0, 0, 0.05);
+		box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+	}
+	.vision-left {
+		flex-direction: row;
+		align-items: center;
+	}
+	.vision-icon {
+		font-size: 14px;
+		margin-right: 6px;
+	}
+	.vision-text {
+		font-size: 12px;
+		color: #555;
+		font-weight: bold;
+	}
+	.vision-arrow {
+		font-size: 14px;
+		color: #999;
+	}
+</style>

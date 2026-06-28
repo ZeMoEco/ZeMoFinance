@@ -1,0 +1,108 @@
+// #ifdef APP-ANDROID
+import UTSAndroid from "io.dcloud.uts.UTSAndroid";
+import Context from "android.content.Context";
+import Intent from "android.content.Intent";
+import ComponentName from "android.content.ComponentName";
+import AppWidgetManager from "android.appwidget.AppWidgetManager";
+// #endif
+
+// #ifdef APP-HARMONY
+import { formProvider, formBindingData } from '@kit.FormKit';
+import { BusinessError } from '@kit.BasicServicesKit';
+// #endif
+
+export class WidgetService {
+    
+    /**
+     * 更新桌面小组件/卡片数据
+     * @param level 等级
+     * @param exp 当前经验
+     * @param maxExp 升级所需经验
+     * @param taskTitle 当前任务标题
+     */
+    static updateWidget(level: number, exp: number, maxExp: number, taskTitle: string) {
+        
+        // =========================
+        // Android 实现
+        // =========================
+        // #ifdef APP-ANDROID
+        const context = UTSAndroid.getAppContext();
+        if (context == null) return;
+
+        try {
+            // 1. 保存数据到 SharedPreferences (供 Widget 进程读取)
+            // 注意：原生 Widget 需要在 Android 原生代码中读取这些 Prefs
+            const prefs = context.getSharedPreferences("zemo_widget_data", Context.MODE_PRIVATE);
+            const editor = prefs.edit();
+            editor.putInt("level", level.toInt());
+            editor.putInt("exp", exp.toInt());
+            editor.putInt("maxExp", maxExp.toInt());
+            editor.putString("taskTitle", taskTitle);
+            editor.apply();
+
+            // 2. 发送广播触发 Widget 刷新
+            const appWidgetManager = AppWidgetManager.getInstance(context);
+            // 包名需确保与 AndroidManifest.xml 及打包配置一致
+            const componentName = new ComponentName(context, "zenith.most.zemo.WidgetProvider");
+            const appWidgetIds = appWidgetManager.getAppWidgetIds(componentName);
+
+            // 修复点: Java IntArray 在 UTS 中需要小心处理
+            // 通常 UTS 包装后会暴露 length 或 size
+            // if (appWidgetIds != null && appWidgetIds.length > 0) {
+            //     const intent = new Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE);
+            //     intent.setComponent(componentName);
+            //     intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, appWidgetIds);
+            //     context.sendBroadcast(intent);
+            //     console.log(`[WidgetService] Sent update broadcast to ${appWidgetIds.length} widgets`);
+            // }
+			   // 【修复】使用 .size 而不是 .length
+			            if (appWidgetIds != null && appWidgetIds.size > 0) {
+			                const intent = new Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE);
+			                intent.setComponent(componentName);
+			                intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, appWidgetIds);
+			                context.sendBroadcast(intent);
+			                // 【修复】日志里也改一下
+			                console.log(`[WidgetService] Sent update broadcast to ${appWidgetIds.size} widgets`);
+			            }
+        } catch (e) {
+            console.error(`[WidgetService] Android update failed: ${e}`);
+        }
+        // #endif
+
+        // =========================
+        // HarmonyOS 实现
+        // =========================
+        // #ifdef APP-HARMONY
+        try {
+            // 1. 保存数据 (Uni Storage)
+            uni.setStorageSync('widget_level', level);
+            uni.setStorageSync('widget_exp', exp);
+            uni.setStorageSync('widget_max_exp', maxExp);
+            uni.setStorageSync('widget_task', taskTitle);
+
+            // 2. 构造 Form 数据
+            const formData = {
+                "level": level,
+                "currentExp": exp,
+                "maxExp": maxExp,
+                "taskTitle": taskTitle
+            };
+            
+            const bindingData = formBindingData.createFormBindingData(JSON.stringify(formData));
+
+            // 3. 请求更新
+            // 注意: updateForm 需要 formId。通常在 EntryAbility 中维护 formId 列表。
+            // 由于 UTS 无法直接访问 ArkTS 维护的 formId，这里建议采用两种策略：
+            // A. 仅保存数据，依赖卡片的定时刷新 (auto-refresh)
+            // B. (高级) 通过 AppStorage 或 Emitter 通知 ArkTS 侧去调用 updateForm
+            
+            console.log("[WidgetService] HarmonyOS widget data saved. Pending native update.");
+            
+            // 示例：如果能获取 formId (需自行维护)
+            // formProvider.updateForm(formId, bindingData).then(() => ...);
+            
+        } catch (e) {            console.error(`[WidgetService] HarmonyOS update failed: ${JSON.stringify(e)}`);
+        }
+        // #endif
+    }
+}

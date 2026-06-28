@@ -1,0 +1,126 @@
+// #ifdef APP-ANDROID
+import Context from "android.content.Context";
+import WindowManager from "android.view.WindowManager";
+import TextView from "android.widget.TextView";
+import Gravity from "android.view.Gravity";
+import Color from "android.graphics.Color";
+import PixelFormat from "android.graphics.PixelFormat";
+import Build from "android.os.Build";
+import View from "android.view.View";
+import MotionEvent from "android.view.MotionEvent";
+import UTSAndroid from "io.dcloud.uts.UTSAndroid";
+import LayoutParams from "android.view.WindowManager.LayoutParams";
+import GradientDrawable from "android.graphics.drawable.GradientDrawable";
+// #endif
+import System from "java.lang.System";
+
+export class FloatingTimer {
+    private static windowManager: WindowManager | null = null;
+    private static floatView: TextView | null = null;
+    private static layoutParams: LayoutParams | null = null;
+    private static onClickListener: (() => void) | null = null;
+
+    static setOnClickListener(listener: () => void) {
+        FloatingTimer.onClickListener = listener;
+    }
+
+    static show(context: Context, initialText: string) {
+        if (FloatingTimer.floatView != null) {
+            FloatingTimer.update(initialText);
+            return;
+        }
+
+        FloatingTimer.windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager;
+        FloatingTimer.floatView = new TextView(context);
+        FloatingTimer.floatView!.setText(initialText);
+        FloatingTimer.floatView!.setTextSize(14.0.toFloat());
+        FloatingTimer.floatView!.setTextColor(Color.parseColor("#00FFFF")); // Cyan text (Arc Reactor glow)
+        // FloatingTimer.floatView!.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        
+        // Iron Man Arc Reactor Style
+        const shape = new GradientDrawable();
+        shape.setShape(GradientDrawable.OVAL);
+        shape.setColor(Color.parseColor("#CC000000")); // Semi-transparent black center
+        shape.setStroke(4, Color.parseColor("#00FFFF")); // Cyan border
+        
+        FloatingTimer.floatView!.setBackground(shape);
+        FloatingTimer.floatView!.setPadding(30, 30, 30, 30);
+        FloatingTimer.floatView!.setGravity(Gravity.CENTER);
+        
+        FloatingTimer.layoutParams = new LayoutParams();
+        if (Build.VERSION.SDK_INT >= 26) {
+            FloatingTimer.layoutParams!.type = LayoutParams.TYPE_APPLICATION_OVERLAY;
+        } else {
+            FloatingTimer.layoutParams!.type = LayoutParams.TYPE_PHONE;
+        }
+        FloatingTimer.layoutParams!.format = PixelFormat.TRANSLUCENT;
+        FloatingTimer.layoutParams!.flags = LayoutParams.FLAG_NOT_FOCUSABLE;
+        FloatingTimer.layoutParams!.gravity = Gravity.TOP | Gravity.START;
+        FloatingTimer.layoutParams!.width = LayoutParams.WRAP_CONTENT;
+        FloatingTimer.layoutParams!.height = LayoutParams.WRAP_CONTENT;
+        FloatingTimer.layoutParams!.x = 100;
+        FloatingTimer.layoutParams!.y = 200;
+
+        // Drag logic
+        let initialX = 0;
+        let initialY = 0;
+        let initialTouchX = 0.0.toFloat();
+        let initialTouchY = 0.0.toFloat();
+        let startTime = System.currentTimeMillis();
+
+        FloatingTimer.floatView!.setOnTouchListener((v: View, event: MotionEvent): boolean => {
+            switch (event.getAction()) {
+                case MotionEvent.ACTION_DOWN:
+                    initialX = FloatingTimer.layoutParams!.x;
+                    initialY = FloatingTimer.layoutParams!.y;
+                    initialTouchX = event.getRawX();
+                    initialTouchY = event.getRawY();
+                    startTime = System.currentTimeMillis();
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    const dx = (event.getRawX() - initialTouchX).toInt();
+                    const dy = (event.getRawY() - initialTouchY).toInt();
+                    FloatingTimer.layoutParams!.x = (initialX + dx).toInt();
+                    FloatingTimer.layoutParams!.y = (initialY + dy).toInt();
+                    FloatingTimer.windowManager!.updateViewLayout(FloatingTimer.floatView, FloatingTimer.layoutParams);
+                    return true;
+                case MotionEvent.ACTION_UP:
+                    const upX = event.getRawX();
+                    const upY = event.getRawY();
+                    const deltaX = Math.abs(upX - initialTouchX);
+                    const deltaY = Math.abs(upY - initialTouchY);
+                    const duration = System.currentTimeMillis() - startTime;
+                    
+                    if (deltaX < 10 && deltaY < 10 && duration < 200) {
+                        if (FloatingTimer.onClickListener != null) {
+                            FloatingTimer.onClickListener!();
+                        }
+                    }
+                    return true;
+            }
+            return false;
+        });
+
+        FloatingTimer.windowManager!.addView(FloatingTimer.floatView, FloatingTimer.layoutParams);
+    }
+
+    static update(text: string) {
+        if (FloatingTimer.floatView != null) {
+            // Must run on UI thread if called from background thread, but UTS usually handles this or we are on main thread
+            FloatingTimer.floatView!.setText(text);
+        }
+    }
+
+    static hide() {
+        if (FloatingTimer.floatView != null && FloatingTimer.windowManager != null) {
+            try {
+                FloatingTimer.windowManager!.removeView(FloatingTimer.floatView);
+            } catch (e) {
+                console.error(e);
+            }
+            FloatingTimer.floatView = null;
+            FloatingTimer.windowManager = null;
+            FloatingTimer.layoutParams = null;
+        }
+    }
+}

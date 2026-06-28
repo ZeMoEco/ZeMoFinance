@@ -1,0 +1,219 @@
+<template>
+  <view v-if="node != null" class="entity-card" :class="[cardColorClass, { 'selected': isSelected }]" @click.stop="onClick">
+    
+    <!-- Connection Port (Left - Input) -->
+    <view class="port port-left"></view>
+
+    <!-- Card Header -->
+    <view class="card-header">
+      <text class="card-icon">{{ typeIcon }}</text>
+      <text class="card-title">{{ title.length > 0 ? title : 'New Card' }}</text>
+      
+      <!-- Task specific action: Jump to Detail -->
+      <view v-if="subtype == 'task'" class="card-action-trigger" @click.stop="onJumpToDetail">
+        <text class="action-icon">↗️</text>
+      </view>
+
+      <!-- Quick Switch / Context Trigger -->
+      <view class="card-action-trigger" @click.stop="onContextClick">
+        <text class="action-icon">⋮</text>
+      </view>
+    </view>
+
+    <!-- Card Body -->
+    <view class="card-body">
+      <text class="card-content">{{ contentPreview }}</text>
+    </view>
+
+    <!-- Connection Port (Right - Output) -->
+    <view class="port port-right" @touchstart.stop="$emit('connect-start')"></view>
+
+  </view>
+</template>
+
+<script lang="uts">
+import { EntityNode } from './VisionTypes.uts';
+
+export default {
+  emits: ['click', 'connect-start', 'context-menu'],
+  props: {
+    node: {
+      type: Object,
+      required: true
+    },
+    isSelected: {
+      type: Boolean,
+      default: false
+    }
+  },
+  data() {
+      return {}
+  },
+  mounted() {
+      // Debug log
+      const n = this.node as EntityNode;
+      console.log("EntityCard mounted", n.id);
+  },
+  computed: {
+    // Direct access helper
+    entity(): EntityNode {
+      return this.node as EntityNode;
+    },
+    subtype(): string {
+       return this.entity.subtype;
+    },
+    title(): string {
+      const d = this.entity.data as UTSJSONObject;
+      return d.getString('title') ?? 'New Card';
+    },
+    contentPreview(): string {
+      const d = this.entity.data as UTSJSONObject;
+      const c = d.getString('content') ?? '';
+      return c.length > 50 ? c.substring(0, 50) + '...' : (c.length == 0 ? 'No content' : c);
+    },
+    typeIcon(): string {
+      const t = this.subtype;
+      if (t == 'task') return '✅'; // Task
+      if (t == 'note') return '📄'; // Note
+      if (t == 'image') return '🖼️'; // Image
+      return '📝';
+    },
+    cardColorClass(): string {
+        const s = this.entity.style as UTSJSONObject | null;
+        if (s == null) return 'bg-white';
+        const color = s.getString('backgroundColor');
+        
+        if (color == 'yellow') return 'bg-yellow';
+        if (color == 'green') return 'bg-green';
+        if (color == 'blue') return 'bg-blue';
+        if (color == 'purple') return 'bg-purple';
+        
+        // Default mapping
+        if (this.subtype == 'task') return 'bg-green';
+        if (this.subtype == 'note') return 'bg-yellow';
+        
+        return 'bg-white';
+    }
+  },
+  methods: {
+    onClick() {
+      this.$emit('click');
+    },
+    onJumpToDetail() {
+        if (this.subtype == 'task') {
+            const d = this.entity.data as UTSJSONObject;
+            const tid = d.getNumber('id');
+            if (tid != null) {
+                 uni.navigateTo({
+                     url: `/pages/tasks/task-detail?id=${tid}`
+                 });
+            }
+        }
+    },
+    onContextClick() {
+        this.$emit('context-menu', this.entity.id);
+    }
+  }
+}
+</script>
+
+<style>
+.entity-card {
+  width: 220px;
+  border-radius: 12px;
+  padding: 12px;
+  /* Soft shadow like the PC version */
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15); /* Darker shadow to be sure */
+  border: 1px solid #ddd; /* Explicit border */
+  /* position: absolute;  REMOVED: Wrapper handles position */
+  flex-direction: column;
+  background-color: #fff; /* Fallback */
+  transition-property: transform, box-shadow;
+  transition-duration: 0.2s;
+}
+
+.entity-card:active {
+    transform: scale(0.98);
+}
+
+.entity-card.selected {
+    border-color: #1890ff;
+    box-shadow: 0 0 0 4px rgba(24, 144, 255, 0.2);
+    z-index: 10;
+}
+
+/* Color Variants (Pastel Palette) */
+.bg-white { background-color: #FFFFFF; }
+.bg-yellow { background-color: #FFF9C4; } /* Lighter Yellow (Post-it) */
+.bg-green { background-color: #F0F4C3; } /* Light Lime/Green */
+.bg-blue { background-color: #E1F5FE; } /* Light Blue */
+.bg-purple { background-color: #F3E5F5; } /* Light Purple */
+
+.card-header {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(0,0,0,0.05);
+}
+
+.card-icon {
+    font-size: 16px;
+    margin-right: 6px;
+}
+
+.card-title {
+  font-size: 15px;
+  font-weight: bold;
+  color: #333;
+  flex: 1;
+  text-overflow: ellipsis;
+  lines: 1;
+}
+
+.card-action-trigger {
+    padding: 0 4px;
+}
+
+.action-icon {
+    font-size: 16px;
+    color: #888;
+}
+
+.card-body {
+  min-height: 40px;
+}
+
+.card-content {
+  font-size: 13px;
+  color: #555;
+  line-height: 1.4;
+  lines: 3;
+  text-overflow: ellipsis;
+}
+
+/* Ports */
+.port {
+  width: 14px;
+  height: 14px;
+  border-radius: 7px;
+  background-color: #fff;
+  border: 2px solid #ddd;
+  position: absolute;
+  top: 50%;
+  margin-top: -7px;
+}
+
+.port-left {
+    left: -7px;
+    background-color: #fff;
+}
+
+.port-right {
+    right: -7px;
+    background-color: #fff;
+    border-color: #999; /* Output looks a bit different */
+}
+
+</style>

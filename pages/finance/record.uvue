@@ -1,0 +1,1749 @@
+﻿<template>
+<view class="record-modal-page">
+<view class="record-backdrop" @click="closeSheet"></view>
+
+<view class="record-sheet">
+<view class="sheet-handle"></view>
+<view class="sheet-close" @click="closeSheet">
+<text class="sheet-close-icon">✕</text>
+</view>
+
+<view class="sheet-header">
+<text class="sheet-title">{{ isEditMode ? '编辑账单' : '记账录入' }}</text>
+<view class="header-options">
+<view class="mini-toggle" :class="includeInFlow ? 'mini-toggle-active' : ''" @click="toggleIncludeInFlow">
+<text class="mini-toggle-text" :class="includeInFlow ? 'mini-toggle-text-active' : ''">{{ includeInFlow ? '计收支' : '不计' }}</text>
+</view>
+<view class="mini-toggle" :class="isReimbursable ? 'mini-toggle-active' : ''" @click="toggleReimbursable">
+<text class="mini-toggle-text" :class="isReimbursable ? 'mini-toggle-text-active' : ''">{{ isReimbursable ? '报销' : '未报' }}</text>
+</view>
+</view>
+</view>
+
+<view class="type-tabs">
+<view
+v-for="mode in modeTabs"
+:key="mode"
+					class="type-tab"
+					:class="activeMode == mode ? 'type-tab-active' : ''"
+@click="onModeTabClick(mode)">
+					<text class="type-tab-text" :class="activeMode == mode ? 'type-tab-text-active' : ''">{{ getModeLabel(mode) }}</text>
+</view>
+</view>
+
+<view class="amount-row">
+				<text class="amount-sign" :class="financeType == 'income' ? 'amount-sign-income' : ''">{{ financeType == 'income' ? '+' : '-' }}</text>
+<input
+class="amount-input"
+:class="amountInputClass"
+type="text"
+v-model="amount"
+placeholder="0.00"
+@input="onAmountInput"
+/>
+<view class="time-chip" @click="refreshTime">
+<text class="time-chip-icon">🗓</text>
+<text class="time-chip-text">{{ displayTime }}</text>
+</view>
+</view>
+
+<view class="divider"></view>
+
+<view class="info-row-grid" v-if="activeMode == 'expense' || activeMode == 'income'">
+<view class="info-cell" @click="showTaskPicker">
+<text class="info-label">项目任务</text>
+<view class="info-select-pill">
+<text class="info-select-icon">📋</text>
+<text class="info-select-text">{{ selectedShoppingTaskName == '' ? '未选择' : selectedShoppingTaskName }}</text>
+<text class="info-select-arrow">⌄</text>
+</view>
+</view>
+
+<view class="info-cell" @click="showStoragePicker">
+<text class="info-label">储存位置</text>
+<view class="info-select-pill">
+<text class="info-select-icon">🪣</text>
+<text class="info-select-text">{{ selectedStorageTargetName == '' ? '未选择' : selectedStorageTargetName }}</text>
+<text class="info-select-arrow">⌄</text>
+</view>
+</view>
+</view>
+
+<view class="refund-picker" v-if="activeMode == 'refund'">
+<scroll-view class="refund-result-float" scroll-y="true" :show-scrollbar="false" v-if="selectedRefundTransactionId == '' && refundSearchText.trim() != ''">
+<view
+v-for="bill in filteredRefundBills"
+:key="bill.id"
+class="refund-result-item"
+@click="selectRefundBill(bill)">
+<text class="refund-result-main">{{ refundBillTitle(bill) }}</text>
+<text class="refund-result-sub">{{ refundBillSubTitle(bill) }}</text>
+</view>
+<view class="refund-result-empty" v-if="filteredRefundBills.length == 0">
+<text class="refund-result-empty-text">没有匹配账单</text>
+</view>
+</scroll-view>
+<text class="refund-fill-label">退款账单</text>
+<view class="refund-fill-row" v-if="selectedRefundTransactionId == ''">
+<input class="refund-fill-input" v-model="refundSearchText" placeholder="输入账单关键词" />
+<text class="refund-fill-arrow">⌄</text>
+</view>
+<view class="refund-fill-row refund-fill-selected" v-if="selectedRefundTransactionId != ''">
+<view class="refund-fill-content">
+<text class="refund-fill-main">{{ selectedRefundTransactionName }}</text>
+<text class="refund-fill-sub">已关联原账单</text>
+</view>
+<text class="refund-fill-clear" @click.stop="clearRefundBill">×</text>
+</view>
+</view>
+
+<view class="info-row-grid" v-if="activeMode == 'transfer'">
+<view class="info-cell" @click="showTargetAccountPicker">
+<text class="info-label">转入账户</text>
+<view class="info-select-pill">
+<text class="info-select-icon">🏦</text>
+<text class="info-select-text">{{ selectedTargetAccountName }}</text>
+<text class="info-select-arrow">⌄</text>
+</view>
+</view>
+<view class="info-cell" @click="showAccountPicker">
+<text class="info-label">转出账户</text>
+<view class="info-select-pill">
+<text class="info-select-icon">💳</text>
+<text class="info-select-text">{{ selectedAccountName }}</text>
+<text class="info-select-arrow">⌄</text>
+</view>
+</view>
+</view>
+
+<view class="category-header-row">
+<text class="category-header">类别选择</text>
+<view class="book-chip" @click="showBookPicker">
+<text class="book-chip-text">{{ selectedBookName }}</text>
+</view>
+</view>
+
+<scroll-view class="category-scroll" :class="categoryRows.length <= 1 ? 'category-scroll-one' : 'category-scroll-two'" scroll-y="true" :show-scrollbar="false">
+<view class="category-list">
+<view
+v-for="(row, rowIndex) in categoryRows"
+:key="'cat-row-' + rowIndex.toString()"
+class="category-row">
+<view
+v-for="cat in row"
+:key="cat.id"
+class="category-item"
+@click="selectCategory(cat.id)">
+<view class="category-chip" :class="category == cat.id ? 'category-chip-active' : ''">
+								<text class="category-icon">{{ cat.icon }}</text>
+							</view>
+<text class="category-text" :class="category == cat.id ? 'category-text-active' : ''">{{ cat.label }}</text>
+</view>
+</view>
+</view>
+</scroll-view>
+
+<view class="note-card">
+<view class="note-card-head">
+<view class="note-account" @click="showAccountPicker">
+<text class="note-left">{{ accountDisplayName }}</text>
+<text class="note-account-arrow">⌄</text>
+</view>
+<view class="adjust-inputs">
+<view class="adjust-field">
+<text class="adjust-label">手续费</text>
+<input class="adjust-input" type="text" v-model="serviceFee" placeholder="0" @input="onServiceFeeInput" />
+</view>
+<view class="adjust-field">
+<text class="adjust-label">优惠券</text>
+<input class="adjust-input" type="text" v-model="couponAmount" placeholder="0" @input="onCouponInput" />
+</view>
+</view>
+</view>
+<input class="note-input" v-model="note" placeholder="记录一条备注..." />
+</view>
+
+<view class="sheet-footer">
+<button class="submit-btn" @click="submit">{{ isEditMode ? '保存修改 →' : '确认记账 →' }}</button>
+<text class="delete-text" v-if="isEditMode" @click="deleteCurrentTransaction">{{ deletingTransaction ? '删除中...' : '删除账单' }}</text>
+<text class="draft-text" v-if="!isEditMode">放弃录入</text>
+</view>
+</view>
+</view>
+</template>
+
+<script lang="uts">
+import { FinanceBiz, AccountNode, BookNode, TransactionMount, CreateTransactionForNodesPayload, UpdateTransactionPayload } from '@/services/biz/FinanceBiz.uts';
+import { CreateStorageItemPayload, TaskBiz, Task } from '@/services/biz/TaskBiz.uts';
+import { AutoFinanceService } from '@/services/sys/AutoFinanceService.uts';
+import { FINANCE_APP_PROFILE } from '@/services/ecosystem/AppProfiles.uts';
+import { EcosystemAppBootstrap } from '@/services/ecosystem/EcosystemAppBootstrap.uts';
+import { AppBackgroundService } from '@/services/sys/AppBackgroundService.uts';
+import { DESK_PET_RECORD_AUTO_BACKGROUND_PARAM } from '@/utils/constant.uts';
+import { AppDialogApi } from '@/components/sys/AppDialogApi.uts';
+
+type RecordMode = 'expense' | 'income' | 'transfer' | 'refund';
+type CategoryItem = {
+id : string
+label : string
+icon : string
+}
+
+export default {
+data() {
+return {
+amount: '',
+activeMode: 'income' as RecordMode,
+category: 'income_salary',
+note: '',
+location: '',
+includeInFlow: true,
+isReimbursable: false,
+serviceFee: '',
+couponAmount: '',
+refundSearchText: '',
+refundCandidates: [] as TransactionMount[],
+selectedRefundTransactionId: '',
+selectedRefundTransactionName: '',
+displayTime: '',
+accounts: [] as AccountNode[],
+selectedAccountId: '',
+allTasks: [] as Task[],
+shoppingCandidates: [] as Task[],
+storageCandidates: [] as Task[],
+selectedShoppingTaskIds: [] as string[],
+selectedShoppingTaskName: '',
+selectedTargetAccountId: '',
+selectedStorageTargetId: '',
+selectedStorageTargetName: '',
+selectedBookId: '',
+bookOptions: [] as BookNode[],
+prefillAccountId: '',
+prefillTransactionTime: 0,
+editTransactionId: '',
+editCategoryLabel: '',
+editOriginalCategory: '',
+categoryChanged: false,
+deletingTransaction: false,
+prefillSourceApp: '',
+prefillPayMethod: '',
+autoBackgroundAfterSubmit: false,
+modeTabs: [
+'expense',
+'income',
+'transfer',
+'refund'
+] as RecordMode[]
+}
+},
+computed: {
+financeType() : string {
+if (this.activeMode == 'expense') return 'expense';
+if (this.activeMode == 'income') return 'income';
+if (this.activeMode == 'refund') return 'income';
+return 'expense';
+},
+currentCategories() : CategoryItem[] {
+if (this.activeMode == 'transfer') {
+return [
+{ id: 'transfer_general', label: '转账', icon: '⇄' },
+{ id: 'transfer_fund', label: '基金', icon: '基' },
+{ id: 'transfer_stock', label: '股票', icon: '股' },
+{ id: 'transfer_security', label: '证券', icon: '券' },
+{ id: 'transfer_finance_add', label: '加仓', icon: '↗' },
+{ id: 'transfer_finance_reduce', label: '减仓', icon: '↘' }
+];
+}
+if (this.activeMode == 'refund') {
+return [
+{ id: 'income_refund_extra', label: '退款', icon: '↩' },
+{ id: 'income_reimburse', label: '报销', icon: '回' },
+{ id: 'income_other', label: '其他', icon: '…' }
+];
+}
+if (this.financeType == 'expense') {
+return [
+{ id: 'expense_tax', label: '可抵税', icon: '🧾' },
+{ id: 'expense_shopping', label: '购物', icon: '🛍' },
+{ id: 'expense_transport', label: '交通', icon: '↗' },
+{ id: 'expense_gift', label: '礼金', icon: '🎁' },
+{ id: 'expense_reward', label: '奖金', icon: '✦' },
+{ id: 'expense_food', label: '餐饮', icon: '🍜' },
+{ id: 'expense_home', label: '居家', icon: '⌂' },
+{ id: 'expense_medical', label: '医疗', icon: '+' },
+{ id: 'expense_study', label: '学习', icon: '书' },
+{ id: 'expense_entertainment', label: '娱乐', icon: '♪' },
+{ id: 'expense_other', label: '其他', icon: '…' }
+];
+}
+return [
+{ id: 'income_tax', label: '可抵税', icon: '🧾' },
+{ id: 'income_salary', label: '工资', icon: '💵' },
+{ id: 'income_gift', label: '礼金', icon: '🎁' },
+{ id: 'income_reward', label: '奖金', icon: '✦' },
+{ id: 'income_reimburse', label: '报销', icon: '回' },
+{ id: 'income_parttime', label: '兼职', icon: '时' },
+{ id: 'income_interest', label: '利息', icon: '%' },
+{ id: 'income_rent', label: '租金', icon: '⌂' },
+{ id: 'income_refund_extra', label: '退款', icon: '↩' },
+{ id: 'income_other', label: '其他', icon: '…' }
+];
+},
+filteredRefundBills() : TransactionMount[] {
+const q = this.refundSearchText.trim().toLowerCase();
+let list = this.refundCandidates;
+if (q != '') {
+list = list.filter((bill : TransactionMount) : boolean => {
+const text = `${bill.description ?? ''} ${bill.category ?? ''} ${bill.account_name ?? ''} ${bill.amount.toString()}`.toLowerCase();
+return text.indexOf(q) >= 0;
+});
+}
+return list.slice(0, 20);
+},
+categoryRows() : CategoryItem[][] {
+const rows = [] as CategoryItem[][];
+const list = this.currentCategories;
+for (let i = 0; i < list.length; i += 4) {
+const row = [] as CategoryItem[];
+for (let j = i; j < i + 4 && j < list.length; j++) {
+row.push(list[j]);
+}
+rows.push(row);
+}
+return rows;
+},
+accountCandidates() : AccountNode[] {
+if (this.activeMode == 'transfer') return this.accounts;
+return this.accounts.filter((acc : AccountNode) : boolean => !this.isTransferOnlyAccount(acc));
+},
+categoryLabel() : string {
+const found = this.currentCategories.find((c : CategoryItem) : boolean => c.id == this.category);
+return found != null ? found.label : '';
+},
+amountInputClass() : string {
+const len = this.amount.trim().length;
+if (len >= 8) return 'amount-input-compact';
+if (len >= 5) return 'amount-input-long';
+return '';
+},
+selectedAccountName() : string {
+if (this.selectedAccountId == '') return '选择账户';
+const acc = this.accounts.find((a : AccountNode) : boolean => a.id == this.selectedAccountId);
+if (acc == null) return '选择账户';
+const name = (acc.name ?? '').toString().trim();
+const base = name == '' ? '至尊账户' : name;
+const raw = (acc.card_no ?? '').toString().trim();
+if (raw == '') return base;
+const tail = raw.length > 4 ? raw.substring(raw.length - 4) : raw;
+return `${base} *${tail}`;
+},
+selectedTargetAccountName() : string {
+if (this.selectedTargetAccountId == '') return '选择账户';
+const acc = this.accounts.find((a : AccountNode) : boolean => a.id == this.selectedTargetAccountId);
+if (acc == null) return '选择账户';
+const name = (acc.name ?? '').toString().trim();
+const base = name == '' ? '至尊账户' : name;
+const raw = (acc.card_no ?? '').toString().trim();
+if (raw == '') return base;
+const tail = raw.length > 4 ? raw.substring(raw.length - 4) : raw;
+return `${base} *${tail}`;
+},
+accountDisplayName() : string {
+if (this.selectedAccountId == '') return '至尊账户';
+const acc = this.accounts.find((a : AccountNode) : boolean => a.id == this.selectedAccountId);
+if (acc == null) return '至尊账户';
+const name = (acc.name ?? '').toString().trim();
+const base = name == '' ? '至尊账户' : name;
+const raw = (acc.card_no ?? '').toString().trim();
+if (raw == '') return base;
+const tail = raw.length > 4 ? raw.substring(raw.length - 4) : raw;
+return `${base} *${tail}`;
+},
+selectedBookName() : string {
+const b = this.bookOptions.find((x : BookNode) : boolean => x.id == this.selectedBookId);
+return b != null ? b.name : '日常账本';
+},
+effectiveCategory() : string {
+if (this.activeMode == 'transfer') return this.categoryLabel == '' ? '转账' : this.categoryLabel;
+if (this.activeMode == 'refund') return '退款';
+if (this.isEditMode && !this.categoryChanged && this.editOriginalCategory.trim() != '') return this.editOriginalCategory;
+return this.categoryLabel;
+},
+isEditMode() : boolean {
+return this.editTransactionId.trim() != '';
+}
+},
+onLoad(options : OnLoadOptions) {
+this.refreshTime();
+let inferredModeFromAmount = '';
+
+// Support prefilled parameters from OCR screen recognition
+const editParam = options['editTransactionId'];
+if (editParam != null) {
+this.editTransactionId = editParam.toString();
+}
+if (this.editTransactionId.trim() == '') {
+const cachedEditId = uni.getStorageSync(AppDialogApi.FINANCE_RECORD_EDIT_ID_KEY);
+if (cachedEditId != null && cachedEditId.toString().trim() != '') {
+this.editTransactionId = cachedEditId.toString();
+}
+}
+const amountParam = options['amount'];
+if (amountParam != null) {
+const amountText = amountParam.toString();
+const amountValue = parseFloat(amountText);
+if (!isNaN(amountValue)) {
+this.amount = Math.abs(amountValue).toString();
+if (amountValue < 0) inferredModeFromAmount = 'expense';
+} else {
+this.amount = amountText.replace(/[^0-9.]/g, '');
+}
+}
+const noteParam = options['note'];
+if (noteParam != null) {
+this.note = noteParam.toString();
+}
+const modeParam = options['activeMode'];
+if (modeParam != null) {
+const rawMode = modeParam.toString();
+if (rawMode == 'expense' || rawMode == 'income' || rawMode == 'transfer' || rawMode == 'refund') this.activeMode = rawMode as RecordMode;
+} else if (inferredModeFromAmount != '') {
+this.activeMode = inferredModeFromAmount as RecordMode;
+if (inferredModeFromAmount == 'expense') this.category = 'expense_tax';
+}
+const categoryParam = options['category'];
+if (categoryParam != null) {
+this.category = categoryParam.toString();
+}
+const categoryLabelParam = options['categoryLabel'];
+if (categoryLabelParam != null) {
+this.editCategoryLabel = categoryLabelParam.toString();
+this.editOriginalCategory = this.editCategoryLabel;
+}
+const accountParam = options['accountId'];
+if (accountParam != null) {
+this.prefillAccountId = accountParam.toString();
+}
+const bookParam = options['bookId'];
+if (bookParam != null) {
+this.selectedBookId = bookParam.toString();
+}
+const transactionTimeParam = options['transactionTime'];
+if (transactionTimeParam != null) {
+const ts = parseFloat(transactionTimeParam.toString());
+if (!isNaN(ts) && ts > 0) {
+this.prefillTransactionTime = ts;
+const d = new Date(ts);
+const h = d.getHours().toString().padStart(2, '0');
+const m = d.getMinutes().toString().padStart(2, '0');
+this.displayTime = `${d.getFullYear()}-${(d.getMonth() + 1).toString().padStart(2, '0')}-${d.getDate().toString().padStart(2, '0')}, ${h}:${m}`;
+}
+}
+const sourceAppParam = options['sourceApp'];
+if (sourceAppParam != null) {
+this.prefillSourceApp = sourceAppParam.toString();
+}
+const payMethodParam = options['payMethod'];
+if (payMethodParam != null) {
+this.prefillPayMethod = payMethodParam.toString();
+}
+const autoBgParam = options[DESK_PET_RECORD_AUTO_BACKGROUND_PARAM];
+this.autoBackgroundAfterSubmit = autoBgParam != null && autoBgParam.toString() == '1';
+this.loadBooks();
+if (this.editTransactionId.trim() != '') {
+this.loadEditingTransaction();
+}
+},
+onShow() {
+},
+onBackPress() : boolean | null {
+AppDialogApi.isRecordOpenGlobal = false;
+uni.removeStorageSync(AppDialogApi.FINANCE_RECORD_EDIT_ID_KEY);
+return false;
+},
+onUnload() {
+AppDialogApi.isRecordOpenGlobal = false;
+uni.removeStorageSync(AppDialogApi.FINANCE_RECORD_EDIT_ID_KEY);
+},
+watch: {
+activeMode(newMode : RecordMode) {
+if (this.isEditMode && this.editCategoryLabel.trim() != '') {
+this.applyCategoryLabel(this.editCategoryLabel);
+this.editCategoryLabel = '';
+return;
+}
+if (newMode == 'income') {
+this.category = 'income_salary';
+} else if (newMode == 'expense') {
+this.category = 'expense_tax';
+} else if (newMode == 'transfer') {
+this.category = 'transfer_general';
+} else if (newMode == 'refund') {
+this.category = 'income_refund_extra';
+this.loadRefundCandidates();
+}
+this.ensureSelectedAccountAllowed();
+},
+selectedBookId(_newVal : string) {
+this.loadAccounts();
+}
+},
+methods: {
+accountCardTail(acc : AccountNode) : string {
+const raw = (acc.card_no ?? '').toString().trim();
+if (raw == '') return '';
+const tail = raw.length > 4 ? raw.substring(raw.length - 4) : raw;
+return `*${tail}`;
+},
+accountDisplayText(acc : AccountNode) : string {
+const name = (acc.name ?? '').toString().trim();
+const base = name == '' ? '至尊账户' : name;
+const tail = this.accountCardTail(acc);
+return tail == '' ? base : `${base} ${tail}`;
+},
+isTransferOnlyAccount(acc : AccountNode) : boolean {
+const category = (acc.category ?? '').toString().trim().toLowerCase();
+const subType = (acc.sub_type ?? '').toString().trim();
+const type = (acc.type ?? '').toString().trim();
+const name = (acc.name ?? '').toString().trim();
+const text = `${subType} ${type} ${name}`;
+if (category == 'investment') return true;
+return text.indexOf('基金') >= 0 || text.indexOf('股票') >= 0 || text.indexOf('证券') >= 0 || text.indexOf('ETF') >= 0;
+},
+ensureSelectedAccountAllowed() {
+const candidates = this.accountCandidates;
+if (candidates.length == 0) {
+this.selectedAccountId = '';
+return;
+}
+if (this.selectedAccountId == '' || candidates.find((a : AccountNode) : boolean => a.id == this.selectedAccountId) == null) {
+this.selectedAccountId = candidates[0].id;
+}
+},
+refundBillTitle(bill : TransactionMount) : string {
+const desc = (bill.description ?? '').toString().trim();
+const cat = (bill.category ?? '').toString().trim();
+const title = desc != '' ? desc : (cat != '' ? cat : '未命名账单');
+const sign = bill.type == 'income' ? '+' : '-';
+return `${title} ${sign}${Math.abs(bill.amount).toFixed(2)}`;
+},
+refundBillSubTitle(bill : TransactionMount) : string {
+const d = new Date(bill.transaction_time);
+const dateText = `${(d.getMonth() + 1).toString().padStart(2, '0')}-${d.getDate().toString().padStart(2, '0')}`;
+const account = (bill.account_name ?? '').toString().trim();
+const cat = (bill.category ?? '').toString().trim();
+return `${dateText} ${account == '' ? '未知账户' : account}${cat == '' ? '' : ' · ' + cat}`;
+},
+closeSheet() {
+if (AppDialogApi.tryCloseDialog()) return;
+uni.navigateBack();
+},
+getModeLabel(mode : RecordMode) : string {
+if (mode == 'expense') return '支出';
+if (mode == 'income') return '收入';
+if (mode == 'transfer') return '转账';
+if (mode == 'refund') return '退款';
+return '支出';
+},
+onModeTabClick(mode : RecordMode) {
+this.categoryChanged = true;
+this.activeMode = mode;
+if (mode == 'transfer') {
+this.selectedShoppingTaskIds = [] as string[];
+this.selectedShoppingTaskName = '';
+this.selectedStorageTargetId = '';
+this.selectedStorageTargetName = '';
+if (this.accounts.length > 1 && this.selectedTargetAccountId == '') {
+for (let i = 0; i < this.accounts.length; i++) {
+if (this.accounts[i].id != this.selectedAccountId) {
+this.selectedTargetAccountId = this.accounts[i].id;
+break;
+}
+}
+}
+} else if (mode == 'refund') {
+this.selectedShoppingTaskIds = [] as string[];
+this.selectedShoppingTaskName = '';
+this.selectedStorageTargetId = '';
+this.selectedStorageTargetName = '';
+this.loadRefundCandidates();
+}
+},
+selectCategory(id : string) {
+this.categoryChanged = true;
+this.category = id;
+},
+async loadRefundCandidates() {
+this.refundCandidates = await FinanceBiz.listRecentTransactions(80);
+},
+filterRefundBills(keyword : string) : TransactionMount[] {
+const q = keyword.trim().toLowerCase();
+let list = this.refundCandidates;
+if (q != '') {
+list = list.filter((bill : TransactionMount) : boolean => {
+const text = `${bill.description ?? ''} ${bill.category ?? ''} ${bill.account_name ?? ''} ${bill.amount.toString()}`.toLowerCase();
+return text.indexOf(q) >= 0;
+});
+}
+return list.slice(0, 12);
+},
+selectRefundBill(bill : TransactionMount) {
+this.selectedRefundTransactionId = bill.id;
+this.selectedRefundTransactionName = this.refundBillTitle(bill);
+this.amount = bill.amount.toString();
+this.selectedAccountId = bill.account_id;
+this.ensureSelectedAccountAllowed();
+const desc = (bill.description ?? '').toString().trim();
+this.note = desc == '' ? '退款' : `退款: ${desc}`;
+},
+clearRefundBill() {
+this.selectedRefundTransactionId = '';
+this.selectedRefundTransactionName = '';
+this.refundSearchText = '';
+},
+refreshTime() {
+const d = new Date();
+const h = d.getHours().toString().padStart(2, '0');
+const m = d.getMinutes().toString().padStart(2, '0');
+this.displayTime = `今天, ${h}:${m}`;
+},
+toggleIncludeInFlow() {
+this.includeInFlow = !this.includeInFlow;
+},
+toggleReimbursable() {
+this.isReimbursable = !this.isReimbursable;
+if (this.isReimbursable && this.activeMode == 'expense') {
+this.category = 'expense_tax';
+}
+},
+normalizeMoneyText(raw : string) : string {
+let val = (raw ?? '').toString().replace(/[^0-9.]/g, '');
+const dots = val.split('.').length - 1;
+if (dots > 1) {
+const firstDotIndex = val.indexOf('.');
+val = val.substring(0, firstDotIndex + 1) + val.substring(firstDotIndex + 1).replace(/\./g, '');
+}
+if (val.includes('.')) {
+const parts = val.split('.');
+if (parts[1].length > 2) {
+val = parts[0] + '.' + parts[1].substring(0, 2);
+}
+}
+return val;
+},
+onServiceFeeInput(e : InputEvent) {
+this.serviceFee = this.normalizeMoneyText(e.detail.value);
+},
+onCouponInput(e : InputEvent) {
+this.couponAmount = this.normalizeMoneyText(e.detail.value);
+},
+moneyTextToNumber(raw : string) : number {
+const val = parseFloat((raw ?? '').toString());
+return isNaN(val) ? 0.0 : Math.abs(val);
+},
+applyTransactionProperties(raw : string | null) {
+if (raw == null || raw.trim() == '') return;
+try {
+const props = JSON.parse(raw) as any;
+if (props['include_in_flow'] != null) this.includeInFlow = props['include_in_flow'] as boolean;
+if (props['is_reimbursable'] != null) this.isReimbursable = props['is_reimbursable'] as boolean;
+if (props['service_fee'] != null) {
+const fee = parseFloat(props['service_fee'].toString());
+this.serviceFee = isNaN(fee) || fee <= 0 ? '' : fee.toString();
+}
+if (props['coupon_amount'] != null) {
+const coupon = parseFloat(props['coupon_amount'].toString());
+this.couponAmount = isNaN(coupon) || coupon <= 0 ? '' : coupon.toString();
+}
+if (props['refund_transaction_id'] != null) this.selectedRefundTransactionId = props['refund_transaction_id'].toString();
+if (props['refund_transaction_name'] != null) this.selectedRefundTransactionName = props['refund_transaction_name'].toString();
+} catch (_e) {}
+},
+buildTransactionProperties(sourceNodeId : string | null) : string {
+const props = {
+shopping_task_ids: this.selectedShoppingTaskIds,
+storage_target_id: this.selectedStorageTargetId == '' ? null : this.selectedStorageTargetId,
+storage_target_name: this.selectedStorageTargetName == '' ? null : this.selectedStorageTargetName,
+source_app: this.prefillSourceApp == '' ? null : this.prefillSourceApp,
+pay_method: this.prefillPayMethod == '' ? null : this.prefillPayMethod,
+source_node_id: sourceNodeId,
+include_in_flow: this.includeInFlow,
+is_reimbursable: this.isReimbursable,
+service_fee: this.moneyTextToNumber(this.serviceFee),
+coupon_amount: this.moneyTextToNumber(this.couponAmount),
+refund_transaction_id: this.selectedRefundTransactionId == '' ? null : this.selectedRefundTransactionId,
+refund_transaction_name: this.selectedRefundTransactionName == '' ? null : this.selectedRefundTransactionName
+};
+return JSON.stringify(props);
+},
+safeJson(value : any) : string {
+try {
+return JSON.stringify(value);
+} catch (_e) {
+try {
+return value == null ? 'null' : value.toString();
+} catch (_e2) {
+return '[unserializable]';
+}
+}
+},
+applyCategoryLabel(label : string) {
+const raw = (label ?? '').toString().trim();
+if (raw == '') return;
+const list = this.currentCategories;
+for (let i = 0; i < list.length; i++) {
+if (list[i].label == raw || list[i].id == raw) {
+this.category = list[i].id;
+return;
+}
+}
+},
+async loadEditingTransaction() {
+const bill = await FinanceBiz.getTransactionMount(this.editTransactionId);
+if (bill == null) {
+uni.showToast({ title: '原账单不存在', icon: 'none' });
+return;
+}
+this.amount = bill.amount.toString();
+this.activeMode = bill.type == 'income' ? 'income' : 'expense';
+this.prefillAccountId = bill.account_id;
+this.selectedAccountId = bill.account_id;
+const categoryText = bill.category == null ? '' : bill.category!.toString();
+this.editCategoryLabel = categoryText;
+this.editOriginalCategory = categoryText;
+this.applyCategoryLabel(categoryText);
+this.note = bill.description == null ? '' : bill.description!.toString();
+this.location = bill.location == null ? '' : bill.location!.toString();
+this.applyTransactionProperties(bill.properties == null ? null : bill.properties!.toString());
+this.prefillTransactionTime = bill.transaction_time;
+const d = new Date(bill.transaction_time);
+const h = d.getHours().toString().padStart(2, '0');
+const m = d.getMinutes().toString().padStart(2, '0');
+this.displayTime = `${d.getFullYear()}-${(d.getMonth() + 1).toString().padStart(2, '0')}-${d.getDate().toString().padStart(2, '0')}, ${h}:${m}`;
+},
+onAmountInput(e : InputEvent) {
+let val = e.detail.value;
+val = val.replace(/[^0-9.]/g, '');
+const dots = val.split('.').length - 1;
+if (dots > 1) {
+const firstDotIndex = val.indexOf('.');
+val = val.substring(0, firstDotIndex + 1) + val.substring(firstDotIndex + 1).replace(/\./g, '');
+}
+if (val.includes('.')) {
+const parts = val.split('.');
+if (parts[1].length > 2) {
+val = parts[0] + '.' + parts[1].substring(0, 2);
+}
+}
+this.amount = val;
+},
+async loadAccounts() {
+const bookId = this.isEditMode ? null : (this.selectedBookId == '' ? null : this.selectedBookId);
+this.accounts = await FinanceBiz.listAccountNodes(bookId);
+if (this.accounts.length > 0) {
+if (this.prefillAccountId != '' && this.accounts.find((a : AccountNode) : boolean => a.id == this.prefillAccountId) != null) {
+this.selectedAccountId = this.prefillAccountId;
+this.prefillAccountId = '';
+} else if (this.selectedAccountId == '' || this.accounts.find((a : AccountNode) : boolean => a.id == this.selectedAccountId) == null) {
+this.selectedAccountId = this.accounts[0].id;
+}
+if (this.accounts.length > 1) {
+if (this.selectedTargetAccountId == '' || this.selectedTargetAccountId == this.selectedAccountId || this.accounts.find((a : AccountNode) : boolean => a.id == this.selectedTargetAccountId) == null) {
+for (let i = 0; i < this.accounts.length; i++) {
+if (this.accounts[i].id != this.selectedAccountId) {
+this.selectedTargetAccountId = this.accounts[i].id;
+break;
+}
+}
+}
+} else {
+this.selectedTargetAccountId = '';
+}
+} else {
+this.selectedAccountId = '';
+this.selectedTargetAccountId = '';
+}
+this.ensureSelectedAccountAllowed();
+},
+async loadBooks() {
+this.bookOptions = await FinanceBiz.listBooks();
+if (this.bookOptions.length > 0) {
+if (this.selectedBookId == '' || this.bookOptions.find((b : BookNode) : boolean => b.id == this.selectedBookId) == null) {
+this.selectedBookId = this.bookOptions[0].id;
+}
+} else {
+this.selectedBookId = '';
+}
+await this.loadAccounts();
+if (this.activeMode == 'refund') {
+await this.loadRefundCandidates();
+}
+if (this.isEditMode && this.editCategoryLabel.trim() != '') {
+this.applyCategoryLabel(this.editCategoryLabel);
+this.editCategoryLabel = '';
+}
+},
+showAccountPicker() {
+const candidates = this.accountCandidates;
+if (candidates.length == 0) {
+uni.showToast({ title: '请先创建账户', icon: 'none' });
+return;
+}
+const itemList = candidates.map((a) : string => this.accountDisplayText(a));
+uni.showActionSheet({
+itemList: itemList,
+success: (res) => {
+this.selectedAccountId = candidates[res.tapIndex].id;
+}
+});
+},
+showBookPicker() {
+if (this.bookOptions.length == 0) return;
+const itemList = this.bookOptions.map((b) : string => b.name);
+itemList.push('＋ 新建账本');
+uni.showActionSheet({
+itemList: itemList,
+success: (res) => {
+if (res.tapIndex == this.bookOptions.length) {
+uni.showModal({
+title: '新建账本',
+editable: true,
+placeholderText: '请输入账本名称',
+success: (modalRes) => {
+if (!modalRes.confirm) return;
+const val = (modalRes.content ?? '').toString().trim();
+if (val == '') {
+uni.showToast({ title: '账本名称不能为空', icon: 'none' });
+return;
+}
+FinanceBiz.createBook(val).then((id) => {
+if (id == null || id == '') {
+uni.showToast({ title: '创建账本失败', icon: 'none' });
+return;
+}
+this.loadBooks().then(() => {
+this.selectedBookId = id;
+uni.showToast({ title: '账本已创建', icon: 'none' });
+});
+});
+}
+});
+return;
+}
+if (res.tapIndex >= 0 && res.tapIndex < this.bookOptions.length) {
+this.selectedBookId = this.bookOptions[res.tapIndex].id;
+}
+}
+});
+},
+showTargetAccountPicker() {
+if (this.accounts.length <= 1) {
+uni.showToast({ title: '至少需要两个账户', icon: 'none' });
+return;
+}
+const candidates = this.accounts.filter((a : AccountNode) : boolean => a.id != this.selectedAccountId);
+const itemList = candidates.map((a) : string => this.accountDisplayText(a));
+uni.showActionSheet({
+itemList: itemList,
+success: (res) => {
+if (res.tapIndex >= 0 && res.tapIndex < candidates.length) {
+this.selectedTargetAccountId = candidates[res.tapIndex].id;
+}
+}
+});
+},
+isActiveTaskStatus(status : string) : boolean {
+const raw = (status ?? '').toString().toLowerCase();
+return raw != 'done' && raw != 'completed' && raw != 'archived' && raw != 'abandoned' && raw != '3';
+},
+isProjectTaskCandidate(task : Task) : boolean {
+return this.isActiveTaskStatus(task.status) && !TaskBiz.isStorageEntityTask(task);
+},
+shouldAutoCompleteLinkedTask(task : Task) : boolean {
+return TaskBiz.getTaskCategory(task) == '购物';
+},
+async refreshTaskCandidatesWithSync(source : string, showLoading : boolean = false) {
+if (showLoading) {
+uni.showLoading({ title: '刷新关联数据...', mask: true });
+}
+try {
+try {
+await EcosystemAppBootstrap.runForegroundSync(FINANCE_APP_PROFILE, source);
+} catch (e) {
+console.warn('[zemo.finance] record sync refresh failed', e);
+}
+await this.loadTaskCandidates();
+} finally {
+if (showLoading) {
+uni.hideLoading();
+}
+}
+},
+async loadTaskCandidates() {
+this.allTasks = await TaskBiz.getAllTasks();
+this.shoppingCandidates = this.allTasks.filter((t : Task) : boolean => {
+return this.isProjectTaskCandidate(t);
+});
+this.storageCandidates = this.allTasks.filter((t : Task) : boolean => {
+return this.isActiveTaskStatus(t.status) && TaskBiz.isStorageBoxTask(t);
+});
+},
+async showTaskPicker() {
+await this.refreshTaskCandidatesWithSync('record-task-picker', true);
+if (this.shoppingCandidates.length == 0) {
+uni.showToast({ title: '当前没有可关联任务', icon: 'none' });
+return;
+}
+const itemList = this.shoppingCandidates.map((t) : string => t.title);
+uni.showActionSheet({
+itemList: itemList,
+success: (res) => {
+const task = this.shoppingCandidates[res.tapIndex];
+this.selectedShoppingTaskIds = [task.id];
+this.selectedShoppingTaskName = task.title;
+}
+});
+},
+async showStoragePicker() {
+await this.refreshTaskCandidatesWithSync('record-storage-picker', true);
+if (this.storageCandidates.length == 0) {
+uni.showToast({ title: '当前没有可选收纳任务', icon: 'none' });
+return;
+}
+const itemList = this.storageCandidates.map((t) : string => t.title);
+uni.showActionSheet({
+itemList: itemList,
+success: (res) => {
+const target = this.storageCandidates[res.tapIndex];
+this.selectedStorageTargetId = target.id;
+this.selectedStorageTargetName = target.title;
+}
+});
+},
+buildStorageItemNote(amount : number, shoppingTitles : string[]) : string {
+const lines = [] as string[];
+lines.push(`来源账单: ${this.note == '' ? '手动记账' : this.note}`);
+lines.push(`关联任务: ${shoppingTitles.length > 0 ? shoppingTitles.join('、') : '未关联'}`);
+lines.push(`收纳位置: ${this.selectedStorageTargetName == '' ? '未选择' : this.selectedStorageTargetName}`);
+lines.push(`金额: ${amount.toFixed(2)}`);
+lines.push(`定位: ${this.location == '' ? '未填写' : this.location}`);
+lines.push(`时间: ${Date.now()}`);
+return lines.join('\n');
+},
+finishSubmitAndMaybeBackground() {
+const shouldBackground = this.autoBackgroundAfterSubmit;
+this.autoBackgroundAfterSubmit = false;
+setTimeout(() => {
+this.closeSheet();
+if (shouldBackground) {
+setTimeout(() => {
+AppBackgroundService.moveToBackground();
+}, 260);
+}
+}, 360);
+},
+async submit() {
+const val = parseFloat(this.amount);
+if (isNaN(val) || val <= 0) {
+uni.showToast({ title: '请输入有效金额', icon: 'none' });
+return;
+}
+if (this.selectedAccountId == '') {
+uni.showToast({ title: '请选择账户', icon: 'none' });
+return;
+}
+
+if (this.isEditMode) {
+const updatePayload = {
+account_id: this.selectedAccountId,
+amount: val,
+type: this.financeType,
+category: this.effectiveCategory,
+description: this.note,
+location: this.location,
+transaction_time: this.prefillTransactionTime > 0 ? this.prefillTransactionTime : null,
+properties: this.buildTransactionProperties(null)
+} as UpdateTransactionPayload;
+console.log(`[FinanceRecord][Debug] record_update_payload=${this.safeJson({ id: this.editTransactionId, payload: updatePayload })}`);
+const ok = await FinanceBiz.updateTransaction(this.editTransactionId, updatePayload);
+console.log(`[FinanceRecord][Debug] record_update_result id=${this.editTransactionId}, ok=${ok ? 'true' : 'false'}`);
+if (ok) {
+uni.showToast({ title: '账单已更新', icon: 'success' });
+this.finishSubmitAndMaybeBackground();
+} else {
+uni.showToast({ title: '保存失败', icon: 'none' });
+}
+return;
+}
+
+if (this.activeMode == 'refund' && this.selectedRefundTransactionId == '') {
+uni.showToast({ title: '请选择退款账单', icon: 'none' });
+return;
+}
+
+if (this.activeMode == 'transfer') {
+if (this.selectedTargetAccountId == '' || this.selectedTargetAccountId == this.selectedAccountId) {
+uni.showToast({ title: '请选择有效转入账户', icon: 'none' });
+return;
+}
+const transferDesc = this.note == '' ? '账户转账' : this.note;
+console.log(`[FinanceRecord][Debug] record_transfer_payload=${this.safeJson({
+fromAccountId: this.selectedAccountId,
+toAccountId: this.selectedTargetAccountId,
+amount: val,
+description: transferDesc,
+category: this.effectiveCategory,
+location: this.location,
+properties: this.buildTransactionProperties(null)
+})}`);
+const transferOk = await FinanceBiz.transferBetweenAccounts(
+this.selectedAccountId,
+this.selectedTargetAccountId,
+val,
+transferDesc,
+this.effectiveCategory,
+this.location,
+this.buildTransactionProperties(null)
+);
+console.log(`[FinanceRecord][Debug] record_transfer_result ok=${transferOk ? 'true' : 'false'}`);
+if (transferOk) {
+uni.showToast({ title: '转账成功', icon: 'success' });
+this.finishSubmitAndMaybeBackground();
+} else {
+uni.showToast({ title: '转账失败', icon: 'none' });
+}
+return;
+}
+
+		const sourceNodeId = this.selectedShoppingTaskIds.length > 0 ? this.selectedShoppingTaskIds[0] : null;
+		const createPayload = {
+			account_id: this.selectedAccountId,
+			amount: val,
+			type: this.financeType,
+			category: this.effectiveCategory,
+			description: this.note,
+			location: this.location,
+			transaction_time: this.prefillTransactionTime > 0 ? this.prefillTransactionTime : null,
+			source_node_id: sourceNodeId,
+			item_node_id: sourceNodeId,
+			location_node_id: this.selectedStorageTargetId == '' ? null : this.selectedStorageTargetId,
+			properties: this.buildTransactionProperties(sourceNodeId),
+			receipt_paths: [] as string[]
+		} as CreateTransactionForNodesPayload;
+		console.log(`[FinanceRecord][Debug] record_create_payload=${this.safeJson(createPayload)}`);
+		const transactionId = await FinanceBiz.createTransactionForNodes(createPayload);
+		console.log(`[FinanceRecord][Debug] record_create_result id=${transactionId == null ? '' : transactionId}`);
+
+		if (transactionId == null || transactionId == '') {
+uni.showToast({ title: '记账失败', icon: 'none' });
+return;
+}
+
+const selectedTitles = [] as string[];
+if (this.activeMode == 'expense') {
+for (let i = 0; i < this.shoppingCandidates.length; i++) {
+if (this.selectedShoppingTaskIds.indexOf(this.shoppingCandidates[i].id) >= 0) {
+selectedTitles.push(this.shoppingCandidates[i].title);
+}
+}
+
+for (let i = 0; i < this.selectedShoppingTaskIds.length; i++) {
+const task = this.shoppingCandidates.find((candidate : Task) : boolean => candidate.id == this.selectedShoppingTaskIds[i]);
+if (task != null && this.shouldAutoCompleteLinkedTask(task)) {
+await TaskBiz.completeTask(this.selectedShoppingTaskIds[i]);
+}
+}
+
+if (this.selectedStorageTargetId != '') {
+if (this.categoryLabel == '快递') {
+await AutoFinanceService.createPickupTaskFromBookkeeping(
+this.note,
+this.selectedStorageTargetId,
+this.selectedStorageTargetName,
+this.selectedShoppingTaskIds
+);
+} else {
+					const storageNote = this.buildStorageItemNote(val, selectedTitles);
+					let itemNames = selectedTitles;
+					if (itemNames.length == 0) {
+						const fallbackName = this.note.trim() == '' ? '记账入箱物品' : this.note.trim();
+						itemNames = [fallbackName];
+					}
+
+					for (let i = 0; i < itemNames.length; i++) {
+						await TaskBiz.createStorageItem(this.selectedStorageTargetId, {
+							item_name: itemNames[i],
+							note: storageNote,
+							amount: val,
+							attachments: [] as string[]
+						} as CreateStorageItemPayload);
+					}
+}
+}
+}
+
+uni.showToast({ title: '记账成功', icon: 'success' });
+this.finishSubmitAndMaybeBackground();
+},
+deleteCurrentTransaction() {
+if (!this.isEditMode || this.deletingTransaction) return;
+uni.showModal({
+title: '删除账单',
+content: '删除后会同步回滚账户余额，确认删除？',
+confirmText: '删除',
+confirmColor: '#e85d67',
+success: (res) => {
+if (!res.confirm) return;
+this.deletingTransaction = true;
+FinanceBiz.deleteTransaction(this.editTransactionId).then((ok) => {
+if (ok) {
+uni.showToast({ title: '账单已删除', icon: 'success' });
+uni.removeStorageSync(AppDialogApi.FINANCE_RECORD_EDIT_ID_KEY);
+uni.setStorageSync('zemo_finance_home_skip_reload_until', (Date.now() + 3000).toString());
+uni.setStorageSync('zemo_finance_home_deleted_transaction_id', this.editTransactionId);
+this.finishSubmitAndMaybeBackground();
+} else {
+uni.showToast({ title: '删除失败', icon: 'none' });
+this.deletingTransaction = false;
+}
+}).catch((_e) => {
+uni.showToast({ title: '删除失败', icon: 'none' });
+this.deletingTransaction = false;
+});
+}
+});
+}
+}
+}
+</script>
+
+<style>
+.record-modal-page {
+flex: 1;
+position: relative;
+overflow: visible;
+background-color: rgba(0, 0, 0, 0);
+justify-content: flex-end;
+}
+
+.record-backdrop {
+position: absolute;
+top: 0;
+left: 0;
+right: 0;
+bottom: 0;
+background-color: rgba(37, 43, 50, 0.24);
+}
+
+.record-sheet {
+position: relative;
+z-index: 2;
+overflow: visible;
+background-color: #eef2f5;
+border-top-left-radius: 30px;
+border-top-right-radius: 30px;
+padding: 11px 14px 13px 14px;
+		padding-bottom: 24px;
+flex-direction: column;
+}
+
+.sheet-handle {
+width: 58px;
+height: 5px;
+border-radius: 99px;
+background-color: #d5dce2;
+align-self: center;
+}
+
+.sheet-close {
+position: absolute;
+top: 10px;
+right: 13px;
+width: 32px;
+height: 32px;
+border-radius: 16px;
+background-color: #dde3e8;
+justify-content: center;
+align-items: center;
+}
+
+.sheet-close-icon {
+font-size: 14px;
+color: #6c747c;
+font-weight: 600;
+}
+
+.sheet-header {
+margin-top: 11px;
+padding-left: 8px;
+padding-right: 38px;
+flex-direction: row;
+align-items: center;
+justify-content: space-between;
+}
+
+.sheet-title {
+font-size: 20px;
+font-weight: 700;
+letter-spacing: 0;
+color: #0d6782;
+}
+
+.header-options {
+flex-direction: row;
+align-items: center;
+}
+
+.mini-toggle {
+height: 28px;
+padding: 0 9px;
+border-radius: 14px;
+background-color: #e1e7ec;
+border-width: 1px;
+border-color: #cbd5dd;
+justify-content: center;
+align-items: center;
+margin-left: 6px;
+}
+
+.mini-toggle-active {
+background-color: #0d6782;
+border-color: #0d6782;
+}
+
+.mini-toggle-text {
+font-size: 11px;
+font-weight: 700;
+color: #60707c;
+}
+
+.mini-toggle-text-active {
+color: #ffffff;
+}
+
+.type-tabs {
+margin-top: 8px;
+flex-direction: row;
+justify-content: space-between;
+padding: 0 3px 6px 3px;
+border-bottom-width: 1px;
+border-bottom-color: #d4dbe1;
+}
+
+.type-tab {
+padding: 5px 3px;
+border-bottom-width: 2px;
+border-bottom-color: transparent;
+}
+
+.type-tab-active {
+border-bottom-color: #0d6782;
+}
+
+.type-tab-text {
+font-size: 14px;
+color: #89939d;
+font-weight: 700;
+}
+
+.type-tab-text-active {
+color: #0d6782;
+}
+
+.amount-row {
+margin-top: 10px;
+flex-direction: row;
+align-items: center;
+}
+
+.amount-sign {
+font-size: 34px;
+font-weight: 700;
+color: #0f607c;
+line-height: 1;
+margin-right: 4px;
+}
+
+.amount-sign-income {
+color: #0f607c;
+}
+
+.amount-input {
+flex: 1;
+min-width: 0;
+height: 50px;
+line-height: 50px;
+font-size: 42px;
+font-weight: 700;
+padding: 0 4px 0 0;
+color: #141c24;
+background-color: transparent;
+}
+
+.amount-input-long {
+font-size: 36px;
+}
+
+.amount-input-compact {
+font-size: 30px;
+}
+
+.time-chip {
+flex-direction: row;
+align-items: center;
+max-width: 108px;
+padding: 5px 8px;
+border-radius: 999px;
+background-color: #e7edf2;
+border-width: 1px;
+border-color: #cfd8df;
+}
+
+.time-chip-icon {
+font-size: 12px;
+margin-right: 3px;
+}
+
+.time-chip-text {
+font-size: 12px;
+font-weight: 700;
+color: #1f2a34;
+}
+
+.divider {
+height: 1px;
+background-color: #d8dfe5;
+margin-top: 8px;
+}
+
+.info-row-grid {
+margin-top: 9px;
+flex-direction: row;
+justify-content: space-between;
+}
+
+.info-cell {
+width: 49%;
+}
+
+.info-label {
+font-size: 12px;
+font-weight: 700;
+color: #6c7782;
+margin-bottom: 6px;
+}
+
+.info-select-pill {
+height: 38px;
+border-radius: 19px;
+background-color: #e4eaef;
+padding: 0 10px;
+flex-direction: row;
+align-items: center;
+border-width: 1px;
+border-color: #ccd5dc;
+}
+
+.info-select-icon {
+font-size: 13px;
+margin-right: 5px;
+}
+
+.info-select-text {
+flex: 1;
+font-size: 12px;
+color: #1f2a33;
+font-weight: 700;
+lines: 1;
+text-overflow: ellipsis;
+}
+
+.info-select-arrow {
+font-size: 11px;
+color: #5c6570;
+}
+
+.refund-picker {
+position: relative;
+z-index: 9000;
+overflow: visible;
+margin-top: 9px;
+background-color: #e7edf2;
+border-radius: 13px;
+padding: 8px;
+border-width: 1px;
+border-color: #ced8df;
+}
+
+.refund-fill-label {
+font-size: 12px;
+font-weight: 700;
+color: #6c7782;
+margin-bottom: 6px;
+}
+
+.refund-fill-row {
+height: 42px;
+border-radius: 18px;
+background-color: #edf3f7;
+border-width: 1px;
+border-color: #d3dde5;
+padding: 0 10px;
+flex-direction: row;
+align-items: center;
+}
+
+.refund-fill-selected {
+height: 50px;
+background-color: #d8e6ef;
+border-color: #b9ccd8;
+}
+
+.refund-fill-placeholder {
+flex: 1;
+font-size: 12px;
+font-weight: 700;
+color: #8a96a1;
+}
+
+.refund-fill-input {
+flex: 1;
+height: 38px;
+line-height: 38px;
+font-size: 12px;
+font-weight: 700;
+color: #1f2a33;
+background-color: transparent;
+padding: 0;
+}
+
+.refund-fill-arrow {
+font-size: 12px;
+font-weight: 700;
+color: #0d6782;
+}
+
+.refund-fill-content {
+flex: 1;
+}
+
+.refund-fill-main {
+font-size: 12px;
+font-weight: 700;
+color: #1f2a33;
+lines: 1;
+text-overflow: ellipsis;
+}
+
+.refund-fill-sub {
+margin-top: 3px;
+font-size: 10px;
+font-weight: 700;
+color: #6b7681;
+}
+
+.refund-fill-clear {
+width: 28px;
+height: 28px;
+line-height: 28px;
+text-align: center;
+border-radius: 14px;
+background-color: #edf3f7;
+font-size: 16px;
+font-weight: 700;
+color: #0d6782;
+}
+
+.refund-result-float {
+position: absolute;
+left: 8px;
+right: 8px;
+bottom: 58px;
+height: 142px;
+z-index: 9001;
+background-color: #edf3f7;
+border-radius: 12px;
+border-width: 1px;
+border-color: #c8d5dd;
+padding: 5px;
+}
+
+.refund-result-item {
+height: 44px;
+border-radius: 10px;
+padding: 5px 8px;
+margin-bottom: 4px;
+background-color: #ffffff;
+border-width: 1px;
+border-color: #d8e1e8;
+}
+
+.refund-result-active {
+background-color: #d8e6ef;
+border-color: #0d6782;
+}
+
+.refund-result-main {
+font-size: 12px;
+font-weight: 700;
+color: #1f2a33;
+lines: 1;
+text-overflow: ellipsis;
+}
+
+.refund-result-sub {
+margin-top: 2px;
+font-size: 10px;
+font-weight: 700;
+color: #6b7681;
+lines: 1;
+text-overflow: ellipsis;
+}
+
+.refund-result-empty {
+height: 44px;
+justify-content: center;
+align-items: center;
+}
+
+.refund-result-empty-text {
+font-size: 12px;
+font-weight: 700;
+color: #8a96a1;
+}
+
+.category-header-row {
+position: relative;
+z-index: 0;
+margin-top: 10px;
+flex-direction: row;
+justify-content: space-between;
+align-items: center;
+}
+
+.category-header {
+font-size: 12px;
+font-weight: 700;
+color: #6c7782;
+}
+
+.book-chip {
+padding: 5px 10px;
+border-radius: 999px;
+background-color: #d8e6ef;
+border-width: 1px;
+border-color: #b9ccd8;
+}
+
+.book-chip-text {
+font-size: 12px;
+font-weight: 700;
+color: #0d6782;
+}
+
+.category-scroll {
+position: relative;
+z-index: 0;
+margin-top: 8px;
+width: 100%;
+}
+
+.category-scroll-one {
+height: 66px;
+}
+
+.category-scroll-two {
+height: 132px;
+}
+
+.category-list {
+flex-direction: column;
+padding-bottom: 2px;
+}
+
+.category-row {
+height: 66px;
+flex-direction: row;
+align-items: flex-start;
+}
+
+.category-item {
+width: 25%;
+align-items: center;
+height: 66px;
+}
+
+.category-chip {
+width: 42px;
+height: 42px;
+border-radius: 21px;
+background-color: #e1e7ec;
+align-items: center;
+justify-content: center;
+border-width: 1px;
+border-color: #d6dde3;
+}
+
+.category-chip-active {
+background-color: #0d6a86;
+border-color: #0d6a86;
+}
+
+.category-icon {
+font-size: 16px;
+}
+
+.category-text {
+margin-top: 4px;
+font-size: 11px;
+font-weight: 700;
+color: #36424e;
+}
+
+.category-text-active {
+color: #0d6a86;
+}
+
+.note-card {
+position: relative;
+z-index: 0;
+margin-top: 10px;
+background-color: #e7edf2;
+border-radius: 13px;
+padding: 10px 10px;
+border-width: 1px;
+border-color: #ced8df;
+}
+
+.note-card-head {
+flex-direction: row;
+align-items: center;
+justify-content: space-between;
+}
+
+.note-account {
+min-width: 82px;
+max-width: 118px;
+height: 32px;
+border-radius: 16px;
+background-color: #d8e6ef;
+padding: 0 8px;
+flex-direction: row;
+align-items: center;
+border-width: 1px;
+border-color: #c1d2dd;
+}
+
+.note-left {
+flex: 1;
+font-size: 12px;
+font-weight: 700;
+color: #0d6782;
+lines: 1;
+text-overflow: ellipsis;
+}
+
+.note-account-arrow {
+font-size: 10px;
+color: #0d6782;
+margin-left: 4px;
+}
+
+.adjust-inputs {
+flex: 1;
+margin-left: 8px;
+flex-direction: row;
+justify-content: flex-end;
+align-items: center;
+}
+
+.adjust-field {
+width: 78px;
+height: 34px;
+border-radius: 17px;
+background-color: #edf3f7;
+border-width: 1px;
+border-color: #d3dde5;
+padding: 0 7px;
+margin-left: 6px;
+flex-direction: row;
+align-items: center;
+}
+
+.adjust-label {
+font-size: 10px;
+font-weight: 700;
+color: #6b7681;
+margin-right: 3px;
+}
+
+.adjust-input {
+flex: 1;
+min-width: 0;
+height: 30px;
+line-height: 30px;
+padding: 0;
+font-size: 11px;
+font-weight: 700;
+color: #1f2a33;
+background-color: transparent;
+}
+
+.note-tag {
+padding: 3px 8px;
+border-radius: 999px;
+background-color: #d7e6ef;
+}
+
+.note-tag-text {
+font-size: 11px;
+font-weight: 700;
+color: #0d6782;
+}
+
+.note-input {
+margin-top: 6px;
+height: 34px;
+line-height: 34px;
+padding: 0 6px;
+font-size: 12px;
+color: #313d48;
+background-color: transparent;
+}
+
+.sheet-footer {
+position: relative;
+z-index: 0;
+margin-top: 12px;
+padding-top: 6px;
+align-items: center;
+border-top-width: 1px;
+border-top-color: #dde4ea;
+}
+
+.submit-btn {
+width: 100%;
+height: 50px;
+line-height: 50px;
+border-radius: 25px;
+background-color: #0b627f;
+color: #ffffff;
+font-size: 17px;
+font-weight: 700;
+border: none;
+}
+
+.draft-text {
+margin-top: 9px;
+font-size: 12px;
+color: #9ca6af;
+font-weight: 700;
+}
+
+.delete-text {
+margin-top: 9px;
+font-size: 12px;
+color: #e85d67;
+font-weight: 700;
+}
+</style>

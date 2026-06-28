@@ -1,0 +1,63 @@
+﻿import { Task } from '@/services/biz/TaskBiz.uts';
+import { NoteItem } from '@/services/biz/NoteBiz.uts';
+
+/**
+ * 瑙嗚鑺傜偣鍩虹被
+ */
+export open class VisionNode {
+    id: string;
+    x: number;
+    y: number;
+    type: string; // 'entity' | 'kinetic'
+
+    constructor(id: string, x: number, y: number, type: string) {
+        this.id = id;
+        this.x = x;
+        this.y = y;
+        this.type = type;
+    }
+}
+
+/**
+ * 瀹炰綋鑺傜偣
+ */
+export class EntityNode extends VisionNode {
+    subtype: string; 
+    data: any; 
+    style: UTSJSONObject; // 缁熶竴浣跨敤 UTSJSONObject
+
+    constructor(id: string, x: number, y: number, subtype: string, data: any, style: UTSJSONObject) {
+        super(id, x, y, 'entity');
+        this.subtype = subtype;
+        this.data = data;
+        this.style = style;
+    }
+    
+    getTask(): Task | null {
+        if (this.subtype == 'task') return this.data as Task;
+        return null;
+    }
+
+    getNote(): NoteItem | null {
+        if (this.subtype == 'note') return this.data as NoteItem;
+        return null;
+    }
+}
+
+/**
+ * 鍔ㄥ姏鑺傜偣
+ */
+export class KineticNode extends VisionNode {
+    subtype: string; 
+    skill_id: string; 
+    config: UTSJSONObject;
+    style: UTSJSONObject; 
+
+    constructor(id: string, x: number, y: number, subtype: string, skill_id: string, config: UTSJSONObject, style: UTSJSONObject) {
+        super(id, x, y, 'kinetic');
+        this.subtype = subtype;
+        this.skill_id = skill_id;
+        this.config = config;
+        this.style = style;
+    }
+}

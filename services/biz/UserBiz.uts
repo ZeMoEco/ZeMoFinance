@@ -1,0 +1,700 @@
+import { DB, SqlArgs } from "@/utils/DB/DB.uts";
+import { TimelineBiz } from "./TimelineBiz.uts";
+import { SYNC_DEVICE_ID_KEY } from '@/utils/constant.uts';
+import { getCurrentAppId } from '@/utils/app/AppRuntime.uts'
+import { genId } from '@/utils/common/id.uts';
+import { LogService } from '@/services/graph/LogService.uts';
+import { TaskBiz, CreateTaskPayload, UpdateTaskPayload } from "./TaskBiz.uts";
+
+type JsonObject = any;
+
+export type UserProfile = {
+  id: number;
+  avatar: string | null;
+  username: string | null;
+  xp: number;
+  level: number;
+  coins: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export type Attribute = {
+  id: number;
+  name: string;
+  value: number;
+  description: string | null;
+}
+
+export type LevelUpResult = {
+  newLevel: number;
+  leveledUp: boolean;
+}
+
+export type Reward = {
+  id: number;
+  title: string;
+  cost: number;
+  description: string | null;
+  created_at: number;
+  actionType: string | null;
+  actionTitle: string | null;
+  actionDesc: string | null;
+  actionTargetId: string | null;
+}
+
+type UserKvWriteOptions = {
+  updatedAt?: number | null;
+  entityVersion?: number | null;
+  lastEventId?: string | null;
+}
+
+export class UserBiz {
+  private static readonly GLOBAL_CONFIG_USER_ID: number = 0;
+  private static readonly ATTR_KEY: string = 'profile_attributes_v1';
+  private static readonly REWARD_KEY: string = 'reward_store_v1';
+
+  static async ensureDeviceId(): Promise<string> {
+    const current = await UserBiz.getGlobalString(SYNC_DEVICE_ID_KEY);
+    const normalized = current == null ? '' : current.toString().trim();
+    if (normalized != '') return normalized;
+
+    const deviceId = genId('dev');
+    await UserBiz.setGlobalString(SYNC_DEVICE_ID_KEY, deviceId);
+    return deviceId;
+  }
+
+  static async createAttribute(name: string, description: string | null = null): Promise<boolean> {
+    const n = name.toString().trim();
+    if (n == '') return false;
+    try {
+      return await DB.tx(async () => {
+        const userId = await UserBiz.getCurrentUserId();
+        const attrs = UserBiz.parseAttributes(await UserBiz.getStringByUserId(userId, UserBiz.ATTR_KEY));
+        const existed = attrs.find((a): boolean => a.name == n);
+        if (existed != null) return false;
+
+        let maxId = 0;
+        for (let i = 0; i < attrs.length; i++) {
+          if (attrs[i].id > maxId) maxId = attrs[i].id;
+        }
+        const item = {
+          id: maxId + 1,
+          name: n,
+          value: 0,
+          description: description
+        } as Attribute;
+        attrs.push(item);
+
+        const stored = await UserBiz.writeUserKvFact(
+          userId,
+          UserBiz.ATTR_KEY,
+          JSON.stringify(attrs),
+          'user.attributes.updated',
+          JSON.stringify({ action: 'attribute_create', item: item, items: attrs }),
+          Date.now(),
+        );
+        if (!stored) throw new Error('save attributes failed');
+
+        await UserBiz.appendUserLog('attribute_create', JSON.stringify(item));
+        return true;
+      });
+    } catch (e) {
+      console.error('[UserBiz] createAttribute failed', e);
+      return false;
+    }
+  }
+
+  static async getUserProfile(): Promise<UserProfile | null> {
+    const sql = "SELECT * FROM users LIMIT 1";
+
+    try {
+      const results = await DB.query(sql);
+      if (results.length > 0) {
+        const row = results[0];
+        return {
+          id: parseInt(row.get("id")?.toString() ?? "0"),
+          username: row.get("username")?.toString() ?? "Guest",
+          avatar: row.get("avatar")?.toString() ?? null,
+          xp: parseInt(row.get("xp")?.toString() ?? "0"),
+          level: parseInt(row.get("level")?.toString() ?? "1"),
+          coins: parseInt(row.get("coins")?.toString() ?? "0"),
+          created_at: parseInt(row.get("created_at")?.toString() ?? "0"),
+          updated_at: parseInt(row.get("updated_at")?.toString() ?? "0")
+        };
+      }
+    } catch (e) {
+      console.error(`[UserBiz] Get profile error: ${e}`);
+    }
+    return null;
+  }
+
+  static async getAttributes(): Promise<Attribute[]> {
+    const raw = await UserBiz.getString(UserBiz.ATTR_KEY);
+    const attrs = UserBiz.parseAttributes(raw);
+    attrs.sort((a, b): number => a.id - b.id);
+    return attrs;
+  }
+
+  static async initAttributesIfNeed(): Promise<void> {
+    const attrs = await UserBiz.getAttributes();
+    if (attrs.length > 0) return;
+
+    const defaults = ["力量", "智力", "耐力", "魅力", "敏捷", "感知"];
+    const seeded = [] as Attribute[];
+    for (let i = 0; i < defaults.length; i++) {
+      seeded.push({
+        id: i + 1,
+        name: defaults[i],
+        value: 0,
+        description: "基础属性"
+      } as Attribute);
+    }
+    try {
+      await DB.tx(async () => {
+        const userId = await UserBiz.getCurrentUserId();
+        const stored = await UserBiz.writeUserKvFact(
+          userId,
+          UserBiz.ATTR_KEY,
+          JSON.stringify(seeded),
+          'user.attributes.updated',
+          JSON.stringify({ action: 'attribute_seed', items: seeded }),
+          Date.now(),
+        );
+        if (!stored) throw new Error('seed attributes failed');
+        await UserBiz.appendUserLog('attribute_seed', JSON.stringify(seeded));
+      });
+    } catch (e) {
+      console.error('[UserBiz] initAttributesIfNeed failed', e);
+    }
+  }
+
+  static async addExp(amount: number): Promise<LevelUpResult> {
+    const profile = await UserBiz.getUserProfile();
+    if (profile == null) return { newLevel: 1, leveledUp: false };
+
+    const newXp = profile.xp + amount;
+    const newLevel = Math.floor(newXp / 100) + 1;
+    const leveledUp = newLevel > profile.level;
+    const now = Date.now();
+
+    try {
+      await DB.tx(async () => {
+        const eventId = genId('evt');
+        const entityVersion = await UserBiz.getNextUserEntityVersion(profile.id);
+        const sql = "UPDATE users SET xp = ?, level = ?, updated_at = ?, entity_version = ?, last_event_id = ?, origin_app_id = COALESCE(origin_app_id, ?) WHERE id = ?";
+        const args: SqlArgs = [newXp, newLevel, now, entityVersion, eventId, getCurrentAppId(), profile.id];
+        const ok = await DB.exec(sql, args);
+        if (!ok) throw new Error('update user xp failed');
+
+
+        await UserBiz.appendUserLog('xp_update', JSON.stringify({ xp: newXp, level: newLevel }));
+      });
+      return { newLevel, leveledUp };
+    } catch (e) {
+      console.error('[UserBiz] addExp failed', e);
+      return { newLevel: profile.level, leveledUp: false };
+    }
+  }
+
+  static async addCoins(amount: number): Promise<boolean> {
+    const profile = await UserBiz.getUserProfile();
+    if (profile == null) return false;
+
+    const newCoins = profile.coins + amount;
+    const now = Date.now();
+
+    try {
+      return await DB.tx(async () => {
+        const eventId = genId('evt');
+        const entityVersion = await UserBiz.getNextUserEntityVersion(profile.id);
+        const sql = "UPDATE users SET coins = ?, updated_at = ?, entity_version = ?, last_event_id = ?, origin_app_id = COALESCE(origin_app_id, ?) WHERE id = ?";
+        const args: SqlArgs = [newCoins, now, entityVersion, eventId, getCurrentAppId(), profile.id];
+        const ok = await DB.exec(sql, args);
+        if (!ok) throw new Error('update user coins failed');
+
+
+        await UserBiz.appendUserLog('coins_update', JSON.stringify({ coins: newCoins, delta: amount }));
+        return true;
+      });
+    } catch (e) {
+      console.error('[UserBiz] addCoins failed', e);
+      return false;
+    }
+  }
+
+  static async updateProfile(username: string, avatar: string): Promise<boolean> {
+    const profile = await UserBiz.getUserProfile();
+    if (profile == null) return false;
+
+    const now = Date.now();
+    try {
+      return await DB.tx(async () => {
+        const eventId = genId('evt');
+        const entityVersion = await UserBiz.getNextUserEntityVersion(profile.id);
+        const sql = "UPDATE users SET username = ?, avatar = ?, updated_at = ?, entity_version = ?, last_event_id = ?, origin_app_id = COALESCE(origin_app_id, ?) WHERE id = ?";
+        const args: SqlArgs = [username, avatar, now, entityVersion, eventId, getCurrentAppId(), profile.id];
+        const ok = await DB.exec(sql, args);
+        if (!ok) throw new Error('update user profile failed');
+
+
+        await UserBiz.appendUserLog('profile_update', JSON.stringify({ username: username, avatar: avatar }));
+        return true;
+      });
+    } catch (e) {
+      console.error('[UserBiz] updateProfile failed', e);
+      return false;
+    }
+  }
+
+  static async listRewards(): Promise<Reward[]> {
+    const raw = await UserBiz.getString(UserBiz.REWARD_KEY);
+    const rewards = UserBiz.parseRewards(raw);
+    rewards.sort((a, b): number => a.cost - b.cost);
+    return rewards;
+  }
+
+  static async createReward(
+    title: string, 
+    cost: number, 
+    description: string | null,
+    actionType: string | null = null,
+    actionTitle: string | null = null,
+    actionDesc: string | null = null,
+    actionTargetId: string | null = null
+  ): Promise<boolean> {
+    const t = title.toString().trim();
+    if (t == '') return false;
+    try {
+      return await DB.tx(async () => {
+        const now = Date.now();
+        const userId = await UserBiz.getCurrentUserId();
+        const rewards = UserBiz.parseRewards(await UserBiz.getStringByUserId(userId, UserBiz.REWARD_KEY));
+        let maxId = 0;
+        for (let i = 0; i < rewards.length; i++) {
+          if (rewards[i].id > maxId) maxId = rewards[i].id;
+        }
+        const item = {
+          id: maxId + 1,
+          title: t,
+          cost: cost,
+          description: description,
+          created_at: now,
+          actionType: actionType,
+          actionTitle: actionTitle,
+          actionDesc: actionDesc,
+          actionTargetId: actionTargetId
+        } as Reward;
+        rewards.push(item);
+        const stored = await UserBiz.writeUserKvFact(
+          userId,
+          UserBiz.REWARD_KEY,
+          JSON.stringify(rewards),
+          'user.rewards.updated',
+          JSON.stringify({ action: 'reward_create', item: item, items: rewards }),
+          now,
+        );
+        if (!stored) throw new Error('save rewards failed');
+        await UserBiz.appendUserLog('reward_create', JSON.stringify(item));
+        return true;
+      });
+    } catch (e) {
+      console.error('[UserBiz] createReward failed', e);
+      return false;
+    }
+  }
+
+  static async updateReward(
+    id: number, 
+    title: string, 
+    cost: number, 
+    description: string | null,
+    actionType: string | null = null,
+    actionTitle: string | null = null,
+    actionDesc: string | null = null,
+    actionTargetId: string | null = null
+  ): Promise<boolean> {
+    try {
+      return await DB.tx(async () => {
+        const userId = await UserBiz.getCurrentUserId();
+        const rewards = UserBiz.parseRewards(await UserBiz.getStringByUserId(userId, UserBiz.REWARD_KEY));
+        const idx = rewards.findIndex((r): boolean => r.id == id);
+        if (idx < 0) return false;
+        rewards[idx].title = title;
+        rewards[idx].cost = cost;
+        rewards[idx].description = description;
+        rewards[idx].actionType = actionType;
+        rewards[idx].actionTitle = actionTitle;
+        rewards[idx].actionDesc = actionDesc;
+        rewards[idx].actionTargetId = actionTargetId;
+        const stored = await UserBiz.writeUserKvFact(
+          userId,
+          UserBiz.REWARD_KEY,
+          JSON.stringify(rewards),
+          'user.rewards.updated',
+          JSON.stringify({ action: 'reward_update', item: rewards[idx], items: rewards }),
+          Date.now(),
+        );
+        if (!stored) throw new Error('update rewards failed');
+        await UserBiz.appendUserLog('reward_update', JSON.stringify(rewards[idx]));
+        return true;
+      });
+    } catch (e) {
+      console.error('[UserBiz] updateReward failed', e);
+      return false;
+    }
+  }
+
+  static async deleteReward(id: number): Promise<boolean> {
+    try {
+      return await DB.tx(async () => {
+        const userId = await UserBiz.getCurrentUserId();
+        const rewards = UserBiz.parseRewards(await UserBiz.getStringByUserId(userId, UserBiz.REWARD_KEY));
+        const remained = rewards.filter((r): boolean => r.id != id);
+        const stored = await UserBiz.writeUserKvFact(
+          userId,
+          UserBiz.REWARD_KEY,
+          JSON.stringify(remained),
+          'user.rewards.updated',
+          JSON.stringify({ action: 'reward_delete', reward_id: id, items: remained }),
+          Date.now(),
+        );
+        if (!stored) throw new Error('delete rewards failed');
+        await UserBiz.appendUserLog('reward_delete', JSON.stringify({ id: id }));
+        return true;
+      });
+    } catch (e) {
+      console.error('[UserBiz] deleteReward failed', e);
+      return false;
+    }
+  }
+
+  static async redeemReward(rewardId: number): Promise<boolean> {
+    try {
+      return await DB.tx(async () => {
+        const rewards = await UserBiz.listRewards();
+        const reward = rewards.find((r): boolean => r.id == rewardId);
+        if (reward == null) throw new Error("Reward not found");
+        const rewardTitle = reward.title;
+        const cost = reward.cost;
+
+        const profile = await UserBiz.getUserProfile();
+        if (profile == null) throw new Error("User profile not found");
+
+        if (profile.coins < cost) {
+          throw new Error("Insufficient coins");
+        }
+
+        const newCoins = profile.coins - cost;
+        const now = Date.now();
+        const eventId = genId('evt');
+        const entityVersion = await UserBiz.getNextUserEntityVersion(profile.id);
+        const updateSql = "UPDATE users SET coins = ?, updated_at = ?, entity_version = ?, last_event_id = ?, origin_app_id = COALESCE(origin_app_id, ?) WHERE id = ?";
+        const updateSuccess = await DB.exec(updateSql, [newCoins, now, entityVersion, eventId, getCurrentAppId(), profile.id]);
+        if (!updateSuccess) throw new Error("Failed to update balance");
+
+
+        await TimelineBiz.addTimelineEntry(`兑换奖励：${rewardTitle} (-${cost} 💰)`);
+        await UserBiz.appendUserLog('reward_redeem', JSON.stringify({ reward_id: rewardId, title: rewardTitle, cost: cost, coins_after: newCoins }));
+
+        // Check custom action triggers
+        if (reward.actionType != null && reward.actionType != '' && reward.actionType != 'none') {
+          const actType = reward.actionType;
+          const actTitle = (reward.actionTitle != null && reward.actionTitle != '') ? reward.actionTitle : rewardTitle;
+          const actDesc = (reward.actionDesc != null) ? reward.actionDesc : '';
+
+          if (actType == 'create_task') {
+            await TaskBiz.createTask({
+              title: actTitle,
+              description: actDesc.trim() == '' ? `兑换奖励 "${rewardTitle}" 自动创建` : actDesc,
+              status: 'todo'
+            } as CreateTaskPayload);
+          } else if (actType == 'create_shopping') {
+            const shoppingTaskId = await TaskBiz.createTask({
+              title: actTitle,
+              description: actDesc.trim() == '' ? `兑换奖励 "${rewardTitle}" 自动创建` : actDesc,
+              status: 'todo'
+            } as CreateTaskPayload);
+            if (shoppingTaskId != null && shoppingTaskId != '') {
+              await TaskBiz.setTaskCategory(shoppingTaskId, '购物');
+            }
+          } else if (actType == 'consume_storage') {
+            if (reward.actionTargetId != null && reward.actionTargetId != '') {
+              const storageTask = await TaskBiz.getTask(reward.actionTargetId);
+              if (storageTask != null) {
+                let md: any = {};
+                if (storageTask.metadata != null && storageTask.metadata!.trim() != '') {
+                  try {
+                    md = JSON.parse(storageTask.metadata!) as any;
+                  } catch (_e) {
+                    md = {};
+                  }
+                }
+                const oldAmountVal = md['amount'];
+                let oldAmount = 0.0;
+                if (oldAmountVal != null) {
+                  const parsedAmt = parseFloat(oldAmountVal.toString());
+                  if (!isNaN(parsedAmt)) oldAmount = parsedAmt;
+                }
+                const newAmount = Math.max(0.0, oldAmount - 1.0);
+                md['amount'] = newAmount;
+
+                await TaskBiz.updateTask(storageTask.id, {
+                  metadata: JSON.stringify(md)
+                } as UpdateTaskPayload);
+                
+                await TaskBiz.addNodeFactLog(storageTask.id, 'consume_storage', `兑换奖励 "${rewardTitle}" 自动消耗：数量 ${oldAmount} -> ${newAmount}`);
+              }
+            }
+          } else if (actType == 'consume_food') {
+            if (reward.actionTargetId != null && reward.actionTargetId != '') {
+              const foodTask = await TaskBiz.getTask(reward.actionTargetId);
+              if (foodTask != null) {
+                const isPlan = (foodTask.tags ?? [] as string[]).includes('scene:cooking_plan');
+                if (isPlan) {
+                  await TaskBiz.updateTask(foodTask.id, {
+                    status: 'done'
+                  } as UpdateTaskPayload);
+                }
+                await TaskBiz.addNodeFactLog(foodTask.id, 'consume_recipe_food', `兑换奖励 "${rewardTitle}" 自动消耗此食谱食品`);
+              }
+            }
+          }
+        }
+
+        return true;
+      });
+    } catch (e) {
+      console.error("Redeem failed", e);
+      return false;
+    }
+  }
+
+  private static parseAttributes(raw: string | null): Attribute[] {
+    const out = [] as Attribute[];
+    if (raw == null) return out;
+    const s = raw.toString().trim();
+    if (s == '') return out;
+    try {
+      const arr = JSON.parse(s) as UTSArray<any>;
+      for (let i = 0; i < arr.length; i++) {
+        const itemRaw = arr[i];
+        if (itemRaw == null) continue;
+        const item = itemRaw as JsonObject;
+        const idVal = item['id'];
+        const nameVal = item['name'];
+        const valueVal = item['value'];
+        const descVal = item['description'];
+        out.push({
+          id: idVal == null ? 0 : parseInt(idVal.toString()),
+          name: nameVal == null ? '' : nameVal.toString(),
+          value: valueVal == null ? 0 : parseInt(valueVal.toString()),
+          description: descVal == null ? null : descVal.toString()
+        } as Attribute);
+      }
+    } catch (_e) {}
+    return out;
+  }
+
+  private static parseRewards(raw: string | null): Reward[] {
+    const out = [] as Reward[];
+    if (raw == null) return out;
+    const s = raw.toString().trim();
+    if (s == '') return out;
+    try {
+      const arr = JSON.parse(s) as UTSArray<any>;
+      for (let i = 0; i < arr.length; i++) {
+        const itemRaw = arr[i];
+        if (itemRaw == null) continue;
+        const item = itemRaw as JsonObject;
+        const idVal = item['id'];
+        const titleVal = item['title'];
+        const costVal = item['cost'];
+        const descVal = item['description'];
+        const createdAtVal = item['created_at'];
+
+        const actionTypeVal = item['actionType'];
+        const actionTitleVal = item['actionTitle'];
+        const actionDescVal = item['actionDesc'];
+        const actionTargetIdVal = item['actionTargetId'];
+
+        out.push({
+          id: idVal == null ? 0 : parseInt(idVal.toString()),
+          title: titleVal == null ? '' : titleVal.toString(),
+          cost: costVal == null ? 0 : parseInt(costVal.toString()),
+          description: descVal == null ? null : descVal.toString(),
+          created_at: createdAtVal == null ? 0 : parseInt(createdAtVal.toString()),
+          actionType: actionTypeVal == null ? null : actionTypeVal.toString(),
+          actionTitle: actionTitleVal == null ? null : actionTitleVal.toString(),
+          actionDesc: actionDescVal == null ? null : actionDescVal.toString(),
+          actionTargetId: actionTargetIdVal == null ? null : actionTargetIdVal.toString()
+        } as Reward);
+      }
+    } catch (_e) {}
+    return out;
+  }
+
+  private static async appendUserLog(action: string, text: string): Promise<void> {
+    if (!DB.isReady) return;
+    try {
+      await DB.tx(async () => {
+        const userId = await UserBiz.getCurrentUserId();
+        const now = Date.now();
+        const logEventId = genId('evt');
+        const ownerId = `user_${userId}`;
+        const log = await LogService.recordOwnedLogAsync('node', ownerId, action, text, {
+          entityVersion: 1,
+          syncEventId: logEventId,
+        });
+        if (log == null) throw new Error('append user log failed');
+
+      });
+    } catch (_e) {}
+  }
+
+  private static async getCurrentUserId(): Promise<number> {
+    try {
+      const profile = await UserBiz.getUserProfile();
+      if (profile == null) return 0;
+      const id = profile.id;
+      return id != null ? parseInt(id.toString()) : 0;
+    } catch (_e) {
+      return 0;
+    }
+  }
+
+  static async getString(key: string): Promise<string | null> {
+    if (!DB.isReady) return null;
+    const userId = await UserBiz.getCurrentUserId();
+    const sql = "SELECT v FROM user_kv WHERE user_id = ? AND k = ? LIMIT 1";
+    const args: SqlArgs = [userId, key];
+    try {
+      const rows = await DB.query(sql, args);
+      if (rows.length == 0) return null;
+      const v = rows[0].get("v");
+      return v == null ? null : v.toString();
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  static async getGlobalString(key: string): Promise<string | null> {
+    return await UserBiz.getStringByUserId(UserBiz.GLOBAL_CONFIG_USER_ID, key);
+  }
+
+  static async setString(key: string, value: string | null, options: UserKvWriteOptions | null = null): Promise<boolean> {
+    if (!DB.isReady) return false;
+    const userId = await UserBiz.getCurrentUserId();
+    return await UserBiz.setStringByUserId(userId, key, value, options);
+  }
+
+  static async setGlobalString(key: string, value: string | null, options: UserKvWriteOptions | null = null): Promise<boolean> {
+    return await UserBiz.setStringByUserId(UserBiz.GLOBAL_CONFIG_USER_ID, key, value, options);
+  }
+
+  static parseIdCsv(raw: string | null): string[] {
+    const out: string[] = [];
+    if (raw == null) return out;
+    const s = raw.toString().trim();
+    if (s.length == 0) return out;
+    const parts = s.split(",");
+    for (let i = 0; i < parts.length; i++) {
+      const p = parts[i].trim();
+      if (p.length == 0) continue;
+      out.push(p);
+    }
+    return out;
+  }
+
+  static toIdCsv(ids: string[]): string {
+    if (ids.length == 0) return "";
+    return ids.map((v): string => v.toString()).join(",");
+  }
+
+  private static async getStringByUserId(userId: number, key: string): Promise<string | null> {
+    if (!DB.isReady) return null;
+    const sql = "SELECT v FROM user_kv WHERE user_id = ? AND k = ? LIMIT 1";
+    const args: SqlArgs = [userId, key];
+    try {
+      const rows = await DB.query(sql, args);
+      if (rows.length == 0) return null;
+      const v = rows[0].get("v");
+      return v == null ? null : v.toString();
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  private static async setStringByUserId(userId: number, key: string, value: string | null, options: UserKvWriteOptions | null = null): Promise<boolean> {
+    if (!DB.isReady) return false;
+    const now = options?.updatedAt == null ? Date.now() : parseInt(options.updatedAt.toString());
+
+    if (value == null) {
+      const delSql = "DELETE FROM user_kv WHERE user_id = ? AND k = ?";
+      const delArgs: SqlArgs = [userId, key];
+      try {
+        return await DB.exec(delSql, delArgs);
+      } catch (_e1) {
+        return false;
+      }
+    }
+
+    const entityVersion = options?.entityVersion == null
+      ? await UserBiz.getNextUserKvVersion(userId, key)
+      : parseInt(options.entityVersion.toString());
+    const lastEventId = options?.lastEventId == null || options.lastEventId.toString().trim() == ''
+      ? null
+      : options.lastEventId.toString().trim();
+    const sql = "INSERT OR REPLACE INTO user_kv (user_id, k, v, updated_at, origin_app_id, entity_version, tombstone_at, last_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+    const args: SqlArgs = [userId, key, value, now, getCurrentAppId(), entityVersion, null, lastEventId];
+    try {
+      return await DB.exec(sql, args);
+    } catch (_e2) {
+      return false;
+    }
+  }
+
+  private static async getNextUserKvVersion(userId: number, key: string): Promise<number> {
+    const rows = await DB.query(
+      'SELECT entity_version FROM user_kv WHERE user_id = ? AND k = ? LIMIT 1',
+      [userId, key],
+    );
+    if (rows.length == 0) return 1;
+    const current = parseInt(rows[0].get('entity_version')?.toString() ?? '0');
+    return current > 0 ? current + 1 : 1;
+  }
+
+  private static async getNextUserEntityVersion(userId: number): Promise<number> {
+    const rows = await DB.query(
+      'SELECT entity_version FROM users WHERE id = ? LIMIT 1',
+      [userId],
+    );
+    if (rows.length == 0) return 1;
+    const current = parseInt(rows[0].get('entity_version')?.toString() ?? '0');
+    return current > 0 ? current + 1 : 1;
+  }
+
+  private static buildUserKvEntityId(userId: number, key: string): string {
+    return `${userId}:${key}`;
+  }
+
+  private static async writeUserKvFact(
+    userId: number,
+    key: string,
+    value: string,
+    topic: string,
+    payloadJson: string,
+    occurredAt: number,
+  ): Promise<boolean> {
+    const eventId = genId('evt');
+    const entityVersion = await UserBiz.getNextUserKvVersion(userId, key);
+    const ok = await UserBiz.setStringByUserId(userId, key, value, {
+      updatedAt: occurredAt,
+      entityVersion,
+      lastEventId: eventId,
+    });
+    if (!ok) return false;
+
+    return true;
+  }
+}

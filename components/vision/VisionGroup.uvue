@@ -1,0 +1,61 @@
+<template>
+	<view class="vision-group" :style="{ width: typedNode.width + 'px', height: typedNode.height + 'px', borderColor: borderColor }">
+		<text class="group-label" :style="{ color: labelColor }">{{ typedNode.label }}</text>
+		<!-- Optional: Add a handle or background -->
+	</view>
+</template>
+
+<script lang="uts">
+	import { GroupNode } from './VisionTypes.uts';
+
+	export default {
+		name: 'VisionGroup',
+		props: {
+			node: {
+				type: Object, // Cast to GroupNode
+				required: true
+			}
+		},
+		computed: {
+			typedNode(): GroupNode {
+				return this.node as GroupNode;
+			},
+			borderColor(): string {
+				const style = this.typedNode.style as UTSJSONObject;
+				if (style == null) return '#ffaa00';
+				const color = style.getString('borderColor');
+				return color != null ? color : '#ffaa00';
+			},
+			labelColor(): string {
+				const style = this.typedNode.style as UTSJSONObject;
+				if (style == null) return '#ffaa00';
+				const color = style.getString('color');
+				return color != null ? color : '#ffaa00';
+			}
+		}
+	}
+</script>
+
+<style>
+	.vision-group {
+		position: absolute;
+		left: 0;
+		top: 0;
+		border-width: 2px;
+		border-style: dashed;
+		border-radius: 12px;
+		background-color: rgba(255, 200, 100, 0.05); /* Light orange background tint */
+		pointer-events: none; /* Let clicks pass through to items inside? Or maybe we want to select the group? */
+		/* For now, let's allow selecting the group if the user clicks the border/header. But pointer-events: none makes it purely visual. */
+		/* If we want to drag the group, we need pointer-envents: auto */
+	}
+
+	.group-label {
+		position: absolute;
+		top: -24px;
+		left: 0;
+		font-size: 14px;
+		font-weight: bold;
+		padding: 2px 8px;
+	}
+</style>

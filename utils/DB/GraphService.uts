@@ -1,0 +1,149 @@
+import { DBManager } from '../DBManager.uts'
+import { genId } from '../common/id.uts'
+
+export type Node = {
+  id: string
+  type: string
+  content: string | null
+  properties: string | null
+  created_at: number
+  updated_at: number
+  is_deleted: number
+}
+
+export type Edge = {
+  id: string
+  source_id: string
+  target_id: string
+  relation_type: string
+  rank: string
+  properties: string | null
+  created_at: number
+}
+
+export class GraphService {
+
+  static generateId(prefix: string = 'id'): string {
+    return genId(prefix)
+  }
+
+  // Get a specific node by ID
+  static async getNode(nodeId: string): Promise<Node | null> {
+    const db = DBManager.getInstance()
+    const res = await db.selectSql(`SELECT * FROM nodes WHERE id = ? AND is_deleted = 0`, [nodeId])
+    if (res.length > 0) {
+      // In SQLite results are Maps
+      const row = res[0]
+      return {
+        id: row.get('id') as string,
+        type: row.get('type') as string,
+        content: row.get('content') as string | null,
+        properties: row.get('properties') as string | null,
+        created_at: row.get('created_at') as number,
+        updated_at: row.get('updated_at') as number,
+        is_deleted: row.get('is_deleted') as number
+      } as Node
+    }
+    return null
+  }
+
+  // Create a new node in the graph
+  static async createNode(type: string, content: string | null, properties: string | null): Promise<string> {
+    const id = this.generateId('node')
+    const now = Date.now()
+    const db = DBManager.getInstance()
+    
+    await db.executeSql(`
+      INSERT INTO nodes (id, type, content, properties, created_at, updated_at, is_deleted)
+      VALUES (?, ?, ?, ?, ?, ?, 0)
+    `, [id, type, content, properties, now, now])
+
+    return id
+  }
+
+  // Connect two nodes with an edge
+  static async connectNodes(sourceId: string, targetId: string, relationType: string = 'CONTAINS', rank: string = '500', properties: string | null = null): Promise<string> {
+    const id = this.generateId('edge')
+    const now = Date.now()
+    const db = DBManager.getInstance()
+
+    await db.executeSql(`
+      INSERT INTO edges (id, source_id, target_id, relation_type, rank, properties, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [id, sourceId, targetId, relationType, rank, properties, now])
+    
+    return id
+  }
+
+  static async updateEdgeProperties(edgeId: string, properties: string | null): Promise<boolean> {
+    const db = DBManager.getInstance()
+    await db.executeSql(`UPDATE edges SET properties = ? WHERE id = ?`, [properties, edgeId])
+    return true
+  }
+
+  // Query all child nodes of a given node
+  static async queryChildren(nodeId: string, relationType: string = 'CONTAINS'): Promise<Node[]> {
+    const db = DBManager.getInstance()
+    const normalized = relationType.toUpperCase()
+    const useContainsFallback = normalized == 'CONTAINS_TASK_TREE'
+      || normalized == 'CONTAINS_NOTE_BLOCK'
+      || normalized == 'CONTAINS_CANVAS'
+
+    const sql = useContainsFallback
+      ? `
+        SELECT n.* FROM nodes n
+        INNER JOIN edges e ON n.id = e.target_id
+        WHERE e.source_id = ? AND (UPPER(e.relation_type) = ? OR UPPER(e.relation_type) = 'CONTAINS') AND n.is_deleted = 0
+        ORDER BY e.rank ASC
+      `
+      : `
+        SELECT n.* FROM nodes n
+        INNER JOIN edges e ON n.id = e.target_id
+        WHERE e.source_id = ? AND UPPER(e.relation_type) = ? AND n.is_deleted = 0
+        ORDER BY e.rank ASC
+      `
+
+    const res = await db.selectSql(sql, [nodeId, normalized])
+
+    // Convert untyped results to Node[]
+    const nodes: Node[] = []
+    for (let i = 0; i < res.length; i++) {
+        const row = res[i]
+        nodes.push({
+          id: row.get('id') as string,
+          type: row.get('type') as string,
+          content: row.get('content') as string | null,
+          properties: row.get('properties') as string | null,
+          created_at: row.get('created_at') as number,
+          updated_at: row.get('updated_at') as number,
+          is_deleted: row.get('is_deleted') as number
+        } as Node)
+    }
+    return nodes
+  }
+
+  // Query all parent nodes referencing this node (Backlinks)
+  static async queryBacklinks(nodeId: string): Promise<Node[]> {
+    const db = DBManager.getInstance()
+    const res = await db.selectSql(`
+      SELECT n.* FROM nodes n
+      INNER JOIN edges e ON n.id = e.source_id
+      WHERE e.target_id = ? AND n.is_deleted = 0
+    `, [nodeId])
+
+    const nodes: Node[] = []
+    for (let i = 0; i < res.length; i++) {
+        const row = res[i]
+        nodes.push({
+          id: row.get('id') as string,
+          type: row.get('type') as string,
+          content: row.get('content') as string | null,
+          properties: row.get('properties') as string | null,
+          created_at: row.get('created_at') as number,
+          updated_at: row.get('updated_at') as number,
+          is_deleted: row.get('is_deleted') as number
+        } as Node)
+    }
+    return nodes
+  }
+}

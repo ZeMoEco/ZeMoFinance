@@ -1,0 +1,88 @@
+import {
+	ChoosePublicDirectory,
+	ChoosePublicDirectoryOptions,
+	ChoosePublicDirectoryResult,
+	ChooseSyncFile,
+	ChooseSyncFileOptions,
+	ChooseSyncFileResult,
+	ChooseModelPackage,
+	ChooseModelPackageOptions,
+	ChooseModelPackageResult,
+} from '../interface.uts'
+import { choosePublicDirectoryNative, chooseSyncFileNative, chooseModelPackageNative, activatePersistedUriPermissionNative } from './src/index.ets'
+
+const SYNC_FILE_RESULT_SEPARATOR = '\n'
+
+function decodeSyncFilePath(value: string): string {
+	const raw = (value ?? '').toString()
+	if (raw == '') return ''
+	try {
+		return decodeURIComponent(raw)
+	} catch (_e0) {
+		return raw
+	}
+}
+
+function parseSyncFileResultPayload(payload: string): ChooseSyncFileResult {
+	const text = (payload ?? '').toString()
+	const parts = text.split(SYNC_FILE_RESULT_SEPARATOR)
+	const backupPath = parts.length > 0 ? decodeSyncFilePath(parts[0]) : ''
+	const syncPath = parts.length > 1 ? decodeSyncFilePath(parts[1]) : ''
+	return { path: backupPath, backupPath, syncPath } as ChooseSyncFileResult
+}
+
+function parseModelPackageResultPayload(payload: string): ChooseModelPackageResult {
+	const text = (payload ?? '').toString()
+	const parts = text.split(SYNC_FILE_RESULT_SEPARATOR)
+	const paths = [] as string[]
+	for (let i = 0; i < parts.length; i++) {
+		const path = decodeSyncFilePath(parts[i])
+		if (path != '') paths.push(path)
+	}
+	const path = paths.length > 0 ? paths[0] : ''
+	return { path, paths } as ChooseModelPackageResult
+}
+
+export const choosePublicDirectory: ChoosePublicDirectory = function(options: ChoosePublicDirectoryOptions) {
+	choosePublicDirectoryNative().then((path: string) => {
+		const res = { path } as ChoosePublicDirectoryResult
+		options.success?.(res)
+		options.complete?.(res)
+	}).catch((e: Error) => {
+		const message = e != null ? e.toString() : '公共目录授权失败'
+		const err = new UniError('zemo-harmony-filepicker', 900002, message)
+		options.fail?.(err)
+		options.complete?.(err)
+	})
+}
+
+export const chooseSyncFile: ChooseSyncFile = function(options: ChooseSyncFileOptions) {
+	const create = options.create === true
+	chooseSyncFileNative(create).then((payload: string) => {
+		const res = parseSyncFileResultPayload(payload)
+		options.success?.(res)
+		options.complete?.(res)
+	}).catch((e: Error) => {
+		const message = e != null ? e.toString() : '固定同步文件选择失败'
+		const err = new UniError('zemo-harmony-filepicker', 900003, message)
+		options.fail?.(err)
+		options.complete?.(err)
+	})
+}
+
+export const chooseModelPackage: ChooseModelPackage = function(options: ChooseModelPackageOptions) {
+	chooseModelPackageNative().then((payload: string) => {
+		const res = parseModelPackageResultPayload(payload)
+		options.success?.(res)
+		options.complete?.(res)
+	}).catch((e: Error) => {
+		const message = e != null ? e.toString() : '模型包选择失败'
+		const err = new UniError('zemo-harmony-filepicker', 900004, message)
+		options.fail?.(err)
+		options.complete?.(err)
+	})
+}
+
+export function activatePersistedUriPermission(path: string): Promise<boolean> {
+	return activatePersistedUriPermissionNative(path)
+}

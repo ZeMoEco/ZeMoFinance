@@ -1,0 +1,233 @@
+import { TaskBiz, CreateTaskPayload } from '@/services/biz/TaskBiz.uts'
+
+export type ChatTodoCandidate = {
+	title: string
+	description: string
+	startAt: number
+	endAt: number
+	priority: number
+	sourceText: string
+}
+
+export type ChatTodoCreateResult = {
+	ok: boolean
+	created: number
+	taskIds: string[]
+	candidates: ChatTodoCandidate[]
+	message: string
+}
+
+export class ChatTodoExtractionService {
+	static looksLikeChatText(text: string): boolean {
+		const value = ChatTodoExtractionService.stripOcrMeta(text)
+		if (value.length < 6) return false
+		if (ChatTodoExtractionService.containsAny(value, ['群聊', '聊天', '发来', '语音', '视频通话', '撤回了一条消息'])) return true
+		const lines = value.split('\n')
+		let speakerLines = 0
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i].trim()
+			if (/^\d{1,2}[:：]\d{2}/.test(line)) continue
+			if (/^.{1,12}[:：]\s*.{2,}$/.test(line)) speakerLines += 1
+		}
+		return speakerLines >= 2
+	}
+
+	static extractCandidates(text: string): ChatTodoCandidate[] {
+		const lines = ChatTodoExtractionService.stripOcrMeta(text).split('\n')
+		const result = [] as ChatTodoCandidate[]
+		for (let i = 0; i < lines.length; i++) {
+			const raw = ChatTodoExtractionService.normalizeLine(lines[i])
+			if (raw == '') continue
+			if (!ChatTodoExtractionService.isTodoLine(raw)) continue
+			const title = ChatTodoExtractionService.cleanTitle(raw)
+			if (title == '' || ChatTodoExtractionService.hasSimilarTitle(result, title)) continue
+			const due = ChatTodoExtractionService.extractDueTime(raw)
+			result.push({
+				title,
+				description: `来自聊天截图：${raw}`,
+				startAt: due,
+				endAt: due,
+				priority: ChatTodoExtractionService.resolvePriority(raw),
+				sourceText: raw
+			} as ChatTodoCandidate)
+			if (result.length >= 8) break
+		}
+		return result
+	}
+
+	static async createTasksFromText(text: string): Promise<ChatTodoCreateResult> {
+		const candidates = ChatTodoExtractionService.extractCandidates(text)
+		console.log(`[ChatTodo][Debug] create_from_text candidates=${candidates.length}, textLength=${(text ?? '').toString().length}`)
+		return await ChatTodoExtractionService.createTasks(candidates, '聊天识别', 'screen_chat_todo')
+	}
+
+	static async createTasks(candidates: ChatTodoCandidate[], tag: string = '模型识别', source: string = 'screen_omni_action'): Promise<ChatTodoCreateResult> {
+		const taskIds = [] as string[]
+		for (let i = 0; i < candidates.length; i++) {
+			const item = candidates[i]
+			const id = await TaskBiz.createTask({
+				title: item.title,
+				description: item.description,
+				status: 'todo',
+				priority: item.priority,
+				start_at: item.startAt,
+				end_at: item.endAt,
+				tags: [tag],
+				metadata: JSON.stringify({
+					source: source,
+					source_text: item.sourceText
+				})
+			} as CreateTaskPayload)
+			console.log(`[ChatTodo][Debug] create_task title=${ChatTodoExtractionService.limitDebugText(item.title, 80)}, due=${item.startAt}, priority=${item.priority}, id=${id == null ? '' : id}`)
+			if (id != null && id != '') taskIds.push(id)
+		}
+		console.log(`[ChatTodo][Debug] create_result created=${taskIds.length}, candidates=${candidates.length}`)
+		return {
+			ok: taskIds.length > 0,
+			created: taskIds.length,
+			taskIds,
+			candidates,
+			message: taskIds.length > 0 ? `已创建 ${taskIds.length} 个待办` : '未识别到可创建的待办'
+		} as ChatTodoCreateResult
+	}
+
+	private static normalizeLine(line: string): string {
+		let value = (line ?? '').toString().trim()
+		value = value.replace(/^\[[0-9:]+\]\s*/, '')
+		if (!/^\d{1,2}[:：]\d{2}/.test(value)) {
+			value = value.replace(/^[^:：]{1,12}[:：]\s*/, '')
+		}
+		value = value.replace(/\s+/g, ' ').trim()
+		if (ChatTodoExtractionService.isNoiseLine(value)) return ''
+		return value
+	}
+
+	private static stripOcrMeta(text: string): string {
+		const rawLines = (text ?? '').toString().replace(/\r\n/g, '\n').split('\n')
+		const result = [] as string[]
+		const metaPattern = /^\[\[ocr:([0-9.\-]+),([0-9.\-]+),([0-9.\-]+),([0-9.\-]+)\]\](.*)$/
+		for (let i = 0; i < rawLines.length; i++) {
+			let value = rawLines[i].trim()
+			const m = metaPattern.exec(value)
+			if (m != null && m.length >= 6) value = m[5].trim()
+			if (value != '') result.push(value)
+		}
+		return result.join('\n')
+	}
+
+	private static isTodoLine(line: string): boolean {
+		if (line.length < 4) return false
+		if (ChatTodoExtractionService.containsAny(line, [
+			'记得', '提醒', '待办', 'todo', 'TODO', '安排', '约', '开会', '会议', '提交', '发我', '发一下',
+			'确认', '处理', '跟进', '复盘', '整理', '买', '缴费', '还款', '转账', '报销', '付款',
+			'明天', '后天', '今晚', '今天', '周一', '周二', '周三', '周四', '周五', '周六', '周日',
+			'下周', '月底', '截止', 'deadline'
+		])) return true
+		return /\d{1,2}[月\/\-]\d{1,2}/.test(line) || /\d{1,2}[:：]\d{2}/.test(line)
+	}
+
+	private static cleanTitle(raw: string): string {
+		let title = raw
+		title = title.replace(/^(麻烦|帮我|请|你|我们|大家|记得|提醒我|提醒一下|待办[:：]?)/g, '')
+		title = title.replace(/(今天|明天|后天|今晚|上午|下午|晚上|中午|下周[一二三四五六日天]?|周[一二三四五六日天]|月底|截止|之前|前)\s*/g, '')
+		title = title.replace(/\d{1,2}[:：]\d{2}/g, '')
+		title = title.replace(/\d{1,2}[月\/\-]\d{1,2}[日号]?/g, '')
+		title = title.trim()
+		title = title.replace(/^(麻烦|帮我|请|你|我们|大家|记得|提醒我|提醒一下|待办[:：]?)/g, '')
+		title = title.replace(/[，。,.!！?？]+$/g, '')
+		title = title.trim()
+		if (title.length > 42) title = title.substring(0, 42)
+		return title
+	}
+
+	private static extractDueTime(raw: string): number {
+		const now = new Date()
+		let year = now.getFullYear()
+		let month = now.getMonth()
+		let day = now.getDate()
+		if (raw.indexOf('明天') >= 0) {
+			const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
+			year = d.getFullYear()
+			month = d.getMonth()
+			day = d.getDate()
+		} else if (raw.indexOf('后天') >= 0) {
+			const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 2)
+			year = d.getFullYear()
+			month = d.getMonth()
+			day = d.getDate()
+		} else {
+			const dateMatch = /(\d{1,2})[月\/\-](\d{1,2})[日号]?/.exec(raw)
+			if (dateMatch != null && dateMatch.length >= 3) {
+				month = parseInt(dateMatch[1]) - 1
+				day = parseInt(dateMatch[2])
+			} else {
+				const weekDay = ChatTodoExtractionService.extractWeekday(raw)
+				if (weekDay >= 0) {
+					const d = ChatTodoExtractionService.nextWeekday(weekDay, raw.indexOf('下周') >= 0)
+					year = d.getFullYear()
+					month = d.getMonth()
+					day = d.getDate()
+				}
+			}
+		}
+		let hour = raw.indexOf('下午') >= 0 || raw.indexOf('晚上') >= 0 ? 18 : 9
+		let minute = 0
+		const timeMatch = /(\d{1,2})[:：](\d{2})/.exec(raw)
+		if (timeMatch != null && timeMatch.length >= 3) {
+			hour = parseInt(timeMatch[1])
+			minute = parseInt(timeMatch[2])
+			if ((raw.indexOf('下午') >= 0 || raw.indexOf('晚上') >= 0) && hour < 12) hour += 12
+		}
+		return new Date(year, month, day, hour, minute, 0).getTime()
+	}
+
+	private static extractWeekday(raw: string): number {
+		const names = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+		for (let i = 0; i < names.length; i++) {
+			if (raw.indexOf(names[i]) >= 0) return i
+		}
+		if (raw.indexOf('周天') >= 0) return 0
+		return -1
+	}
+
+	private static nextWeekday(target: number, forceNextWeek: boolean): Date {
+		const now = new Date()
+		const current = now.getDay()
+		let delta = target - current
+		if (delta <= 0) delta += 7
+		if (forceNextWeek) delta += 7
+		return new Date(now.getFullYear(), now.getMonth(), now.getDate() + delta)
+	}
+
+	private static resolvePriority(raw: string): number {
+		if (ChatTodoExtractionService.containsAny(raw, ['紧急', '马上', '立刻', '今天', '今晚', '截止'])) return 2
+		return 0
+	}
+
+	private static isNoiseLine(line: string): boolean {
+		if (line == '') return true
+		if (/^\d{1,2}:\d{2}$/.test(line)) return true
+		if (ChatTodoExtractionService.containsAny(line, ['以下为新消息', '撤回了一条消息', '查看更多消息', '图片', '表情'])) return true
+		return false
+	}
+
+	private static hasSimilarTitle(list: ChatTodoCandidate[], title: string): boolean {
+		for (let i = 0; i < list.length; i++) {
+			if (list[i].title == title) return true
+		}
+		return false
+	}
+
+	private static containsAny(text: string, keywords: string[]): boolean {
+		for (let i = 0; i < keywords.length; i++) {
+			if (text.indexOf(keywords[i]) >= 0) return true
+		}
+		return false
+	}
+
+	private static limitDebugText(text: string, limit: number): string {
+		const value = (text ?? '').toString().replace(/\s+/g, ' ')
+		if (value.length <= limit) return value
+		return `${value.substring(0, limit)}...(len=${value.length})`
+	}
+}

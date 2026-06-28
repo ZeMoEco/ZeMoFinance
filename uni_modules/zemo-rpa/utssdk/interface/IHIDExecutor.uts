@@ -1,0 +1,133 @@
+/**
+ * IHIDExecutor — 蓝牙 HID (Human Interface Device) 执行器接口
+ * 
+ * 预留接口，用于通过蓝牙 HID 协议模拟硬件输入设备。
+ * 相比无障碍服务，HID 模式可绕过应用层安全检测，
+ * 实现更底层的输入模拟（类似物理键鼠操作）。
+ * 
+ * 使用场景:
+ *   - 需要绕过无障碍检测的应用
+ *   - 游戏自动化（反作弊系统通常只检测软件模拟层）
+ *   - 跨设备控制（一台手机通过蓝牙控制另一台）
+ * 
+ * 实现方式 (规划):
+ *   - Android: BluetoothHidDevice API (Android 9+)
+ *   - 需要与另一台设备配对，或使用硬件/虚拟 HID Profile
+ * 
+ * @version 1.0.0
+ * @status RESERVED — 接口定义完成，实现待开发
+ */
+
+/**
+ * HID 连接状态
+ */
+export enum HIDConnectionState {
+	DISCONNECTED = "DISCONNECTED",
+	CONNECTING = "CONNECTING",
+	CONNECTED = "CONNECTED",
+	ERROR = "ERROR"
+}
+
+/**
+ * HID 设备信息
+ */
+export type HIDDeviceInfo = {
+	/** 设备名称 */
+	name: string
+	/** 设备 MAC 地址 */
+	address: string
+	/** 连接状态 */
+	state: HIDConnectionState
+}
+
+/**
+ * HID 执行器接口
+ */
+export interface IHIDExecutor {
+	/**
+	 * 扫描可用的蓝牙设备
+	 */
+	scanDevices(): Promise<HIDDeviceInfo[]>
+
+	/**
+	 * 连接到目标设备
+	 * @param address 蓝牙 MAC 地址
+	 */
+	connect(address: string): Promise<boolean>
+
+	/**
+	 * 断开连接
+	 */
+	disconnect(): void
+
+	/**
+	 * 获取当前连接状态
+	 */
+	getConnectionState(): HIDConnectionState
+
+	/**
+	 * 模拟触摸/点击
+	 * @param x 屏幕 X 坐标
+	 * @param y 屏幕 Y 坐标
+	 */
+	tap(x: number, y: number): Promise<boolean>
+
+	/**
+	 * 模拟长按
+	 * @param x 屏幕 X 坐标
+	 * @param y 屏幕 Y 坐标
+	 * @param duration 按住时长 (ms)
+	 */
+	longPress(x: number, y: number, duration: number): Promise<boolean>
+
+	/**
+	 * 模拟滑动
+	 * @param x1 起点 X
+	 * @param y1 起点 Y
+	 * @param x2 终点 X
+	 * @param y2 终点 Y
+	 * @param duration 滑动时长 (ms)
+	 */
+	swipe(x1: number, y1: number, x2: number, y2: number, duration: number): Promise<boolean>
+
+	/**
+	 * 模拟文字输入 (通过 HID 键盘)
+	 * @param text 要输入的文字
+	 */
+	inputText(text: string): Promise<boolean>
+
+	/**
+	 * 模拟按键
+	 * @param keyCode HID 键码
+	 */
+	sendKey(keyCode: number): Promise<boolean>
+}
+
+/**
+ * HID 执行器工厂 — 获取平台实现 (预留)
+ */
+export class HIDExecutorFactory {
+	/**
+	 * 获取 HID 执行器实例
+	 * 当前返回 null，待蓝牙 HID 模块实现后替换
+	 */
+	static create(context: any | null = null): IHIDExecutor | null {
+		// #ifdef APP-ANDROID
+		// TODO: 实现 AndroidHIDExecutor
+		// return new AndroidHIDExecutor(context);
+		console.log("[HIDExecutor] Bluetooth HID 模式尚未实现，当前使用无障碍服务模式");
+		// #endif
+		return null;
+	}
+
+	/**
+	 * 检查当前设备是否支持蓝牙 HID
+	 */
+	static isSupported(context: any | null = null): boolean {
+		// #ifdef APP-ANDROID
+		// Android 9+ (API 28) 支持 BluetoothHidDevice
+		// TODO: 检查 Build.VERSION.SDK_INT >= 28 && BluetoothAdapter.isEnabled()
+		// #endif
+		return false;
+	}
+}

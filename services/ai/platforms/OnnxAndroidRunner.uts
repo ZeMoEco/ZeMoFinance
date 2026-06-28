@@ -1,0 +1,155 @@
+// // #ifdef APP-ANDROID
+// import UTSAndroid from 'io.dcloud.uts.UTSAndroid'
+// import File from 'java.io.File'
+// import HashMap from 'java.util.HashMap'
+// import ArrayReflect from 'java.lang.reflect.Array'
+// import Long from 'java.lang.Long'
+// import Class from 'java.lang.Class'
+// // #endif
+
+// import { FileUtil } from '@/utils/file/file.uts'
+// import { ModelConfig } from '../ModelConfig.uts'
+// import { Tokenizer } from '../Tokenizer.uts'
+
+// export class OnnxAndroidRunner {
+// 	static async embedText(text: string, _scene: string = 'task'): Promise<number[] | null> {
+// 		// #ifdef APP-ANDROID
+// 		try {
+// 			const modelPath = await OnnxAndroidRunner.ensureModelFile();
+// 			if (modelPath == null || modelPath == '') return null;
+// 			await Tokenizer.ensureLoaded();
+// 			const tokens = Tokenizer.tokenize(text, 64);
+
+// 			const envCls = Class.forName('ai.onnxruntime.OrtEnvironment');
+// 			const env = envCls.getMethod('getEnvironment').invoke(null);
+// 			const optsCls = Class.forName('ai.onnxruntime.SessionOptions');
+// 			const opts = optsCls.getConstructor().newInstance();
+// 			const sessionCls = Class.forName('ai.onnxruntime.OrtSession');
+// 			const session = envCls.getMethod('createSession', Class.forName('java.lang.String'), optsCls)
+// 				.invoke(env, modelPath, opts);
+
+// 			// 构造输入
+// 			const inputIds = OnnxAndroidRunner.toLongArray(tokens.inputIds);
+// 			const attentionMask = OnnxAndroidRunner.toLongArray(tokens.attentionMask);
+// 			const tokenTypeIds = OnnxAndroidRunner.toLongArray(tokens.tokenTypeIds);
+// 			const shape = OnnxAndroidRunner.toLongShape(1, tokens.inputIds.length);
+
+// 			const tensorCls = Class.forName('ai.onnxruntime.OnnxTensor');
+// 			const tInput = tensorCls.getMethod('createTensor', envCls, Class.forName('java.lang.Object'), Class.forName('java.lang.Object'))
+// 				.invoke(null, env, inputIds, shape);
+// 			const tMask = tensorCls.getMethod('createTensor', envCls, Class.forName('java.lang.Object'), Class.forName('java.lang.Object'))
+// 				.invoke(null, env, attentionMask, shape);
+// 			const tType = tensorCls.getMethod('createTensor', envCls, Class.forName('java.lang.Object'), Class.forName('java.lang.Object'))
+// 				.invoke(null, env, tokenTypeIds, shape);
+
+// 			const inputs: HashMap<string, any> = new HashMap();
+// 			inputs.put(ModelConfig.TASK_MODEL_INPUT_NAME, tInput);
+// 			inputs.put(ModelConfig.TASK_MODEL_MASK_NAME, tMask);
+// 			inputs.put(ModelConfig.TASK_MODEL_TYPE_NAME, tType);
+// 			const resultCls = Class.forName('ai.onnxruntime.OrtSession$Result');
+// 			const result: any = sessionCls.getMethod('run', Class.forName('java.util.Map'))
+// 				.invoke(session, inputs);
+// 			const outputValueCls = Class.forName('ai.onnxruntime.OnnxValue');
+// 			const outputValue: any = resultCls.getMethod('get', Class.forName('java.lang.Integer'))
+// 				.invoke(result, 0);
+// 			const value: any = outputValueCls.getMethod('getValue').invoke(outputValue);
+// 			const emb = OnnxAndroidRunner.meanPool(value, tokens.attentionMask);
+
+// 			// 释放资源
+// 			const closeableCls = Class.forName('java.lang.AutoCloseable');
+// 			try { closeableCls.getMethod('close').invoke(outputValue); } catch (_eClose0) {}
+// 			try { closeableCls.getMethod('close').invoke(result); } catch (_eClose1) {}
+// 			try { closeableCls.getMethod('close').invoke(tInput); } catch (_eClose2) {}
+// 			try { closeableCls.getMethod('close').invoke(tMask); } catch (_eClose3) {}
+// 			try { closeableCls.getMethod('close').invoke(tType); } catch (_eClose4) {}
+// 			try { closeableCls.getMethod('close').invoke(session); } catch (_eClose3) {}
+
+// 			return emb;
+// 		} catch (_e) {
+// 			return null;
+// 		}
+// 		// #endif
+
+// 		// #ifndef APP-ANDROID
+// 		return null;
+// 		// #endif
+// 	}
+
+// 	private static meanPool(value: any, mask: number[]): number[] | null {
+// 		if (value == null) return null;
+// 		try {
+// 			const batch = ArrayReflect.get(value, 0);
+// 			const seqLen = ArrayReflect.getLength(batch);
+// 			if (seqLen <= 0) return null;
+// 			const firstVec = ArrayReflect.get(batch, 0);
+// 			const hidden = ArrayReflect.getLength(firstVec);
+// 			const out: number[] = [];
+// 			for (let h = 0; h < hidden; h++) out.push(0);
+// 			let count = 0;
+// 			for (let i = 0; i < seqLen && i < mask.length; i++) {
+// 				if (mask[i] != 1) continue;
+// 				const vec = ArrayReflect.get(batch, i.toInt());
+// 				for (let h = 0; h < hidden; h++) {
+// 					const v = ArrayReflect.get(vec, h.toInt());
+// 					out[h] += parseFloat(v.toString());
+// 				}
+// 				count++;
+// 			}
+// 			if (count <= 0) return out;
+// 			for (let h = 0; h < hidden; h++) out[h] = out[h] / count;
+// 			return out;
+// 		} catch (_e) {}
+// 		return null;
+// 	}
+
+// 	private static toLongArray(nums: number[]): any {
+// 		// #ifdef APP-ANDROID
+// 		const arr = ArrayReflect.newInstance(Long.TYPE, nums.length.toInt());
+// 		for (let i = 0; i < nums.length; i++) ArrayReflect.set(arr, i.toInt(), nums[i].toInt());
+// 		return arr;
+// 		// #endif
+// 		// #ifndef APP-ANDROID
+// 		return nums;
+// 		// #endif
+// 	}
+
+// 	private static toLongShape(dim0: number, dim1: number): any {
+// 		// #ifdef APP-ANDROID
+// 		const shape = ArrayReflect.newInstance(Long.TYPE, 2);
+// 		ArrayReflect.set(shape, 0, dim0.toInt());
+// 		ArrayReflect.set(shape, 1, dim1.toInt());
+// 		return shape;
+// 		// #endif
+// 		// #ifndef APP-ANDROID
+// 		return [dim0, dim1];
+// 		// #endif
+// 	}
+
+// 	private static async ensureModelFile(): Promise<string> {
+// 		const destPath = ModelConfig.TASK_MODEL_RUNTIME_PATH;
+// 		await FileUtil.ensureDir(ModelConfig.TASK_MODEL_RUNTIME_DIR);
+
+// 		try {
+// 			const f = new File(destPath);
+// 			if (f.exists()) return destPath;
+// 		} catch (_e0) {}
+
+// 		// 从 static 复制到运行时目录
+// 		return new Promise(resolve => {
+// 			const fsm = uni.getFileSystemManager();
+// 			const srcPath = UTSAndroid.convert2AbsFullPath(ModelConfig.TASK_MODEL_ASSET_PATH);
+// 			fsm.readFile({
+// 				filePath: srcPath,
+// 				success: (res) => {
+// 					fsm.writeFile({
+// 						filePath: destPath,
+// 						data: res.data,
+// 						success: () => resolve(destPath),
+// 						fail: (_e2: any) => resolve('')
+// 					})
+// 				},
+// 				fail: (_e1: any) => resolve('')
+// 			})
+// 		})
+// 	}
+// }

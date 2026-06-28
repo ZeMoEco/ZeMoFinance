@@ -1,0 +1,1257 @@
+export type WebDavConfig = {
+	url: string;
+	username: string;
+	password: string;
+}
+
+export type WebDavDownloadResult = {
+	ok: boolean;
+	tempFilePath: string;
+	message: string;
+}
+
+export type WebDavTextResponse = {
+	ok: boolean;
+	statusCode: number;
+	text: string;
+	etag: string;
+	lastModified: string;
+	message: string;
+}
+
+export type WebDavLockResult = {
+	ok: boolean;
+	message: string;
+	lockToken: string;
+}
+
+export type WebDavProgressCallback = (current: number, total: number) => void;
+
+import { RUNTIME_DB_EXPORT_DIR } from '@/utils/constant.uts'
+import { FileUtil } from '@/utils/file/file.uts'
+
+// #ifdef APP-HARMONY
+import fs from '@ohos.file.fs'
+// #endif
+
+// #ifdef APP-ANDROID
+import UTSAndroid from 'io.dcloud.uts.UTSAndroid'
+import File from 'java.io.File'
+import FileInputStream from 'java.io.FileInputStream'
+import ByteArray from 'kotlin.ByteArray'
+import ByteArrayOutputStream from 'java.io.ByteArrayOutputStream'
+import URL from 'java.net.URL'
+import HttpURLConnection from 'java.net.HttpURLConnection'
+import OutputStream from 'java.io.OutputStream'
+import BufferedInputStream from 'java.io.BufferedInputStream'
+import InputStream from 'java.io.InputStream'
+import FileOutputStream from 'java.io.FileOutputStream'
+import Thread from 'java.lang.Thread'
+import { UTSJSONObject } from 'io.dcloud.uts';
+// #endif
+
+export class WebDAVService {
+	private static anyGet(obj: any, key: string): any | null {
+		try {
+			if (obj == null) {
+				return null;
+			}
+			// #ifdef APP-ANDROID
+			if (obj instanceof UTSJSONObject) {
+				const o = obj as UTSJSONObject;
+				const v = o.get(key);
+				return v != null ? v : null;
+			}
+			// #endif
+			if (obj instanceof Map) {
+				const m = obj as Map<string, any | null>;
+				return m.get(key);
+			}
+			const plainValue = (obj as any)[key]
+			if (plainValue != null) return plainValue
+			return null;
+		} catch (_e) {
+			return null;
+		}
+	}
+
+	private static anyGetString(obj: any, key: string): string | null {
+		const v = WebDAVService.anyGet(obj, key);
+		if (v == null) return null;
+		try {
+			const s = v.toString();
+			return s != null ? s : null;
+		} catch (_e) {
+			return null;
+		}
+	}
+
+	private static anyGetNumber(obj: any, key: string): number | null {
+		const s = WebDAVService.anyGetString(obj, key);
+		if (s == null) return null;
+		try {
+			const n = parseInt(s);
+			return isNaN(n) ? null : n;
+		} catch (_e) {
+			return null;
+		}
+	}
+
+	private static anyGetObject(obj: any, key: string): any | null {
+		try {
+			const v = WebDAVService.anyGet(obj, key);
+			if (v == null) return null;
+			return v;
+		} catch (_e) {
+			return null;
+		}
+	}
+
+	private static getHeaderString(headerObj: any | null, name: string): string {
+		try {
+			if (headerObj == null) return '';
+			const v1 = WebDAVService.anyGetString(headerObj, name);
+			if (v1 != null && v1.trim() != '') return v1;
+			const lower = name.toLowerCase();
+			const v2 = WebDAVService.anyGetString(headerObj, lower);
+			if (v2 != null && v2.trim() != '') return v2;
+			const upper = name.toUpperCase();
+			const v3 = WebDAVService.anyGetString(headerObj, upper);
+			if (v3 != null && v3.trim() != '') return v3;
+		} catch (_e) {}
+		return '';
+	}
+
+	private static anyErrorMessage(err: any): string {
+		const e1 = WebDAVService.anyGetString(err, 'errMsg');
+		if (e1 != null && e1.trim() != '') return e1;
+		const e2 = WebDAVService.anyGetString(err, 'message');
+		if (e2 != null && e2.trim() != '') return e2;
+		try {
+			if (err != null) {
+				const s = err.toString();
+				if (s != null && s.trim() != '') return s;
+			}
+		} catch (_e) {}
+		try {
+			const json = JSON.stringify(err)
+			if (json != null && json.trim() != '' && json != '{}' && json != 'null') return json
+		} catch (_e) {}
+		return 'unknown';
+	}
+	private static base64EncodeAscii(input: string): string {
+		const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+		let str = (input ?? '').toString();
+		let output = '';
+		let i = 0;
+		while (i < str.length) {
+			const i1 = i;
+			i++;
+			const c1nAny = str.charCodeAt(i1);
+			const c1 = ((c1nAny != null ? c1nAny : 0) as number) & 0xff;
+
+			let c2n: number | null = null;
+			if (i < str.length) {
+				const i2 = i;
+				i++;
+				const c2Any = str.charCodeAt(i2);
+				if (c2Any != null) c2n = ((c2Any as number) & 0xff);
+			}
+
+			let c3n: number | null = null;
+			if (i < str.length) {
+				const i3 = i;
+				i++;
+				const c3Any = str.charCodeAt(i3);
+				if (c3Any != null) c3n = ((c3Any as number) & 0xff);
+			}
+
+			const e1 = c1 >> 2;
+			const e2 = ((c1 & 3) << 4) | ((c2n != null ? c2n : 0) >> 4);
+			let e3 = ((c2n != null ? c2n : 0) & 15) << 2;
+			let e4 = 0;
+			if (c3n != null) {
+				e3 |= (c3n >> 6);
+				e4 = c3n & 63;
+			}
+
+			output += chars.charAt(e1);
+			output += chars.charAt(e2);
+			if (c2n == null) {
+				output += '==';
+			} else if (c3n == null) {
+				output += chars.charAt(e3);
+				output += '=';
+			} else {
+				output += chars.charAt(e3);
+				output += chars.charAt(e4);
+			}
+		}
+		return output;
+	}
+
+	private static buildAuthHeader(username: string, password: string): string {
+		const token = `${(username ?? '').toString()}:${(password ?? '').toString()}`;
+		return 'Basic ' + WebDAVService.base64EncodeAscii(token);
+	}
+
+	private static normalizeUrl(url: string): string {
+		let u = (url ?? '').toString().trim();
+		u = u.replace(/\s/g, '');
+		return u;
+	}
+
+	private static clipMessage(raw: string, maxLen: number = 160): string {
+		const text = (raw ?? '').toString().trim();
+		if (text == '') return '';
+		if (text.length <= maxLen) return text;
+		return text.substring(0, maxLen) + '...';
+	}
+
+	private static buildRequestFailureMessage(method: string, url: string, code: number, detail: string = ''): string {
+		const normalizedMethod = (method ?? '').toString().trim().toUpperCase();
+		const normalizedUrl = WebDAVService.normalizeUrl(url);
+		const clippedDetail = WebDAVService.clipMessage(detail);
+		let msg = '';
+		if (code == 401) msg = `验证失败(401): 账号或密码错误 [${normalizedMethod}] ${normalizedUrl}`;
+		else msg = `Request failed: ${code} [${normalizedMethod}] ${normalizedUrl}`;
+		if (clippedDetail != '') msg += ' - ' + clippedDetail;
+		return msg;
+	}
+
+	private static parseStatusCodeFromMessage(message: string): number {
+		const text = (message ?? '').toString()
+		const match = text.match(/HTTP\s+(\d+)/i)
+		if (match != null && match.length > 1) {
+			const raw = match[1] ?? ''
+			const code = parseInt(raw.toString())
+			if (!isNaN(code)) return code
+		}
+		return 0
+	}
+
+	private static buildTextFallbackFilePath(tag: string): string {
+		const safeTag = (tag ?? 'text').toString().replace(/[^a-zA-Z0-9_-]/g, '_')
+		return `${RUNTIME_DB_EXPORT_DIR}/webdav_${safeTag}_${Date.now()}_${Math.floor(Math.random() * 100000)}.txt`
+	}
+
+	private static async getTextViaDownloadFallback(url: string, cfg: WebDavConfig): Promise<WebDavTextResponse> {
+		const downloadCfg: WebDavConfig = { url, username: cfg.username, password: cfg.password }
+		const download = await WebDAVService.downloadToTempFile(downloadCfg, null)
+		if (!download.ok) {
+			return {
+				ok: false,
+				statusCode: WebDAVService.parseStatusCodeFromMessage(download.message),
+				text: '',
+				etag: '',
+				lastModified: '',
+				message: download.message,
+			} as WebDavTextResponse
+		}
+
+		let text = ''
+		try {
+			const fileText = await FileUtil.readTextFile(download.tempFilePath, 'utf8')
+			if (fileText == null) {
+				return {
+					ok: false,
+					statusCode: 0,
+					text: '',
+					etag: '',
+					lastModified: '',
+					message: `WebDAV 文本下载回退读取失败 [GET] ${WebDAVService.normalizeUrl(url)}`,
+				} as WebDavTextResponse
+			}
+			text = fileText
+		} finally {
+			await FileUtil.removeFile(download.tempFilePath)
+		}
+
+		return {
+			ok: true,
+			statusCode: 200,
+			text,
+			etag: '',
+			lastModified: '',
+			message: '',
+		} as WebDavTextResponse
+	}
+
+	private static async putTextViaFileFallback(url: string, text: string, cfg: WebDavConfig): Promise<WebDavTextResponse> {
+		await FileUtil.ensureDir(RUNTIME_DB_EXPORT_DIR)
+		const tempFilePath = WebDAVService.buildTextFallbackFilePath('put_text')
+		const writeOk = await FileUtil.writeTextFile(tempFilePath, (text ?? '').toString(), 'utf8')
+		if (!writeOk) {
+			return {
+				ok: false,
+				statusCode: 0,
+				text: '',
+				etag: '',
+				lastModified: '',
+				message: `WebDAV 文本上传回退失败 [PUT] ${WebDAVService.normalizeUrl(url)}: 临时文件写入失败`,
+			} as WebDavTextResponse
+		}
+
+		try {
+			const uploadMessage = await WebDAVService.putFile(tempFilePath, { url, username: cfg.username, password: cfg.password } as WebDavConfig, null)
+			if (uploadMessage == 'WebDAV 上传成功') {
+				return {
+					ok: true,
+					statusCode: 200,
+					text: '',
+					etag: '',
+					lastModified: '',
+					message: '',
+				} as WebDavTextResponse
+			}
+			return {
+				ok: false,
+				statusCode: WebDAVService.parseStatusCodeFromMessage(uploadMessage),
+				text: '',
+				etag: '',
+				lastModified: '',
+				message: uploadMessage,
+			} as WebDavTextResponse
+		} finally {
+			await FileUtil.removeFile(tempFilePath)
+		}
+	}
+
+	private static async requestText(method: string, url: string, headers: UTSJSONObject | null = null, data: any | null = null): Promise<WebDavTextResponse> {
+		return await new Promise((resolve) => {
+			try {
+				const headerObj0 = headers != null ? headers : (new UTSJSONObject())
+				const onSuccess = (res: any) => {
+						let code = 0;
+						try {
+							const sc = WebDAVService.anyGetNumber(res, 'statusCode');
+							code = sc != null ? sc : 0;
+						} catch (_e0) { code = 0; }
+
+						const headerObj = WebDAVService.anyGetObject(res, 'header');
+						const etag = WebDAVService.getHeaderString(headerObj, 'ETag');
+						const lastModified = WebDAVService.getHeaderString(headerObj, 'Last-Modified');
+
+						let text = '';
+						try {
+							const d = WebDAVService.anyGet(res, 'data');
+							if (d != null) text = d.toString();
+						} catch (_e1) { text = ''; }
+
+						const isOk = code >= 200 && code < 300;
+						let msg = '';
+						if (!isOk) {
+							msg = WebDAVService.buildRequestFailureMessage(method, url, code, text);
+						}
+						resolve({ ok: isOk, statusCode: code, text, etag, lastModified, message: msg } as WebDavTextResponse);
+				}
+				const onFail = (err: any) => {
+					const errMsg = WebDAVService.anyErrorMessage(err);
+					resolve({ ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: WebDAVService.buildRequestFailureMessage(method, url, 0, errMsg) } as WebDavTextResponse);
+				}
+				if (data != null) {
+					uni.request({
+						url: url,
+						method: method,
+						header: headerObj0,
+						dataType: 'text',
+						responseType: 'text',
+						data: data,
+						success: onSuccess,
+						fail: onFail,
+					})
+				} else {
+					uni.request({
+						url: url,
+						method: method,
+						header: headerObj0,
+						dataType: 'text',
+						responseType: 'text',
+						success: onSuccess,
+						fail: onFail,
+					})
+				}
+			} catch (e) {
+				resolve({ ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: WebDAVService.buildRequestFailureMessage(method, url, 0, (e as Error).message) } as WebDavTextResponse);
+			}
+		});
+	}
+
+	public static async getText(url: string, cfg: WebDavConfig): Promise<WebDavTextResponse> {
+		const u = WebDAVService.normalizeUrl(url);
+		if (u == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV URL 为空' } as WebDavTextResponse;
+		if (cfg.username.toString().trim() == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV 用户名为空' } as WebDavTextResponse;
+		const h = new UTSJSONObject()
+		h['Authorization'] = WebDAVService.buildAuthHeader(cfg.username, cfg.password)
+		h['Accept'] = 'text/plain, text/markdown, */*'
+		const res = await WebDAVService.requestText('GET', u, h, null);
+		if (!res.ok && res.statusCode == 0) {
+			console.log('WebDAVService: getText fallback via downloadFile', u)
+			return await WebDAVService.getTextViaDownloadFallback(u, cfg)
+		}
+		return res;
+	}
+
+	public static async head(url: string, cfg: WebDavConfig): Promise<WebDavTextResponse> {
+		const u = WebDAVService.normalizeUrl(url);
+		if (u == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV URL 为空' } as WebDavTextResponse;
+		if (cfg.username.toString().trim() == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV 用户名为空' } as WebDavTextResponse;
+		const h = new UTSJSONObject()
+		h['Authorization'] = WebDAVService.buildAuthHeader(cfg.username, cfg.password)
+		return await WebDAVService.requestText('HEAD', u, h, null);
+	}
+
+	private static copyHeaderIfPresent(dst: UTSJSONObject, src: any | null, key: string): void {
+		try {
+			if (src == null) return
+			const v = WebDAVService.anyGet(src, key)
+			if (v != null) {
+				dst[key] = v
+			}
+		} catch (_e0) {}
+	}
+
+	public static async putText(url: string, text: string, cfg: WebDavConfig, extraHeaders: any | null = null): Promise<WebDavTextResponse> {
+		const u = WebDAVService.normalizeUrl(url);
+		if (u == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV URL 为空' } as WebDavTextResponse;
+		if (cfg.username.toString().trim() == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV 用户名为空' } as WebDavTextResponse;
+		const headers = new UTSJSONObject()
+		headers['Authorization'] = WebDAVService.buildAuthHeader(cfg.username, cfg.password)
+		headers['Content-Type'] = 'text/markdown; charset=utf-8'
+		WebDAVService.copyHeaderIfPresent(headers, extraHeaders, 'If-Match')
+		WebDAVService.copyHeaderIfPresent(headers, extraHeaders, 'If-None-Match')
+		WebDAVService.copyHeaderIfPresent(headers, extraHeaders, 'Lock-Token')
+		WebDAVService.copyHeaderIfPresent(headers, extraHeaders, 'Depth')
+		WebDAVService.copyHeaderIfPresent(headers, extraHeaders, 'Timeout')
+		const res = await WebDAVService.requestText('PUT', u, headers, (text ?? '').toString());
+		if (!res.ok && res.statusCode == 0 && extraHeaders == null) {
+			console.log('WebDAVService: putText fallback via temp file', u)
+			return await WebDAVService.putTextViaFileFallback(u, text, cfg)
+		}
+		return res;
+	}
+
+	public static async remove(url: string, cfg: WebDavConfig): Promise<WebDavTextResponse> {
+		const u = WebDAVService.normalizeUrl(url);
+		if (u == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV URL 为空' } as WebDavTextResponse;
+		if (cfg.username.toString().trim() == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV 用户名为空' } as WebDavTextResponse;
+		const h = new UTSJSONObject()
+		h['Authorization'] = WebDAVService.buildAuthHeader(cfg.username, cfg.password)
+		return await WebDAVService.requestText('DELETE', u, h, null);
+	}
+
+	public static async mkcol(url: string, cfg: WebDavConfig): Promise<WebDavTextResponse> {
+		const u = WebDAVService.normalizeUrl(url);
+		if (u == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV URL 为空' } as WebDavTextResponse;
+		if (cfg.username.toString().trim() == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV 用户名为空' } as WebDavTextResponse;
+		const h = new UTSJSONObject()
+		h['Authorization'] = WebDAVService.buildAuthHeader(cfg.username, cfg.password)
+		return await WebDAVService.requestText('MKCOL', u, h, null);
+	}
+
+	public static async ensureCollection(url: string, cfg: WebDavConfig): Promise<WebDavTextResponse> {
+		const created = await WebDAVService.mkcol(url, cfg);
+		if (created.ok) return created;
+		if (created.statusCode == 301 || created.statusCode == 302 || created.statusCode == 405) {
+			return { ok: true, statusCode: created.statusCode, text: created.text, etag: created.etag, lastModified: created.lastModified, message: 'collection-exists' } as WebDavTextResponse;
+		}
+		return created;
+	}
+
+	public static async tryLock(url: string, cfg: WebDavConfig): Promise<WebDavLockResult> {
+		const u = WebDAVService.normalizeUrl(url);
+		if (u == '') return { ok: false, message: 'WebDAV URL 为空', lockToken: '' } as WebDavLockResult;
+		if (cfg.username.toString().trim() == '') return { ok: false, message: 'WebDAV 用户名为空', lockToken: '' } as WebDavLockResult;
+
+		const lockBody = '<?xml version="1.0" encoding="utf-8"?>\n<D:lockinfo xmlns:D="DAV:">\n  <D:lockscope><D:exclusive/></D:lockscope>\n  <D:locktype><D:write/></D:locktype>\n  <D:owner>ZeMo</D:owner>\n</D:lockinfo>';
+		const h = new UTSJSONObject()
+		h['Authorization'] = WebDAVService.buildAuthHeader(cfg.username, cfg.password)
+		h['Timeout'] = 'Second-60'
+		h['Content-Type'] = 'application/xml; charset=utf-8'
+		const r = await WebDAVService.requestText('LOCK', u, h, lockBody);
+		if (r.ok) {
+			let token = ''
+			try {
+				token = ''
+			} catch (_e0) { token = '' }
+			return { ok: true, message: 'LOCK ok', lockToken: token } as WebDavLockResult;
+		}
+		return { ok: false, message: r.statusCode > 0 ? ('LOCK失败: HTTP ' + r.statusCode) : ('LOCK失败: ' + r.message), lockToken: '' } as WebDavLockResult;
+	}
+
+	public static async unlock(url: string, lockToken: string, cfg: WebDavConfig): Promise<WebDavTextResponse> {
+		const u = WebDAVService.normalizeUrl(url);
+		if (u == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV URL 为空' } as WebDavTextResponse;
+		if (cfg.username.toString().trim() == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV 用户名为空' } as WebDavTextResponse;
+		const headers = new UTSJSONObject()
+		headers['Authorization'] = WebDAVService.buildAuthHeader(cfg.username, cfg.password)
+		if (lockToken != null && lockToken.trim() != '') {
+			headers['Lock-Token'] = lockToken
+		}
+		return await WebDAVService.requestText('UNLOCK', u, headers, null);
+	}
+
+	private static normalizeLocalFilePath(p: string): string {
+		let s = p != null ? p.toString() : ''
+		if (s.trim() == '') return ''
+		s = s.replace(/\\/g, '/')
+		
+		s = s.replace('unifile://usr//', 'unifile://usr/')
+		s = s.replace('unifile://cache//', 'unifile://cache/')
+		
+		while (s.indexOf('unifile://usr//') == 0) s = 'unifile://usr/' + s.substring('unifile://usr//'.length)
+		while (s.indexOf('unifile://cache//') == 0) s = 'unifile://cache/' + s.substring('unifile://cache//'.length)
+		return s
+	}
+
+	private static resolveAndroidAbsPath(p: string): string {
+		let s = WebDAVService.normalizeLocalFilePath(p)
+		if (s.trim() == '') return ''
+		// #ifdef APP-ANDROID
+		try {
+			const f = new File(s);
+			if (f.exists()) return s;
+
+			const ctx = UTSAndroid.getAppContext()
+			if (ctx != null) {
+				if (s.indexOf('unifile://usr/') == 0) {
+					const rel = s.substring('unifile://usr/'.length)
+					let relClean = rel
+					while (relClean.startsWith('/')) relClean = relClean.substring(1)
+
+					const filesDir = ctx.getFilesDir().getAbsolutePath().replace(/\\/g, '/')
+					const base = filesDir.endsWith('/') ? filesDir.substring(0, filesDir.length - 1) : filesDir
+					const pathInternal = base + '/' + relClean
+					if (new File(pathInternal).exists()) return pathInternal
+
+					const extDirObj = ctx.getExternalFilesDir(null)
+					if (extDirObj != null) {
+						const extDir = extDirObj.getAbsolutePath().replace(/\\/g, '/')
+						const extBase = extDir.endsWith('/') ? extDir.substring(0, extDir.length - 1) : extDir
+						const pathExt = extBase + '/' + relClean
+						if (new File(pathExt).exists()) return pathExt
+					}
+
+					return pathInternal
+				}
+				if (s.indexOf('unifile://cache/') == 0) {
+					const base = ctx.getCacheDir().getAbsolutePath().toString().replace(/\\/g, '/')
+					const rel = s.substring('unifile://cache/'.length)
+					let relClean = rel
+					while (relClean.startsWith('/')) relClean = relClean.substring(1)
+					
+					return base + '/' + relClean
+				}
+			}
+		} catch (_e0) {
+		}
+		// #endif
+		return ''
+	}
+
+	private static readFileAsByteArrayAndroid(filePath: string): ByteArray | null {
+		// #ifdef APP-ANDROID
+		try {
+			const abs = WebDAVService.resolveAndroidAbsPath(filePath)
+			if (abs.trim() == '') return null
+			const f = new File(abs)
+			if (!f.exists()) return null
+			const input = new FileInputStream(f)
+			try {
+				const out = new ByteArrayOutputStream()
+				const buf = new ByteArray(1024 * 64)
+				while (true) {
+					const n = input.read(buf)
+					if (n <= 0) break
+					out.write(buf, 0, n)
+				}
+				const bytes = out.toByteArray() as ByteArray
+				return bytes
+			} finally {
+				input.close()
+			}
+		} catch (_e1) {
+			return null
+		}
+		// #endif
+		return null
+	}
+
+	private static fileExists(path: string): Promise<boolean> {
+		return new Promise((resolve) => {
+			try {
+				const p = WebDAVService.normalizeLocalFilePath(path)
+				// #ifdef APP-HARMONY
+				try {
+					resolve(fs.accessSync(p))
+					return
+				} catch (_e0) {}
+				// #endif
+
+				const fsManager = uni.getFileSystemManager();
+				fsManager.stat({
+					path: p,
+					success: () => resolve(true),
+					fail: (_e: any) => resolve(false)
+				});
+			} catch (_e2) {
+				resolve(false)
+			}
+		})
+	}
+
+	private static readFileAsBinary(filePath: string): Promise<any> {
+		return new Promise((resolve, reject) => {
+			try {
+				const p = WebDAVService.normalizeLocalFilePath(filePath);
+
+				// #ifdef APP-HARMONY
+				try {
+					if (fs.accessSync(p)) {
+						let file: any | null = null
+						try {
+							file = fs.openSync(p, fs.OpenMode.READ_ONLY)
+							const stat = fs.statSync(file.fd)
+							const size = parseInt(stat.size.toString())
+							const out = new ArrayBuffer(size)
+							if (size > 0) fs.readSync(file.fd, out)
+							resolve(out)
+							return
+						} finally {
+							try { if (file != null) fs.closeSync(file) } catch (_e0) {}
+						}
+					}
+				} catch (_e1) {
+					console.log(`[WebDAVService] Harmony native read fallback path=${p} error=${WebDAVService.anyErrorMessage(_e1)}`)
+				}
+				// #endif
+
+				const fsManager = uni.getFileSystemManager();
+				fsManager.readFile({
+					filePath: p,
+					success: (res: any) => {
+						try {
+							let d: any | null = null
+							try {
+								const obj = res as UTSJSONObject
+								const v = obj.get('data')
+								if (v != null) {
+									d = v
+								} else {
+									const v2 = obj['data']
+									if (v2 != null) d = v2
+								}
+							} catch (_e0) {
+							}
+							if (d != null) {
+								resolve(d)
+								return
+							}
+
+							const b = WebDAVService.readFileAsByteArrayAndroid(p)
+							if (b != null) {
+								resolve(b)
+								return
+							}
+							reject('readFile 返回 data 为空');
+						} catch (e) {
+							reject(e);
+						}
+					},
+					fail: (err: any) => {
+						const b = WebDAVService.readFileAsByteArrayAndroid(p)
+						if (b != null) {
+							resolve(b)
+							return
+						}
+						reject(err)
+					}
+				});
+			} catch (e) {
+				reject(e);
+			}
+		});
+	}
+
+	public static async checkConnection(cfg: WebDavConfig): Promise<WebDavTextResponse> {
+		console.log('WebDAVService: checking connection to', cfg.url, 'with user:', cfg.username);
+		const u = WebDAVService.normalizeUrl(cfg.url);
+		if (u == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV URL 为空' } as WebDavTextResponse;
+		if (cfg.username.toString().trim() == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV 用户名为空' } as WebDavTextResponse;
+		if (cfg.password.toString().trim() == '') return { ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'WebDAV 密码为空' } as WebDavTextResponse;
+		
+		// #ifdef APP-ANDROID
+		return await new Promise((resolve) => {
+			const thread = new Thread(() => {
+				let conn: HttpURLConnection | null = null;
+				try {
+					const testFileName = "zemo_conn_test.txt";
+					const testUrl = u + (u.endsWith('/') ? '' : '/') + testFileName;
+					console.log('WebDAVService: checking via PUT', testUrl);
+
+					const urlObj = new URL(testUrl);
+					conn = urlObj.openConnection() as HttpURLConnection;
+					conn.setRequestMethod("PUT"); 
+					conn.setDoOutput(true);
+					conn.setInstanceFollowRedirects(true);
+					conn.setConnectTimeout(10000);
+					conn.setReadTimeout(10000);
+
+					const auth = WebDAVService.buildAuthHeader(cfg.username, cfg.password);
+					conn.setRequestProperty("Authorization", auth);
+					conn.setRequestProperty("User-Agent", "ZeMo/1.0");
+					conn.setRequestProperty("Connection", "close");
+					
+					const os = conn.getOutputStream();
+					const jStr = new java.lang.String('zemo-check');
+					os.write(jStr.getBytes());
+					os.flush();
+					os.close();
+
+					const code = conn.getResponseCode();
+					console.log('WebDAVService: PUT response code', code);
+					
+					let isOk = code >= 200 && code < 300;
+					
+					// Cleanup
+					if (isOk) {
+						conn.disconnect();
+						try {
+							conn = urlObj.openConnection() as HttpURLConnection;
+							conn.setRequestMethod("DELETE");
+							conn.setRequestProperty("Authorization", auth);
+							conn.setRequestProperty("Connection", "close");
+							conn.getResponseCode();
+						} catch(_e){ console.log('Cleanup delete failed', _e); }
+					}
+
+					let msg = '';
+					if (code == 401) msg = '验证失败(401): 账号或密码错误';
+					else if (!isOk) msg = 'Check failed: ' + code;
+					
+					resolve({ 
+						ok: isOk, 
+						statusCode: code, 
+						text: 'Native PUT Check', 
+						etag: '', 
+						lastModified: '', 
+						message: msg
+					} as WebDavTextResponse);
+
+				} catch(e) {
+					console.error('WebDAVService: connection check error', e);
+					resolve({ ok: false, statusCode: 0, text: '', etag: '', lastModified: '', message: 'Native Check Exception: ' + e.toString() } as WebDavTextResponse);
+				} finally {
+					try { if(conn != null) conn.disconnect(); } catch(_){}
+				}
+			});
+			thread.start();
+		});
+		// #endif
+
+		// #ifndef APP-ANDROID
+		const h = new UTSJSONObject()
+		h['Authorization'] = WebDAVService.buildAuthHeader(cfg.username, cfg.password)
+		h['Depth'] = '0'
+		const res = await WebDAVService.requestText('PROPFIND', u, h, null);
+        
+        // Enhance message if 401
+        if (res.statusCode == 401 && !res.ok) {
+            res.message = '验证失败(401): 账号或密码错误';
+        }
+        return res;
+		// #endif
+	}
+
+	public static async resolveRealUrl(startUrl: string, cfg: WebDavConfig): Promise<string> {
+		// #ifdef APP-ANDROID
+		return await new Promise((resolve) => {
+			const thread = new Thread(() => {
+				let conn: HttpURLConnection | null = null;
+				try {
+					const urlObj = new URL(startUrl);
+					conn = urlObj.openConnection() as HttpURLConnection;
+					conn.setRequestMethod("OPTIONS"); 
+					conn.setInstanceFollowRedirects(true);
+					conn.setConnectTimeout(5000);
+					conn.setReadTimeout(5000);
+
+					const auth = WebDAVService.buildAuthHeader(cfg.username, cfg.password);
+					conn.setRequestProperty("Authorization", auth);
+					conn.setRequestProperty("User-Agent", "ZeMo/1.0");
+					conn.setRequestProperty("Connection", "close");
+
+					const code = conn.getResponseCode();
+					const finalUrl = conn.getURL().toString();
+					resolve((finalUrl != null && finalUrl.length > 0) ? finalUrl : startUrl);
+				} catch(e) {
+					resolve(startUrl);
+				} finally {
+					try { if(conn != null) conn.disconnect(); } catch(_){}
+				}
+			});
+			thread.start();
+		});
+		// #endif
+		return startUrl;
+	}
+
+	public static async putFile(localFilePath: string, cfg: WebDavConfig, onProgress: WebDavProgressCallback | null = null): Promise<string> {
+		let urlStr = WebDAVService.normalizeUrl(cfg.url);
+		if (urlStr == '') return 'WebDAV URL 为空';
+		if (cfg.username.toString().trim() == '') return 'WebDAV 用户名为空';
+
+		const p = WebDAVService.normalizeLocalFilePath(localFilePath)
+		if (p.trim() == '') return '本地文件路径为空'
+		
+		// #ifdef APP-ANDROID
+		const targetUrl = urlStr; 
+
+		return await new Promise((resolve) => {
+			try {
+				const absPath = WebDAVService.resolveAndroidAbsPath(p);
+				if (absPath == '') {
+					resolve('无法解析文件路径: ' + p);
+					return;
+				}
+				const file = new File(absPath);
+				if (!file.exists()) {
+					resolve('本地文件不存在: ' + absPath);
+					return;
+				}
+				const fileSize0 = file.length();
+                console.log(`[WebDAVService] Ready to upload. File: ${absPath}, Size: ${fileSize0}`)
+				const fileSize = fileSize0 > 0 ? fileSize0.toDouble() : 0.0;
+
+				const thread = new Thread(() => {
+					let currentUrl = targetUrl;
+					let redirectCount = 0;
+					const maxRedirects = 10;
+					let success = false;
+					let lastErrorMsg = '';
+					
+					while (redirectCount < maxRedirects) {
+						let conn: HttpURLConnection | null = null;
+						let fis: FileInputStream | null = null;
+						let os: OutputStream | null = null;
+						let performGetRedirectCheck = false;
+						
+						try {
+							const urlObj = new URL(currentUrl);
+							conn = urlObj.openConnection() as HttpURLConnection;
+							conn.setRequestMethod("PUT");
+							conn.setDoOutput(true);
+							conn.setDoInput(true);
+							conn.setInstanceFollowRedirects(false); 
+							
+							const auth = WebDAVService.buildAuthHeader(cfg.username, cfg.password);
+							conn.setRequestProperty("Authorization", auth);
+							conn.setRequestProperty("User-Agent", "ZeMo/1.0");
+							conn.setRequestProperty("Content-Type", "application/octet-stream");
+							conn.setRequestProperty("Connection", "close"); 
+							
+							const len = file.length();
+							if (len > 0) conn.setFixedLengthStreamingMode(len);
+							
+							os = conn.getOutputStream();
+							fis = new FileInputStream(file);
+							const buffer = new ByteArray(8192);
+							let bytesRead = fis.read(buffer);
+							let bytesSent = 0.0;
+							let lastUpdate = 0.0;
+
+							while (bytesRead != -1) {
+								os.write(buffer, 0, bytesRead);
+								bytesSent = bytesSent + bytesRead.toDouble();
+								const now = Date.now();
+								if (onProgress != null && (now - lastUpdate > 100 || bytesSent == fileSize)) {
+									onProgress(bytesSent, fileSize);
+									lastUpdate = now.toDouble();
+								}
+								bytesRead = fis.read(buffer);
+							}
+							os.flush();
+                            try {
+                                os.close();
+                            } catch (_e_close) {
+                                console.error('WebDAV Upload OS Close Error:', _e_close);
+                            }
+                            // Set to null so finally block doesn't try to close again (though safe)
+                            os = null; 
+							
+							const code = conn.getResponseCode();
+							
+							if (code >= 200 && code < 300) {
+								success = true;
+								resolve('WebDAV 上传成功');
+								break;
+							} 
+							
+							if (code >= 300 && code < 400) {
+								const loc = conn.getHeaderField("Location");
+								if (loc != null && loc.trim() != '') {
+									redirectCount++;
+									currentUrl = loc;
+									continue; 
+								}
+							}
+							
+							if (code == 405) {
+								performGetRedirectCheck = true;
+							}
+                            
+							let msg = 'WebDAV 上传失败: HTTP ' + code
+							const isInfini = (currentUrl.indexOf('teracloud.jp') > 0 || currentUrl.indexOf('infini-cloud') > 0);
+							
+							if (code == 405) msg += ' (方法不允许: PUT)';
+							if (code == 502) msg += ' (网关错误)';
+							if (code == 404) msg += ' (路径不存在)';
+							if (code == 401) msg += ' (鉴权失败)';
+							if (isInfini) msg += ' [InfiniCLOUD]';
+                             
+                            lastErrorMsg = msg + ' (' + currentUrl + ')';
+							
+						} catch (e) {
+							lastErrorMsg = 'WebDAV 上传异常: ' + e.toString();
+							break;
+						} finally {
+							try { if (os != null) os.close(); } catch (_) {}
+							try { if (fis != null) fis.close(); } catch (_) {}
+							try { if (conn != null) conn.disconnect(); } catch (_) {}
+						}
+
+						if (performGetRedirectCheck && redirectCount < maxRedirects) {
+                            let recoveryConn: HttpURLConnection | null = null;
+                            try {
+                                let parentUrl = currentUrl;
+                                const slashHigh = currentUrl.lastIndexOf('/');
+                                if (slashHigh > 8) { 
+                                    parentUrl = currentUrl.substring(0, slashHigh + 1);
+                                }
+                                
+                                const recUrlObj = new URL(parentUrl);
+                                recoveryConn = recUrlObj.openConnection() as HttpURLConnection;
+                                recoveryConn.setRequestMethod("GET"); 
+                                recoveryConn.setInstanceFollowRedirects(false); 
+                                const auth = WebDAVService.buildAuthHeader(cfg.username, cfg.password);
+                                recoveryConn.setRequestProperty("Authorization", auth);
+                                recoveryConn.setRequestProperty("User-Agent", "ZeMo/1.0");
+                                recoveryConn.setConnectTimeout(5000);
+                                
+                                const rCode = recoveryConn.getResponseCode();
+                                if (rCode >= 300 && rCode < 400) {
+                                    const rLoc = recoveryConn.getHeaderField("Location");
+                                    if (rLoc != null && rLoc.trim() != '') {
+                                        let newBase = rLoc;
+                                        if (!newBase.endsWith('/')) newBase += '/';
+                                        
+                                        const pParts = p.split('/');
+                                        const fName = pParts[pParts.length - 1];
+                                        
+                                        currentUrl = newBase + fName;
+                                        redirectCount++;
+                                        continue; 
+                                    }
+                                }
+                            } catch(_e) {
+                            } finally {
+                                try { if (recoveryConn != null) recoveryConn.disconnect(); } catch (_) {}
+                            }
+                        }
+                        break;
+					}
+					
+					if (!success) {
+						resolve(lastErrorMsg);
+					}
+				});
+				thread.start();
+			} catch (e) {
+				resolve('启动上传线程失败: ' + (e as Error).message);
+			}
+		});
+
+		// #endif
+
+		// #ifndef APP-ANDROID
+		const ex = await WebDAVService.fileExists(p)
+		if (!ex) return '本地文件不存在: ' + p
+
+		let data: any;
+		try {
+			data = await WebDAVService.readFileAsBinary(p);
+		} catch (e) {
+			return '读取备份文件失败: ' + WebDAVService.anyErrorMessage(e);
+		}
+
+		return await new Promise((resolve) => {
+			try {
+				const task = uni.request({
+					url: urlStr,
+					method: 'PUT',
+					header: {
+						'Authorization': WebDAVService.buildAuthHeader(cfg.username, cfg.password),
+						'Content-Type': 'application/octet-stream'
+					},
+					dataType: 'text',
+					responseType: 'text',
+					data,
+					success: (res: any) => {
+						let code = 0;
+						try {
+							const sc = WebDAVService.anyGetNumber(res, 'statusCode');
+							code = sc != null ? sc : 0;
+						} catch (_e) { code = 0; }
+						if (code >= 200 && code < 300) {
+							if (onProgress != null) onProgress(100.0, 100.0);
+							resolve('WebDAV 上传成功');
+							return;
+						}
+						let msg = 'WebDAV 上传失败: HTTP ' + code
+						if (code == 405) msg += ' (方法不允许: '+urlStr+')';
+						else if (code >= 300 && code < 400) {
+							msg += ' (Redirect?)'
+						}
+                        else msg += ' ('+urlStr+')';
+						resolve(msg);
+					},
+					fail: (err: any) => {
+						resolve(`WebDAV 上传失败 [PUT] ${urlStr}: ` + WebDAVService.anyErrorMessage(err));
+					}
+				});
+				// PUT request on non-Android usually doesn't expose easy progress on uni.request in some platforms 
+				// but in app-plus it might support task. But uni.request doesn't return RequestTask in standard type sometimes? 
+				// Checked: uni.request returns RequestTask.
+				// However, if we are here, we might not have progress. 
+			} catch (e) {
+				resolve(`WebDAV 上传失败 [PUT] ${urlStr}: ` + (e as Error).message);
+			}
+		});
+		// #endif
+	}
+
+	public static async downloadToTempFile(cfg: WebDavConfig, onProgress: WebDavProgressCallback | null = null): Promise<WebDavDownloadResult> {
+		const urlStr = WebDAVService.normalizeUrl(cfg.url);
+		if (urlStr == '') return { ok: false, tempFilePath: '', message: 'WebDAV URL 为空' };
+		if (cfg.username.toString().trim() == '') return { ok: false, tempFilePath: '', message: 'WebDAV 用户名为空' };
+
+		// #ifdef APP-ANDROID
+		return await new Promise((resolve) => {
+			try {
+				const thread = new Thread(() => {
+					let conn: HttpURLConnection | null = null;
+					let ins: InputStream | null = null;
+					let fos: FileOutputStream | null = null;
+					try {
+						const urlObj = new URL(urlStr);
+						conn = urlObj.openConnection() as HttpURLConnection;
+						conn.setRequestMethod("GET");
+						conn.setRequestProperty("Authorization", WebDAVService.buildAuthHeader(cfg.username, cfg.password));
+						
+						const code = conn.getResponseCode();
+						if (code >= 200 && code < 300) {
+							const ctx = UTSAndroid.getAppContext();
+							if (ctx != null) {
+								const cacheDir = ctx.getCacheDir();
+								const tempName = "webdav_" + new Date().getTime() + ".tmp";
+								const tempFile = new File(cacheDir, tempName);
+								
+								// Get Content Length for progress
+								let contentLength = 0;
+								try {
+									contentLength = conn.getContentLength();
+								} catch(_e) { contentLength = 0; }
+								const totalC = contentLength > 0 ? contentLength.toDouble() : 0.0;
+								
+								ins = conn.getInputStream();
+								fos = new FileOutputStream(tempFile);
+								
+								// Create buffer
+								const buffer = new ByteArray(8192);
+								let len = ins.read(buffer);
+								let currentLoaded = 0.0;
+								let lastUpdate = 0.0;
+								
+								while (len != -1) {
+									fos.write(buffer, 0, len);
+									currentLoaded = currentLoaded + len.toDouble();
+									const now = Date.now();
+									if (onProgress != null && (now - lastUpdate > 100 || (totalC > 0 && currentLoaded == totalC))) {
+										onProgress(currentLoaded, totalC);
+										lastUpdate = now.toDouble();
+									}
+									len = ins.read(buffer);
+								}
+								fos.flush();
+								fos.close();
+								fos = null;
+								
+								// Extra validation
+								console.log('WebDAV Download temp finished. Expected:', totalC, 'Got:', currentLoaded);
+								if (totalC > 0 && currentLoaded < totalC) {
+									resolve({ ok: false, tempFilePath: '', message: `WebDAV 下载失败 [GET] ${urlStr}: 文件不完整 (Exp:${totalC}, Got:${currentLoaded})` });
+									} else if (currentLoaded == 0.0) {
+										resolve({ ok: false, tempFilePath: '', message: `WebDAV 下载失败 [GET] ${urlStr}: 文件为空` });
+								} else {
+									resolve({ ok: true, tempFilePath: tempFile.getAbsolutePath(), message: 'WebDAV 下载成功' });
+								}
+							} else {
+								resolve({ ok: false, tempFilePath: '', message: 'Context is null' });
+							}
+						} else {
+								resolve({ ok: false, tempFilePath: '', message: `WebDAV 下载失败 [GET] ${urlStr}: HTTP ${code}` });
+						}
+					} catch (e) {
+							resolve({ ok: false, tempFilePath: '', message: `WebDAV 下载异常 [GET] ${urlStr}: ` + e.toString() });
+					} finally {
+						try { if (fos != null) fos.close(); } catch (_) {}
+						try { if (ins != null) ins.close(); } catch (_) {}
+						try { if (conn != null) conn.disconnect(); } catch (_) {}
+					}
+				});
+				thread.start();
+			} catch (e) {
+				resolve({ ok: false, tempFilePath: '', message: `启动下载线程失败 [GET] ${urlStr}: ` + (e as Error).message });
+			}
+		});
+		// #endif
+
+		// #ifndef APP-ANDROID
+		return await new Promise((resolve) => {
+			try {
+				const task = uni.downloadFile({
+					url: urlStr,
+					header: {
+						'Authorization': WebDAVService.buildAuthHeader(cfg.username, cfg.password)
+					},
+					success: (res: any) => {
+						let code = 0;
+						try {
+							const sc = WebDAVService.anyGetNumber(res, 'statusCode');
+							code = sc != null ? sc : 0;
+						} catch (_e) { code = 0; }
+						if (code >= 200 && code < 300) {
+							const p0 = WebDAVService.anyGetString(res, 'tempFilePath');
+							const p = p0 != null ? p0 : '';
+							resolve({ ok: true, tempFilePath: p, message: 'WebDAV 下载成功' });
+							return;
+						}
+						resolve({ ok: false, tempFilePath: '', message: `WebDAV 下载失败 [GET] ${urlStr}: HTTP ${code}` });
+					},
+					fail: (err: any) => {
+						resolve({ ok: false, tempFilePath: '', message: `WebDAV 下载失败 [GET] ${urlStr}: ` + WebDAVService.anyErrorMessage(err) });
+					}
+				});
+				
+				if (onProgress != null) {
+					task.onProgressUpdate((res) => {
+						onProgress(res.totalBytesWritten, res.totalBytesExpectedToWrite);
+					});
+				}
+			} catch (e) {
+				resolve({ ok: false, tempFilePath: '', message: `WebDAV 下载失败 [GET] ${urlStr}: ` + (e as Error).message });
+			}
+		});
+		// #endif
+	}
+
+	public static async downloadToFile(url: string, savePath: string, cfg: WebDavConfig, onProgress: WebDavProgressCallback | null = null): Promise<WebDavDownloadResult> {
+		const urlStr = WebDAVService.normalizeUrl(url);
+		if (urlStr == '') return { ok: false, tempFilePath: '', message: 'WebDAV URL 为空' };
+		if (cfg.username.toString().trim() == '') return { ok: false, tempFilePath: '', message: 'WebDAV 用户名为空' };
+		
+		const p = WebDAVService.normalizeLocalFilePath(savePath)
+		if (p.trim() == '') return { ok: false, tempFilePath: '', message: '本地保存路径为空' };
+
+		// #ifdef APP-ANDROID
+		return await new Promise((resolve) => {
+			try {
+				const thread = new Thread(() => {
+					let conn: HttpURLConnection | null = null;
+					let ins: InputStream | null = null;
+					let fos: FileOutputStream | null = null;
+					try {
+						// 1. Check existing file size for resume
+						const absPath = WebDAVService.resolveAndroidAbsPath(p);
+						if (absPath == '') {
+							resolve({ ok: false, tempFilePath: '', message: '无法解析保存路径' });
+							return;
+						}
+						const targetFile = new File(absPath);
+						let existingSize = 0;
+						if (targetFile.exists()) {
+							existingSize = targetFile.length().toInt(); 
+						}
+						
+						const urlObj = new URL(urlStr);
+						conn = urlObj.openConnection() as HttpURLConnection;
+						conn.setRequestMethod("GET");
+						conn.setRequestProperty("Authorization", WebDAVService.buildAuthHeader(cfg.username, cfg.password));
+						
+						// If file exists, try to resume
+						if (existingSize > 0) {
+							conn.setRequestProperty("Range", "bytes=" + existingSize + "-");
+						}
+						
+						const code = conn.getResponseCode();
+						
+						const isResume = (code == 206);
+						const isFull = (code >= 200 && code < 300);
+						
+						if (isResume || isFull) {
+							// Determine open mode
+							const append = isResume;
+							fos = new FileOutputStream(targetFile, append);
+							ins = conn.getInputStream();
+							
+							let contentLen = 0;
+							try { contentLen = conn.getContentLength(); } catch(_){}
+							const remaining = contentLen > 0 ? contentLen.toDouble() : 0.0;
+							const totalExpected = isResume ? (existingSize.toDouble() + remaining) : remaining;
+							let currentTotal = isResume ? existingSize.toDouble() : 0.0;
+							
+							const buffer = new ByteArray(8192);
+							let len = ins.read(buffer);
+							while (len != -1) {
+								fos.write(buffer, 0, len);
+								currentTotal += len.toDouble();
+								if (onProgress != null && totalExpected > 0) {
+									onProgress(currentTotal, totalExpected);
+								}
+								len = ins.read(buffer);
+							}
+							fos.flush();
+							fos.close();
+							fos = null;
+
+							if (totalExpected > 0 && currentTotal < totalExpected) {
+								resolve({ ok: false, tempFilePath: '', message: 'WebDAV 下载失败: 文件不完整 (Expected ' + totalExpected + ')' });
+							} else {
+								resolve({ ok: true, tempFilePath: absPath, message: 'WebDAV 下载成功' });
+							}
+						} else if (code == 416) {
+							resolve({ ok: false, tempFilePath: '', message: 'WebDAV 断点续传失败 (416RangeError)' });
+						} else {
+							resolve({ ok: false, tempFilePath: '', message: 'WebDAV 下载失败: HTTP ' + code });
+						}
+
+					} catch (e) {
+						resolve({ ok: false, tempFilePath: '', message: 'WebDAV 下载异常: ' + e.toString() });
+					} finally {
+						try { if (fos != null) fos.close(); } catch (_) {}
+						try { if (ins != null) ins.close(); } catch (_) {}
+						try { if (conn != null) conn.disconnect(); } catch (_) {}
+					}
+				});
+				thread.start();
+			} catch (e) {
+				resolve({ ok: false, tempFilePath: '', message: '启动下载线程失败: ' + (e as Error).message });
+			}
+		});
+		// #endif
+		
+		// #ifndef APP-ANDROID
+		return await WebDAVService.downloadToTempFile(cfg, onProgress);
+		// #endif
+	}
+}

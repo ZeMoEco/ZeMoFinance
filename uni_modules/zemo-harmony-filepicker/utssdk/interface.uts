@@ -1,0 +1,51 @@
+export type ChoosePublicDirectoryResult = {
+	path: string
+}
+
+export type ChoosePublicDirectoryFail = IUniError
+
+export type ChoosePublicDirectoryComplete = ChoosePublicDirectoryResult | ChoosePublicDirectoryFail
+
+export type ChoosePublicDirectoryOptions = {
+	success?: (res: ChoosePublicDirectoryResult) => void
+	fail?: (res: ChoosePublicDirectoryFail) => void
+	complete?: (res: ChoosePublicDirectoryComplete) => void
+}
+
+export type ChoosePublicDirectory = (options: ChoosePublicDirectoryOptions) => void
+
+export type ChooseSyncFileResult = {
+	path: string
+	backupPath: string
+	syncPath: string
+}
+
+export type ChooseSyncFileFail = IUniError
+
+export type ChooseSyncFileComplete = ChooseSyncFileResult | ChooseSyncFileFail
+
+export type ChooseSyncFileOptions = {
+	create?: boolean
+	success?: (res: ChooseSyncFileResult) => void
+	fail?: (res: ChooseSyncFileFail) => void
+	complete?: (res: ChooseSyncFileComplete) => void
+}
+
+export type ChooseSyncFile = (options: ChooseSyncFileOptions) => void
+
+export type ChooseModelPackageResult = {
+	path: string
+	paths: string[]
+}
+
+export type ChooseModelPackageFail = IUniError
+
+export type ChooseModelPackageComplete = ChooseModelPackageResult | ChooseModelPackageFail
+
+export type ChooseModelPackageOptions = {
+	success?: (res: ChooseModelPackageResult) => void
+	fail?: (res: ChooseModelPackageFail) => void
+	complete?: (res: ChooseModelPackageComplete) => void
+}
+
+export type ChooseModelPackage = (options: ChooseModelPackageOptions) => void

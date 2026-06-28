@@ -1,0 +1,16 @@
+import { DB } from '@/utils/DB/DB.uts'
+
+export class VisionStore {
+    static async set(key: string, value: string): Promise<void> {
+        await DB.exec('INSERT OR REPLACE INTO user_kv (user_id, k, v, updated_at) VALUES (?, ?, ?, ?)', [0, key, value, Date.now()])
+    }
+
+    static async get(key: string): Promise<string | null> {
+        const rows = await DB.query('SELECT v FROM user_kv WHERE user_id = 0 AND k = ? LIMIT 1', [key])
+        if (rows.length > 0) {
+            const v = rows[0].get('v')
+            return v == null ? null : v.toString()
+        }
+        return null
+    }
+}

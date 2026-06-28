@@ -1,0 +1,321 @@
+<template>
+	<scroll-view class="finance-home-scroll" scroll-y="true" lower-threshold="80" @scrolltolower="$emit('load-more')">
+		<view class="assets-card">
+			<view class="assets-head">
+				<view>
+					<text class="assets-label">{{ cardMetricTitle }}</text>
+					<text class="assets-bank-name">泽墨账</text>
+				</view>
+				<view class="assets-tools">
+					<view class="tool-btn" @click="$emit('calendar')">
+						<text class="tool-icon">日</text>
+					</view>
+					<view class="eye-btn" @click="$emit('toggle-hide')">
+						<text class="eye-icon">{{ hideAmount ? '🙈' : '👁' }}</text>
+					</view>
+				</view>
+			</view>
+			<text class="assets-amount">¥ {{ hideAmount ? '****' : cardMetricValue.toFixed(2) }}</text>
+			<view class="assets-sub-row">
+				<view class="assets-chip">
+					<text class="assets-chip-text">{{ cardMetricBadge }}</text>
+				</view>
+				<text class="assets-sub-text">{{ cardMetricDesc }}</text>
+			</view>
+			<view class="card-bottom-row">
+				<text class="card-number">****  {{ cardMetricTail }}</text>
+				<text class="card-holder">{{ cardMetricHolder }}</text>
+			</view>
+		</view>
+
+		<view class="section-head">
+			<text class="section-title">最近账单</text>
+			<text class="section-action" @click="$emit('record')">记一笔</text>
+		</view>
+
+		<view class="bill-day" v-for="group in billGroups" :key="group.dayKey">
+			<view class="bill-day-head">
+				<view class="bill-day-title-row">
+					<text class="bill-day-title">{{ group.title }}</text>
+					<text class="bill-week">{{ group.weekday }}</text>
+				</view>
+				<view class="bill-day-summary">
+					<text class="bill-summary-label">收</text>
+					<text class="bill-summary-income">{{ group.income.toFixed(2) }}</text>
+					<text class="bill-summary-label bill-summary-gap">支</text>
+					<text class="bill-summary-expense">{{ group.expense.toFixed(2) }}</text>
+				</view>
+			</view>
+
+			<view class="bill-list-card">
+				<view class="bill-row" v-for="bill in group.bills" :key="bill.id" @click.stop="openBillEditor(bill.id)" @tap.stop="openBillEditor(bill.id)">
+					<view class="bill-icon-box">
+						<text class="bill-icon">{{ getCategoryIcon(bill.category) }}</text>
+					</view>
+					<view class="bill-info">
+						<text class="bill-category">{{ getCategoryText(bill.category) }}</text>
+						<text class="bill-time">{{ getBillSubtitle(bill) }}</text>
+					</view>
+					<view class="bill-right">
+						<text class="bill-amount" :class="getBillAmountClass(bill)">{{ getBillAmountText(bill) }}</text>
+						<text class="bill-account">{{ getAccountText(bill) }}</text>
+					</view>
+				</view>
+			</view>
+		</view>
+
+		<view class="empty-tip" v-if="recentBills.length == 0">
+			<text class="empty-text">暂无账单，去记一笔</text>
+		</view>
+		<view class="load-tip" v-if="recentBills.length > 0">
+			<text class="load-tip-text">{{ billLoading ? '加载中...' : (billHasMore ? '上拉加载更多' : '没有更多账单') }}</text>
+		</view>
+		<view class="list-bottom-spacer"></view>
+	</scroll-view>
+</template>
+
+<script lang="uts">
+	import { TransactionMount } from '@/services/biz/FinanceBiz.uts';
+	import { AppDialogApi } from '@/components/sys/AppDialogApi.uts';
+
+	type BillDayGroup = {
+		dayKey: string;
+		title: string;
+		weekday: string;
+		income: number;
+		expense: number;
+		bills: TransactionMount[];
+	};
+
+	type BillDaySummary = {
+		dayKey: string;
+		income: number;
+		expense: number;
+	};
+
+	export default {
+		emits: ['toggle-hide', 'record', 'load-more', 'calendar'],
+		props: {
+			recentBills: { type: Array as PropType<TransactionMount[]>, default: () => [] as TransactionMount[] },
+			billDaySummaries: { type: Array as PropType<BillDaySummary[]>, default: () => [] as BillDaySummary[] },
+			hideAmount: { type: Boolean, default: false },
+			cardMetricTitle: { type: String, default: '' },
+			cardMetricValue: { type: Number, default: 0.0 },
+			cardMetricBadge: { type: String, default: '' },
+			cardMetricDesc: { type: String, default: '' },
+			cardMetricTail: { type: String, default: '' },
+			cardMetricHolder: { type: String, default: '' },
+			billLoading: { type: Boolean, default: false },
+			billHasMore: { type: Boolean, default: true }
+		},
+		data() {
+			return {
+				noop: 0
+			}
+		},
+		computed: {
+			billGroups() : BillDayGroup[] {
+				const groups = [] as BillDayGroup[];
+				this.recentBills.forEach((bill) => {
+					const d = new Date(bill.transaction_time);
+					const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+					const dayKey = dayStart.toString();
+					let target = null as BillDayGroup | null;
+					for (let i = 0; i < groups.length; i++) {
+						if (groups[i].dayKey == dayKey) {
+							target = groups[i];
+							break;
+						}
+					}
+					if (target == null) {
+						target = {
+							dayKey: dayKey,
+							title: this.formatDayTitle(dayStart),
+							weekday: this.formatWeekday(dayStart),
+							income: 0.0,
+							expense: 0.0,
+							bills: [] as TransactionMount[]
+						} as BillDayGroup;
+						groups.push(target);
+					}
+					target.bills.push(bill);
+					if (this.isBillIncludedInFlow(bill)) {
+						const amount = Math.abs(bill.amount);
+						if (bill.type == 'income') {
+							target.income += amount;
+						} else {
+							target.expense += amount;
+						}
+					}
+				});
+				for (let i = 0; i < groups.length; i++) {
+					const summary = this.findBillDaySummary(groups[i].dayKey);
+					if (summary != null) {
+						groups[i].income = summary.income;
+						groups[i].expense = summary.expense;
+					}
+				}
+				return groups;
+			}
+		},
+		methods: {
+			findBillDaySummary(dayKey : string) : BillDaySummary | null {
+				for (let i = 0; i < this.billDaySummaries.length; i++) {
+					if (this.billDaySummaries[i].dayKey == dayKey) return this.billDaySummaries[i];
+				}
+				return null;
+			},
+			isBillIncludedInFlow(bill : TransactionMount) : boolean {
+				const raw = bill.properties == null ? '' : bill.properties!.toString();
+				if (raw.trim() == '') return true;
+				try {
+					const props = JSON.parse(raw) as any;
+					const flag = props['include_in_flow'];
+					if (flag == null) return true;
+					const text = flag.toString();
+					return text != 'false' && text != '0';
+				} catch (_e) {
+					return true;
+				}
+			},
+			getCategoryIcon(c : string | null) : string {
+				if (c == null) return '💸';
+				if (c.includes('餐')) return '🍽';
+				if (c.includes('购')) return '🛍';
+				if (c.includes('交通')) return '🚗';
+				if (c.includes('工资')) return '💵';
+				if (c.includes('转')) return '💳';
+				if (c.includes('信贷') || c.includes('债') || c.includes('分期')) return '💳';
+				if (c.includes('其他')) return '🔗';
+				return '💸';
+			},
+			getCategoryText(c : string | null) : string {
+				if (c == null || c == '') return '账单';
+				return c;
+			},
+			formatDayTitle(dayStart : number) : string {
+				const target = new Date(dayStart);
+				const now = new Date();
+				const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+				const diffDays = Math.round((today - dayStart) / 86400000);
+				if (diffDays == 0) return '今天';
+				if (diffDays == 1) return '昨天';
+				const month = (target.getMonth() + 1).toString().padStart(2, '0');
+				const day = target.getDate().toString().padStart(2, '0');
+				return `${month}月${day}日`;
+			},
+			formatWeekday(dayStart : number) : string {
+				const labels = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'] as string[];
+				return labels[new Date(dayStart).getDay()];
+			},
+			getBillSubtitle(bill : TransactionMount) : string {
+				const desc = bill.description ?? '';
+				if (!this.isBillIncludedInFlow(bill)) return desc.trim() != '' ? `不计入收支 · ${desc}` : '不计入收支';
+				if (desc.trim() != '') return desc;
+				return this.getAccountText(bill);
+			},
+			getBillAmountText(bill : TransactionMount) : string {
+				const prefix = this.isBillIncludedInFlow(bill) ? (bill.type == 'income' ? '+' : '-') : '';
+				return `${prefix}${Math.abs(bill.amount).toFixed(2)}`;
+			},
+			getBillAmountClass(bill : TransactionMount) : string {
+				if (!this.isBillIncludedInFlow(bill)) return 'bill-neutral';
+				return bill.type == 'income' ? 'bill-income' : 'bill-expense';
+			},
+			getAccountText(bill : TransactionMount) : string {
+				const name = bill.account_name ?? '';
+				if (name.trim() != '') return name;
+				return bill.account_id;
+			},
+			openBillEditor(billId : string) {
+				AppDialogApi.openFinanceRecordForEdit(billId);
+			}
+		}
+	}
+</script>
+
+<style>
+	.finance-home-scroll { flex: 1; width: 100%; height: 100%; padding: 10px 14px 0 14px; box-sizing: border-box; border-radius: 10px; overflow: hidden; }
+	.assets-card { flex-direction: column; background-color: rgba(255,255,255,0.62); border-radius: 18px; padding: 18px; margin: 0 0 10px 0; aspect-ratio: 1.586; border-width: 1px; border-color: rgba(255,255,255,0.72); box-shadow: 0 14px 32px rgba(44,62,92,0.12); }
+	.assets-head, .assets-tools, .assets-sub-row, .card-bottom-row, .section-head, .section-title-row, .accounts-head, .account-columns, .account-top, .bill-day-head, .bill-day-title-row, .bill-day-summary, .bill-row { flex-direction: row; }
+	.assets-head, .card-bottom-row, .section-head, .accounts-head { justify-content: space-between; }
+	.assets-head { align-items: flex-start; margin-bottom: 24px; }
+	.assets-tools, .assets-sub-row, .section-head, .account-top, .bill-day-head, .bill-row { align-items: center; }
+	.assets-label { font-size: 13px; color: #748097; margin-bottom: 6px; }
+	.assets-bank-name { font-size: 16px; font-weight: bold; color: #1b2846; }
+	.eye-btn, .tool-btn, .tool-sync { width: 34px; height: 34px; border-radius: 17px; background-color: rgba(255,255,255,0.56); border-width: 1px; border-color: rgba(255,255,255,0.74); justify-content: center; align-items: center; box-shadow: 0 5px 14px rgba(44,62,92,0.10); }
+	.tool-btn { margin-right: 8px; }
+	.eye-icon, .tool-icon, .tool-sync-icon { font-size: 16px; color: #33415f; }
+	.tool-icon { font-size: 14px; font-weight: bold; }
+	.assets-amount { font-size: 31px; font-weight: bold; color: #243152; margin-bottom: 12px; }
+	.assets-sub-row { flex: 1; }
+	.assets-chip { border-radius: 10px; padding: 4px 9px; background-color: rgba(59,115,217,0.12); border-width: 1px; border-color: rgba(59,115,217,0.14); margin-right: 8px; }
+	.assets-chip-text { font-size: 11px; color: #3b73d9; font-weight: bold; }
+	.assets-sub-text, .card-number, .card-holder { font-size: 12px; color: #758097; }
+	.card-number, .card-holder { font-weight: bold; }
+	.section-head { margin-top: 22px; margin-bottom: 12px; }
+	.section-title { font-size: 17px; font-weight: bold; color: #1b2846; }
+	.section-total { font-size: 15px; font-weight: bold; color: #3b73d9; margin-left: 10px; }
+	.section-action { font-size: 13px; color: #3b73d9; }
+	.accounts-head { align-items: flex-end; margin-top: 22px; margin-bottom: 12px; }
+	.cash-col { width: 53%; overflow: visible; }
+	.debt-col { width: 42%; overflow: visible; }
+	.cash-stack, .credit-stack { flex-direction: column; position: relative; overflow: visible; }
+	.credit-stack { height: 240rpx; }
+	.cash-account-card { background-color: #fff; border-radius: 16px; padding: 22rpx; border-width: 1px; border-color: rgba(13,77,84,0.08); box-shadow: 0 4px 12px rgba(13,77,84,0.1); }
+	.cash-stack .cash-account-card { min-height: 150rpx; }
+	.credit-stack .cash-account-card { min-height: 190rpx; justify-content: flex-start; }
+	.credit-card { background-color: rgba(59,115,217,0.82); border-radius: 18px; box-shadow: 0 8px 22px rgba(59,115,217,0.24); }
+	.account-top { justify-content: space-between; margin-bottom: 7px; }
+	.account-icon-box { width: 30px; height: 30px; border-radius: 9px; background-color: #eef2f4; justify-content: center; align-items: center; }
+	.account-icon-box-credit { background-color: rgba(255,255,255,0.16); }
+	.account-icon { font-size: 16px; }
+	.account-tag { background-color: #eef2f4; padding: 3px 10px; border-radius: 8px; }
+	.account-tag-text { font-size: 11px; color: #7a8a92; }
+	.account-name { font-size: 12px; color: #8a97a0; margin-bottom: 2px; }
+	.account-balance { font-size: 16px; font-weight: bold; color: #1b2846; }
+	.credit-top-info, .holding-profit { align-items: flex-end; }
+	.credit-label { font-size: 11px; color: rgba(255,255,255,0.7); margin-bottom: 1px; }
+	.credit-label-gap { margin-top: 5px; }
+	.credit-value-light { font-size: 16px; font-weight: bold; color: #fff; }
+	.stack-dots { flex-direction: row; justify-content: center; align-items: center; margin-top: 16rpx; }
+	.stack-dots-v { margin-top: 56rpx; }
+	.stack-dot { width: 6px; height: 6px; border-radius: 3px; background-color: #cdd8dc; margin: 0 3px; }
+	.stack-dot-active { width: 16px; background-color: #3b73d9; }
+	.invest-scroll { width: 100%; height: 220rpx; flex-direction: row; white-space: nowrap; }
+	.invest-card { min-width: 200rpx; height: 200rpx; flex-shrink: 0; background-color: rgba(255,255,255,0.95); border-radius: 28rpx; padding: 24rpx; margin-right: 20rpx; justify-content: center; box-shadow: 0 3px 10px rgba(0,0,0,0.03); }
+	.invest-icon-box { width: 72rpx; height: 72rpx; border-radius: 20rpx; background-color: #eef6f5; justify-content: center; align-items: center; margin-bottom: 16rpx; }
+	.invest-icon { font-size: 20px; }
+	.invest-name { font-size: 13px; color: #6b7b83; margin-bottom: 5px; }
+	.invest-value { font-size: 17px; font-weight: bold; color: #1b2846; white-space: nowrap; }
+	.invest-add { justify-content: center; align-items: center; }
+	.invest-add-icon { font-size: 26px; color: #3b73d9; margin-bottom: 4px; }
+	.invest-add-text, .empty-text { font-size: 12px; color: #3b73d9; }
+	.bill-day { margin-bottom: 14px; }
+	.bill-day-head { justify-content: space-between; margin-bottom: 6px; padding: 0 2px; }
+	.bill-day-title-row { align-items: flex-end; }
+	.bill-day-title { font-size: 15px; font-weight: bold; color: #1b2846; margin-right: 10px; }
+	.bill-week, .bill-summary-label, .bill-account { font-size: 12px; color: #8c98a4; }
+	.bill-day-summary { align-items: center; }
+	.bill-summary-label { margin-right: 4px; }
+	.bill-summary-gap { margin-left: 10px; }
+	.bill-summary-income { font-size: 13px; color: #52b6a5; }
+	.bill-summary-expense { font-size: 13px; color: #e85d67; }
+	.bill-list-card { background-color: rgba(255,255,255,0.66); border-radius: 14px; padding: 4px 0; border-width: 1px; border-color: rgba(255,255,255,0.72); box-shadow: 0 8px 20px rgba(44,62,92,0.08); overflow: hidden; }
+	.bill-row { min-height: 64px; padding: 9px 12px; }
+	.bill-icon-box { width: 34px; height: 34px; border-radius: 17px; background-color: rgba(245,248,251,0.74); border-width: 1px; border-color: rgba(255,255,255,0.72); justify-content: center; align-items: center; margin-right: 10px; }
+	.bill-icon { font-size: 17px; }
+	.bill-info { flex: 1; }
+	.bill-category { font-size: 15px; font-weight: bold; color: #1b2846; margin-bottom: 4px; }
+	.bill-time { font-size: 12px; color: #9aa6ac; }
+	.bill-right { align-items: flex-end; min-width: 82px; }
+	.bill-amount { font-size: 16px; font-weight: bold; margin-bottom: 4px; }
+	.bill-income { color: #52b6a5; }
+	.bill-expense { color: #e85d67; }
+	.bill-neutral { color: #8c98a4; }
+	.empty-tip, .empty-mini { align-items: center; padding: 20px; }
+	.empty-text { color: #9aa6ac; font-size: 13px; }
+	.load-tip { align-items: center; padding: 10px 0 4px 0; }
+	.load-tip-text { font-size: 12px; color: #9aa6ac; }
+	.list-bottom-spacer { height: 90px; }
+</style>

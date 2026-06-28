@@ -1,0 +1,57 @@
+export enum ExportMode {
+  DB_ONLY = 'db_only',
+  FULL = 'full'
+}
+
+export const ZEMO_DB_NAME = 'ZeMo.db'
+export const APP_ID = 'zemo.main'
+export const SYNC_DEVICE_ID_KEY = 'device_id'
+export const LOCAL_SYNC_DIRTY_EVENT = 'zemo.local_sync_dirty'
+export const LOCAL_SYNC_AUTO_SOURCE = 'local-change-auto'
+export const LOCAL_SYNC_AUTO_DEBOUNCE_MS = 800
+export const DESK_PET_BILL_CAPTURE_EVENT = 'zemo.desk_pet_bill_capture'
+export const DESK_PET_RECORD_OPEN_EVENT = 'zemo.desk_pet_record_open'
+export const DESK_PET_PENDING_BILL_CAPTURE_KEY = 'desktop_pet_pending_bill_capture'
+export const DESK_PET_PENDING_RECORD_OPEN_KEY = 'desktop_pet_pending_record_open'
+export const DESK_PET_PENDING_RECORD_QUERY_KEY = 'desktop_pet_pending_record_query'
+export const DESK_PET_PENDING_RECORD_AUTO_CONFIRM_KEY = 'desktop_pet_pending_record_auto_confirm'
+export const DESK_PET_PIP_MODE_KEY = 'desktop_pet_pip_mode'
+export const DESK_PET_PIP_METRIC_KEY = 'desktop_pet_pip_metric'
+export const DESK_PET_PIP_SNAPSHOT_KEY = 'desktop_pet_pip_snapshot'
+export const DESK_PET_RECORD_AUTO_BACKGROUND_PARAM = 'deskPetAutoBackground'
+export const DESK_PET_CAPTURED_BILL_TEXT_KEY = 'desktop_pet_captured_bill_text'
+export const DESK_PET_CAPTURED_SCREEN_IMAGE_KEY = 'desktop_pet_captured_screen_image'
+export const DESK_PET_SCREEN_SUMMARY_KEY = 'desktop_pet_screen_summary'
+export const DESK_PET_BILL_DEBUG_TEXT_KEY = 'desktop_pet_bill_debug_text'
+export const DESK_PET_BILL_DEBUG_STATUS_KEY = 'desktop_pet_bill_debug_status'
+export const FINANCE_HOME_PENDING_TRANSACTION_CHANGE_KEY = 'zemo_finance_home_pending_transaction_change'
+
+/**
+ * 注意：项目根目录的 assets/ 只是“逻辑分层目录”。
+ * 运行时可写目录必须使用沙箱路径（USER_DATA_PATH）。
+ * 去除末尾斜杠以避免 // 路径问题
+ */
+const _ROOT_BASE = uni.env.USER_DATA_PATH.replace(/\/+$/, '')
+export const RUNTIME_ROOT_DIR = `${_ROOT_BASE}/zemo`
+export const RUNTIME_ASSETS_DIR = `${RUNTIME_ROOT_DIR}/assets`
+
+export const RUNTIME_IMAGES_DIR = `${RUNTIME_ASSETS_DIR}/images`
+export const RUNTIME_NOTE_IMAGES_DIR = `${RUNTIME_IMAGES_DIR}/note`
+export const RUNTIME_BILL_IMAGES_DIR = `${RUNTIME_IMAGES_DIR}/bill`
+export const RUNTIME_VIDEOS_DIR = `${RUNTIME_ASSETS_DIR}/videos`
+export const RUNTIME_NOTE_VIDEOS_DIR = `${RUNTIME_VIDEOS_DIR}/note`
+export const RUNTIME_MUSIC_DIR = `${RUNTIME_ASSETS_DIR}/music`
+export const RUNTIME_NOTE_DOCS_DIR = `${RUNTIME_ASSETS_DIR}/note_docs`
+
+export const FULL_EXPORT_ASSETS_SUBDIR = 'assets'
+export const FULL_EXPORT_IMAGES_SUBDIR = `${FULL_EXPORT_ASSETS_SUBDIR}/images`
+export const FULL_EXPORT_MUSIC_SUBDIR = `${FULL_EXPORT_ASSETS_SUBDIR}/music`
+export const FULL_EXPORT_VIDEOS_SUBDIR = `${FULL_EXPORT_ASSETS_SUBDIR}/videos`
+export const FULL_EXPORT_NOTE_DOCS_SUBDIR = `${FULL_EXPORT_ASSETS_SUBDIR}/note_docs`
+export const FULL_EXPORT_STORAGE_SUBDIR = `${FULL_EXPORT_ASSETS_SUBDIR}/storage`
+
+export const RUNTIME_DB_EXPORT_DIR = `${RUNTIME_ASSETS_DIR}/db_export`
+export const RUNTIME_FULL_EXPORT_DIR = `${RUNTIME_ASSETS_DIR}/full_export`
+
+export const EXPORT_DB_PREFIX = 'ZeMo_DB_'
+export const EXPORT_FULL_PREFIX = 'ZeMo_FULL_'

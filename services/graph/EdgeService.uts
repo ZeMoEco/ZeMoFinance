@@ -1,0 +1,120 @@
+import { Node, NodeType, Edge, EdgeType, RelationalEdgeType, MaskEdgeType } from '../../utils/types/index.uts';
+import { DB } from '@/utils/DB/DB.uts';
+import type { SqlArgs } from '@/utils/DB/DB.uts';
+import { genId } from '@/utils/common/id.uts';
+
+/**
+ * 图关系引擎 (EdgeService)
+ * 【核心职责】：处理所有拓扑树推演、连表查询、面具系统的装配与摘除。
+ * 【约束】：绝不在内存中全量拉取节点进行匹配计算，全部下推到底层 SQLite 的 JOIN 和复合索引。
+ */
+export class EdgeService {
+
+  private static mapRowToNode(row: Map<string, any | null>): Node {
+    const rawType = (row.get('type')?.toString() ?? '').toUpperCase();
+    const nodeType = rawType.indexOf('NOTE') >= 0 ? NodeType.Note : NodeType.Task;
+    return {
+      id: row.get('id')?.toString() ?? '',
+      type: nodeType,
+      status: row.get('status')?.toString() ?? '',
+      content: row.get('content')?.toString() ?? '',
+      properties: row.get('properties')?.toString() ?? '',
+      created_at: parseInt(row.get('created_at')?.toString() ?? '0'),
+      updated_at: parseInt(row.get('updated_at')?.toString() ?? '0')
+    } as Node;
+  }
+
+  public static async createEdgeAsync(sourceId: string, targetId: string, type: EdgeType, properties: string | null = null): Promise<Edge | null> {
+    const now = Date.now();
+    const id = genId('edge');
+
+    const edge: Edge = {
+      id,
+      source_id: sourceId,
+      target_id: targetId,
+      relation_type: type.toString(),
+      properties: properties,
+      created_at: now
+    };
+
+    const ok = await DB.exec(
+      `INSERT INTO edges (id, source_id, target_id, relation_type, properties, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+      [edge.id, edge.source_id, edge.target_id, edge.relation_type, edge.properties ?? '', edge.created_at]
+    );
+    return ok ? edge : null;
+  }
+
+  public static async removeEdgeAsync(sourceId: string, targetId: string, type: EdgeType): Promise<boolean> {
+    return await DB.exec(
+      `DELETE FROM edges WHERE source_id = ? AND target_id = ? AND relation_type = ?`,
+      [sourceId, targetId, type.toString()]
+    );
+  }
+
+  public static async removeIncomingRelationEdgesAsync(targetId: string, relationTypes: RelationalEdgeType[]): Promise<boolean> {
+    if (targetId == null || targetId == '' || relationTypes.length == 0) return false;
+
+    let placeholders = '';
+    const relationTypeParams = [] as string[];
+    for (let i = 0; i < relationTypes.length; i++) {
+      if (i > 0) placeholders += ', ';
+      placeholders += '?';
+      relationTypeParams.push(relationTypes[i].toString());
+    }
+    const sql = `DELETE FROM edges WHERE target_id = ? AND relation_type IN (${placeholders})`;
+    const params = [targetId] as SqlArgs;
+    for (let i = 0; i < relationTypeParams.length; i++) {
+      params.push(relationTypeParams[i]);
+    }
+    return await DB.exec(sql, params);
+  }
+
+  // ==========================================
+  // 【结构拓扑引擎】: Relational 穿越与连表推演
+  // ==========================================
+
+  public static async getTargetNodesAsync(sourceId: string, type: RelationalEdgeType): Promise<Node[]> {
+    const sql = `
+      SELECT n.* FROM nodes n
+      INNER JOIN edges e ON n.id = e.target_id
+      WHERE e.source_id = ? AND e.relation_type = ?
+      ORDER BY e.created_at ASC
+    `;
+    const rows = await DB.query(sql, [sourceId, type.toString()]);
+    return rows.map((r) => this.mapRowToNode(r));
+  }
+
+  public static async getSourceNodesAsync(targetId: string, type: RelationalEdgeType): Promise<Node[]> {
+    const sql = `
+      SELECT n.* FROM nodes n
+      INNER JOIN edges e ON n.id = e.source_id
+      WHERE e.target_id = ? AND e.relation_type = ?
+    `;
+    const rows = await DB.query(sql, [targetId, type.toString()]);
+    return rows.map((r) => this.mapRowToNode(r));
+  }
+
+
+  // ==========================================
+  // 【状态面具引擎】: Mask 佩戴与动态切换
+  // ==========================================
+
+  public static async setMaskAsync(nodeId: string, maskType: MaskEdgeType, properties: string): Promise<boolean> {
+    const delOk = await DB.exec(
+      `DELETE FROM edges WHERE source_id = ? AND target_id = ? AND relation_type = ?`,
+      [nodeId, nodeId, maskType.toString()]
+    );
+    if (!delOk) return false;
+    const edge = await this.createEdgeAsync(nodeId, nodeId, maskType, properties);
+    return edge != null;
+  }
+
+  public static async getMaskPropertiesAsync(nodeId: string, maskType: MaskEdgeType): Promise<string | null> {
+    const rows = await DB.query(
+      `SELECT properties FROM edges WHERE source_id = ? AND target_id = ? AND relation_type = ? LIMIT 1`,
+      [nodeId, nodeId, maskType.toString()]
+    );
+    if (rows.length == 0) return null;
+    return rows[0].get('properties')?.toString() ?? null;
+  }
+}

@@ -1,0 +1,241 @@
+<template>
+	<view class="note-panel">
+		<view v-if="loading" class="note-empty">
+			<text class="note-empty-text">加载中...</text>
+		</view>
+		<view v-else style="flex:1; display: flex; flex-direction: column;">
+			<view class="latest-editor">
+				<NoteInlineEditor :noteId="activeNoteId" :taskId="taskId" :initAttributeId="''" @saved="onNoteSaved" @scroll-to="$emit('scroll-to', $event)"></NoteInlineEditor>
+			</view>
+		</view>
+	</view>
+</template>
+
+<script lang="uts">
+import { NoteBiz, NoteItem } from "@/services/biz/NoteBiz.uts";
+import { TaskBiz, Task } from '@/services/biz/TaskBiz.uts';
+import NoteInlineEditor from '@/components/note/NoteInlineEditor.uvue'
+
+export default {
+	name: 'task-note-panel',
+	components: { NoteInlineEditor },
+	emits: ['notes-count-change', 'notes-items-change', 'active-note-change', 'scroll-to'],
+	props: {
+		taskId: { type: String, required: true },
+		newNoteSignal: { type: Number, required: false, default: 0 },
+		selectNoteSignal: { type: Number, required: false, default: 0 },
+		selectNoteId: { type: String, required: false, default: "" }
+	},
+	data() {
+		return {
+			notes: [] as NoteItem[],
+			loading: false,
+			activeNoteId: "",
+			recipeRepairTriedTaskId: ""
+		}
+	},
+	watch: {
+		newNoteSignal(_v: number) {
+			this.startNewNote()
+		},
+		selectNoteSignal(_v: number) {
+			const id = this.selectNoteId;
+			if (id != "" && id != "0") this.selectNote(id)
+		}
+	},
+	mounted() {
+		this.loadNotes(false)
+		uni.$on('note-updated', this.onNoteUpdated)
+	},
+	destroyed() {
+		uni.$off('note-updated', this.onNoteUpdated)
+	},
+	methods: {
+		readJsonStringField(payload: any | null, key: string): string {
+			if (payload == null) return '';
+			try {
+				const value = payload[key];
+				return value == null ? '' : value.toString().trim();
+			} catch (_e) {
+				return '';
+			}
+		},
+		isRecipeImportTask(task: Task): boolean {
+			for (let i = 0; i < task.tags.length; i++) {
+				const tag = task.tags[i] == null ? '' : task.tags[i].toString().trim().toLowerCase();
+				if (tag == 'scene:recipe_import' || tag == 'source:web_recipe') return true;
+			}
+
+			const metadataRaw = task.metadata == null ? '' : task.metadata.toString().trim();
+			if (metadataRaw == '' || metadataRaw.charAt(0) != '{') return false;
+			try {
+				const metadataObj = JSON.parse(metadataRaw) as any;
+				return this.readJsonStringField(metadataObj, 'source') == 'web_recipe_paste';
+			} catch (_e) {
+				return false;
+			}
+		},
+		async tryRepairRecipeImportNote(taskId: string): Promise<NoteItem | null> {
+			const task = await TaskBiz.getTask(taskId);
+			if (task == null) return null;
+			if (!this.isRecipeImportTask(task)) return null;
+
+			const recipeContent = task.description == null ? '' : task.description.toString().trim();
+			if (recipeContent == '') return null;
+
+			const titleRaw = task.title == null ? '' : task.title.toString().trim();
+			const recipeTitle = titleRaw == '' ? '网页食谱导入' : titleRaw;
+
+			const created = await NoteBiz.saveNoteAndLinkAsync(recipeTitle, recipeContent, taskId);
+			if (created == null) return null;
+			if (created.related_task_id != null && created.related_task_id != '') return created;
+
+			const edgeId = await NoteBiz.referenceNoteToNode(taskId, created.node.id);
+			return edgeId != null && edgeId != '' ? created : null;
+		},
+		buildNotePreviewText(note: NoteItem): string {
+			const raw = note.node.content == null ? '' : note.node.content.toString();
+			if (raw == '') return '未命名笔记';
+
+			if (raw.charAt(0) == '{') {
+				try {
+					const payload = JSON.parse(raw) as any;
+					const title = this.readJsonStringField(payload, 'title');
+					if (title != '') {
+						return title.length > 26 ? `${title.substring(0, 26)}...` : title;
+					}
+
+					const content = this.readJsonStringField(payload, 'content');
+					if (content != '') {
+						const firstLine = content.split('\n')[0].trim();
+						return firstLine.length > 26 ? `${firstLine.substring(0, 26)}...` : firstLine;
+					}
+				} catch (_e) {}
+			}
+
+			const normalized = raw.replace(/\s+/g, ' ').trim();
+			if (normalized == '') return '未命名笔记';
+			return normalized.length > 26 ? `${normalized.substring(0, 26)}...` : normalized;
+		},
+		getLatestNoteId(): string {
+			if (this.notes.length == 0) return '';
+
+			let latestId = this.notes[0].node.id;
+			let latestTs = this.notes[0].node.updated_at > 0 ? this.notes[0].node.updated_at : this.notes[0].node.created_at;
+			for (let i = 1; i < this.notes.length; i++) {
+				const n = this.notes[i].node;
+				const ts = n.updated_at > 0 ? n.updated_at : n.created_at;
+				if (ts >= latestTs) {
+					latestTs = ts;
+					latestId = n.id;
+				}
+			}
+			return latestId;
+		},
+		emitNotesMeta() {
+			this.$emit('notes-count-change', this.notes.length)
+			const items: any[] = []
+			for (let i = 0; i < this.notes.length; i++) {
+				const n = this.notes[i]
+				items.push({ key: n.node.id, text: this.buildNotePreviewText(n) })
+			}
+			this.$emit('notes-items-change', items)
+			this.$emit('active-note-change', this.activeNoteId)
+		},
+		onNoteUpdated(_p: any | null) {
+			this.loadNotes(false)
+		},
+		async loadNotes(silent: boolean = false) {
+			if (!silent) this.loading = true
+			try {
+				const id = this.taskId;
+				if (id != "0" && id != "") {
+					// Load child notes
+					let childNotes = await NoteBiz.getNotesByTaskAsync(id)
+					if (childNotes.length == 0 && this.recipeRepairTriedTaskId != id) {
+						this.recipeRepairTriedTaskId = id
+						const repairedNote = await this.tryRepairRecipeImportNote(id)
+						if (repairedNote != null) {
+							childNotes = await NoteBiz.getNotesByTaskAsync(id)
+							if (childNotes.length == 0) childNotes.push(repairedNote)
+						}
+					}
+					// Load the task itself as a "Main Note" (description)
+					// Since we relaxed NoteService constraints, getNote(id) works for Tasks too
+					const mainNote = await NoteBiz.getNoteAsync(id)
+					
+					this.notes = [] as NoteItem[]
+					if (mainNote != null) {
+						// Distinguish title if necessary, or just use task title
+						// Maybe append a marker to title for display? Or leave as is.
+						// mainNote.node.content = "【主描述】" + mainNote.node.content 
+						this.notes.push(mainNote)
+					}
+					this.notes.push(...childNotes)
+				} else {
+					this.notes = [] as NoteItem[]
+				}
+				if (this.notes.length > 0) {
+					const defaultId = this.getLatestNoteId()
+					let exists = false
+					for (let i = 0; i < this.notes.length; i++) {
+						if (this.notes[i].node.id == this.activeNoteId) {
+							exists = true
+							break
+						}
+					}
+					if (!exists) this.activeNoteId = defaultId
+				} else {
+					this.activeNoteId = ""
+				}
+				this.emitNotesMeta()
+			} catch (_e2) {
+				this.notes = [] as NoteItem[]
+				this.activeNoteId = ""
+				this.emitNotesMeta()
+			} finally {
+				this.loading = false
+			}
+		},
+		startNewNote() {
+			this.activeNoteId = ""
+			this.emitNotesMeta()
+		},
+		selectNote(noteId: string) {
+			this.activeNoteId = noteId
+			this.emitNotesMeta()
+		},
+		onNoteSaved(_noteId: string) {
+			this.loadNotes(true)
+		}
+	}
+}
+</script>
+
+<style>
+	.note-panel {
+		padding: 10 16;
+		min-height: 500px;
+		display: flex;
+		flex-direction: column;
+	}
+
+	.latest-editor {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+	}
+
+	.note-empty {
+		padding: 20 0;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.note-empty-text {
+		font-size: 12;
+		color: #666;
+	}
+
+	/* List UI moved to shared ExpandSelector in task-detail */
+</style>

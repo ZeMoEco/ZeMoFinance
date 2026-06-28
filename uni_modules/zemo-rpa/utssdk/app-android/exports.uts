@@ -1,0 +1,27 @@
+/**
+ * zemo-rpa Android 平台入口
+ * 
+ * GlobalInputListener (AccessibilityService) 是原生 Kotlin 类，
+ * 位于 src/GlobalInputListener.kt，编译到 uts.sdk.modules.zemoRpa 包中。
+ * 
+ * UTS 桥接层 (services/GlobalInputListener.uts) 负责注册事件监听，
+ * 将系统回调分发给 RPARecorder 等 UTS 业务模块。
+ * 
+ * Android 平台实现文件:
+ *   src/GlobalInputListener.kt        — 原生 AccessibilityService (Kotlin)
+ *   services/GlobalInputListener.uts   — UTS 桥接 (事件处理逻辑)
+ *   services/RPARecorderImpl.uts       — 录制器实现
+ *   services/RPAExecutorImpl.uts       — 执行器实现
+ *   utils/FloatingRecorder.uts         — 悬浮窗
+ *   utils/AppUtils.uts                 — 应用工具
+ *   utils/ScreenCaptureUtils.uts       — 截图工具
+ */
+
+// Re-export UTS bridge functions
+export { getCurrentForegroundInfo, nativeDispatchTap, getNativeServiceInstance } from './services/GlobalInputListener.uts';
+export { RPAExecutorImpl } from './services/RPAExecutorImpl.uts';
+export { RPARecorderImpl } from './services/RPARecorderImpl.uts';
+export { FloatingRecorder } from './utils/FloatingRecorder.uts';
+export { AppUtils } from './utils/AppUtils.uts';
+export { ScreenCaptureUtils } from './utils/ScreenCaptureUtils.uts';
+

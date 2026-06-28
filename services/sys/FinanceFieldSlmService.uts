@@ -1,0 +1,349 @@
+export type FinanceFieldSlmTop = {
+  label: string
+  score: number
+}
+
+export type FinanceFieldSlmLine = {
+  raw: string
+  text: string
+  x: number
+  y: number
+  w: number
+  h: number
+  index: number
+}
+
+export type FinanceFieldSlmPrediction = {
+  id: string
+  index: number
+  raw: string
+  text: string
+  x: number
+  y: number
+  w: number
+  h: number
+  label: string
+  confidence: number
+  top3: FinanceFieldSlmTop[]
+}
+
+export type FinanceFieldSlmResult = {
+  ok: boolean
+  ready: boolean
+  message: string
+  type: string
+  source: string
+  lines: FinanceFieldSlmLine[]
+  predictions: FinanceFieldSlmPrediction[]
+  rawResult: string
+}
+
+type FinanceFieldSlmRequest = {
+  id: string
+  text: string
+}
+
+type FinanceFieldLayoutRequest = {
+  id: string
+  text: string
+  x: number
+  y: number
+  w: number
+  h: number
+}
+
+export class FinanceFieldSlmService {
+  static async classifyBillText(text: string, source: string): Promise<FinanceFieldSlmResult> {
+    return await FinanceFieldSlmService.classifyText(text, 'bill', source)
+  }
+
+  static async classifyInvestmentText(text: string, source: string): Promise<FinanceFieldSlmResult> {
+    return await FinanceFieldSlmService.classifyText(text, 'investment', source)
+  }
+
+  static hasLabel(prediction: FinanceFieldSlmPrediction | null, labels: string[], minScore: number = 0.28): boolean {
+    if (prediction == null) return false
+    for (let i = 0; i < labels.length; i++) {
+      if (prediction.label == labels[i] && prediction.confidence >= minScore) return true
+    }
+    for (let i = 0; i < prediction.top3.length; i++) {
+      const item = prediction.top3[i]
+      for (let j = 0; j < labels.length; j++) {
+        if (item.label == labels[j] && item.score >= minScore) return true
+      }
+    }
+    return false
+  }
+
+  static bestByLabels(predictions: FinanceFieldSlmPrediction[], labels: string[], minScore: number = 0.28): FinanceFieldSlmPrediction | null {
+    let best: FinanceFieldSlmPrediction | null = null
+    let bestScore = -1.0
+    for (let i = 0; i < predictions.length; i++) {
+      const p = predictions[i]
+      const score = FinanceFieldSlmService.labelScore(p, labels)
+      if (score < minScore) continue
+      if (score > bestScore) {
+        bestScore = score
+        best = p
+      }
+    }
+    return best
+  }
+
+  static labelScore(prediction: FinanceFieldSlmPrediction, labels: string[]): number {
+    let best = 0.0
+    for (let i = 0; i < labels.length; i++) {
+      if (prediction.label == labels[i] && prediction.confidence > best) best = prediction.confidence
+    }
+    for (let i = 0; i < prediction.top3.length; i++) {
+      const item = prediction.top3[i]
+      for (let j = 0; j < labels.length; j++) {
+        if (item.label == labels[j] && item.score > best) best = item.score
+      }
+    }
+    return best
+  }
+
+  static parseOcrLines(text: string): FinanceFieldSlmLine[] {
+    const rawLines = (text ?? '').toString().replace(/\r\n/g, '\n').split('\n')
+    const result = [] as FinanceFieldSlmLine[]
+    const metaPattern = /^\[\[ocr:([0-9.\-]+),([0-9.\-]+),([0-9.\-]+),([0-9.\-]+)\]\](.*)$/
+    for (let i = 0; i < rawLines.length; i++) {
+      const raw = rawLines[i]
+      const value = raw.trim()
+      if (value == '') continue
+      const m = metaPattern.exec(value)
+      if (m != null && m.length >= 6) {
+        result.push({
+          raw: value,
+          text: m[5].trim(),
+          x: parseFloat(m[1]),
+          y: parseFloat(m[2]),
+          w: parseFloat(m[3]),
+          h: parseFloat(m[4]),
+          index: i
+        } as FinanceFieldSlmLine)
+      } else {
+        result.push({
+          raw: value,
+          text: value,
+          x: 0.0,
+          y: i * 44.0,
+          w: 0.0,
+          h: 36.0,
+          index: i
+        } as FinanceFieldSlmLine)
+      }
+    }
+    result.sort((a: FinanceFieldSlmLine, b: FinanceFieldSlmLine): number => {
+      const dy = a.y - b.y
+      if (Math.abs(dy) > 8) return dy
+      return a.x - b.x
+    })
+    for (let i = 0; i < result.length; i++) result[i].index = i
+    return result
+  }
+
+  private static async classifyText(text: string, type: string, source: string): Promise<FinanceFieldSlmResult> {
+    const emptyPredictions = [] as FinanceFieldSlmPrediction[]
+    const lines = FinanceFieldSlmService.parseOcrLines(text)
+    if (lines.length == 0) {
+      return { ok: false, ready: false, message: 'OCR 文本为空', type, source, lines, predictions: emptyPredictions, rawResult: '' } as FinanceFieldSlmResult
+    }
+    const message = '金融字段 SLM 已移除，当前使用屏幕视觉模型/规则解析'
+    console.log(`[FinanceFieldSLM][Debug] slm_removed source=${source}, type=${type}, lines=${lines.length}`)
+    return { ok: false, ready: false, message, type, source, lines, predictions: emptyPredictions, rawResult: '' } as FinanceFieldSlmResult
+  }
+
+  private static buildLayoutRequests(lines: FinanceFieldSlmLine[]): FinanceFieldLayoutRequest[] {
+    const requests = [] as FinanceFieldLayoutRequest[]
+    for (let i = 0; i < lines.length && requests.length < 96; i++) {
+      const line = lines[i]
+      if (line.text == '') continue
+      requests.push({
+        id: line.index.toString(),
+        text: line.text,
+        x: line.x,
+        y: line.y,
+        w: line.w <= 0 ? Math.max(1, line.text.length * 16) : line.w,
+        h: line.h <= 0 ? 36 : line.h
+      } as FinanceFieldLayoutRequest)
+    }
+    return requests
+  }
+
+  private static buildRequests(lines: FinanceFieldSlmLine[], type: string): FinanceFieldSlmRequest[] {
+    const requests = [] as FinanceFieldSlmRequest[]
+    const headerText = type == 'investment' ? FinanceFieldSlmService.extractInvestmentHeader(lines) : ''
+    for (let i = 0; i < lines.length && requests.length < 96; i++) {
+      const line = lines[i]
+      if (line.text == '') continue
+      const context = type == 'investment'
+        ? FinanceFieldSlmService.buildInvestmentContext(line, lines, headerText)
+        : FinanceFieldSlmService.buildBillContext(line, lines)
+      requests.push({ id: line.index.toString(), text: context } as FinanceFieldSlmRequest)
+    }
+    return requests
+  }
+
+  private static buildBillContext(line: FinanceFieldSlmLine, lines: FinanceFieldSlmLine[]): string {
+    const prev = FinanceFieldSlmService.nearText(lines, line.index - 1)
+    const next = FinanceFieldSlmService.nearText(lines, line.index + 1)
+    return FinanceFieldSlmService.limitText(
+      `页面: 账单详情; 上文: ${prev}; OCR单元格: ${line.text}; 下文: ${next}; 坐标: x=${Math.round(line.x)}, y=${Math.round(line.y)}`,
+      360
+    )
+  }
+
+  private static buildInvestmentContext(line: FinanceFieldSlmLine, lines: FinanceFieldSlmLine[], headerText: string): string {
+    const rowText = FinanceFieldSlmService.nearRowText(lines, line)
+    return FinanceFieldSlmService.limitText(
+      `页面: 理财持仓; 表头: ${headerText}; 行文本: ${rowText}; OCR单元格: ${line.text}; 区域/列: ${FinanceFieldSlmService.columnHint(line)}`,
+      420
+    )
+  }
+
+  private static extractInvestmentHeader(lines: FinanceFieldSlmLine[]): string {
+    const picked = [] as string[]
+    for (let i = 0; i < lines.length; i++) {
+      const text = lines[i].text
+      if (!FinanceFieldSlmService.containsAny(text, ['市值', '盈亏', '收益', '持仓', '可用', '证券代码', '代码', '名称', '金额/昨日收益', '持有收益/率'])) continue
+      FinanceFieldSlmService.pushUnique(picked, text)
+    }
+    if (picked.length > 0) return FinanceFieldSlmService.limitText(picked.join(' '), 160)
+    const fallback = [] as string[]
+    for (let i = 0; i < lines.length && i < 12; i++) FinanceFieldSlmService.pushUnique(fallback, lines[i].text)
+    return FinanceFieldSlmService.limitText(fallback.join(' '), 160)
+  }
+
+  private static nearRowText(lines: FinanceFieldSlmLine[], target: FinanceFieldSlmLine): string {
+    const parts = [] as string[]
+    for (let i = 0; i < lines.length; i++) {
+      const item = lines[i]
+      if (Math.abs(item.y - target.y) > 92) continue
+      FinanceFieldSlmService.pushUnique(parts, item.text)
+    }
+    return FinanceFieldSlmService.limitText(parts.join(' '), 180)
+  }
+
+  private static nearText(lines: FinanceFieldSlmLine[], index: number): string {
+    if (index < 0 || index >= lines.length) return ''
+    return lines[index].text
+  }
+
+  private static columnHint(line: FinanceFieldSlmLine): string {
+    if (line.x < 280) return '名称列'
+    if (line.x < 620) return '金额/盈亏列'
+    if (line.x < 780) return '持仓/可用列'
+    return '证券代码/右侧指标列'
+  }
+
+  private static parsePredictions(rawResult: string, lines: FinanceFieldSlmLine[]): FinanceFieldSlmPrediction[] {
+    const result = [] as FinanceFieldSlmPrediction[]
+    try {
+      const parsed = JSON.parse((rawResult ?? '').toString()) as any
+      if (parsed == null || parsed.ok != true || !Array.isArray(parsed.items)) return result
+      for (let i = 0; i < parsed.items.length; i++) {
+        const item = parsed.items[i] as any
+        if (item == null) continue
+        const id = item.id == null ? '' : item.id.toString()
+        const index = parseInt(id)
+        if (isNaN(index) || index < 0 || index >= lines.length) continue
+        const line = lines[index]
+        const top3 = [] as FinanceFieldSlmTop[]
+        if (Array.isArray(item.top3)) {
+          for (let j = 0; j < item.top3.length; j++) {
+            const top = item.top3[j] as any
+            if (top == null) continue
+            top3.push({
+              label: top.label == null ? '' : top.label.toString(),
+              score: FinanceFieldSlmService.safeNumber(top.score)
+            } as FinanceFieldSlmTop)
+          }
+        }
+        result.push({
+          id,
+          index,
+          raw: line.raw,
+          text: line.text,
+          x: line.x,
+          y: line.y,
+          w: line.w,
+          h: line.h,
+          label: item.label == null ? 'other' : item.label.toString(),
+          confidence: FinanceFieldSlmService.safeNumber(item.confidence),
+          top3
+        } as FinanceFieldSlmPrediction)
+      }
+    } catch (_e) {}
+    return result
+  }
+
+  private static rawOk(rawResult: string): boolean {
+    try {
+      const parsed = JSON.parse((rawResult ?? '').toString()) as any
+      return parsed != null && parsed.ok == true
+    } catch (_e) {
+      return false
+    }
+  }
+
+  private static rawMessage(rawResult: string): string {
+    try {
+      const parsed = JSON.parse((rawResult ?? '').toString()) as any
+      if (parsed != null && parsed.message != null) return parsed.message.toString()
+    } catch (_e) {}
+    return '金融字段 SLM 推理失败'
+  }
+
+  private static debugPredictions(predictions: FinanceFieldSlmPrediction[]): any[] {
+    const result = [] as any[]
+    for (let i = 0; i < predictions.length && i < 80; i++) {
+      const p = predictions[i]
+      result.push({
+        index: p.index,
+        text: p.text,
+        box: `${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.w)},${Math.round(p.h)}`,
+        label: p.label,
+        confidence: p.confidence,
+        top3: p.top3
+      })
+    }
+    return result
+  }
+
+  private static safeNumber(value: any): number {
+    const num = parseFloat(value == null ? '' : value.toString())
+    return isNaN(num) ? 0.0 : num
+  }
+
+  private static containsAny(text: string, keywords: string[]): boolean {
+    for (let i = 0; i < keywords.length; i++) {
+      if (text.indexOf(keywords[i]) >= 0) return true
+    }
+    return false
+  }
+
+  private static pushUnique(list: string[], value: string): void {
+    const text = (value ?? '').toString().trim()
+    if (text == '') return
+    for (let i = 0; i < list.length; i++) {
+      if (list[i] == text) return
+    }
+    list.push(text)
+  }
+
+  private static limitText(text: string, maxLen: number): string {
+    const value = (text ?? '').toString()
+    if (value.length <= maxLen) return value
+    return value.substring(0, maxLen)
+  }
+
+  private static safeJson(value: any): string {
+    try {
+      return JSON.stringify(value)
+    } catch (_e) {
+      return '[unserializable]'
+    }
+  }
+}

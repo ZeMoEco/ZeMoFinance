@@ -1,0 +1,67 @@
+// HarmonyOS Entry for Zemo Ask
+
+import { ZemoAsk } from './src/index.ets';
+
+export function showFloatWindow(): void {
+    ZemoAsk.show("mic");
+}
+
+export function hideFloatWindow(): void {
+    ZemoAsk.hide();
+}
+
+export function setFloatWindowText(text: string): void {
+    ZemoAsk.show(text);
+}
+
+export function isFloatWindowShowing(): boolean {
+    return ZemoAsk.getIsShowing();
+}
+
+export function getFloatWindowPosition(): number[] {
+    return ZemoAsk.getWindowPosition();
+}
+
+export function moveFloatWindow(x: number, y: number): void {
+    ZemoAsk.moveWindow(x, y);
+}
+
+export function triggerAutoDockSmooth(): void {
+    ZemoAsk.triggerAutoDockSmooth();
+}
+
+export function triggerDeskPetBillCapture(): void {
+    ZemoAsk.triggerDeskPetBillCapture();
+}
+
+export function consumePipMiniMindImageValues(): Float32Array | null {
+    return ZemoAsk.consumePipMiniMindImageValues();
+}
+
+export function refreshPipContent(): void {
+    ZemoAsk.refreshPipContent();
+}
+
+export function moveFinanceAppToBackground(): void {
+    ZemoAsk.moveFinanceAppToBackground();
+}
+
+export function getSherpaEngine(): Object | null {
+    return null; // Stub
+}
+
+export function classifyFinanceFields(requestsJson: string, modelPath: string, vocabPath: string, labelsPath: string): Promise<string> {
+    return Promise.resolve(JSON.stringify({ ok: false, message: '金融字段 SLM 已移除，请使用屏幕视觉模型' }));
+}
+
+export function classifyFinanceLayoutFields(requestsJson: string, modelPath: string, vocabPath: string, labelsPath: string, configPath: string): Promise<string> {
+    return Promise.resolve(JSON.stringify({ ok: false, message: '金融字段 Layout SLM 已移除，请使用屏幕视觉模型' }));
+}
+
+export function classifyScreenIntent(text: string, modelPath: string, labelsPath: string): Promise<string> {
+    return Promise.resolve(JSON.stringify({ ok: false, message: 'ScreenOmni MindSpore kit 模型已移除，请使用 Native C++ MiniMind-O 全模态模型', method: 'screen_omni_ms_removed' }));
+}
+
+export function classifyScreenImageIntent(imagePath: string, modelPath: string, labelsPath: string): Promise<string> {
+    return Promise.resolve(JSON.stringify({ ok: false, message: 'ScreenOmni 图片 MindSpore kit 模型已移除，请使用 Native C++ MiniMind-O 全模态模型', method: 'screen_omni_vision_ms_removed' }));
+}

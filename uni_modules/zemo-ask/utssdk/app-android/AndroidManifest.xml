@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 删除了 package 属性，因为已经在 build.gradle 里定义了 -->
+
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <application>
+        <!-- ★★★ 注意：这里删除了所有的 <activity> 标签 ★★★ -->
+
+        <!-- 只保留 Service -->
+        <service
+            android:name="uts.sdk.modules.zemoAi.VoiceService"
+            android:enabled="true"
+            android:exported="false"
+			 android:process=":voice"
+            android:foregroundServiceType="microphone" />
+    </application>
+</manifest>

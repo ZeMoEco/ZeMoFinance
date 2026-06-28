@@ -1,0 +1,20 @@
+// import { RUNTIME_ASSETS_DIR } from '@/utils/constant.uts';
+
+// export class ModelConfig {
+// 	// 打包到 /static/ai/ 目录
+// 	static readonly TASK_MODEL_ASSET_PATH: string = '/static/ai/minilm_l3_q.onnx';
+// 	static readonly TASK_MODEL_FILENAME: string = 'minilm_l3_q.onnx';
+// 	static readonly TASK_MODEL_RUNTIME_DIR: string = `${RUNTIME_ASSETS_DIR}/ai`;
+// 	static readonly TASK_MODEL_RUNTIME_PATH: string = `${ModelConfig.TASK_MODEL_RUNTIME_DIR}/${ModelConfig.TASK_MODEL_FILENAME}`;
+// 	static readonly TASK_VOCAB_ASSET_PATH: string = '/static/ai/vocab.txt';
+
+// 	// Harmony MindSpore Lite 模型
+// 	static readonly TASK_MODEL_MS_ASSET_PATH: string = '/static/ai/task_nlp.ms';
+// 	static readonly TASK_MODEL_MS_FILENAME: string = 'task_nlp.ms';
+// 	static readonly TASK_MODEL_MS_RUNTIME_PATH: string = `${ModelConfig.TASK_MODEL_RUNTIME_DIR}/${ModelConfig.TASK_MODEL_MS_FILENAME}`;
+
+// 	// 模型输入/输出名（如与实际不一致，请同步修改）
+// 	static readonly TASK_MODEL_INPUT_NAME: string = 'input_ids';
+// 	static readonly TASK_MODEL_MASK_NAME: string = 'attention_mask';
+// 	static readonly TASK_MODEL_TYPE_NAME: string = 'token_type_ids';
+// }

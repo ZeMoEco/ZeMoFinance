@@ -1,0 +1,337 @@
+﻿<template>
+  <view class="tasktree-container">
+    <view v-for="wrap in flatNodes" :key="wrap.node.id" :id="'task-node-' + wrap.node.data.id">
+      <view 
+        class="task-row" 
+        :style="{ paddingLeft: (((wrap.level + level) * 20) + 15) + 'px' }"
+        @click.stop="onNodeClick(wrap.node)"
+        @longpress="onNodeLongPress(wrap.node)"
+      >
+        <!-- Indentation Symbol -->
+        <text v-if="(wrap.level + level) > 0" class="indent-symbol">|-</text>
+
+        <!-- Checkbox or Note Icon (Task Detail Style) -->
+        <view class="checkbox-area" @click.stop="onToggleClick(wrap.node)">
+          <text class="checkbox-icon" v-if="wrap.node.data.entity_type == 'note'">📝</text>
+          <text class="checkbox-icon" v-else>{{ isDone(wrap.node) ? '☑' : '☐' }}</text>
+        </view>
+
+        <!-- Content -->
+        <view class="task-content">
+            <view class="title-row">
+            <text class="task-title" :class="isDone(wrap.node) ? 'text-done' : ''">{{ wrap.node.title }}</text>
+                <!-- Priority Tag -->
+            <view class="mini-tag priority-tag" v-if="wrap.node.priority > 0">
+              <text class="mini-tag-text">P{{ wrap.node.priority }}</text>
+                </view>
+    				<!-- Shopping Summary -->
+    				<view class="mini-tag" v-if="getShoppingBadge(wrap.node) != ''">
+    					<text class="mini-tag-text">{{ getShoppingBadge(wrap.node) }}</text>
+    				</view>
+                    
+                    <!-- Skill Badge -->
+                    <TaskSkillBadge 
+                        v-if="getLinkedSkill(wrap.node) != '' || getSuggestedSkill(wrap.node) != ''"
+                        :skillId="getLinkedSkill(wrap.node) != '' ? getLinkedSkill(wrap.node) : getSuggestedSkill(wrap.node)"
+                        :status="getSkillStatus(wrap.node.id)"
+                        @run="onRunSkill(wrap.node, $event as string)"
+                    />
+            </view>
+        </view>
+
+        <!-- Expand Icon -->
+        <view class="expand-icon" @click.stop="toggleExpand(wrap.node)" v-if="wrap.node.children.length > 0">
+            <text class="icon-text">{{ (wrap.node.expanded ?? false) ? '▼' : '▶' }}</text>
+        </view>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script lang="uts">
+import { TreeNode, TaskBiz } from '@/services/biz/TaskBiz.uts';
+import { PluginManager } from '@/services/ai/plugins/PluginManager.uts';
+import TaskSkillBadge from './TaskSkillBadge.uvue';
+
+type FlatNode = {
+  node: TreeNode;
+  level: number;
+}
+
+export default {
+	name: "task-tree",
+  components: { TaskSkillBadge },
+  props: {
+    nodes: {
+      type: Array,
+      required: true
+    },
+    level: {
+      type: Number,
+      default: 0
+    }
+  },
+  data() {
+      return {
+          runningSkills: new Map<string, string>() // taskId -> status ('running'|'done'|'idle')
+      }
+  },
+  emits: ['select', 'longpress', 'toggle', 'expand-change'],
+  computed: {
+    flatNodes(): FlatNode[] {
+      const out = [] as FlatNode[];
+      this.collectVisible((this.nodes as TreeNode[]), 0, out);
+      return out;
+    }
+  },
+  methods: {
+  getLinkedSkill(node: TreeNode): string {
+      const meta = this.parseMeta(node.data.metadata);
+      if (meta != null) {
+          // Check for explicit link
+          const sid = meta.getString("linked_skill_id");
+          if (sid != null && sid != '') return sid;
+      }
+      return '';
+  },
+  getSuggestedSkill(node: TreeNode): string {
+      // Logic for Smart Suggestion
+      // Simple Keyword Match for now
+      const title = node.title;
+  	  if (title.includes("买") || title.includes("购")) return "agent.shopping";
+      if (title.includes("鎬荤粨") || title.includes("鍒嗘瀽")) return "skill.summarize";
+      return '';
+  },
+  getSkillStatus(taskId: string): string {
+      return this.runningSkills.get(taskId) ?? 'idle';
+  },
+  async onRunSkill(node: TreeNode, skillId: string) {
+      const taskId = node.id;
+      // Prevent double run
+      if (this.runningSkills.get(taskId) == 'running') return;
+      
+      this.runningSkills.set(taskId, 'running');
+      uni.showToast({ title: "Activating Agent...", icon: "none" });
+      
+      try {
+          // Mock Input
+          const inputData = node.data;
+          
+          // Execute
+          const result = await PluginManager.executeSkill(skillId, inputData);
+          
+          // Log
+          await TaskBiz.addTaskLog(
+               taskId, 
+               "system", 
+               `[Agent: ${skillId}] executed via List.\nResult: ${result}`, 
+               []
+           );
+           
+           this.runningSkills.set(taskId, 'done');
+           uni.showToast({ title: "Agent Task Completed", icon: "success" });
+           
+           // Reset status after delay
+           setTimeout(() => {
+               this.runningSkills.set(taskId, 'idle');
+           }, 3000);
+           
+      } catch (e) {
+          console.error("Agent Run Failed", e);
+          this.runningSkills.set(taskId, 'idle');
+          uni.showToast({ title: "Agent Failed", icon: "none" });
+      }
+  },
+  collectVisible(nodes: TreeNode[], lvl: number, out: FlatNode[]) {
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      out.push({ node, level: lvl } as FlatNode);
+      if ((node.expanded ?? false) && node.children.length > 0) {
+        this.collectVisible(node.children as TreeNode[], lvl + 1, out);
+      }
+    }
+  },
+  parseMeta(metadataStr: string | null): UTSJSONObject | null {
+    if (metadataStr == null) return null;
+    const raw = metadataStr.toString();
+    if (raw.trim() == '') return null;
+    try {
+      const obj = JSON.parse(raw);
+      if (obj != null && typeof obj === 'object') {
+        return obj as UTSJSONObject;
+      }
+    } catch (_e) {}
+    return null;
+  },
+  getShoppingBadge(node: TreeNode): string {
+    try {
+      const meta = this.parseMeta(node.data.metadata);
+      let cat = '学习';
+      if (meta != null) {
+        try {
+          const v = meta.getString('category');
+          if (v != null && v.toString().trim() != '') cat = v.toString();
+        } catch (_eCat) {
+          try {
+            const meta2 = JSON.parse(JSON.stringify(meta)) as UTSJSONObject;
+            const v2 = meta2.getString('category');
+            if (v2 != null && v2.toString().trim() != '') cat = v2.toString();
+          } catch (_eCat2) {}
+        }
+      }
+      if (cat != '购物') return '';
+
+      let amount = '';
+      let actual = '';
+      let platform = '';
+      if (meta != null) {
+        try {
+          const aStr = meta.getString('shopping_amount');
+          if (aStr != null) {
+            amount = aStr.toString();
+          } else {
+            const aNum = meta.getNumber('shopping_amount');
+            amount = aNum != null ? aNum.toString() : '';
+          }
+
+          const acStr = meta.getString('shopping_actual');
+          if (acStr != null) {
+            actual = acStr.toString();
+          } else {
+            const acNum = meta.getNumber('shopping_actual');
+            actual = acNum != null ? acNum.toString() : '';
+          }
+
+          const p = meta.getString('shopping_platform');
+          platform = p != null ? p.toString() : '';
+        } catch (_eFields) {
+          try {
+            const meta2 = JSON.parse(JSON.stringify(meta)) as UTSJSONObject;
+            const aStr2 = meta2.getString('shopping_amount');
+            if (aStr2 != null) {
+              amount = aStr2.toString();
+            } else {
+              const aNum2 = meta2.getNumber('shopping_amount');
+              amount = aNum2 != null ? aNum2.toString() : '';
+            }
+
+            const acStr2 = meta2.getString('shopping_actual');
+            if (acStr2 != null) {
+              actual = acStr2.toString();
+            } else {
+              const acNum2 = meta2.getNumber('shopping_actual');
+              actual = acNum2 != null ? acNum2.toString() : '';
+            }
+
+            const p2 = meta2.getString('shopping_platform');
+            platform = p2 != null ? p2.toString() : '';
+          } catch (_eFields2) {}
+        }
+      }
+      if (amount == '' && actual == '' && platform == '') return '';
+      let s = '';
+      if (amount != '') s += `楼${amount}`;
+      if (actual != '') s += (s != '' ? ' / ' : '') + `楼${actual}`;
+      if (platform != '') s += (s != '' ? ' ' : '') + platform;
+      return s;
+    } catch (_e2) {
+      return '';
+    }
+  },
+    toggleExpand(node: TreeNode) {
+        // 鍏堝彇褰撳墠鍊硷紝榛樿涓?false
+        const current = node.expanded ?? false;
+        // 鍙栧弽骞惰祴鍊?
+        node.expanded = !current;
+        this.$emit('expand-change', node);
+    },
+    onNodeClick(node: TreeNode) {
+      this.$emit('select', node);
+    },
+    onNodeLongPress(node: TreeNode) {
+      this.$emit('longpress', node);
+    },
+    onToggleClick(node: TreeNode) {
+      // Emit toggle request to parent; parent decides complete/uncomplete behavior
+      console.log('[TaskTree] emit toggle, node.id:', node.id, 'status:', node.status);
+      this.$emit('toggle', node);
+    },
+    isDone(node: TreeNode): boolean {
+      if (node.status == 'done') return true;
+      if (node.status == 'archived') {
+          if (node.data.metadata != null) {
+              return node.data.metadata!.includes('"archived_status":"done"');
+          }
+      }
+      return false;
+    }
+  }
+}
+</script>
+
+<style>
+.tasktree-container {
+    width: 100%;
+}
+.task-row {
+  flex-direction: row;
+  align-items: center;
+  padding: 12px 15px;
+  border-bottom-width: 1px;
+  border-bottom-color: #f9f9f9;
+  background-color: #fff;
+}
+.checkbox-area {
+  padding: 5px 10px 5px 0;
+}
+.checkbox-icon {
+  font-size: 18px;
+}
+.task-content {
+  flex: 1;
+  justify-content: center;
+}
+.title-row {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+}
+.task-title {
+  font-size: 15px;
+  color: #333;
+  margin-right: 8px;
+}
+.text-done {
+  text-decoration-line: line-through;
+  color: #aaa;
+}
+.mini-tag {
+    padding: 2px 6px;
+    border-radius: 4px;
+    background-color: #f0f0f0;
+    margin-left: 4px;
+}
+.priority-tag {
+    background-color: #fff3e0;
+}
+.mini-tag-text {
+    font-size: 10px;
+    color: #ef6c00;
+}
+.expand-icon {
+  width: 30px;
+  height: 30px;
+  justify-content: center;
+  align-items: center;
+}
+.icon-text {
+    font-size: 12px;
+    color: #999;
+}
+.indent-symbol {
+    color: #ccc;
+    margin-right: 4px;
+    font-size: 14px;
+}
+</style>
+

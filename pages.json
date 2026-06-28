@@ -1,0 +1,77 @@
+{
+	"pages": [
+		{
+			"path": "pages/finance/home",
+			"style": {
+				"navigationBarTitleText": "泽墨账",
+				"navigationStyle": "custom"
+			}
+		},
+		{
+			"path": "pages/finance/account-detail",
+			"style": {
+				"navigationBarTitleText": "账户详情"
+			}
+		},
+		{
+			"path": "pages/finance/fund-detail",
+			"style": {
+				"navigationBarTitleText": "持仓详情"
+			}
+		},
+		{
+			"path": "pages/finance/record",
+			"style": {
+				"navigationBarTitleText": "记一笔",
+				"navigationStyle": "custom",
+				"backgroundColor": "#00000000"
+			}
+		},
+		{
+			"path": "pages/calendar/index",
+			"style": {
+				"navigationBarTitleText": "金额日历",
+				"navigationStyle": "custom",
+				"backgroundColor": "#00000000"
+			}
+		},
+		{
+			"path": "pages/debug/index",
+			"style": {
+				"navigationBarTitleText": "调试工具"
+			}
+		},
+		{
+			"path": "pages/settings/sync-settings",
+			"style": {
+				"navigationBarTitleText": "同步设置"
+			}
+		},
+		{
+			"path": "uni_modules/zemo-ask/pages/setting/index",
+			"style": {
+				"navigationBarTitleText": "桌宠与悬浮助手设置",
+				"backgroundColor": "#00000000"
+			}
+		},
+		{
+			"path": "uni_modules/zemo-ask/pages/desk-pet-float/index",
+			"style": {
+				"navigationStyle": "custom",
+				"backgroundColor": "#00000000"
+			}
+		}
+	],
+	"globalStyle": {
+		"navigationBarTextStyle": "black",
+		"navigationBarTitleText": "泽墨账",
+		"navigationBarBackgroundColor": "#F8F8F8",
+		"backgroundColor": "#F8F8F8"
+	},
+	"uniIdRouter": {
+		"loginPage": "",
+		"needLogin": [
+			""
+		]
+	}
+}

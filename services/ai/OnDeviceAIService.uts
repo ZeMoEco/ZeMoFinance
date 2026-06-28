@@ -1,0 +1,153 @@
+import { initModel, chatStream, clearHistory, loadAuxModel } from "@/uni_modules/zemo-ai";
+import { RAGService } from './RAGService.uts';
+// #ifdef APP-ANDROID
+import { UTSAndroid } from "io.dcloud.uts";
+import { UTSJSONObject } from 'io.dcloud.uts';
+// #endif
+
+export type AICommand = {
+    cmd: string;
+    params: Map<string, any>;
+}
+
+export type AIAgentResult = {
+    isCommand: boolean;
+    text?: string;
+    command?: AICommand;
+    done?: boolean;
+}
+
+export class OnDeviceAIService {
+    private static isReady: boolean = false;
+
+    /**
+     * 初始化：支持 LLM, RAG, Vision
+     */
+    static init(modelPath: string, ragPath: string | null = null, visionPath: string | null = null): boolean {
+        // #ifdef APP-ANDROID
+        try {
+            const safeRagPath = (ragPath != null && ragPath.length > 0) ? ragPath : null;
+            const safeVisionPath = (visionPath != null && visionPath.length > 0) ? visionPath : null;
+
+            console.log(` AI Init... LLM: ${modelPath}, RAG: ${safeRagPath ?? "OFF"}, Vision: ${safeVisionPath ?? "OFF"}`);
+            
+            // 1. Load Aux Models first (non-blocking usually)
+            if (safeRagPath != null) {
+                loadAuxModel("embedding", safeRagPath, true);
+            }
+            if (safeVisionPath != null) {
+                loadAuxModel("vision", safeVisionPath, true);
+            }
+
+            // 2. Load Main LLM (Blocking/Heavy)
+            const success = initModel(modelPath);
+            
+            if (success) OnDeviceAIService.isReady = true;
+            return success;
+        } catch (e) {
+            console.error("❌ AI Init Crash:", e);
+            return false;
+        }
+        // #endif
+        // #ifndef APP-ANDROID
+        return false;
+        // #endif
+    }
+
+    /**
+     * 知识库同步：让 RAG 记住新的工具用法
+     * 使用 UTS 层 RAGService
+     */
+    static memorize(texts: string[]) {
+        if (OnDeviceAIService.isReady) {
+            texts.forEach((text, idx) => {
+                const id = "mem_" + Date.now() + "_" + idx;
+                const metadata = new Map<string, string>();
+                metadata.set("type", "memory");
+                RAGService.addDocument(id, text, metadata);
+            });
+        }
+    }
+    
+    /**
+     * 清除对话历史
+     */
+    static clearContext() {
+        // #ifdef APP-ANDROID
+        clearHistory();
+        // #endif
+    }
+
+    static chat(prompt: string, callback: (result: AIAgentResult) => void): void {
+        if (!OnDeviceAIService.isReady) {
+            callback({ isCommand: false, text: "System: AI not ready.", done: true });
+            return;
+        }
+
+        // #ifdef APP-ANDROID
+        try {
+            let fullText = "";
+            chatStream(prompt, (delta: string, done: boolean) => {
+                fullText = fullText + delta;
+                const response = fullText;
+
+                // === 强力 JSON 提取 ===
+                let isCmd = false;
+                let cmdObj: AICommand | null = null;
+                
+                const startIdx = response.indexOf('{');
+                const endIdx = response.lastIndexOf('}');
+
+                if (startIdx >= 0 && endIdx > startIdx + 5) {
+                    const potentialJson = response.substring(startIdx, endIdx + 1);
+                    
+                    // Basic brace balancing check to reduce JSON parse errors on incomplete chunks
+                    let balance = 0;
+                    for (let i = 0; i < potentialJson.length; i++) {
+                        const char = potentialJson.charAt(i);
+                        if (char == '{') balance++;
+                        else if (char == '}') balance--;
+                    }
+                    if (balance !== 0) {
+                         // Incomplete JSON, wait for next token
+                         return; // Continue stream
+                    }
+
+                    try {
+                        const jsonObj = JSON.parse(potentialJson) as any;
+                        // #ifdef APP-ANDROID
+                        if (jsonObj instanceof UTSJSONObject) {
+                            const cmdName = jsonObj.getString("cmd");
+                            if (cmdName != null) {
+                                isCmd = true;
+                                const paramsMap = new Map<string, any>();
+                                const paramsObj = jsonObj.get("params");
+                                if (paramsObj instanceof UTSJSONObject) {
+                                    const tempMap = paramsObj.toMap();
+                                    tempMap.forEach((v, k) => { if (v != null) paramsMap.set(k, v); });
+                                }
+                                cmdObj = { cmd: cmdName, params: paramsMap };
+                            }
+                        }
+                        // #endif
+                        // #ifndef APP-ANDROID
+                        // Non-Android platforms: just return text, no command parsing
+                        // #endif
+                    } catch (e) { }
+                }
+
+                if (isCmd && cmdObj != null) {
+                    callback({ isCommand: true, command: cmdObj, done: done });
+                } else {
+                    callback({ isCommand: false, text: response, done: done });
+                }
+            });
+        } catch (e) {
+            callback({ isCommand: false, text: `Error: ${e}`, done: true });
+        }
+        // #endif
+        // #ifndef APP-ANDROID
+        callback({ isCommand: false, text: "Not supported.", done: true });
+        // #endif
+    }
+}9  

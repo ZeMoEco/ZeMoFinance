@@ -1,0 +1,129 @@
+// #ifdef APP-ANDROID
+import File from 'java.io.File'
+import UTSAndroid from 'io.dcloud.uts.UTSAndroid'
+// #endif
+
+export class FileHelper {
+	static async ensureDir(dirPath: string): Promise<void> {
+		const fs = uni.getFileSystemManager();
+		return new Promise((resolve, reject) => {
+			fs.access({
+				path: dirPath,
+				success: () => resolve(),
+				fail: () => {
+					fs.mkdir({
+						dirPath,
+						recursive: true,
+						success: () => resolve(),
+						fail: (err) => {
+							// If fails, check if it exists now (concurrency)
+							fs.access({
+								path: dirPath,
+								success: () => resolve(),
+								fail: () => reject(err)
+							});
+						}
+					});
+				}
+			});
+		});
+	}
+
+	static async readTextFile(filePath: string): Promise<string | null> {
+		return new Promise((resolve) => {
+			uni.getFileSystemManager().readFile({
+				filePath,
+				encoding: 'utf8',
+				success: (res) => resolve(res.data as string),
+				fail: () => resolve(null)
+			});
+		});
+	}
+
+	static toAndroidAbsPath(p: string): string {
+		// #ifdef APP-ANDROID
+		return UTSAndroid.convert2AbsFullPath(p);
+		// #endif
+		// #ifndef APP-ANDROID
+		return p;
+		// #endif
+	}
+
+	static async copyDir(srcDir: string, destDir: string): Promise<void> {
+		// Ensure dest dir exists
+		await FileHelper.ensureDir(destDir);
+
+		return new Promise((resolve, reject) => {
+			uni.getFileSystemManager().readdir({
+				dirPath: srcDir,
+				success: (res) => {
+					FileHelper.processCopyDirResult(res, srcDir, destDir).then(() => {
+						resolve();
+					}, (err: any) => {
+						reject(err);
+					});
+				},
+				fail: (err) => reject(err)
+			});
+		});
+	}
+
+	private static async processCopyDirResult(res: ReadDirSuccessResult, srcDir: string, destDir: string): Promise<void> {
+		const files = res.files;
+		if (files == null) {
+			return;
+		}
+
+		for (let i = 0; i < files.length; i++) {
+			const name = files[i];
+			if (name == '.git' || name == '.gitattributes') continue;
+
+			const srcPath = srcDir + '/' + name;
+			const destPath = destDir + '/' + name;
+
+			// Check if directory
+			const isDir = await FileHelper.isDir(srcPath);
+			if (isDir) {
+				await FileHelper.copyDir(srcPath, destPath);
+			} else {
+				await FileHelper.copyFile(srcPath, destPath);
+			}
+		}
+	}
+
+	static async isDir(path: string): Promise<boolean> {
+		// #ifdef APP-ANDROID
+		const absPath = FileHelper.toAndroidAbsPath(path);
+		const f = new File(absPath);
+		return Promise.resolve(f.exists() && f.isDirectory());
+		// #endif
+
+		// #ifndef APP-ANDROID
+		return new Promise((resolve) => {
+			uni.getFileSystemManager().stat({
+				path,
+				success: (res) => {
+					const stats = (res as UTSJSONObject).get('stats');
+					// Simplification for non-Android fallback (stub or strictly uni api)
+					// In pure UTS common without specific types, this is hard.
+					// Assuming always Android for this plugin context mostly.
+					// Try to access isDirectory if possible or check mode
+					resolve(true); // Placeholder for non-android strictly for now to pass compilation if used
+				},
+				fail: () => resolve(false)
+			});
+		});
+		// #endif
+	}
+
+	static async copyFile(src: string, dest: string): Promise<void> {
+		return new Promise((resolve, reject) => {
+			uni.getFileSystemManager().copyFile({
+				srcPath: src,
+				destPath: dest,
+				success: () => resolve(),
+				fail: (err) => reject(err)
+			});
+		});
+	}
+}

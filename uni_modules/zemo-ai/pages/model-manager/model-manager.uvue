@@ -1,0 +1,369 @@
+<template>
+  <view class="page-container">
+    <SpringScrollView :refreshing="false">
+      <view class="content-wrapper">
+        
+        <!-- Status Card -->
+        <view class="glass-card">
+          <view class="card-header">
+            <text class="card-title">AI Engine Status</text>
+            <text class="card-subtitle">Local LLM & RAG Engine</text>
+          </view>
+          
+          <view v-if="aiStatus === 'ready'" class="status-box success-box">
+             <text class="status-icon">✅</text>
+             <text class="status-text-ready">Engine Ready</text>
+          </view>
+          <view v-else-if="aiStatus === 'loading'" class="status-box warn-box">
+             <text class="status-icon">⏳</text>
+             <text class="status-text-warn">Initializing...</text>
+          </view>
+          <view v-else-if="aiStatus === 'downloading'" class="status-box warn-box">
+             <text class="status-icon">⬇️</text>
+             <text class="status-text-warn">Downloading...</text>
+          </view>
+          <view v-else class="status-box warn-box">
+             <text class="status-icon">⚠️</text>
+             <text class="status-text-warn">Not Loaded</text>
+          </view>
+
+          <view class="divider"></view>
+
+          <!-- Chat Test -->
+          <text class="section-label-text">Quick Test</text>
+          <view class="chat-preview">
+                 <text class="chat-response">{{ aiResponseText }}</text>
+          </view>
+          <view class="action-row" style="margin-top: 10px;">
+                <input class="text-input" style="flex:1; margin-bottom:0;" v-model="aiTestMsg" placeholder="Ask something..." />
+                <button class="btn-primary" size="mini" style="margin-left: 8px; height: 40px; line-height: 40px;" @click="testAI" :disabled="aiThinking">Send</button>
+          </view>
+        </view>
+
+        <!-- Model Management Card -->
+        <view class="glass-card">
+            <view class="card-header">
+              <text class="card-title">📦 Model Manager</text>
+              <text class="card-subtitle">Download & Update Models</text>
+            </view>
+
+            <view class="model-type-grid">
+              <view class="model-type-item" :class="{ 'model-type-active': selectedModelType === 'llm' }" @click="selectedModelType = 'llm'">
+                <text class="model-type-icon">🧠</text>
+                <text class="model-type-name">LLM</text>
+              </view>
+              <view class="model-type-item" :class="{ 'model-type-active': selectedModelType === 'rag' }" @click="selectedModelType = 'rag'">
+                <text class="model-type-icon">🔍</text>
+                <text class="model-type-name">RAG</text>
+              </view>
+              <view class="model-type-item" :class="{ 'model-type-active': selectedModelType === 'vision' }" @click="selectedModelType = 'vision'">
+                <text class="model-type-icon">🖼️</text>
+                <text class="model-type-name">Vision</text>
+              </view>
+              <view class="model-type-item" :class="{ 'model-type-active': selectedModelType === 'asr' }" @click="selectedModelType = 'asr'">
+                <text class="model-type-icon">🎤</text>
+                <text class="model-type-name">ASR</text>
+              </view>
+              <view class="model-type-item" :class="{ 'model-type-active': selectedModelType === 'kws' }" @click="selectedModelType = 'kws'">
+                <text class="model-type-icon">👋</text>
+                <text class="model-type-name">KWS</text>
+              </view>
+              <view class="model-type-item" :class="{ 'model-type-active': selectedModelType === 'speaker' }" @click="selectedModelType = 'speaker'">
+                <text class="model-type-icon">👤</text>
+                <text class="model-type-name">Speaker</text>
+              </view>
+              <view class="model-type-item" :class="{ 'model-type-active': selectedModelType === 'vad' }" @click="selectedModelType = 'vad'">
+                <text class="model-type-icon">📊</text>
+                <text class="model-type-name">VAD</text>
+              </view>
+            </view>
+
+            <view class="divider"></view>
+
+            <!-- Current Model Info -->
+            <view class="section-label-row">
+              <text class="section-label-text">{{ modelDisplayNames[selectedModelType] }}</text>
+            </view>
+            
+            <text class="tips-text" style="margin-bottom: 10px;">
+              File: {{ modelFileNames[selectedModelType] }}
+            </text>
+
+            <input class="text-input" v-model="customModelUrl" :placeholder="'Input ' + selectedModelType.toUpperCase() + ' URL'" />
+
+            <!-- Progress -->
+            <view v-if="modelDownloading">
+              <progress :percent="modelDownloadProgress" stroke-width="8" show-info activeColor="#007aff" style="margin: 10px 0;" />
+              <text class="tips-text centered-text">{{ modelDownloadStatus }}</text>
+            </view>
+
+            <view class="action-row" style="margin-top: 10px;">
+              <button class="btn-primary" style="flex: 1;" @click="downloadSelectedModel" :disabled="modelDownloading || customModelUrl.trim() === ''">
+                {{ modelDownloading ? 'Downloading...' : 'Download & Overwrite' }}
+              </button>
+            </view>
+
+            <view class="divider"></view>
+
+            <view class="action-row">
+              <button class="btn-outline" style="flex: 1;" @click="loadSavedModelUrls">Load Saved URLs</button>
+              <button class="btn-outline" style="flex: 1; margin-left: 10px;" @click="saveModelUrls">Save URLs</button>
+            </view>
+        </view>
+
+        <!-- Voice Settings Card -->
+        <view class="glass-card">
+            <view class="card-header">
+              <text class="card-title">Voice Settings</text>
+              <text class="card-subtitle">Sherpa ONNX Integration</text>
+            </view>
+
+             <!-- Voice Status -->
+            <view v-if="voiceStatus === 'ready'" class="status-box success-box">
+              <text class="status-icon">🎙️</text>
+              <text class="status-text-ready">Voice Ready</text>
+            </view>
+            <view v-else-if="voiceStatus === 'checking'" class="status-box warn-box">
+              <text class="status-icon">⏳</text>
+              <text class="status-text-warn">Initializing...</text>
+            </view>
+            <view v-else class="status-box warn-box">
+              <text class="status-icon">⚠️</text>
+              <text class="status-text-warn">Voice Unavailable</text>
+            </view>
+
+            <view class="divider"></view>
+            
+             <!-- Voice Input Switch -->
+            <view class="switch-row" style="margin-bottom: 15px;">
+              <text class="setting-label" style="margin-bottom: 0;">Voice Input → AI Chat</text>
+              <switch :checked="voiceInputMode" @change="(e: UniSwitchChangeEvent) => { voiceInputMode = e.detail.value; }" :disabled="aiStatus !== 'ready'" />
+            </view>
+
+            <view class="action-row">
+                 <button class="btn-outline" @click="checkVoiceEngine">Re-check Engine</button>
+            </view>
+        </view>
+
+      </view>
+    </SpringScrollView>
+  </view>
+</template>
+
+<script lang="uts">
+import { AIAgentExecutor } from '@/services/ai/AIAgentExecutor.uts';
+import SpringScrollView from "@/components/sys/SpringScrollView.uvue";
+// #ifdef APP-ANDROID
+import { getSherpaEngine } from '@/uni_modules/zemo-ask/utssdk/app-android/index.uts';
+// #endif
+
+export default {
+  components: { SpringScrollView },
+  data() {
+    return {
+      // AI
+      aiStatus: 'checking',
+      aiResponseText: 'Ready to chat.',
+      aiTestMsg: '',
+      aiThinking: false,
+      aiSaveDir: uni.env.USER_DATA_PATH + "/models",
+      aiModelFileName: 'model.litertlm',
+      
+      // Voice
+      voiceStatus: 'checking',
+      voiceInputMode: false,
+      
+      // Downloads
+      selectedModelType: 'llm',
+      customModelUrl: '',
+      modelDownloading: false,
+      modelDownloadProgress: 0,
+      modelDownloadStatus: '',
+      
+      modelUrls: {
+        llm: 'https://www.modelscope.cn/models/ZeMo2026/Gemma3xGecko/resolve/master/gemma3-1b-it-int4.litertlm',
+        rag: 'https://www.modelscope.cn/models/ZeMo2026/Gemma3xGecko/resolve/master/Gecko_256_quant.tflite',
+        vision: 'https://www.modelscope.cn/models/ZeMo2026/Gemma3xGecko/resolve/master/vision_mobilenet_v3.tflite',
+        asr: '', kws: '', speaker: '', vad: ''
+      },
+      modelFileNames: {
+        llm: 'model.litertlm',
+        rag: 'rag_embedder.tflite',
+        vision: 'vision_model.tflite',
+        asr: 'asr_model.onnx',
+        kws: 'kws_model.onnx',
+        speaker: 'speaker_model.onnx',
+        vad: 'vad_model.onnx'
+      },
+      modelDisplayNames: {
+        llm: 'LLM (Gemma)',
+        rag: 'RAG Embedder',
+        vision: 'Vision Model',
+        asr: 'ASR Model',
+        kws: 'KWS Model',
+        speaker: 'Speaker Model',
+        vad: 'VAD Model'
+      }
+    }
+  },
+  onLoad() {
+      this.checkAIModel();
+      this.checkVoiceEngine();
+      this.loadSavedModelUrls();
+  },
+  computed: {
+      aiFullPath(): string { return (this.aiSaveDir as string) + "/" + (this.modelFileNames['llm'] as string); },
+      ragFullPath(): string { return (this.aiSaveDir as string) + "/" + (this.modelFileNames['rag'] as string); },
+      visionFullPath(): string { return (this.aiSaveDir as string) + "/" + (this.modelFileNames['vision'] as string); }
+  },
+  watch: {
+    selectedModelType(newVal: string) {
+       const val = this.modelUrls[newVal];
+       this.customModelUrl = (val != null) ? (val as String) : '';
+    }
+  },
+  methods: {
+    checkAIModel() {
+      const fs = uni.getFileSystemManager();
+      try {
+        fs.accessSync(this.aiFullPath);
+        
+        // Check optional models
+        let ragPath: string | null = null;
+        try { fs.accessSync(this.ragFullPath); ragPath = this.ragFullPath; } catch(e){}
+        
+        let visionPath: string | null = null;
+        try { fs.accessSync(this.visionFullPath); visionPath = this.visionFullPath; } catch(e){}
+
+        this.aiStatus = 'loading';
+        // Initialize all models
+        const res = AIAgentExecutor.init(this.aiFullPath, ragPath, visionPath);
+        if(res){
+           this.waitForEngine();
+        } else {
+           this.aiStatus = 'none';
+        }
+      } catch (e) {
+        this.aiStatus = 'none';
+      }
+    },
+    waitForEngine() {
+        if (AIAgentExecutor.isNativeReady()) {
+            this.aiStatus = 'ready';
+        } else {
+            setTimeout(() => { this.waitForEngine() }, 1000);
+        }
+    },
+    testAI() {
+        if (this.aiTestMsg == "") return;
+        this.aiThinking = true;
+        this.aiResponseText = "";
+        AIAgentExecutor.chat(this.aiTestMsg, (segment: string, done: boolean) => {
+            if (segment != "") this.aiResponseText += segment;
+            if (done) this.aiThinking = false;
+        });
+    },
+    downloadSelectedModel() {
+        const url = this.customModelUrl.trim();
+        if(!url.startsWith('http')) return;
+        
+        this.modelUrls[this.selectedModelType] = url;
+        this.modelDownloading = true;
+        this.modelDownloadStatus = 'Starting...';
+        
+        let saveDir = uni.env.USER_DATA_PATH + '/models';
+        if (this.selectedModelType !== 'llm' && this.selectedModelType !== 'rag' && this.selectedModelType !== 'vision') {
+            saveDir = uni.env.USER_DATA_PATH + '/voice_models';
+        }
+        
+        const fileName = this.modelFileNames[this.selectedModelType] as String;
+        const fullPath = saveDir + '/' + fileName;
+        
+        const fs = uni.getFileSystemManager();
+        try { fs.accessSync(saveDir); } catch(e) { try{ fs.mkdirSync(saveDir, true); }catch(e2){} }
+        
+        uni.downloadFile({
+            url: url,
+            filePath: fullPath,
+            success: (res) => {
+                if(res.statusCode === 200) {
+                    this.modelDownloadStatus = 'Done';
+                    if(this.selectedModelType === 'llm') this.checkAIModel();
+                } else {
+                    this.modelDownloadStatus = 'Failed: ' + res.statusCode;
+                }
+                this.modelDownloading = false;
+            },
+            fail: (err) => {
+                this.modelDownloadStatus = 'Error';
+                this.modelDownloading = false;
+            }
+        }).onProgressUpdate((res) => {
+             this.modelDownloadProgress = res.progress;
+             const cur = (res.totalBytesWritten / 1024 / 1024).toFixed(1);
+             const total = (res.totalBytesExpectedToWrite / 1024 / 1024).toFixed(1);
+             this.modelDownloadStatus = `${cur}MB / ${total}MB`;
+        });
+    },
+    loadSavedModelUrls() {
+        try {
+            const saved = uni.getStorageSync('model_download_urls');
+            if (saved != null) {
+                const parsed = JSON.parse(saved as string) as UTSJSONObject;
+                for (const key in parsed) {
+                    if (this.modelUrls[key] != null) this.modelUrls[key] = parsed[key];
+                }
+                const currentVal = this.modelUrls[this.selectedModelType];
+                this.customModelUrl = (currentVal != null) ? (currentVal as String) : '';
+            }
+        } catch(e){}
+    },
+    saveModelUrls() {
+        this.modelUrls[this.selectedModelType] = this.customModelUrl;
+        uni.setStorageSync('model_download_urls', JSON.stringify(this.modelUrls));
+    },
+    checkVoiceEngine() {
+      // #ifdef APP-ANDROID
+        try {
+
+            const engine = getSherpaEngine();
+            if(engine.checkReady()) {
+                this.voiceStatus = 'ready';
+            } else {
+                this.voiceStatus = 'checking';
+                setTimeout(() => { this.checkVoiceEngine() }, 1000);
+            }
+
+        } catch(e){ this.voiceStatus = 'none'; }
+        // #endif
+        // #ifndef APP-ANDROID
+        this.voiceStatus = 'none';
+        // #endif
+    }
+  }
+}
+</script>
+
+<style>
+.page-container { flex: 1; background-color: #f5f5f7; padding: 15px; }
+.glass-card { background: white; border-radius: 12px; padding: 15px; margin-bottom: 15px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
+.card-header { margin-bottom: 15px; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+.card-title { font-size: 18px; font-weight: bold; }
+.card-subtitle { font-size: 12px; color: #888; }
+.divider { height: 1px; background: #eee; margin: 15px 0; }
+.status-box { padding: 10px; border-radius: 8px; display: flex; align-items: center; }
+.success-box { background: #f6ffed; border: 1px solid #b7eb8f; }
+.warn-box { background: #fffbe6; border: 1px solid #ffe58f; }
+.status-icon { margin-right: 10px; font-size: 18px; }
+.chat-preview { background: #f9f9f9; padding: 10px; border-radius: 8px; min-height: 60px; margin-bottom: 10px; }
+.action-row { display: flex; }
+.btn-primary { background: #007aff; color: white; border-radius: 6px; border-width: 0; font-size: 14px; }
+.btn-outline { background: transparent; border: 1px solid #ddd; color: #333; border-radius: 6px; font-size: 14px; }
+.model-type-grid { display: flex; flex-wrap: wrap; }
+.model-type-item { width: 30%; background: #f0f0f0; border-radius: 8px; padding: 10px; display: flex; flex-direction: column; align-items: center; border: 2px solid transparent; margin: 1.5%; }
+.model-type-active { background: #e6f7ff; border-color: #1890ff; }
+.text-input { background: #fff; border: 1px solid #ddd; height: 40px; border-radius: 6px; padding: 0 10px; margin-bottom: 10px; }
+.tips-text { font-size: 12px; color: #999; }
+.centered-text { text-align: center; width: 100%; }
+.switch-row { display: flex; justify-content: space-between; align-items: center; }
+</style>

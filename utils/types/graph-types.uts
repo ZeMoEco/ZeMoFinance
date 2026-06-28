@@ -1,0 +1,74 @@
+// Graph model enums for task graph refactor phase 1.
+
+export enum GraphRelationType {
+  // Context edges
+  ContextCooking = 'context:cooking',
+  ContextShopping = 'context:shopping',
+  ContextOrganizing = 'context:organizing',
+  ContextFinance = 'context:finance',
+
+  // Existing structural edges
+  ContainsTaskTree = 'CONTAINS_TASK_TREE',
+  Contains = 'CONTAINS',
+  References = 'REFERENCES',
+  ContainsNoteBlock = 'CONTAINS_NOTE_BLOCK',
+
+  // New relation types used by refactor
+  ContainsAccount = 'CONTAINS_ACCOUNT',
+  StoredIn = 'STORED_IN',
+  LocatedAt = 'LOCATED_AT',
+}
+
+export const CONTEXT_RELATION_TYPES: GraphRelationType[] = [
+  GraphRelationType.ContextCooking,
+  GraphRelationType.ContextShopping,
+  GraphRelationType.ContextOrganizing,
+  GraphRelationType.ContextFinance,
+]
+
+export enum ContextEdgeStatus {
+  Todo = 'todo',
+  InProgress = 'in_progress',
+  Done = 'done',
+  Archived = 'archived',
+  Abandoned = 'abandoned',
+}
+
+export const DEFAULT_CONTEXT_EDGE_STATUS: ContextEdgeStatus = ContextEdgeStatus.Todo
+
+export enum CookingSecondaryCategory {
+  MainDish = 'main_dish',
+  SideDish = 'side_dish',
+  Soup = 'soup',
+  Dessert = 'dessert',
+}
+
+export enum ShoppingSecondaryCategory {
+  Grocery = 'grocery',
+  Daily = 'daily',
+  Online = 'online',
+  Offline = 'offline',
+}
+
+export enum OrganizingSecondaryCategory {
+  Fridge = 'fridge',
+  Wardrobe = 'wardrobe',
+  Desk = 'desk',
+}
+
+export enum FinanceSecondaryCategory {
+  Food = 'food',
+  Transport = 'transport',
+  Entertainment = 'entertainment',
+}
+
+export type EdgeSecondaryCategory =
+  | CookingSecondaryCategory
+  | ShoppingSecondaryCategory
+  | OrganizingSecondaryCategory
+  | FinanceSecondaryCategory
+
+export enum LogOwnerType {
+  Node = 'node',
+  Edge = 'edge',
+}

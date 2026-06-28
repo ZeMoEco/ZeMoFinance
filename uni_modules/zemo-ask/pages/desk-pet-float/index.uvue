@@ -1,0 +1,111 @@
+<template>
+  <view class="pet-container" @touchstart="onTouchStart" @touchmove="onTouchMove" @touchend="onTouchEnd">
+    <view class="pet-lottie-shell" :class="isDragging ? 'pet-lottie-shell-dragging' : ''">
+      <web-view class="pet-lottie-view" :src="lottieWebUrl"></web-view>
+      <view class="pet-touch-capture"></view>
+    </view>
+    <view class="pet-label-box" v-if="!isDragging">
+      <text class="pet-label">点我识别记账</text>
+    </view>
+  </view>
+</template>
+
+<script lang="uts">
+import { moveFloatWindow, getFloatWindowPosition, triggerAutoDockSmooth, triggerDeskPetBillCapture } from '@/uni_modules/zemo-ask';
+
+export default {
+  data() {
+    return {
+      startX: 0 as number,
+      startY: 0 as number,
+      windowStartX: 0 as number,
+      windowStartY: 0 as number,
+      isDragging: false as boolean,
+      clickTimeThreshold: 200 as number,
+      lastTouchTime: 0 as number,
+      lottieWebUrl: '/uni_modules/zemo-ask/static/lottie-player.html' as string
+    }
+  },
+  methods: {
+    onTouchStart(e: TouchEvent) {
+      const touch = e.touches[0];
+      this.startX = touch.screenX;
+      this.startY = touch.screenY;
+      this.lastTouchTime = Date.now();
+      this.isDragging = false;
+      const pos = getFloatWindowPosition();
+      if (pos.length >= 2) {
+        this.windowStartX = pos[0];
+        this.windowStartY = pos[1];
+      }
+    },
+    onTouchMove(e: TouchEvent) {
+      const touch = e.touches[0];
+      const dx = touch.screenX - this.startX;
+      const dy = touch.screenY - this.startY;
+      if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
+        this.isDragging = true;
+      }
+      if (this.isDragging) {
+        const ratio = uni.getSystemInfoSync().pixelRatio;
+        moveFloatWindow(this.windowStartX + dx / ratio, this.windowStartY + dy / ratio);
+      }
+    },
+    onTouchEnd() {
+      const duration = Date.now() - this.lastTouchTime;
+      if (!this.isDragging || duration < this.clickTimeThreshold) {
+        this.isDragging = false;
+        triggerDeskPetBillCapture();
+        return;
+      }
+      this.isDragging = false;
+      const autoSide = uni.getStorageSync('desktop_pet_auto_side');
+      if (autoSide == null || autoSide.toString() == '1') {
+        triggerAutoDockSmooth();
+      }
+    }
+  }
+}
+</script>
+
+<style>
+.pet-container {
+  width: 250px;
+  height: 250px;
+  background-color: transparent;
+  justify-content: center;
+  align-items: center;
+  flex-direction: column;
+  position: relative;
+}
+.pet-lottie-shell {
+  width: 170px;
+  height: 170px;
+  position: relative;
+  align-items: center;
+  justify-content: center;
+}
+.pet-lottie-shell-dragging {
+  transform: scale(1.15);
+}
+.pet-lottie-view,
+.pet-touch-capture {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 170px;
+  height: 170px;
+  background-color: transparent;
+}
+.pet-label-box {
+  margin-top: 8px;
+  background-color: rgba(52, 73, 94, 0.85);
+  padding: 4px 10px;
+  border-radius: 12px;
+}
+.pet-label {
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: bold;
+}
+</style>

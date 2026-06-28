@@ -1,0 +1,88 @@
+<template>
+	<view v-if="visible" class="pm-container">
+		<view class="pm-mask" @click="close"></view>
+		<view class="pm-dropdown" :style="fixedStyle">
+			<scroll-view scroll-y="true" class="pm-list">
+				<view v-for="(it, idx) in items" :key="idx" class="pm-item" @click.stop="pick(it as string)">
+					<text class="pm-item-text">{{ it }}</text>
+				</view>
+			</scroll-view>
+		</view>
+	</view>
+</template>
+
+<script lang="uts">
+	export default {
+		name: 'popover-menu',
+		emits: ['update:visible', 'select'],
+		props: {
+			visible: { type: Boolean, default: false },
+			items: { type: Array, default: () => [] as string[] },
+			x: { type: Number, default: 0 },
+			y: { type: Number, default: 0 }
+		},
+		computed: {
+			fixedStyle(): string {
+				// 简单的边缘检测
+				const sys = uni.getSystemInfoSync()
+				let left = this.x
+				let top = this.y
+				const width = 160
+				
+				// 如果靠右，往左显示
+				if (left + width > sys.windowWidth) {
+					left = sys.windowWidth - width - 10
+				}
+				
+				return `position:absolute; top:${top}px; left:${left}px; width:${width}px; z-index: 10000;`
+			}
+		},
+		methods: {
+			close() {
+				this.$emit('update:visible', false)
+			},
+			pick(item: string) {
+				this.$emit('select', item)
+				this.close()
+			}
+		}
+	}
+</script>
+
+<style scoped>
+	.pm-container {
+		position: fixed;
+		top: 0; left: 0; right: 0; bottom: 0;
+		z-index: 9999;
+	}
+	.pm-mask {
+		position: absolute;
+		top: 0; left: 0; right: 0; bottom: 0;
+		background-color: rgba(0, 0, 0, 0.01);
+	}
+	.pm-dropdown {
+		position: absolute;
+		background-color: rgba(255, 255, 255, 0.95);
+		/* backdrop-filter: blur(10px); */
+		border-radius: 12px;
+		box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+		padding: 6px;
+		/* 宽度在 computed 中控制 */
+	}
+	.pm-list {
+		max-height: 200px;
+	}
+	.pm-item {
+		padding: 10px 12px;
+		border-radius: 8px;
+		flex-direction: row;
+		align-items: center;
+	}
+	.pm-item:active {
+		background-color: rgba(0,0,0,0.05);
+	}
+	.pm-item-text {
+		font-size: 14px;
+		color: #333;
+	}
+</style>

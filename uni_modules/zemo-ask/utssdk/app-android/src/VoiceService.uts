@@ -1,0 +1,136 @@
+import Service from "android.app.Service";
+import Intent from "android.content.Intent";
+import IBinder from "android.os.IBinder";
+import Context from "android.content.Context";
+import Notification from "android.app.Notification";
+import NotificationChannel from "android.app.NotificationChannel";
+import NotificationManager from "android.app.NotificationManager";
+import Build from "android.os.Build";
+import Handler from "android.os.Handler";
+import Looper from "android.os.Looper";
+import Log from "android.util.Log";
+import { Thread, System } from "java.lang"; // 导入 System
+import { SherpaEngine } from "./SherpaEngine.uts";
+import { getSherpaEngine, ZeMo } from "../index.uts"; 
+import ServiceInfo from "android.content.pm.ServiceInfo"; // 必须引入这个类
+const TAG = "ZeMo-VoiceService";
+const CHANNEL_ID = "ZemoVoiceChannel";
+const NOTIFICATION_ID: Int = 1001;
+
+export class VoiceService extends Service {
+    constructor() { super(); }
+    
+    static engineInstance: SherpaEngine | null = null;
+    static onEvent: ((event: string) => void) | null = null;
+    
+    // 修复：在这里显式声明静态变量
+    static lastVolTime: Long = 0;
+    
+    private static uiHandler = new Handler(Looper.getMainLooper());
+
+    static startRegisterSpeaker() {
+        if (VoiceService.engineInstance != null) {
+            VoiceService.engineInstance!.setRegisterMode(true, "Admin"); 
+            VoiceService.setChatMode(true);
+        }
+    }
+
+    static stopRegisterSpeaker() {
+        if (VoiceService.engineInstance != null) {
+            VoiceService.engineInstance!.setRegisterMode(false, "Admin");
+        }
+    }
+
+    override onCreate() {
+        super.onCreate();
+        this.startForegroundServiceNotification();
+        new Thread(() => {
+            const engine = new SherpaEngine();
+            if (engine.init(this)) VoiceService.engineInstance = engine;
+        }).start();
+    }
+
+     static setChatMode(enable: boolean) {
+           const engine = VoiceService.engineInstance;
+           if (engine == null) return;
+           if (enable) {
+               engine.startRecording((res: string) => {
+                   // 音量节流
+                   if (res.startsWith("VOL:")) {
+                       const now = System.currentTimeMillis();
+                       if (now - VoiceService.lastVolTime < 300) return;
+                       VoiceService.lastVolTime = now;
+                   }
+   
+                   // 异步分发，不阻塞主线程
+                   VoiceService.uiHandler.post(() => {
+                       if (VoiceService.onEvent != null) {
+                           try {
+                               VoiceService.onEvent!(res);
+                           } catch (e) {
+                               // 失败说明回调已过期
+                           }
+                       }
+                   });
+               });
+           } else {
+               engine.stopRecording();
+           }
+       }
+
+    private safeEmit(msg: string) {
+        VoiceService.uiHandler.post(() => {
+            if (VoiceService.onEvent != null) {
+                try {
+                    VoiceService.onEvent!(msg);
+                } catch (e) {}
+            }
+        });
+    }
+
+    // 重点：改为 START_NOT_STICKY 减少非预期重启
+  override onStartCommand(intent : Intent, flags : Int, startId : Int) : Int {
+    console.log("⚡ [Heartbeat] VoiceService 正在启动..."); 
+    
+    // 现在 ZeMo.checkMicPermission 可以访问了
+    if (!ZeMo.checkMicPermission()) {
+      console.error("❌ [Heartbeat] Service 启动失败：没有麦克风权限");
+      return Service.START_NOT_STICKY;
+    }
+
+    // 启动录音，现在 getSherpaEngine 可以找到了
+    const engine = getSherpaEngine();
+    engine.startRecording((res : string) => {
+      VoiceService.onEvent?.(res);
+    });
+      return Service.START_STICKY;
+  }
+    
+    override onBind(intent: Intent): IBinder | null { return null; }
+
+    override onDestroy() {
+        VoiceService.engineInstance?.release();
+        VoiceService.engineInstance = null;
+        this.stopForeground(true);
+        super.onDestroy();
+    }
+
+  
+      private startForegroundServiceNotification() {
+          const CHANNEL_ID = "ZemoVoice";
+          if (Build.VERSION.SDK_INT >= 26) {
+              const channel = new NotificationChannel(CHANNEL_ID, "AI助手运行中", NotificationManager.IMPORTANCE_LOW);
+              const manager = this.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager;
+              manager.createNotificationChannel(channel);
+          }
+          const builder = new Notification.Builder(this, CHANNEL_ID)
+              .setContentTitle("ZeMo AI")
+              .setContentText("语音识别服务已就绪")
+              .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+              .build();
+          
+          // 关键：正确启动前台服务
+          if (Build.VERSION.SDK_INT >= 34) this.startForeground(1001, builder, 128);
+          else this.startForeground(1001, builder);
+      }
+}

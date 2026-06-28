@@ -1,0 +1,34 @@
+export class Storage {
+  static getString(key: string, defaultValue: string = ''): string {
+    try {
+      const v = uni.getStorageSync(key)
+      if (v == null) return defaultValue
+      return v.toString()
+    } catch (_) {
+      return defaultValue
+    }
+  }
+
+  static setString(key: string, value: string): void {
+    uni.setStorageSync(key, value)
+  }
+
+  static getJSON<T>(key: string, defaultValue: T): T {
+    try {
+      const v = uni.getStorageSync(key)
+      if (typeof v === 'string' && v.length > 0) return JSON.parse(v) as T
+      if (v == null) return defaultValue
+      return v as T
+    } catch (_) {
+      return defaultValue
+    }
+  }
+
+  static setJSON(key: string, value: any): void {
+    uni.setStorageSync(key, JSON.stringify(value ?? null))
+  }
+
+  static remove(key: string): void {
+    uni.removeStorageSync(key)
+  }
+}

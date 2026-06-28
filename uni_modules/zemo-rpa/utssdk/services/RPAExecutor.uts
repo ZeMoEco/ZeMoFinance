@@ -1,0 +1,456 @@
+import { RPAStep, RPAActionType, ExecutionMode, ExecutionInputMode, RPAExecutionConfig, StepInputMode, RPAScript, RPABranchCondition } from '../utils/RPAStep.uts';
+import { IHIDExecutor, HIDExecutorFactory, HIDConnectionState } from '../interface/IHIDExecutor.uts';
+
+// #ifdef APP-ANDROID
+import { RPAExecutorImpl } from '../app-android/exports.uts';
+// #endif
+
+/**
+ * 默认执行配置
+ */
+const DEFAULT_CONFIG: RPAExecutionConfig = {
+	mode: ExecutionMode.FOREGROUND,
+	inputMode: ExecutionInputMode.ACCESSIBILITY,
+	stepDelay: 500,
+	retryCount: 1,
+	continueOnError: true,
+	loopCount: 0,
+	enableAIBranching: false
+};
+
+/**
+ * 步骤执行结果
+ */
+export type StepExecutionResult = {
+	success: boolean
+	stepId: string
+	/** 下一步的 ID (可能因分支而不同于默认线性流) */
+	nextStepId: string
+	/** 是否由 AI 决定了分支 */
+	aiDecided: boolean
+	/** 错误信息 */
+	errorMessage: string
+}
+
+/**
+ * 执行进度回调
+ */
+export type ExecutionProgressCallback = (step: number, total: number, desc: string) => void;
+
+/**
+ * AI 分支决策回调 — 由上层 AI 模块提供
+ */
+export type AIBranchDecisionCallback = (step: RPAStep, branches: RPABranchCondition[]) => Promise<string>;
+
+export class RPAExecutor {
+	static isRunning: boolean = false;
+	static currentStep: number = 0;
+	static totalSteps: number = 0;
+	private static config: RPAExecutionConfig = DEFAULT_CONFIG;
+	private static onProgress: ExecutionProgressCallback | null = null;
+	/** AI 分支决策回调 */
+	private static onAIBranch: AIBranchDecisionCallback | null = null;
+	/** HID 执行器实例 */
+	private static hidExecutor: IHIDExecutor | null = null;
+	/** 当前执行的脚本对象 */
+	private static currentScript: RPAScript | null = null;
+	
+	/**
+	 * 设置执行配置
+	 */
+	static setConfig(config: RPAExecutionConfig) {
+		RPAExecutor.config = config;
+	}
+
+	/**
+	 * 获取当前配置
+	 */
+	static getConfig(): RPAExecutionConfig {
+		return RPAExecutor.config;
+	}
+
+	/**
+	 * 设置进度回调
+	 */
+	static setProgressCallback(callback: ExecutionProgressCallback | null) {
+		RPAExecutor.onProgress = callback;
+	}
+
+	/**
+	 * 设置 AI 分支决策回调
+	 */
+	static setAIBranchCallback(callback: AIBranchDecisionCallback | null) {
+		RPAExecutor.onAIBranch = callback;
+	}
+
+	/**
+	 * 初始化 HID 执行器
+	 */
+	static async initHIDExecutor(context: any | null = null): Promise<boolean> {
+		RPAExecutor.hidExecutor = HIDExecutorFactory.create(context);
+		if (RPAExecutor.hidExecutor == null) {
+			console.warn("[RPAExecutor] HID executor not available");
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * 停止执行
+	 */
+	static stop() {
+		RPAExecutor.isRunning = false;
+	}
+
+	/**
+	 * 执行完整脚本对象 (v2，支持分支和 Canvas 数据)
+	 */
+	static async executeRPAScript(script: RPAScript, config: RPAExecutionConfig | null = null): Promise<boolean> {
+		RPAExecutor.currentScript = script;
+		return await RPAExecutor.executeScript(script.steps, config);
+	}
+
+	/**
+	 * 执行脚本 (使用当前配置)
+	 * 支持分支执行: 根据步骤的 nextStepId 和 branches 决定执行流
+	 */
+	static async executeScript(script: RPAStep[], config: RPAExecutionConfig | null = null): Promise<boolean> {
+		if (RPAExecutor.isRunning) {
+			console.warn("RPAExecutor is already running");
+			return false;
+		}
+		
+		const execConfig = config ?? RPAExecutor.config;
+		RPAExecutor.isRunning = true;
+		RPAExecutor.totalSteps = script.length;
+
+		// 蓝牙 HID 模式检查
+		if (execConfig.inputMode == ExecutionInputMode.BLUETOOTH_HID) {
+			if (RPAExecutor.hidExecutor == null) {
+				await RPAExecutor.initHIDExecutor();
+			}
+			if (RPAExecutor.hidExecutor == null) {
+				console.warn("[RPAExecutor] Bluetooth HID not available, falling back to ACCESSIBILITY");
+			}
+		}
+
+		// 平行视界模式
+		if (execConfig.mode == ExecutionMode.PARALLEL_VISION) {
+			console.log("[RPAExecutor] Running in PARALLEL_VISION mode");
+			// #ifdef APP-ANDROID
+			RPAExecutorImpl.enterParallelVisionMode();
+			// #endif
+		}
+
+		// 后台模式
+		if (execConfig.mode == ExecutionMode.BACKGROUND) {
+			console.log("[RPAExecutor] Running in BACKGROUND mode");
+			// #ifdef APP-ANDROID
+			RPAExecutorImpl.enterBackgroundMode();
+			// #endif
+		}
+
+		const loops = execConfig.loopCount > 0 ? execConfig.loopCount : 1;
+		let allSuccess = true;
+
+		// 构建步骤 ID -> 步骤的索引 Map，用于分支跳转
+		const stepMap = new Map<string, number>();
+		for (let idx = 0; idx < script.length; idx++) {
+			stepMap.set(script[idx].id, idx);
+		}
+
+		for (let loop = 0; loop < loops; loop++) {
+			if (!RPAExecutor.isRunning) break;
+			
+			if (loops > 1) {
+				console.log(`[RPAExecutor] Loop ${loop + 1}/${loops}`);
+			}
+
+			// 分支感知的执行: 从第一步开始，根据 nextStepId 跳转
+			let currentStepIndex = 0;
+			let executedCount = 0;
+			const maxExecutions = script.length * 3; // 防止无限循环
+
+			while (currentStepIndex < script.length && executedCount < maxExecutions) {
+				if (!RPAExecutor.isRunning) {
+					console.log("[RPAExecutor] Execution stopped by user");
+					break;
+				}
+
+				const step = script[currentStepIndex];
+				RPAExecutor.currentStep = currentStepIndex + 1;
+				executedCount++;
+				
+				const stepDesc = step.description != "" ? step.description : ("" + step.actionType + " " + step.widgetText);
+				
+				// 进度回调
+				if (RPAExecutor.onProgress != null) {
+					RPAExecutor.onProgress!(currentStepIndex + 1, script.length, stepDesc);
+				}
+				
+				console.log(`[RPAExecutor] Step ${currentStepIndex + 1}/${script.length}: ${step.actionType} ${step.widgetText}`);
+				
+				// 带重试的步骤执行
+				const result = await RPAExecutor.executeStepWithRetry(step, execConfig);
+
+				if (!result.success) {
+					console.error(`[RPAExecutor] Step ${currentStepIndex + 1} failed after ${execConfig.retryCount + 1} attempts`);
+					allSuccess = false;
+					if (!execConfig.continueOnError) {
+						RPAExecutor.isRunning = false;
+						break;
+					}
+				}
+
+				// 确定下一步
+				let nextIndex = currentStepIndex + 1; // 默认线性
+
+				// 检查 AI 分支决策
+				if (result.nextStepId != "" && result.nextStepId != step.nextStepId) {
+					const branchIdx = stepMap.get(result.nextStepId);
+					if (branchIdx != null) {
+						console.log(`[RPAExecutor] AI branch: jumping to step ${branchIdx + 1}`);
+						nextIndex = branchIdx;
+					}
+				}
+				// 检查步骤本身的 nextStepId (如用户在 Canvas 中设置了非线性连接)
+				else if (step.nextStepId != "" && !result.aiDecided) {
+					const linkedIdx = stepMap.get(step.nextStepId);
+					if (linkedIdx != null) {
+						nextIndex = linkedIdx;
+					}
+				}
+
+				// 步骤间延迟
+				const delay = step.waitAfter > 0 ? step.waitAfter : execConfig.stepDelay;
+				if (delay > 0 && RPAExecutor.isRunning) {
+					await RPAExecutor.sleep(delay);
+				}
+
+				currentStepIndex = nextIndex;
+			}
+		}
+
+		// 退出特殊模式
+		if (execConfig.mode == ExecutionMode.BACKGROUND) {
+			// #ifdef APP-ANDROID
+			RPAExecutorImpl.exitBackgroundMode();
+			// #endif
+		}
+		if (execConfig.mode == ExecutionMode.PARALLEL_VISION) {
+			// #ifdef APP-ANDROID
+			RPAExecutorImpl.exitParallelVisionMode();
+			// #endif
+		}
+
+		RPAExecutor.isRunning = false;
+		RPAExecutor.currentStep = 0;
+		RPAExecutor.currentScript = null;
+		console.log("[RPAExecutor] Execution completed, success=" + allSuccess);
+		return allSuccess;
+	}
+
+	/**
+	 * 带重试的步骤执行
+	 */
+	private static async executeStepWithRetry(step: RPAStep, config: RPAExecutionConfig): Promise<StepExecutionResult> {
+		let result: StepExecutionResult = {
+			success: false,
+			stepId: step.id,
+			nextStepId: "",
+			aiDecided: false,
+			errorMessage: ""
+		};
+
+		for (let retry = 0; retry <= config.retryCount; retry++) {
+			if (retry > 0) {
+				console.log(`[RPAExecutor] Retry ${retry}/${config.retryCount} for step ${step.id}`);
+				await RPAExecutor.sleep(300);
+			}
+			
+			const success = await RPAExecutor.executeStep(step, config);
+			if (success) {
+				result.success = true;
+				break;
+			}
+		}
+
+		// 执行成功后，检查是否有分支需要 AI 决策
+		if (result.success && step.branches.length > 0 && config.enableAIBranching) {
+			result = await RPAExecutor.evaluateBranches(step, result);
+		}
+
+		return result;
+	}
+
+	/**
+	 * AI 分支评估
+	 */
+	private static async evaluateBranches(step: RPAStep, result: StepExecutionResult): Promise<StepExecutionResult> {
+		if (RPAExecutor.onAIBranch != null) {
+			try {
+				const targetStepId = await RPAExecutor.onAIBranch!(step, step.branches);
+				if (targetStepId != "") {
+					result.nextStepId = targetStepId;
+					result.aiDecided = true;
+					console.log(`[RPAExecutor] AI decided branch: ${step.id} -> ${targetStepId}`);
+				}
+			} catch (e) {
+				console.error("[RPAExecutor] AI branch decision failed:", e);
+			}
+		} else {
+			// 无 AI 回调时，使用简单的条件匹配
+			for (let b = 0; b < step.branches.length; b++) {
+				const branch = step.branches[b];
+				if (branch.type == "always" || branch.type == "default") {
+					result.nextStepId = branch.targetStepId;
+					break;
+				}
+				// TODO: 实现 text_match / element_exist 等简单条件
+			}
+		}
+		return result;
+	}
+
+	/**
+	 * 执行单个步骤 — 根据每步的 stepInputMode 选择执行方式
+	 */
+	static async executeStep(step: RPAStep, config: RPAExecutionConfig | null = null): Promise<boolean> {
+		const execConfig = config ?? RPAExecutor.config;
+
+		// 全局操作 (无需平台实现)
+		if (step.actionType == RPAActionType.SLEEP) {
+			await RPAExecutor.sleep(step.duration > 0 ? step.duration : 1000);
+			return true;
+		}
+
+		if (step.actionType == RPAActionType.WAIT_RENDER) {
+			// #ifdef APP-ANDROID
+			return await RPAExecutorImpl.waitForRenderComplete(step.duration > 0 ? step.duration : 3000);
+			// #endif
+			return true;
+		}
+
+		// 确定该步骤的输入方式
+		const inputMode = RPAExecutor.resolveInputMode(step, execConfig);
+
+		// #ifdef APP-ANDROID
+		// OPEN_APP: 启动应用
+		if (step.actionType == RPAActionType.OPEN_APP) {
+			const pkg = step.appPackage != "" ? step.appPackage : step.accessibilityId;
+			if (pkg != "") {
+				return RPAExecutorImpl.launchApp(pkg);
+			}
+			return false;
+		}
+
+		// BACK / HOME: 全局导航
+		if (step.actionType == RPAActionType.BACK) {
+			return RPAExecutorImpl.performGlobalAction("BACK");
+		}
+		if (step.actionType == RPAActionType.HOME) {
+			return RPAExecutorImpl.performGlobalAction("HOME");
+		}
+
+		// ==== 根据输入模式执行 ====
+
+		// 模式 1: 蓝牙 HID
+		if (inputMode == StepInputMode.BLUETOOTH_HID && RPAExecutor.hidExecutor != null) {
+			return await RPAExecutor.executeViaHID(step);
+		}
+
+		// 模式 2: 无障碍 (或 AUTO 默认)
+		if (inputMode == StepInputMode.ACCESSIBILITY || inputMode == StepInputMode.AUTO) {
+			// 2a. 尝试无障碍/控件匹配 (Software Mode)
+			if (step.widgetText != "" || step.accessibilityId != "") {
+				const accResult = await RPAExecutorImpl.performAccessibilityAction(step);
+				if (accResult) {
+					console.log("[RPAExecutor] Executed via Accessibility");
+					return true;
+				}
+			}
+
+			// 2b. AUTO 模式降级到坐标
+			if (inputMode == StepInputMode.AUTO) {
+				return await RPAExecutor.executeViaCoordinate(step);
+			}
+			return false;
+		}
+
+		// 模式 3: 强制坐标点击
+		if (inputMode == StepInputMode.COORDINATE) {
+			return await RPAExecutor.executeViaCoordinate(step);
+		}
+
+		// 默认: 尝试无障碍 → 降级坐标
+		if (step.widgetText != "" || step.accessibilityId != "") {
+			const accResult = await RPAExecutorImpl.performAccessibilityAction(step);
+			if (accResult) return true;
+		}
+		return await RPAExecutor.executeViaCoordinate(step);
+
+		// #endif
+
+		return false;
+	}
+
+	/**
+	 * 确定步骤的实际执行输入方式
+	 */
+	private static resolveInputMode(step: RPAStep, config: RPAExecutionConfig): StepInputMode {
+		// 步骤级别优先
+		if (step.stepInputMode != StepInputMode.AUTO) {
+			return step.stepInputMode;
+		}
+		// 全局配置映射
+		if (config.inputMode == ExecutionInputMode.BLUETOOTH_HID) {
+			return StepInputMode.BLUETOOTH_HID;
+		}
+		return StepInputMode.AUTO;
+	}
+
+	/**
+	 * 通过蓝牙 HID 执行步骤
+	 */
+	private static async executeViaHID(step: RPAStep): Promise<boolean> {
+		const hid = RPAExecutor.hidExecutor;
+		if (hid == null) return false;
+
+		if (step.actionType == RPAActionType.CLICK) {
+			return await hid.tap(step.x, step.y);
+		} else if (step.actionType == RPAActionType.LONG_PRESS) {
+			return await hid.longPress(step.x, step.y, step.duration > 0 ? step.duration : 800);
+		} else if (step.actionType == RPAActionType.SWIPE) {
+			return await hid.swipe(step.x, step.y, step.endX, step.endY, step.duration > 0 ? step.duration : 300);
+		} else if (step.actionType == RPAActionType.INPUT) {
+			return await hid.inputText(step.widgetText);
+		}
+		return false;
+	}
+
+	/**
+	 * 通过坐标点击执行步骤 (手势/GestureDescription)
+	 */
+	private static async executeViaCoordinate(step: RPAStep): Promise<boolean> {
+		// #ifdef APP-ANDROID
+		if (step.actionType == RPAActionType.CLICK) {
+			return await RPAExecutorImpl.performCoordinateClick(step.x, step.y);
+		} else if (step.actionType == RPAActionType.LONG_PRESS) {
+			return await RPAExecutorImpl.performLongPress(step.x, step.y, step.duration > 0 ? step.duration : 800);
+		} else if (step.actionType == RPAActionType.SWIPE) {
+			return await RPAExecutorImpl.performSwipe(step.x, step.y, step.endX, step.endY, step.duration);
+		} else if (step.actionType == RPAActionType.INPUT) {
+			return await RPAExecutorImpl.performInput(step.widgetText);
+		}
+		// #endif
+		return false;
+	}
+
+	static sleep(ms: number): Promise<void> {
+		return new Promise((resolve) => {
+			setTimeout(() => {
+				resolve();
+			}, ms);
+		});
+	}
+}

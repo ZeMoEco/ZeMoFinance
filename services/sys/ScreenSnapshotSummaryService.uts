@@ -1,0 +1,363 @@
+import { DeskPetBillCaptureService, BillTextResult } from '@/services/sys/DeskPetBillCaptureService.uts'
+import { OcrModelService } from '@/services/sys/office/OcrModelService.uts'
+import { DESK_PET_SCREEN_SUMMARY_KEY } from '@/utils/constant.uts'
+
+export type ScreenSnapshotSummaryTop = {
+	label: string
+	score: number
+}
+
+type MiniMindOSummaryJson = {
+	title: string
+	summary: string
+	intent: string
+	kind: string
+	action: string
+	confidence: number
+}
+
+type ZemoAiRuntime = {
+	chatMultiModal(prompt: string, imagePath: string, callback: (text: string, done: boolean) => void): void
+	initModel(modelPath: string): boolean
+	isModelReady(): boolean
+}
+
+export type ScreenSnapshotSummaryResult = {
+	ok: boolean
+	source: string
+	imagePath: string
+	title: string
+	summary: string
+	content: string
+	ocrText: string
+	modelLabel: string
+	modelKind: string
+	modelAction: string
+	modelMethod: string
+	modelReady: boolean
+	confidence: number
+	top3: ScreenSnapshotSummaryTop[]
+	message: string
+}
+
+export class ScreenSnapshotSummaryService {
+	private static readonly MODEL_TIMEOUT_MS = 14000
+	private static zemoAiRuntimePromise: Promise<ZemoAiRuntime> | null = null
+
+	static async summarizeCurrentScreen(skipLiveCapture: boolean = false, consumeStoredText: boolean = false): Promise<ScreenSnapshotSummaryResult> {
+		let imagePath = ''
+		try {
+			const capturedImage = await DeskPetBillCaptureService.captureScreenImagePath()
+			imagePath = capturedImage == null ? '' : capturedImage
+		} catch (e) {
+			console.warn(`[屏幕摘要] 获取截图失败：${ScreenSnapshotSummaryService.errorMessage(e)}`)
+		}
+
+		let textResult: BillTextResult
+		try {
+			textResult = await DeskPetBillCaptureService.captureBillText(skipLiveCapture, consumeStoredText)
+		} catch (e2) {
+			textResult = {
+				ok: false,
+				text: '',
+				source: 'ocr-error',
+				message: ScreenSnapshotSummaryService.errorMessage(e2)
+			} as BillTextResult
+		}
+		const result = await ScreenSnapshotSummaryService.summarizeCaptured(
+			imagePath,
+			textResult.ok ? textResult.text : '',
+			textResult.source,
+			textResult.message
+		)
+		ScreenSnapshotSummaryService.storeLatestSummary(result)
+		return result
+	}
+
+	static async summarizeCaptured(imagePath: string, ocrText: string, source: string, message: string = ''): Promise<ScreenSnapshotSummaryResult> {
+		const normalizedImage = (imagePath ?? '').toString().trim()
+		const normalizedText = (ocrText ?? '').toString()
+		const lines = ScreenSnapshotSummaryService.plainLines(normalizedText)
+		const amount = ScreenSnapshotSummaryService.extractFirstAmount(lines.join('\n'))
+		let ready = false
+		if (normalizedImage != '') {
+			await ScreenSnapshotSummaryService.prepareMiniMindOModel()
+			ready = await ScreenSnapshotSummaryService.isMiniMindReady()
+		}
+		let modelMessage = ''
+		let modelOutput = ''
+		let parsed: MiniMindOSummaryJson | null = null
+
+		if (normalizedImage == '') {
+			modelMessage = '没有可用截图'
+		} else {
+			const prompt = ScreenSnapshotSummaryService.buildPrompt(normalizedText, source)
+			modelOutput = await ScreenSnapshotSummaryService.callMiniMindO(prompt, normalizedImage)
+			ready = await ScreenSnapshotSummaryService.isMiniMindReady() || ready
+			if (modelOutput == '') {
+				modelMessage = '原生 MiniMind-O 未返回内容'
+			} else {
+				parsed = ScreenSnapshotSummaryService.parseModelOutput(modelOutput)
+				if (parsed == null) modelMessage = '原生 MiniMind-O 输出不是有效 JSON'
+			}
+		}
+
+		const label = parsed == null || parsed.intent == '' ? 'screen_summary' : parsed.intent
+		const title = parsed == null || parsed.title == '' ? ScreenSnapshotSummaryService.titleForLabel(label) : parsed.title
+		const kind = parsed == null || parsed.kind == '' ? ScreenSnapshotSummaryService.kindForLabel(label) : parsed.kind
+		const action = parsed == null || parsed.action == '' ? ScreenSnapshotSummaryService.actionForLabel(label) : parsed.action
+		const confidence = parsed == null || isNaN(parsed.confidence) ? 0.0 : parsed.confidence
+		const summary = parsed == null || parsed.summary == ''
+			? ScreenSnapshotSummaryService.buildFallbackSummary(lines, amount, message, modelMessage)
+			: parsed.summary
+		const top3 = confidence > 0.0 ? [{ label, score: confidence } as ScreenSnapshotSummaryTop] : [] as ScreenSnapshotSummaryTop[]
+		const result = {
+			ok: parsed != null || lines.length > 0,
+			source: source == '' ? 'screen-snapshot' : source,
+			imagePath: normalizedImage,
+			title,
+			summary,
+			content: ScreenSnapshotSummaryService.buildContent(lines, normalizedImage, modelOutput),
+			ocrText: normalizedText,
+			modelLabel: label,
+			modelKind: kind,
+			modelAction: action,
+			modelMethod: ready ? 'minimind_o_native_full_modal' : '',
+			modelReady: ready,
+			confidence,
+			top3,
+			message: modelMessage
+		} as ScreenSnapshotSummaryResult
+		ScreenSnapshotSummaryService.storeLatestSummary(result)
+		const modelState = normalizedImage == '' ? '未调用（无截图）' : (ready ? '可用' : '不可用')
+		console.log(`[屏幕摘要] 来源=${result.source}，MiniMind-O=${modelState}，截图=${normalizedImage == '' ? '无' : normalizedImage}，摘要=${result.summary}`)
+		return result
+	}
+
+	static readLatestSummaryText(): string {
+		try {
+			const value = uni.getStorageSync(DESK_PET_SCREEN_SUMMARY_KEY)
+			return value == null ? '' : value.toString()
+		} catch (_e) {}
+		return ''
+	}
+
+	private static storeLatestSummary(result: ScreenSnapshotSummaryResult): void {
+		try {
+			uni.setStorageSync(DESK_PET_SCREEN_SUMMARY_KEY, JSON.stringify({
+				updatedAt: Date.now(),
+				source: result.source,
+				imagePath: result.imagePath,
+				title: result.title,
+				summary: result.summary,
+				modelLabel: result.modelLabel,
+				modelKind: result.modelKind,
+				modelAction: result.modelAction,
+				modelMethod: result.modelMethod,
+				modelReady: result.modelReady,
+				confidence: result.confidence,
+				top3: result.top3
+			}))
+		} catch (_e) {}
+	}
+
+	private static buildPrompt(ocrText: string, source: string): string {
+		return [
+			'任务：根据手机截图和 OCR 文本输出屏幕理解 JSON。',
+			'只输出 JSON，不要 Markdown、代码块或解释。',
+			'{"title":"","summary":"","intent":"bill_record|investment_import|chat_todo|shopping_activity|entertainment_activity|phone_action|screen_summary","kind":"bill|investment|chat|activity|phone_action|general","action":"create_transaction|import_investment|create_todos|record_activity|suggest_phone_action|summarize_screen","confidence":0.0}',
+			'规则：枚举值必须从 schema 中选择；summary 用一句中文说明屏幕内容和可执行动作；confidence 取 0 到 1。',
+			`source=${source}`,
+			'OCR 文本：',
+			ScreenSnapshotSummaryService.limitText(ocrText, 6000)
+		].join('\n')
+	}
+
+	private static callMiniMindO(prompt: string, imagePath: string): Promise<string> {
+		return new Promise((resolve) => {
+			let done = false
+			let timer = -1
+			let output = ''
+			const finish = () => {
+				if (done) return
+				done = true
+				if (timer != -1) {
+					clearTimeout(timer as number)
+					timer = -1
+				}
+				resolve(output.trim())
+			}
+			timer = (setTimeout(() => {
+				console.warn('[屏幕摘要] MiniMind-O 调用超时')
+				finish()
+			}, ScreenSnapshotSummaryService.MODEL_TIMEOUT_MS) as number
+			const callback = (text: string, complete: boolean) => {
+				if (text != null && text != '') output += text
+				if (complete) finish()
+			}
+			void ScreenSnapshotSummaryService.getZemoAiRuntime().then((ai: ZemoAiRuntime): void => {
+				try {
+					ai.chatMultiModal(prompt, imagePath, callback)
+				} catch (e) {
+					console.warn(`[屏幕摘要] MiniMind-O 调用异常：${ScreenSnapshotSummaryService.errorMessage(e)}`)
+					finish()
+				}
+			}).catch((e: Error): void => {
+				console.warn(`[屏幕摘要] zemo-ai 加载失败：${ScreenSnapshotSummaryService.errorMessage(e)}`)
+				finish()
+			})
+		})
+	}
+
+	private static async prepareMiniMindOModel(): Promise<void> {
+		try {
+			const status = await OcrModelService.getStatus()
+			if (status.miniMindOModelPath != '') {
+				console.log(`[屏幕摘要] 准备 MiniMind-O：${status.miniMindOModelMessage}，路径=${status.miniMindOModelPath}`)
+				const ai = await ScreenSnapshotSummaryService.getZemoAiRuntime()
+				ai.initModel(status.miniMindOModelPath)
+			} else {
+				console.warn('[屏幕摘要] MiniMind-O 未配置：请在设置页选择 zemo_screen_minimind_o_prefill_s192.ms')
+			}
+		} catch (e) {
+			console.warn(`[屏幕摘要] MiniMind-O 路径准备失败：${ScreenSnapshotSummaryService.errorMessage(e)}`)
+		}
+	}
+
+	private static async isMiniMindReady(): Promise<boolean> {
+		try {
+			const ai = await ScreenSnapshotSummaryService.getZemoAiRuntime()
+			return ai.isModelReady()
+		} catch (_e) {}
+		return false
+	}
+
+	private static async getZemoAiRuntime(): Promise<ZemoAiRuntime> {
+		if (ScreenSnapshotSummaryService.zemoAiRuntimePromise == null) {
+			ScreenSnapshotSummaryService.zemoAiRuntimePromise = new Promise<ZemoAiRuntime>((resolve, reject) => {
+				void import('@/uni_modules/zemo-ai').then((module: Object): void => {
+					resolve(module as ZemoAiRuntime)
+				}).catch((e: Error): void => {
+					reject(e)
+				})
+			})
+		}
+		return ScreenSnapshotSummaryService.zemoAiRuntimePromise as Promise<ZemoAiRuntime>
+	}
+
+	private static parseModelOutput(output: string): MiniMindOSummaryJson | null {
+		const json = ScreenSnapshotSummaryService.extractJson(output)
+		if (json == '') return null
+		try {
+			const parsed = JSON.parse(json) as MiniMindOSummaryJson
+			return {
+				title: parsed.title == null ? '' : parsed.title.toString().trim(),
+				summary: parsed.summary == null ? '' : parsed.summary.toString().trim(),
+				intent: parsed.intent == null ? '' : parsed.intent.toString().trim(),
+				kind: parsed.kind == null ? '' : parsed.kind.toString().trim(),
+				action: parsed.action == null ? '' : parsed.action.toString().trim(),
+				confidence: parsed.confidence == null ? 0.0 : Number(parsed.confidence)
+			} as MiniMindOSummaryJson
+		} catch (_e) {}
+		return null
+	}
+
+	private static extractJson(output: string): string {
+		const raw = (output ?? '').toString().trim()
+		const start = raw.indexOf('{')
+		const end = raw.lastIndexOf('}')
+		if (start < 0 || end <= start) return ''
+		return raw.substring(start, end + 1)
+	}
+
+	private static buildFallbackSummary(lines: string[], amount: string, message: string, modelMessage: string): string {
+		const parts = [] as string[]
+		if (lines.length > 0) {
+			parts.push(`OCR ${lines.length} 行`)
+			if (amount != '') parts.push(`包含金额 ${amount}`)
+			parts.push(`主要内容：${ScreenSnapshotSummaryService.limitText(lines.slice(0, 4).join(' / '), 120)}`)
+		} else {
+			parts.push('未拿到 OCR 文本')
+		}
+		if (message != '') parts.push(message)
+		if (modelMessage != '') parts.push(modelMessage)
+		return parts.join('，')
+	}
+
+	private static titleForLabel(label: string): string {
+		if (label == 'chat_todo') return '聊天待办'
+		if (label == 'bill_record') return '账单页面'
+		if (label == 'investment_import') return '理财/资产页面'
+		if (label == 'shopping_activity') return '购物浏览'
+		if (label == 'entertainment_activity') return '娱乐活动'
+		if (label == 'phone_action') return '手机操作页面'
+		return '屏幕摘要'
+	}
+
+	private static kindForLabel(label: string): string {
+		if (label == 'chat_todo') return 'chat'
+		if (label == 'bill_record') return 'bill'
+		if (label == 'investment_import') return 'investment'
+		if (label == 'shopping_activity' || label == 'entertainment_activity') return 'activity'
+		if (label == 'phone_action') return 'phone_action'
+		return 'general'
+	}
+
+	private static actionForLabel(label: string): string {
+		if (label == 'chat_todo') return 'create_todos'
+		if (label == 'bill_record') return 'create_transaction'
+		if (label == 'investment_import') return 'import_investment'
+		if (label == 'shopping_activity' || label == 'entertainment_activity') return 'record_activity'
+		if (label == 'phone_action') return 'suggest_phone_action'
+		return 'summarize_screen'
+	}
+
+	private static buildContent(lines: string[], imagePath: string, modelOutput: string): string {
+		const out = [] as string[]
+		if (imagePath != '') out.push(`image=${imagePath}`)
+		if (modelOutput != '') out.push(`model_output=${ScreenSnapshotSummaryService.limitText(modelOutput, 2000)}`)
+		if (lines.length > 0) {
+			out.push('')
+			const limit = Math.min(lines.length, 20)
+			for (let i = 0; i < limit; i++) out.push(lines[i])
+			if (lines.length > limit) out.push(`... 还有 ${lines.length - limit} 行`)
+		}
+		return out.join('\n')
+	}
+
+	private static plainLines(text: string): string[] {
+		const rawLines = (text ?? '').toString().replace(/\r\n/g, '\n').split('\n')
+		const result = [] as string[]
+		const metaPattern = /^\[\[ocr:([0-9.\-]+),([0-9.\-]+),([0-9.\-]+),([0-9.\-]+)\]\](.*)$/
+		for (let i = 0; i < rawLines.length; i++) {
+			let value = rawLines[i].trim()
+			const m = metaPattern.exec(value)
+			if (m != null && m.length >= 6) value = m[5].trim()
+			if (value != '') result.push(value)
+		}
+		return result
+	}
+
+	private static extractFirstAmount(text: string): string {
+		const m = /[+\-]?\s*[¥￥]?\s*[0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*(?:元)?/.exec(text)
+		return m == null || m.length == 0 ? '' : m[0].replace(/\s+/g, '').trim()
+	}
+
+	private static limitText(text: string, maxLen: number): string {
+		const value = (text ?? '').toString().trim()
+		if (value.length <= maxLen) return value
+		return `${value.substring(0, maxLen)}...`
+	}
+
+	private static errorMessage(value: Object | null): string {
+		if (value == null) return 'unknown'
+		try {
+			const err = value as Error
+			if (err.message != null && err.message != '') return err.message
+		} catch (_e0) {}
+		try {
+			return value.toString()
+		} catch (_e1) {}
+		return 'unknown'
+	}
+}

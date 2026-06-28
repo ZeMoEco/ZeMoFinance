@@ -1,0 +1,704 @@
+<template>
+	<view class="invest-page">
+		<view class="category-row">
+			<scroll-view class="category-scroll" scroll-x="true" show-scrollbar="false" direction="horizontal"
+				@touchstart="onTabScrollStart" @touchmove="onTabScrollMove"
+				@touchend="onTabScrollEnd" @touchcancel="onTabScrollEnd">
+				<view class="category-tab" v-for="(tab, idx) in accountTabs" :key="tab + idx.toString()"
+					:class="activeFinanceTab == idx ? 'category-tab-active' : ''"
+					@click="switchFinanceTab(idx)" @longpress="openTabManager">
+					<text class="category-tab-text" :class="activeFinanceTab == idx ? 'category-tab-text-active' : ''">{{ tabDisplayName(tab, idx) }}</text>
+				</view>
+			</scroll-view>
+			<view class="category-add" @click="addCustomTab">
+				<text class="category-add-text">＋</text>
+			</view>
+			<view class="category-menu" @click="openTabManager">
+				<text class="category-menu-text">≡</text>
+			</view>
+		</view>
+
+		<scroll-view class="finance-invest-scroll" scroll-y="true">
+			<view class="summary-band">
+				<view class="summary-left">
+					<view class="summary-label-row">
+						<text class="summary-label">{{ activeFinanceTab == 0 ? activeAccountName : accountDisplayName(activeAccountName) }}资产</text>
+						<text class="summary-eye" @click="toggleHide">{{ hideAmount ? '显示' : '隐藏' }}</text>
+						<view class="summary-refresh" @click="$emit('refresh-market')"><text class="summary-refresh-text">↻</text></view>
+					</view>
+					<text class="summary-amount">{{ hideAmount ? '****' : formatMoney(investTotal) }}</text>
+					<text class="summary-meta">{{ summaryMetaText }}</text>
+				</view>
+				<view class="summary-right">
+					<view class="summary-label-row summary-right-label">
+						<text class="summary-label">{{ activeFinanceTab == 0 ? '账户数' : '现金余额' }}</text>
+					</view>
+					<text class="summary-profit" :class="activeFinanceTab == 0 || dailyProfit >= 0 ? 'profit-red' : 'profit-green'">
+						{{ activeFinanceTab == 0 ? accountSummaries.length.toString() : (hideAmount ? '****' : formatMoney(activeCashBalance)) }}
+					</text>
+				</view>
+			</view>
+
+			<view class="invest-account-list" v-if="activeFinanceTab == 0">
+				<view class="invest-account-group" v-for="group in accountHoldingGroups" :key="group.name">
+					<view class="invest-account-card" @click="toggleAccountGroup(group.name)">
+						<view class="invest-account-main">
+							<text class="invest-account-name">{{ compactAccountName(accountDisplayName(group.name)) }}</text>
+							<text class="invest-account-meta">{{ group.holdingCount }} 个持仓 · 现金 {{ hideAmount ? '****' : formatAmount(group.cashBalance) }}</text>
+						</view>
+						<view class="invest-account-side">
+							<text class="invest-account-total">{{ hideAmount ? '****' : formatAmount(group.totalBalance) }}</text>
+							<view class="invest-account-sub-row">
+								<text class="invest-account-sub invest-account-sub-inline">持仓 {{ hideAmount ? '****' : formatAmount(group.holdingBalance) }}</text>
+								<view class="invest-account-total-btn" v-if="accountModeFor(group.name) != 'otc'" @click.stop="$emit('reconcile-total', group.name)"><text class="invest-account-total-btn-text">总额</text></view>
+								<text class="invest-account-arrow">{{ isAccountGroupCollapsed(group.name) ? '⌄' : '⌃' }}</text>
+							</view>
+						</view>
+					</view>
+
+					<view class="account-holding-list" v-if="group.holdings.length > 0 && !isAccountGroupCollapsed(group.name)">
+						<view class="account-holding-row" v-for="inv in group.holdings" :key="inv.id" @click="$emit('fund', inv)">
+							<view class="fund-cell">
+								<text class="fund-name">{{ investLabel(inv) }}</text>
+								<view class="fund-sub-row">
+									<text class="fund-tag" v-if="isRecentlyUpdated(inv)">已更新</text>
+									<text class="fund-sub">{{ holdingSubtitle(inv) }}</text>
+									<view class="holding-edit-btn" @click.stop="$emit('edit-fund', inv)"><text class="holding-edit-text">编辑</text></view>
+								</view>
+								<text class="fund-note-preview" v-if="noteFor(inv) != ''">{{ noteFor(inv) }}</text>
+							</view>
+							<view class="account-holding-right">
+								<text class="account-holding-amount">{{ hideAmount ? '****' : formatAmount(inv.balance) }}</text>
+								<text class="account-holding-rate" :class="inv.profit_rate >= 0 ? 'profit-red' : 'profit-green'">{{ rateText(inv) }}</text>
+							</view>
+						</view>
+					</view>
+					<view class="account-holding-empty" v-if="group.holdings.length == 0 && !isAccountGroupCollapsed(group.name)">
+						<text class="account-holding-empty-text">暂无持仓</text>
+					</view>
+				</view>
+				<view class="empty-tip" v-if="accountSummaries.length == 0">
+					<text class="empty-text">暂无理财账户</text>
+				</view>
+			</view>
+
+			<view class="table-head" v-if="activeFinanceTab != 0">
+				<view class="table-tool" @click="openTabManager"><text class="table-tool-text">⚙</text></view>
+				<view class="table-tool" @click="$emit('refresh-market')"><text class="table-tool-text">↻</text></view>
+				<view class="table-tool" v-if="accountModeFor(activeTabLabel()) != 'otc'" @click="$emit('reconcile-total', activeTabLabel())"><text class="table-tool-text">¥</text></view>
+				<view class="table-tool" @click="toggleNoteMode"><text class="table-tool-text">{{ noteMode ? '记' : '○' }}</text></view>
+				<view class="table-name-head"><text class="table-head-text">持仓任务</text><text class="sort-mark">▲▼</text></view>
+				<view class="table-days-head"><text class="table-head-text">持有天数</text><text class="date-mark">{{ todayLabel }}</text></view>
+				<view class="table-rate-head"><text class="table-head-text">本涨幅</text><text class="date-mark">{{ todayLabel }}</text></view>
+			</view>
+
+			<view v-if="activeFinanceTab != 0">
+				<view class="holding-row" v-for="inv in visibleInvestAccounts" :key="inv.id" @click="$emit('fund', inv)">
+					<view class="fund-cell">
+						<text class="fund-name">{{ investLabel(inv) }}</text>
+						<view class="fund-sub-row">
+							<text class="fund-tag" v-if="isRecentlyUpdated(inv)">已更新</text>
+							<text class="fund-sub">{{ holdingSubtitle(inv) }}</text>
+							<view class="holding-edit-btn" @click.stop="$emit('edit-fund', inv)"><text class="holding-edit-text">编辑</text></view>
+						</view>
+						<view class="holding-note" v-if="noteMode" @click.stop>
+							<input class="holding-note-input" :value="noteFor(inv)" placeholder="记录对这个代码/基金的看法" @input="onNoteInput(inv, $event)" @click.stop />
+						</view>
+						<text class="fund-note-preview" v-if="!noteMode && noteFor(inv) != ''">{{ noteFor(inv) }}</text>
+					</view>
+					<text class="cost-cell">{{ hideAmount ? '****' : formatAmount(inv.balance) }}</text>
+					<text class="days-cell">{{ holdingDays(inv) }}</text>
+					<text class="rate-cell" :class="inv.profit_rate >= 0 ? 'profit-red' : 'profit-green'">
+						{{ rateText(inv) }}
+					</text>
+				</view>
+			</view>
+
+			<view class="empty-tip" v-if="activeFinanceTab != 0 && visibleInvestAccounts.length == 0">
+				<text class="empty-text">当前账户暂无基金/股票持仓</text>
+			</view>
+			<view class="list-bottom-spacer"></view>
+		</scroll-view>
+
+	</view>
+</template>
+
+<script lang="uts">
+	import { AccountNode } from '@/services/biz/FinanceBiz.uts';
+
+	type InvestAccountSummary = {
+		name: string;
+		totalBalance: number;
+		cashBalance: number;
+		holdingBalance: number;
+		holdingCount: number;
+	};
+
+	type InvestAccountHoldingGroup = {
+		name: string;
+		totalBalance: number;
+		cashBalance: number;
+		holdingBalance: number;
+		holdingCount: number;
+		holdings: AccountNode[];
+	};
+
+	export default {
+		emits: ['fund', 'edit-fund', 'gesture-lock', 'toggle-hide', 'refresh-market', 'refresh-data', 'reconcile-total'],
+		props: {
+			accounts: { type: Array as PropType<AccountNode[]>, default: () => [] as AccountNode[] },
+			hideAmount: { type: Boolean, default: false }
+		},
+		data() {
+			return {
+				customAccountTabs: [] as string[],
+				activeFinanceTab: 0,
+				noteMode: false,
+				notes: new UTSJSONObject(),
+				tabTouchStartX: 0.0,
+				tabTouchStartY: 0.0,
+				tabHorizontalMoving: false,
+				collapsedAccountGroups: [] as string[]
+			}
+		},
+		created() {
+			this.loadCustomAccounts();
+			this.loadNotes();
+		},
+		computed: {
+			investAccounts() : AccountNode[] {
+				return this.accounts.filter((a : AccountNode) : boolean => a.category == 'investment');
+			},
+			holdingInvestAccounts() : AccountNode[] {
+				return this.investAccounts.filter((a : AccountNode) : boolean => !this.isInvestmentCash(a));
+			},
+			accountTabs() : string[] {
+				const tabs = ['全部账户'] as string[];
+				const list = this.investAccounts;
+				for (let i = 0; i < list.length; i++) {
+					const name = this.accountNameForHolding(list[i]);
+					if (tabs.indexOf(name) < 0) tabs.push(name);
+				}
+				for (let j = 0; j < this.customAccountTabs.length; j++) {
+					const custom = this.customAccountTabs[j];
+					if (custom != '' && tabs.indexOf(custom) < 0) tabs.push(custom);
+				}
+				return tabs;
+			},
+			activeAccountName() : string {
+				return this.activeTabLabel();
+			},
+			visibleAccountAssets() : AccountNode[] {
+				const label = this.activeTabLabel();
+				if (this.activeFinanceTab == 0) return this.investAccounts;
+				return this.investAccounts.filter((a : AccountNode) : boolean => this.accountNameForHolding(a) == label);
+			},
+			visibleInvestAccounts() : AccountNode[] {
+				return this.visibleAccountAssets.filter((a : AccountNode) : boolean => !this.isInvestmentCash(a));
+			},
+			investTotal() : number {
+				let sum = 0.0;
+				const list = this.visibleAccountAssets;
+				for (let i = 0; i < list.length; i++) sum += list[i].balance;
+				return sum;
+			},
+			activeCashBalance() : number {
+				let sum = 0.0;
+				const list = this.visibleAccountAssets;
+				for (let i = 0; i < list.length; i++) {
+					if (this.isInvestmentCash(list[i])) sum += list[i].balance;
+				}
+				return sum;
+			},
+			activeHoldingBalance() : number {
+				let sum = 0.0;
+				const list = this.visibleInvestAccounts;
+				for (let i = 0; i < list.length; i++) sum += list[i].balance;
+				return sum;
+			},
+			accountSummaries() : InvestAccountSummary[] {
+				const list = [] as InvestAccountSummary[];
+				const accounts = this.investAccounts;
+				for (let i = 0; i < accounts.length; i++) {
+					const acc = accounts[i];
+					const name = this.accountNameForHolding(acc);
+					let targetIndex = -1;
+					for (let j = 0; j < list.length; j++) {
+						if (list[j].name == name) {
+							targetIndex = j;
+							break;
+						}
+					}
+					if (targetIndex < 0) {
+						list.push({
+							name: name,
+							totalBalance: 0.0,
+							cashBalance: 0.0,
+							holdingBalance: 0.0,
+							holdingCount: 0
+						} as InvestAccountSummary);
+						targetIndex = list.length - 1;
+					}
+					list[targetIndex].totalBalance += acc.balance;
+					if (this.isInvestmentCash(acc)) {
+						list[targetIndex].cashBalance += acc.balance;
+					} else {
+						list[targetIndex].holdingBalance += acc.balance;
+						list[targetIndex].holdingCount += 1;
+					}
+				}
+				for (let k = 0; k < this.customAccountTabs.length; k++) {
+					const name = this.customAccountTabs[k];
+					if (name == '') continue;
+					let exists = false;
+					for (let m = 0; m < list.length; m++) {
+						if (list[m].name == name) {
+							exists = true;
+							break;
+						}
+					}
+					if (!exists) {
+						list.push({
+							name: name,
+							totalBalance: 0.0,
+							cashBalance: 0.0,
+							holdingBalance: 0.0,
+							holdingCount: 0
+						} as InvestAccountSummary);
+					}
+				}
+				return list;
+			},
+			accountHoldingGroups() : InvestAccountHoldingGroup[] {
+				const groups = [] as InvestAccountHoldingGroup[];
+				const summaries = this.accountSummaries;
+				for (let i = 0; i < summaries.length; i++) {
+					const s = summaries[i];
+					const holdings = [] as AccountNode[];
+					const list = this.holdingInvestAccounts;
+					for (let j = 0; j < list.length; j++) {
+						if (this.accountNameForHolding(list[j]) == s.name) holdings.push(list[j]);
+					}
+					groups.push({
+						name: s.name,
+						totalBalance: s.totalBalance,
+						cashBalance: s.cashBalance,
+						holdingBalance: s.holdingBalance,
+						holdingCount: s.holdingCount,
+						holdings: holdings
+					} as InvestAccountHoldingGroup);
+				}
+				return groups;
+			},
+			summaryMetaText() : string {
+				if (this.activeFinanceTab == 0) {
+					return `${this.holdingInvestAccounts.length} 个持仓 · ${this.accountSummaries.length} 个账户`;
+				}
+				return `持仓 ${this.hideAmount ? '****' : this.formatMoney(this.activeHoldingBalance)} · ${this.visibleInvestAccounts.length} 个`;
+			},
+			dailyProfit() : number {
+				let sum = 0.0;
+				const list = this.visibleInvestAccounts;
+				for (let i = 0; i < list.length; i++) {
+					const directProfit = list[i].profit_amount;
+					if (Math.abs(directProfit) >= 0.005) {
+						sum += directProfit;
+						continue;
+					}
+					const rate = list[i].profit_rate;
+					if (rate <= -100) continue;
+					const cost = list[i].balance / (1 + rate / 100);
+					sum += list[i].balance - cost;
+				}
+				return sum;
+			},
+			todayLabel() : string {
+				const now = new Date();
+				const m = (now.getMonth() + 1).toString().padStart(2, '0');
+				const d = now.getDate().toString().padStart(2, '0');
+				return `${m}-${d}`;
+			}
+		},
+		methods: {
+			loadCustomAccounts() {
+				let raw = uni.getStorageSync('finance_invest_accounts');
+				if (raw == null || raw.toString() == '') raw = uni.getStorageSync('finance_invest_tabs');
+				if (raw == null || raw.toString() == '') return;
+				try {
+					const parsed = JSON.parse(raw.toString()) as string[];
+					const next = [] as string[];
+					for (let i = 0; i < parsed.length; i++) {
+						const name = (parsed[i] ?? '').toString().trim();
+						if (name == '全部' || name == '全部账户' || name == '默认') continue;
+						if (name != '' && next.indexOf(name) < 0) next.push(name);
+					}
+					this.customAccountTabs = next;
+				} catch (_e) {}
+			},
+			saveCustomAccounts() {
+				uni.setStorageSync('finance_invest_accounts', JSON.stringify(this.customAccountTabs));
+			},
+			loadNotes() {
+				const raw = uni.getStorageSync('finance_holding_notes');
+				if (raw == null || raw.toString() == '') return;
+				try {
+					this.notes = JSON.parse(raw.toString()) as UTSJSONObject;
+				} catch (_e) {
+					this.notes = new UTSJSONObject();
+				}
+			},
+			saveNotes() {
+				uni.setStorageSync('finance_holding_notes', JSON.stringify(this.notes));
+			},
+			activeTabLabel() : string {
+				const tabs = this.accountTabs;
+				if (this.activeFinanceTab < 0 || this.activeFinanceTab >= tabs.length) return '全部账户';
+				return tabs[this.activeFinanceTab];
+			},
+			tabDisplayName(name : string, idx : number) : string {
+				if (idx == 0) return name;
+				return this.compactAccountName(this.accountDisplayName(name));
+			},
+			compactAccountName(name : string) : string {
+				const text = name.trim();
+				if (text.length <= 9) return text;
+				return `${text.substring(0, 3)}...${text.substring(text.length - 3)}`;
+			},
+			isCoreTabIndex(idx : number) : boolean {
+				return idx == 0;
+			},
+			switchFinanceTab(idx : number) {
+				if (idx < 0 || idx >= this.accountTabs.length) return;
+				this.activeFinanceTab = idx;
+			},
+			switchFinanceTabByName(name : string) {
+				const idx = this.accountTabs.indexOf(name);
+				if (idx >= 0) this.activeFinanceTab = idx;
+			},
+			isAccountGroupCollapsed(name : string) : boolean {
+				return this.collapsedAccountGroups.indexOf(name) >= 0;
+			},
+			toggleAccountGroup(name : string) {
+				const idx = this.collapsedAccountGroups.indexOf(name);
+				if (idx >= 0) {
+					this.collapsedAccountGroups.splice(idx, 1);
+					return;
+				}
+				this.collapsedAccountGroups.push(name);
+			},
+			selectInvestAccount(name : string) {
+				const target = name.trim() == '' ? '默认账户' : name.trim();
+				const idx = this.accountTabs.indexOf(target);
+				if (idx >= 0) {
+					this.activeFinanceTab = idx;
+					return;
+				}
+				this.activeFinanceTab = 0;
+			},
+			toggleHide() {
+				this.$emit('toggle-hide');
+			},
+			toggleNoteMode() {
+				this.noteMode = !this.noteMode;
+			},
+			addCustomTab() {
+				this.$emit('reconcile-total', '');
+			},
+			openTabManager() {
+				uni.showActionSheet({
+					itemList: [this.noteMode ? '关闭笔记模式' : '开启笔记模式', '新增理财账户', '重命名当前账户', '删除当前账户', '清空自建账户'],
+					success: (res) => {
+						if (res.tapIndex == 0) this.toggleNoteMode();
+						if (res.tapIndex == 1) this.addCustomTab();
+						if (res.tapIndex == 2) this.renameActiveTab();
+						if (res.tapIndex == 3) this.deleteActiveTab();
+						if (res.tapIndex == 4) this.resetTabs();
+					}
+				});
+			},
+			renameActiveTab() {
+				const oldName = this.activeTabLabel();
+				if (this.isCoreTabIndex(this.activeFinanceTab)) {
+					uni.showToast({ title: '汇总账户不可重命名', icon: 'none' });
+					return;
+				}
+				uni.showModal({
+					title: '重命名理财账户',
+					editable: true,
+					placeholderText: oldName,
+					success: (res) => {
+						if (!res.confirm) return;
+						const name = (res.content ?? '').toString().trim();
+						if (name == '') return;
+						if (this.accountTabs.indexOf(name) >= 0) {
+							uni.showToast({ title: '账户已存在', icon: 'none' });
+							return;
+						}
+						const customIndex = this.customAccountTabs.indexOf(oldName);
+						if (customIndex < 0) {
+							uni.showToast({ title: '已有持仓账户请在持仓里改所属账户', icon: 'none' });
+							return;
+						}
+						this.customAccountTabs[customIndex] = name;
+						this.saveCustomAccounts();
+						this.activeFinanceTab = this.accountTabs.indexOf(name);
+					}
+				});
+			},
+			deleteActiveTab() {
+				if (this.isCoreTabIndex(this.activeFinanceTab)) {
+					uni.showToast({ title: '核心账户不可删除', icon: 'none' });
+					return;
+				}
+				const name = this.activeTabLabel();
+				const customIndex = this.customAccountTabs.indexOf(name);
+				const holdingCount = this.holdingCountForAccount(name);
+				if (holdingCount > 0) {
+					uni.showToast({ title: '已有持仓账户不可直接删除', icon: 'none' });
+					return;
+				}
+				const cashAccounts = this.cashAccountsForAccount(name);
+				uni.showModal({
+					title: '确认删除账户',
+					content: cashAccounts.length > 0 ? `确认删除理财账户「${name}」？将同时删除该账户现金。` : `确认删除理财账户「${name}」？`,
+					success: (res) => {
+						if (!res.confirm) return;
+						this.confirmDeleteAccount(customIndex, cashAccounts);
+					}
+				});
+			},
+			async confirmDeleteAccount(customIndex : number, cashAccounts : AccountNode[]) {
+				let ok = true;
+				for (let i = 0; i < cashAccounts.length; i++) {
+					const deleted = await FinanceBiz.deleteAccountNode(cashAccounts[i].id);
+					if (!deleted) ok = false;
+				}
+				if (customIndex >= 0) {
+					this.customAccountTabs.splice(customIndex, 1);
+					this.saveCustomAccounts();
+				}
+				this.activeFinanceTab = 0;
+				this.$emit('refresh-data');
+				uni.showToast({ title: ok ? '账户已删除' : '部分删除失败', icon: ok ? 'success' : 'none' });
+			},
+			resetTabs() {
+				this.customAccountTabs = [] as string[];
+				this.activeFinanceTab = 0;
+				this.saveCustomAccounts();
+			},
+			accountNameForHolding(acc : AccountNode) : string {
+				const provider = (acc.provider ?? '').toString().trim();
+				if (provider != '') return provider;
+				return '默认账户';
+			},
+			accountTailFor(name : string) : string {
+				const target = name.trim() == '' ? '默认账户' : name.trim();
+				const raw = uni.getStorageSync('finance_invest_account_tails');
+				if (raw != null && raw.toString() != '') {
+					try {
+						const obj = JSON.parse(raw.toString()) as UTSJSONObject;
+						const saved = obj.get(target);
+						if (saved != null && saved.toString().trim() != '') return saved.toString().trim();
+					} catch (_e) {}
+				}
+				const accounts = this.investAccounts;
+				for (let i = 0; i < accounts.length; i++) {
+					const acc = accounts[i];
+					if (!this.isInvestmentCash(acc)) continue;
+					if (this.accountNameForHolding(acc) == target && acc.card_no.trim() != '') return acc.card_no.trim();
+				}
+				for (let j = 0; j < accounts.length; j++) {
+					const acc = accounts[j];
+					if (this.accountNameForHolding(acc) == target && acc.card_no.trim() != '') return acc.card_no.trim();
+				}
+				return '';
+			},
+			accountModeFor(name : string) : string {
+				const target = name.trim() == '' ? '默认账户' : name.trim();
+				const raw = uni.getStorageSync('finance_invest_account_modes');
+				if (raw != null && raw.toString() != '') {
+					try {
+						const obj = JSON.parse(raw.toString()) as UTSJSONObject;
+						const saved = obj.get(target);
+						if (saved != null && saved.toString() == 'otc') return 'otc';
+					} catch (_e) {}
+				}
+				return 'security';
+			},
+			accountDisplayName(name : string) : string {
+				const target = name.trim() == '' ? '默认账户' : name.trim();
+				const tail = this.accountTailFor(target);
+				return tail == '' ? target : `${target}(${tail})`;
+			},
+			isInvestmentCash(acc : AccountNode) : boolean {
+				return acc.sub_type == '账户现金';
+			},
+			holdingCountForAccount(name : string) : number {
+				let count = 0;
+				const list = this.investAccounts;
+				for (let i = 0; i < list.length; i++) {
+					const acc = list[i];
+					if (this.isInvestmentCash(acc)) continue;
+					if (this.accountNameForHolding(acc) == name) count++;
+				}
+				return count;
+			},
+			cashAccountsForAccount(name : string) : AccountNode[] {
+				const list = [] as AccountNode[];
+				const accounts = this.investAccounts;
+				for (let i = 0; i < accounts.length; i++) {
+					const acc = accounts[i];
+					if (!this.isInvestmentCash(acc)) continue;
+					if (this.accountNameForHolding(acc) == name) list.push(acc);
+				}
+				return list;
+			},
+			holdingSubtitle(inv : AccountNode) : string {
+				const parts = [] as string[];
+				if (inv.code != '') parts.push(inv.code);
+				if (inv.sub_type != '') parts.push(inv.sub_type);
+				if (inv.units > 0) parts.push(`${inv.units.toFixed(2)}份`);
+				parts.push(`￥ ${this.hideAmount ? '****' : this.formatAmount(inv.balance)}`);
+				if (inv.quote_time != '') parts.push(inv.quote_time);
+				const date = this.formatShortDate(inv.created_at);
+				if (date != '') parts.push(date);
+				return parts.join(' · ');
+			},
+			noteFor(inv : AccountNode) : string {
+				const v = this.notes.get(inv.id);
+				return v == null ? '' : v.toString();
+			},
+			onNoteInput(inv : AccountNode, e : InputEvent) {
+				this.notes.set(inv.id, e.detail.value);
+				this.saveNotes();
+			},
+			onTabScrollStart(e : UniTouchEvent) {
+				this.tabTouchStartX = e.touches[0].clientX;
+				this.tabTouchStartY = e.touches[0].clientY;
+				this.tabHorizontalMoving = true;
+				this.$emit('gesture-lock', true);
+			},
+			onTabScrollMove(e : UniTouchEvent) {
+				const dx = e.touches[0].clientX - this.tabTouchStartX;
+				const dy = e.touches[0].clientY - this.tabTouchStartY;
+				if (Math.abs(dx) <= Math.abs(dy)) return;
+				e.stopPropagation();
+			},
+			onTabScrollEnd(_e : UniTouchEvent) {
+				this.tabHorizontalMoving = false;
+				this.$emit('gesture-lock', false);
+			},
+			formatMoney(val : number) : string {
+				return val.toFixed(2);
+			},
+			formatSignedMoney(val : number) : string {
+				const sign = val >= 0 ? '' : '-';
+				return `${sign}${Math.abs(val).toFixed(2)}`;
+			},
+			formatAmount(val : number) : string {
+				if (val >= 10000) return `${(val / 10000).toFixed(2)}万`;
+				return val.toFixed(2);
+			},
+			holdingDays(inv : AccountNode) : string {
+				if (inv.created_at <= 0) return '-';
+				const days = Math.floor((Date.now() - inv.created_at) / (24 * 60 * 60 * 1000)) + 1;
+				return days <= 0 ? '1' : days.toString();
+			},
+			formatShortDate(ts : number) : string {
+				if (ts <= 0) return '';
+				const date = new Date(ts);
+				const m = (date.getMonth() + 1).toString().padStart(2, '0');
+				const d = date.getDate().toString().padStart(2, '0');
+				return `${m}-${d}`;
+			},
+			isRecentlyUpdated(inv : AccountNode) : boolean {
+				return Date.now() - inv.created_at < 7 * 24 * 60 * 60 * 1000;
+			},
+			rateText(inv : AccountNode) : string {
+				if (inv.profit_rate == 0) return '-';
+				const sign = inv.profit_rate > 0 ? '+' : '';
+				return `${sign}${inv.profit_rate.toFixed(2)}%`;
+			},
+			investLabel(inv : AccountNode) : string {
+				if (inv.name != '') return inv.name;
+				if (inv.sub_type != '') return inv.sub_type;
+				return '未命名持仓';
+			}
+		}
+	}
+</script>
+
+<style>
+	.invest-page { flex: 1; width: 100%; height: 100%; background-color: rgba(242, 246, 248, 0.18); }
+	.category-row { height: 42px; flex-direction: row; align-items: center; padding-left: 14px; background-color: rgba(255,255,255,0.40); border-bottom-width: 1px; border-bottom-color: rgba(255,255,255,0.58); }
+	.category-scroll { flex: 1; height: 44px; flex-direction: row; white-space: nowrap; }
+	.category-tab { height: 42px; flex-shrink: 0; justify-content: center; align-items: center; margin-right: 20px; border-bottom-width: 2px; border-bottom-color: transparent; }
+	.category-tab-active { border-bottom-color: #2f6fe4; }
+	.category-tab-text { font-size: 15px; color: #758097; }
+	.category-tab-text-active { color: #1b2846; font-weight: bold; }
+	.category-add, .category-menu { width: 36px; height: 42px; justify-content: center; align-items: center; }
+	.category-add-text { font-size: 20px; color: #7d8499; }
+	.category-menu-text { font-size: 22px; color: #7d8499; }
+	.finance-invest-scroll { flex: 1; width: 100%; height: 0; padding: 10px 12px 0 12px; box-sizing: border-box; background-color: rgba(255,255,255,0.18); }
+	.summary-band { min-height: 94px; padding: 16px 16px 10px 16px; margin-bottom: 10px; border-radius: 16px; flex-direction: row; justify-content: space-between; background-color: rgba(255,255,255,0.60); border-width: 1px; border-color: rgba(255,255,255,0.72); box-shadow: 0 12px 28px rgba(44,62,92,0.10); }
+	.summary-left, .summary-right { flex: 1; }
+	.summary-right { align-items: flex-end; }
+	.summary-label-row { flex-direction: row; align-items: center; margin-bottom: 8px; }
+	.summary-right-label { justify-content: flex-end; }
+	.summary-label { font-size: 13px; color: #748097; }
+	.summary-eye { margin-left: 8px; font-size: 12px; color: #3b73d9; }
+	.summary-refresh { width: 28px; height: 24px; margin-left: 6px; justify-content: center; align-items: center; }
+	.summary-refresh-text { font-size: 17px; color: #3b73d9; font-weight: bold; }
+	.summary-amount { font-size: 24px; color: #243152; font-weight: bold; }
+	.summary-meta { margin-top: 5px; font-size: 11px; color: #7b849a; lines: 1; text-overflow: ellipsis; }
+	.summary-profit { font-size: 22px; font-weight: bold; }
+	.invest-account-list { flex-direction: column; }
+	.invest-account-group { margin-bottom: 12px; border-radius: 13px; overflow: hidden; background-color: rgba(255,255,255,0.48); border-width: 1px; border-color: rgba(255,255,255,0.68); }
+	.invest-account-card { min-height: 74px; padding: 14px 14px; flex-direction: row; align-items: center; justify-content: space-between; background-color: rgba(255,255,255,0.64); border-bottom-width: 1px; border-bottom-color: rgba(226,232,244,0.72); }
+	.invest-account-main { flex: 1; min-width: 0; padding-right: 10px; }
+	.invest-account-name { font-size: 16px; color: #1b2846; font-weight: bold; lines: 1; text-overflow: ellipsis; }
+	.invest-account-meta { margin-top: 6px; font-size: 12px; color: #7b849a; lines: 1; text-overflow: ellipsis; }
+	.invest-account-side { align-items: flex-end; }
+	.invest-account-total { font-size: 17px; color: #243152; font-weight: bold; }
+	.invest-account-sub { margin-top: 5px; font-size: 11px; color: #8e96ab; }
+	.invest-account-sub-row { margin-top: 5px; flex-direction: row; align-items: center; justify-content: flex-end; }
+	.invest-account-sub-inline { margin-top: 0; }
+	.invest-account-total-btn { height: 20px; padding: 0 7px; margin-left: 7px; border-radius: 10px; background-color: rgba(59,115,217,0.10); justify-content: center; align-items: center; }
+	.invest-account-total-btn-text { font-size: 11px; color: #3b73d9; font-weight: bold; }
+	.invest-account-arrow { margin-left: 6px; font-size: 13px; color: #8e96ab; }
+	.account-holding-list { flex-direction: column; }
+	.account-holding-row { min-height: 62px; padding: 10px 12px 9px 14px; flex-direction: row; align-items: flex-start; border-bottom-width: 1px; border-bottom-color: rgba(255,255,255,0.58); background-color: rgba(255,255,255,0.38); }
+	.account-holding-right { width: 92px; align-items: flex-end; padding-top: 2px; }
+	.account-holding-amount { font-size: 15px; font-weight: bold; color: #46516f; }
+	.account-holding-rate { margin-top: 5px; font-size: 12px; font-weight: bold; }
+	.account-holding-empty { padding: 15px 14px; background-color: rgba(255,255,255,0.34); }
+	.account-holding-empty-text { font-size: 12px; color: #9aa3b6; }
+	.table-head { height: 36px; flex-direction: row; align-items: center; padding: 0 10px; background-color: rgba(255,255,255,0.44); border-radius: 12px 12px 0 0; border-width: 1px; border-color: rgba(255,255,255,0.58); }
+	.table-tool { width: 28px; height: 36px; justify-content: center; align-items: center; }
+	.table-tool-text { font-size: 15px; color: #9aa2b5; }
+	.table-name-head { flex: 1; flex-direction: row; align-items: center; justify-content: flex-end; }
+	.table-days-head { width: 70px; align-items: flex-end; }
+	.table-rate-head { width: 72px; align-items: flex-end; }
+	.table-head-text { font-size: 12px; color: #8e96ab; }
+	.sort-mark { font-size: 8px; color: #b1b7c7; margin-left: 3px; }
+	.date-mark { font-size: 10px; color: #8e96ab; margin-top: 1px; }
+	.holding-row { min-height: 64px; padding: 10px 10px 8px 14px; flex-direction: row; align-items: flex-start; border-bottom-width: 1px; border-bottom-color: rgba(255,255,255,0.54); background-color: rgba(255,255,255,0.58); }
+	.fund-cell { flex: 1; min-width: 0; padding-right: 8px; }
+	.fund-name { font-size: 15px; font-weight: bold; color: #1b2846; lines: 1; text-overflow: ellipsis; }
+	.fund-sub-row { margin-top: 5px; flex-direction: row; align-items: center; }
+	.fund-tag { height: 14px; line-height: 14px; border-radius: 3px; border-width: 1px; border-color: #98b8e8; color: #437ac9; font-size: 9px; padding: 0 3px; margin-right: 4px; }
+	.fund-sub { flex: 1; min-width: 0; font-size: 11px; color: #6d7796; lines: 1; text-overflow: ellipsis; }
+	.holding-edit-btn { flex-shrink: 0; height: 22px; padding: 0 8px; margin-left: 8px; border-radius: 11px; background-color: rgba(13,110,110,0.10); justify-content: center; align-items: center; }
+	.holding-edit-text { font-size: 11px; color: #0d6e6e; font-weight: bold; }
+	.fund-note-preview { margin-top: 6px; font-size: 12px; color: #536079; lines: 1; text-overflow: ellipsis; }
+	.cost-cell { width: 70px; text-align: right; font-size: 16px; font-weight: bold; color: #46516f; padding-top: 2px; }
+	.days-cell { width: 52px; text-align: right; font-size: 16px; font-weight: bold; color: #46516f; padding-top: 2px; }
+	.rate-cell { width: 72px; text-align: right; font-size: 15px; font-weight: bold; padding-top: 2px; }
+	.profit-red { color: #d65962; }
+	.profit-green { color: #14a86b; }
+	.holding-note { margin-top: 8px; }
+	.holding-note-input { height: 30px; border-radius: 8px; background-color: rgba(255,255,255,0.62); padding: 0 9px; font-size: 12px; color: #1f2d3d; border-width: 1px; border-color: rgba(255,255,255,0.72); }
+	.empty-tip { align-items: center; padding: 32px 16px; background-color: rgba(255,255,255,0.48); border-radius: 0 0 12px 12px; }
+	.empty-text { color: #9aa3b6; font-size: 13px; }
+	.list-bottom-spacer { height: 44px; }
+</style>

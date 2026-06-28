@@ -1,0 +1,492 @@
+import { OnDeviceAIService, AIAgentResult, AICommand } from './OnDeviceAIService.uts';
+import { PromptFactorService, AISkill, AssembledPrompt, CreateFactorInput } from './PromptFactorService.uts';
+import { TaskBiz, CreateTaskPayload } from '../biz/TaskBiz.uts';
+import { TomatoService } from '../sys/alarm/TomatoService.uts';
+import { PluginRegistry, PluginDefinition } from './PluginRegistry.uts';
+import { PluginManager } from './plugins/PluginManager.uts';
+import { RAGService, SkillDoc, RAGSearchResult } from './RAGService.uts';
+import { FunctionCallingService, ParsedFunctionCall } from './FunctionCallingService.uts';
+import { invokeNativePlugin, isModelReady } from "@/uni_modules/zemo-ai";
+// #ifdef APP-ANDROID
+import { UTSAndroid } from "io.dcloud.uts";
+// #endif
+//import { UTSJSONObject } from 'io.dcloud.uts';
+
+type CommandHandler = (params : Map<string, any | null>) => Promise<string>;
+
+export class AIAgentExecutor {
+
+	private static HANDLERS : Map<string, CommandHandler> = new Map();
+	private static isInitialized : boolean = false;
+	private static isRAGReady : boolean = false;
+
+	// Is Native Engine Ready?
+	static isNativeReady() : boolean {
+		return isModelReady();
+	}
+
+	// 初始化
+	static init(modelPath : string, ragPath : string | null = null, visionPath : string | null = null) : boolean {
+		AIAgentExecutor.ensureHandlers();
+		PluginRegistry.init();
+		PluginManager.init(); // Initialize Dynamic Plugins
+		PromptFactorService.initTables();
+		
+		const result = OnDeviceAIService.init(modelPath, ragPath, visionPath);
+		
+		// 初始化UTS层RAG（从数据库加载知识）
+		if (result) {
+			AIAgentExecutor.initRAG();
+		}
+		
+		// 注册内置函数到UTS层FunctionCallingService
+		AIAgentExecutor.syncFunctions();
+		
+		return result;
+	}
+	
+	// 初始化UTS层RAG
+	private static async initRAG() {
+		try {
+			// 从技能库加载知识
+			const skills = await PromptFactorService.getAllSkills();
+			const skillDocs: SkillDoc[] = [];
+			
+			skills.forEach(skill => {
+				const doc: SkillDoc = {
+					name: skill.display_name,
+					description: skill.description,
+					keywords: skill.keywords,
+					examples: skill.examples
+				};
+				skillDocs.push(doc);
+			});
+			
+			// 使用RAGService初始化
+			const count = RAGService.initFromSkills(skillDocs);
+			
+			// 加载Prompt因子作为知识
+			const factors = await PromptFactorService.getFactorsForScene('general');
+			factors.forEach(f => {
+				const metadata = new Map<string, string>();
+				metadata.set("type", "factor");
+				metadata.set("scene", f.scene_tag);
+				RAGService.addDocument("factor_" + f.id, `${f.name}: ${f.content}`, metadata);
+			});
+			
+			console.log(`[AIAgent] RAG initialized with ${RAGService.size()} documents`);
+			AIAgentExecutor.isRAGReady = RAGService.size() > 0;
+		} catch (e) {
+			console.error("[AIAgent] RAG init failed:", e);
+		}
+	}
+	
+	// 同步函数定义到UTS层FunctionCallingService
+	private static syncFunctions() {
+		// 注册内置函数
+		FunctionCallingService.registerBuiltin(
+			"createTask",
+			"创建一个新的待办任务",
+			[
+				{ name: "title", type: "string", required: true, description: "任务标题" },
+				{ name: "description", type: "string", required: false, description: "任务描述" },
+				{ name: "tags", type: "array", required: false, description: "标签列表" }
+			]
+		);
+		
+		FunctionCallingService.registerBuiltin(
+			"startFocusTimer",
+			"启动专注计时器，帮助用户集中注意力工作",
+			[
+				{ name: "taskTitle", type: "string", required: false, description: "专注任务标题" },
+				{ name: "durationMinutes", type: "number", required: false, description: "专注时长（分钟）" }
+			]
+		);
+		
+		FunctionCallingService.registerBuiltin(
+			"startBreakTimer",
+			"启动休息计时器，帮助用户放松休息",
+			[
+				{ name: "durationMinutes", type: "number", required: false, description: "休息时长（分钟）" }
+			]
+		);
+		
+		// 注册动态插件
+		const plugins = PluginRegistry.getAllDefinitions();
+		plugins.forEach(p => {
+			FunctionCallingService.register(JSON.stringify(p));
+		});
+		
+		console.log(`[AIAgent] Registered ${FunctionCallingService.getAllNames().length} functions`);
+	}
+
+	// 注册本地工具
+	private static ensureHandlers() {
+		if (AIAgentExecutor.isInitialized) return;
+		
+		// 1. 创建任务 (关联 TaskBiz)
+		AIAgentExecutor.HANDLERS.set("createTask", async (params) : Promise<string> => {
+			const title = params.get("title") != null ? "" + params.get("title") : null;
+			if (title == null || title.trim() == "") {
+				throw new Error("Missing 'title' parameter.");
+			}
+
+			let tags : string[] = [];
+			const tagsVal = params.get("tags");
+			if (tagsVal != null && Array.isArray(tagsVal)) {
+				(tagsVal as Array<any>).forEach((it) => {
+					tags.push(it.toString());
+				});
+			}
+
+					await TaskBiz.createTask({
+				title: title!,
+				description: params.get("description") != null ? "" + params.get("description") : null,
+				tags: tags,
+				parent_id: null
+			} as CreateTaskPayload);
+
+			return `Created task: ${title}`;
+		});
+
+		// 2. 专注
+		AIAgentExecutor.HANDLERS.set("startFocusTimer", async (params) : Promise<string> => {
+			const mins = AIAgentExecutor.safeParseNumber(params.get("durationMinutes"), 25);
+			const title = params.get("taskTitle") != null ? "" + params.get("taskTitle") : "Focus";
+			TomatoService.getInstance().startFocus(null, title, "countdown", Math.floor(mins * 60));
+			return `Focus started: ${title} (${mins}m)`;
+		});
+
+		// 3. 休息
+		AIAgentExecutor.HANDLERS.set("startBreakTimer", async (params) : Promise<string> => {
+			const mins = AIAgentExecutor.safeParseNumber(params.get("durationMinutes"), 5);
+			TomatoService.getInstance().startBreak(Math.floor(mins * 60));
+			return `Break started: ${mins}m`;
+		});
+
+		AIAgentExecutor.isInitialized = true;
+	}
+
+	// 获取所有工具定义 (内置 + 动态插件)
+	private static getToolDefinitionsJSON(): string {
+		return FunctionCallingService.getDefinitionsJson();
+	}
+
+	// 导入插件接口
+	static importPlugin(jsonConfig: string): boolean {
+		return PluginRegistry.register(jsonConfig);
+	}
+
+	static removePlugin(name: string) {
+		PluginRegistry.unregister(name);
+	}
+
+	// === 智能对话与进化 (增强版 ReAct 循环) ===
+	static chat(userInput : string, callback : (text : string, done : boolean) => void) {
+		(async () => {
+			AIAgentExecutor.ensureHandlers();
+
+			// 1. UTS层RAG检索上下文
+			let ragContext = '';
+			if (AIAgentExecutor.isRAGReady) {
+				ragContext = RAGService.getContext(userInput, 3);
+			}
+			
+			// 2. UTS层技能匹配 (作为补充)
+			const matchedSkills = await PromptFactorService.matchSkills(userInput);
+			let detectedScene = 'general';
+			let skillContext = '';
+
+			if (matchedSkills.length > 0) {
+				const topSkill = matchedSkills[0];
+				skillContext = `推荐技能: ${topSkill.display_name} (${topSkill.description})`;
+				if (topSkill.skill_name.includes('break')) detectedScene = 'rest_assist';
+				else if (topSkill.skill_name.includes('task')) detectedScene = 'task_parse';
+				else if (topSkill.skill_name.includes('focus')) detectedScene = 'focus_assist';
+			}
+			
+			// 3. 组装Prompt因子
+			let assembled = await PromptFactorService.assemblePrompt(detectedScene, skillContext);
+
+			// 4. 使用FunctionCallingService构建完整Prompt
+			const fullPrompt = FunctionCallingService.buildPrompt(
+				assembled.full_prompt,
+				userInput,
+				ragContext
+			);
+
+			let retryCount = 0;
+			const MAX_RETRIES = 2;
+			let isSuccess = false;
+			let fullHistory = fullPrompt;
+
+			// 5. ReAct循环：推理 -> 执行 -> 观察 -> 修正
+			while (retryCount <= MAX_RETRIES && !isSuccess) {
+				const res : AIAgentResult = await AIAgentExecutor.callAI(fullHistory, (token) => {
+					callback(token, false);
+				});
+				
+				// 使用UTS层解析函数调用
+				let parsedFC: ParsedFunctionCall | null = null;
+				if (res.text != null) {
+					parsedFC = FunctionCallingService.parse(res.text!);
+				}
+
+				// 判断是否有函数调用
+				const hasCommand = res.isCommand && res.command != null;
+				const hasParsedFC = parsedFC != null && parsedFC.found === true;
+
+				if (hasCommand || hasParsedFC) {
+					let cmdName = '';
+					let cmdParams = new Map<string, any | null>();
+					
+					if (hasParsedFC && parsedFC != null) {
+						cmdName = parsedFC.functionName;
+						cmdParams = parsedFC.arguments;
+					} else if (hasCommand) {
+						const cmd = res.command!;
+						cmdName = cmd.cmd;
+						// Convert Map<string, any> to Map<string, any | null>
+						cmd.params.forEach((v : any, k : string) => {
+							cmdParams.set(k, v);
+						});
+					}
+					
+					let result = "";
+					
+					try {
+						// A. 尝试内置 Handler
+						const handler = AIAgentExecutor.HANDLERS.get(cmdName);
+						// B. 尝试 Native 插件 (Old Registry)
+						const pluginDef = PluginRegistry.getPlugin(cmdName);
+                        // C. 尝试 JS 动态插件 (New Manager)
+                        const funcDef = FunctionCallingService.getFunction(cmdName);
+						
+						if (handler != null) {
+							result = await handler(cmdParams);
+						} else if (pluginDef != null) {
+							result = await AIAgentExecutor.executeDynamicPlugin(pluginDef, cmdParams);
+						} else if (funcDef != null && funcDef.implementation.startsWith("js:")) {
+                            const parts = funcDef.implementation.split(":");
+                            if (parts.length >= 3) {
+                                result = await PluginManager.execute(parts[1], parts[2], cmdParams);
+                            } else {
+                                result = "Error: Invalid plugin signature";
+                            }
+                        } else {
+							throw new Error(`Unknown tool: ${cmdName}`);
+						}
+
+						// === 成功 ===
+						callback(`✅ 执行成功: ${result}`, false);
+
+						// 记录日志 & 学习
+						AIAgentExecutor.logFactorUsage(assembled, userInput, result, true);
+
+						// 添加到RAG作为经验
+						RAGService.addExperience(userInput, cmdName, result, true);
+
+						// 生成友好回复
+						const summaryPrompt = `System: Action executed successfully. Function: ${cmdName}. Result: ${result}. Reply to user in a friendly way.`;
+						const summaryRes = await AIAgentExecutor.callAI(summaryPrompt, (token) => {
+							callback(token, false);
+						});
+						callback("", true);
+						isSuccess = true;
+
+					} catch (e) {
+						// === 失败 ===
+						const errorMsg = "" + e;
+						console.error(`[Agent] Error: ${errorMsg}`);
+
+						// 自我反思生成修正规则
+						let paramsStr = "{";
+						cmdParams.forEach((v : any | null, k : string) => {
+							paramsStr += "\"" + k + "\":\"" + (v != null ? v : "null") + "\",";
+						});
+						paramsStr += "}";
+						const reflectionPrompt = "System: Command \'" + cmdName + "\' failed. Error: \"" + errorMsg + "\". Params: " + paramsStr + ". Create a correction rule.";
+						const reflectionRes = await AIAgentExecutor.callAI(reflectionPrompt, null);
+						const correctionRule = reflectionRes.text?.trim() ?? "Check params.";
+
+						// 保存纠错因子
+						await PromptFactorService.createFactor({
+							factor_type: 'error_correction',
+							scene_tag: detectedScene,
+							name: `Auto-Fix: ${cmdName}`,
+							content: `避免错误 '${errorMsg}': ${correctionRule}`,
+							priority: 80,
+							is_active: true,
+							metadata: `{"cmd":"${cmdName}"}`
+						} as CreateFactorInput);
+
+						// 添加失败经验到RAG
+						RAGService.addExperience(userInput, cmdName, errorMsg, false);
+
+						fullHistory += `\nSystem: Failed (${errorMsg}). Rule: ${correctionRule}. Try again.`;
+						callback(`⚠️ 遇到问题: ${errorMsg}，正在自我修正...`, false);
+						retryCount++;
+					}
+				} else {
+					// 纯文本回复
+					callback("", true);
+					isSuccess = true;
+				}
+			}
+
+			if (!isSuccess && retryCount > MAX_RETRIES) {
+				callback("抱歉，多次尝试失败。我已记录错误，下次会改进。", true);
+			}
+		})();
+	}
+	
+	// === 添加知识到RAG ===
+	static addKnowledge(id: string, text: string, metadata: Map<string, string> = new Map()): boolean {
+		return RAGService.addDocument(id, text, metadata);
+	}
+	
+	// === 搜索RAG知识库 ===
+	static searchKnowledge(query: string, topK: number = 5): any[] {
+		const results = RAGService.search(query, topK);
+		const arr: any[] = [];
+		for (let i = 0; i < results.length; i++) {
+			const r = results[i];
+			const metaMap = new Map<string, string>();
+            const rMeta = r.metadata;
+			if (rMeta != null) {
+                // Workaround for UTS Map.forEach issue on Android
+                rMeta.forEach((v, k) => {
+                    metaMap.set(k, v);
+                });
+			}
+			const item = new Map<string, any>();
+			item.set("id", r.id);
+			item.set("text", r.text);
+			item.set("score", r.score);
+			item.set("metadata", metaMap);
+			arr.push(item);
+		}
+		return arr;
+	}
+	
+	// === 清除对话历史 ===
+	static clearConversation() {
+		OnDeviceAIService.clearContext();
+	}
+	
+	// === 新增：获取RAG知识库大小 ===
+	static getKnowledgeSize(): number {
+		return RAGService.size();
+	}
+
+	private static callAI(prompt : string, onProgress: ((text: string) => void) | null = null) : Promise<AIAgentResult> {
+		return new Promise((resolve) => {
+			let lastLen = 0;
+			OnDeviceAIService.chat(prompt, (res) => {
+				
+				// Stream text if requested (and not a command yet)
+				if (onProgress != null && res.text != null && !res.isCommand) {
+					const full = res.text!;
+					if (full.length > lastLen) {
+						const delta = full.substring(lastLen);
+						onProgress(delta);
+						lastLen = full.length;
+					}
+				}
+				
+				if (res.done == true) {
+					resolve(res);
+				}
+			});
+		});
+	}
+
+	private static safeParseNumber(val : any | null, defaultValue : number) : number {
+		if (val == null) return defaultValue;
+		const n = parseFloat(val.toString());
+		return isNaN(n) ? defaultValue : n;
+	}
+
+	private static logFactorUsage(assembled : AssembledPrompt, input : string, output : string, success : boolean) {
+		if (assembled.used_factors.length > 0) {
+			for (const f of assembled.used_factors) {
+				PromptFactorService.logExecution({
+					factor_id: f.id,
+					scene_tag: assembled.scene_tag,
+					user_input: input,
+					ai_output: output,
+					is_success: success,
+					error_type: null,
+					feedback: null,
+					execution_time_ms: 0
+				});
+			}
+		}
+	}
+	
+	// 执行动态插件逻辑
+	private static async executeDynamicPlugin(def: PluginDefinition, params: Map<string, any | null>): Promise<string> {
+		const impl = def.implementation;
+		
+		// 转换参数 Map -> JSON String
+		const paramObjStr = (() : string => {
+			let s = "{";
+			let first = true;
+			params.forEach((v : any | null, k : string) => {
+				if (!first) s += ",";
+				s += "\"" + k + "\":\"" + (v != null ? v : "null") + "\"";
+				first = false;
+			});
+			s += "}";
+			return s;
+		})();
+
+		// TYPE 1: UniApp Native Module (native:ModuleID:MethodName)
+		// 注意: uni.requireNativePlugin 在 UTS 中不支持，改用反射方式
+		if(impl.startsWith("native:")) {
+			const parts = impl.split(":");
+			if(parts.length < 3) throw new Error("Invalid plugin implementation format");
+			
+			const modId = parts[1];
+			const method = parts[2];
+			
+			// #ifdef APP-ANDROID
+			// 使用反射调用原生模块
+			return invokeNativePlugin(modId, method, paramObjStr);
+			// #endif
+			
+			// #ifndef APP-ANDROID
+			return "Native plugins only supported on Android";
+			// #endif
+		}
+		
+		// TYPE 2: Java Reflection (reflection:ClassName:MethodName)
+		// Uses ZemoAIImpl helper to invoke arbitrary internal classes
+		if(impl.startsWith("reflection:")) {
+			const parts = impl.split(":");
+			if(parts.length < 3) throw new Error("Invalid reflection format");
+			
+			const className = parts[1];
+			const method = parts[2];
+			
+			// #ifdef APP-ANDROID
+			return invokeNativePlugin(className, method, paramObjStr);
+			// #endif
+			
+			// #ifndef APP-ANDROID
+			return "Reflection only supported on Android";
+			// #endif
+		}
+
+		// TYPE 3: JS Plugin (js:PluginID:FuncName)
+		if (impl.startsWith("js:")) {
+			const parts = impl.split(":");
+			if(parts.length < 3) throw new Error("Invalid js format");
+			const pluginId = parts[1];
+			const funcName = parts[2];
+			return await PluginManager.execute(pluginId, funcName, params);
+		}
+		
+		return "Unknown implementation type: " + impl;
+	}
+}

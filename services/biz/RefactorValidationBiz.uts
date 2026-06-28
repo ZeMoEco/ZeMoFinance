@@ -1,0 +1,197 @@
+import { DB } from '@/utils/DB/DB.uts';
+import { TaskBiz, CreateSubtaskResult } from '@/services/biz/TaskBiz.uts';
+import { NoteBiz } from '@/services/biz/NoteBiz.uts';
+import { FinanceBiz } from '@/services/biz/FinanceBiz.uts';
+
+export type ValidationCheck = {
+  name: string,
+  passed: boolean,
+  detail: string,
+};
+
+export type ValidationReport = {
+  passed: boolean,
+  checks: ValidationCheck[],
+  summary: string,
+};
+
+export class RefactorValidationBiz {
+  private static addCheck(list: ValidationCheck[], name: string, passed: boolean, detail: string): void {
+    list.push({ name, passed, detail } as ValidationCheck);
+  }
+
+  public static async runStage4MetadataChecks(): Promise<ValidationReport> {
+    const checks = [] as ValidationCheck[];
+    const createdNodeIds = [] as string[];
+    const createdEdgeIds = [] as string[];
+    const createdTxnIds = [] as string[];
+
+    const now = Date.now();
+    const parentTitle = `refactor_check_parent_${now}`;
+    const childTitle = `refactor_check_child_${now}`;
+
+    try {
+      const parentId = await TaskBiz.createTask({
+        title: parentTitle,
+        description: 'stage4 metadata check',
+        tags: ['category:学习']
+      });
+      if (parentId == null || parentId == '') {
+        this.addCheck(checks, 'create_parent_task', false, '创建父任务失败');
+        return this.finalize(checks);
+      }
+      createdNodeIds.push(parentId);
+      this.addCheck(checks, 'create_parent_task', true, `parent=${parentId}`);
+
+      const subtask = await TaskBiz.createSubtask(parentId, {
+        title: childTitle,
+        description: 'stage4 metadata check child',
+        tags: ['category:学习']
+      });
+      if (subtask == null) {
+        this.addCheck(checks, 'create_subtask', false, '创建子任务失败');
+        return this.finalize(checks);
+      }
+      createdNodeIds.push(subtask.nodeId);
+      createdEdgeIds.push(subtask.edgeId);
+      this.addCheck(checks, 'create_subtask', true, `child=${subtask.nodeId}, edge=${subtask.edgeId}`);
+
+      const noteId = await NoteBiz.createNote({
+        title: `refactor_check_note_${now}`,
+        content: 'stage4 note reference check'
+      });
+      if (noteId == null || noteId == '') {
+        this.addCheck(checks, 'create_note', false, '创建笔记失败');
+        return this.finalize(checks);
+      }
+      createdNodeIds.push(noteId);
+
+      const refEdgeId = await NoteBiz.referenceNoteToNode(parentId, noteId);
+      if (refEdgeId == null || refEdgeId == '') {
+        this.addCheck(checks, 'link_note_references', false, '创建 REFERENCES 关系失败');
+        return this.finalize(checks);
+      }
+      createdEdgeIds.push(refEdgeId);
+      this.addCheck(checks, 'link_note_references', true, `edge=${refEdgeId}`);
+
+      const noteInTreeRows = await DB.query(
+        `SELECT id FROM edges
+         WHERE source_id = ?
+           AND target_id = ?
+           AND relation_type IN ('CONTAINS_TASK_TREE', 'CONTAINS')
+           AND is_deleted = 0
+         LIMIT 1`,
+        [parentId, noteId]
+      );
+      this.addCheck(
+        checks,
+        'note_not_in_task_tree',
+        noteInTreeRows.length == 0,
+        noteInTreeRows.length == 0 ? '笔记未混入子任务树' : '检测到笔记被写入任务树'
+      );
+
+      const contextEdgeId = await TaskBiz.ensureTaskContextEdge(parentId, 'context:shopping');
+      if (contextEdgeId == null || contextEdgeId == '') {
+        this.addCheck(checks, 'create_context_edge', false, '创建 context edge 失败');
+        return this.finalize(checks);
+      }
+      createdEdgeIds.push(contextEdgeId);
+
+      const contextLogId = await TaskBiz.addContextLog(contextEdgeId, 'check', 'stage4 context log');
+      if (contextLogId == null || contextLogId == '') {
+        this.addCheck(checks, 'write_context_log', false, '写入 edge log 失败');
+      } else {
+        this.addCheck(checks, 'write_context_log', true, `log=${contextLogId}`);
+      }
+
+      const wrongContextTreeRows = await DB.query(
+        `SELECT id FROM edges
+         WHERE source_id = ?
+           AND target_id = ?
+           AND relation_type LIKE 'context:%'
+           AND is_deleted = 0
+         LIMIT 1`,
+        [parentId, subtask.nodeId]
+      );
+      this.addCheck(
+        checks,
+        'no_context_edge_for_parent_child',
+        wrongContextTreeRows.length == 0,
+        wrongContextTreeRows.length == 0 ? '未发现 context:* 父子关系' : '发现 context:* 被用于父子关系'
+      );
+
+      let accounts = await FinanceBiz.listAccountNodes();
+      if (accounts.length == 0) {
+        const created = await FinanceBiz.createAccountNode('RefactorCheckAccount', '现金', 10, null);
+        if (created) accounts = await FinanceBiz.listAccountNodes();
+      }
+
+      if (accounts.length == 0) {
+        this.addCheck(checks, 'finance_transaction', false, '无可用账户，无法验证 transaction');
+      } else {
+        const accountId = accounts[0].id;
+        const txnId = await FinanceBiz.createTransactionForNodes({
+          account_id: accountId,
+          amount: 1,
+          type: 'expense',
+          category: 'self_check',
+          description: 'stage4 metadata check',
+          source_node_id: parentId
+        });
+
+        if (txnId == null || txnId == '') {
+          this.addCheck(checks, 'finance_transaction', false, '创建 transaction 失败');
+        } else {
+          createdTxnIds.push(txnId);
+          const txnRows = await DB.query('SELECT id FROM transactions WHERE id = ? AND is_deleted = 0 LIMIT 1', [txnId]);
+          const shadowLogRows = await DB.query('SELECT id FROM logs WHERE owner_id = ? AND is_deleted = 0 LIMIT 1', [txnId]);
+          const txnExists = txnRows.length > 0;
+          const noShadowLog = shadowLogRows.length == 0;
+          this.addCheck(
+            checks,
+            'finance_transaction_truth_source',
+            txnExists && noShadowLog,
+            txnExists && noShadowLog ? 'transaction 正常且未混入 logs owner_id' : 'transaction/logs 隔离异常'
+          );
+        }
+      }
+
+      return this.finalize(checks);
+    } catch (e) {
+      this.addCheck(checks, 'runtime_exception', false, `异常: ${e}`);
+      return this.finalize(checks);
+    } finally {
+      const ts = Date.now();
+      for (let i = 0; i < createdTxnIds.length; i++) {
+        const id = createdTxnIds[i];
+        await DB.exec('UPDATE transactions SET is_deleted = 1, updated_at = ? WHERE id = ?', [ts, id]);
+      }
+      for (let i = 0; i < createdEdgeIds.length; i++) {
+        const id = createdEdgeIds[i];
+        await DB.exec('UPDATE edges SET is_deleted = 1, updated_at = ? WHERE id = ?', [ts, id]);
+      }
+      for (let i = 0; i < createdNodeIds.length; i++) {
+        const id = createdNodeIds[i];
+        await DB.exec('UPDATE nodes SET is_deleted = 1, updated_at = ? WHERE id = ?', [ts, id]);
+      }
+      for (let i = 0; i < createdNodeIds.length; i++) {
+        const id = createdNodeIds[i];
+        await DB.exec('UPDATE edges SET is_deleted = 1, updated_at = ? WHERE (source_id = ? OR target_id = ?) AND is_deleted = 0', [ts, id, id]);
+      }
+    }
+  }
+
+  private static finalize(checks: ValidationCheck[]): ValidationReport {
+    let passedCount = 0;
+    for (let i = 0; i < checks.length; i++) {
+      if (checks[i].passed) passedCount++;
+    }
+    const allPassed = checks.length > 0 && passedCount == checks.length;
+    const summary = `${passedCount}/${checks.length} checks passed`;
+    return {
+      passed: allPassed,
+      checks,
+      summary
+    } as ValidationReport;
+  }
+}

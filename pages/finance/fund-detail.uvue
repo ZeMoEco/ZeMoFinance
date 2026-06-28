@@ -1,0 +1,964 @@
+<template>
+	<view class="page">
+		<view class="content-wrapper" :style="bgStyle">
+			<scroll-view class="detail-scroll" scroll-y="true">
+				<!-- Hero Card -->
+				<view class="hero-card" v-if="account != null">
+					<view class="hero-top">
+						<view class="hero-icon">
+							<text class="hero-icon-text">📈</text>
+						</view>
+						<view class="hero-title-area">
+							<text class="hero-name">{{ account?.name ?? '' }}</text>
+							<text class="hero-sub">{{ heroSubtitle }}</text>
+						</view>
+					</view>
+
+					<text class="hero-label">持仓市值 (CNY)</text>
+					<text class="hero-value">¥{{ (account?.balance ?? 0).toFixed(2) }}</text>
+
+					<view class="hero-profit-pill" :style="profitPillStyle">
+						<text class="hero-profit-text" :style="profitTextStyle">
+							{{ profitDirection >= 0 ? '▲' : '▼' }}
+							{{ profitDirection >= 0 ? '+' : '' }}{{ (account?.profit_rate ?? 0).toFixed(2) }}%
+						</text>
+						<text class="hero-profit-amount" :style="profitTextStyle">{{ estimatedProfitText }}</text>
+					</view>
+				</view>
+
+				<!-- Stats Grid -->
+				<view class="stats-grid" v-if="account != null">
+					<view class="stat-card">
+						<text class="stat-label">代码</text>
+						<text class="stat-value">{{ codeText }}</text>
+					</view>
+					<view class="stat-card">
+						<text class="stat-label">类型</text>
+						<text class="stat-value">{{ subTypeText }}</text>
+					</view>
+					<view class="stat-card" @click="showProviderPicker">
+						<text class="stat-label">所属账户</text>
+						<text class="stat-value">{{ providerText }}</text>
+					</view>
+					<view class="stat-card">
+						<text class="stat-label">所属账本</text>
+						<text class="stat-value">{{ bookName }}</text>
+					</view>
+				</view>
+
+				<!-- Include in total -->
+				<view class="info-row" v-if="account != null">
+					<text class="info-row-label">计入总资产</text>
+					<text class="info-row-value" :style="(account?.include_in_total ?? true) ? 'color:#0d6e6e' : 'color:#ff6b6b'">
+						{{ (account?.include_in_total ?? true) ? '是 · 计入净资产' : '否 · 不计入' }}
+					</text>
+				</view>
+
+				<view class="info-row" v-if="account != null">
+					<text class="info-row-label">行情</text>
+					<text class="info-row-value" @click="refreshQuote">{{ quoteSummary }}</text>
+				</view>
+
+				<!-- Holdings change / transactions -->
+				<view class="section-title-area">
+					<text class="section-title">持仓变动</text>
+				</view>
+
+				<view class="transaction-card" v-for="item in transactions" :key="item.id">
+					<view class="trans-left">
+						<text class="trans-category">{{ getCategoryText(item.category) }}</text>
+						<text class="trans-time">{{ formatTime(item.transaction_time) }}</text>
+						<text class="trans-desc" v-if="hasDescription(item.description)">{{ item.description }}</text>
+					</view>
+					<view class="trans-right">
+						<text class="trans-amount" :class="item.type == 'income' ? 'amount-income' : 'amount-expense'">
+							{{ item.type == 'income' ? '+' : '-' }}{{ formatTransactionAmount(item.amount) }}
+						</text>
+						<text class="trans-balance">市值: {{ item.balance_snapshot.toFixed(2) }}</text>
+					</view>
+				</view>
+
+				<view class="empty-tip" v-if="transactions.length == 0">
+					<text class="empty-text">暂无持仓变动记录</text>
+				</view>
+				<view class="list-bottom-spacer"></view>
+			</scroll-view>
+
+			<!-- Bottom action -->
+			<view class="bottom-bar">
+				<view class="bottom-btn record-btn" @click="openHoldingAction">
+					<text class="bottom-btn-text">记一笔</text>
+				</view>
+				<view class="bottom-btn delete-btn" @click="confirmDeleteFund">
+					<text class="bottom-btn-text delete-btn-text">删除</text>
+				</view>
+			</view>
+
+		</view>
+
+		<view class="trade-overlay" v-if="showTradeSheet" @click="closeTradeSheet">
+			<view class="trade-sheet" @click.stop>
+				<view class="trade-handle"></view>
+				<text class="trade-title">{{ tradeSheetTitle }}</text>
+				<text class="trade-sub">{{ tradePriceText }}</text>
+				<view class="trade-input-row">
+					<view class="trade-input-card trade-input-card-last">
+						<text class="trade-label">金额</text>
+						<view class="trade-amount-row">
+							<text class="trade-symbol">¥</text>
+							<input class="trade-input" v-model="tradeAmount" type="text" placeholder="0.00" @input="onTradeAmountInput" />
+						</view>
+					</view>
+					<view class="trade-input-card">
+						<text class="trade-label">份额</text>
+						<input class="trade-input trade-unit-input" v-model="tradeUnits" type="text" placeholder="0.00" @input="onTradeUnitsInput" />
+					</view>
+				</view>
+				<text class="trade-tip" v-if="tradeMode == 'reduce'">卖出后资金进入 {{ tradeCashAccountName }}</text>
+				<view class="trade-actions">
+					<view class="trade-cancel" @click="closeTradeSheet"><text class="trade-cancel-text">取消</text></view>
+					<view class="trade-submit" @click="submitTrade"><text class="trade-submit-text">{{ tradeSubmitText }}</text></view>
+				</view>
+			</view>
+		</view>
+		<GlobalBackground />
+	</view>
+</template>
+
+<script lang="uts">
+	import { FinanceBiz, AccountNode, BookNode, TransactionMount, AssetAccountPayload } from '@/services/biz/FinanceBiz.uts';
+	import { FinanceMarketService } from '@/services/market/FinanceMarketService.uts';
+	import GlobalBackground from "@/components/GlobalBackground.uvue";
+
+	export default {
+		components: { GlobalBackground },
+		data() {
+			return {
+				accountId: "",
+				account: null as AccountNode | null,
+				accounts: [] as AccountNode[],
+				books: [] as BookNode[],
+				transactions: [] as TransactionMount[],
+				backgroundImage: "",
+				transparency: 0.3,
+				showTradeSheet: false,
+				tradeMode: 'add',
+				tradeAmount: '',
+				tradeUnits: '',
+				tradeAmountTouched: false,
+				tradeUnitsTouched: false,
+				tradeSubmitting: false
+			}
+		},
+		onLoad(options : OnLoadOptions) {
+			const idStr = options.get('id');
+			if (idStr != null) {
+				this.accountId = idStr.toString();
+			}
+		},
+		async onShow() {
+			this.loadTheme();
+			if (this.accountId != "") {
+				await this.loadData();
+				await this.refreshQuote(false);
+			}
+		},
+		computed: {
+			bgStyle() : string {
+				return `background-color: rgba(245, 245, 245, ${this.transparency})`;
+			},
+			heroSubtitle() : string {
+				if (this.account == null) return '';
+				const parts: string[] = [];
+				if (this.account!.code != '') parts.push(this.account!.code);
+				if (this.account!.sub_type != '') parts.push(this.account!.sub_type);
+				return parts.length > 0 ? parts.join(' · ') : '基金/股票持仓';
+			},
+			codeText() : string {
+				if (this.account == null || this.account!.code == '') return '—';
+				return this.account!.code;
+			},
+			subTypeText() : string {
+				if (this.account == null || this.account!.sub_type == '') return '—';
+				return this.account!.sub_type;
+			},
+			providerText() : string {
+				if (this.account == null || this.account!.provider == '') return '—';
+				return this.investAccountDisplayName(this.account!.provider);
+			},
+			quoteSummary() : string {
+				if (this.account == null) return '点击刷新';
+				if (this.account!.quote_time == '') return '点击刷新行情';
+				const price = this.account!.estimate_nav > 0 ? this.account!.estimate_nav : this.account!.latest_nav;
+				return `刷新 ${price.toFixed(4)} · ${this.account!.quote_time}`;
+			},
+			bookName() : string {
+				if (this.account == null) return '—';
+				const b = this.books.find((x : BookNode) : boolean => x.id == this.account!.book_id);
+				return b != null ? b.name : '主账本';
+			},
+			estimatedProfitText() : string {
+				if (this.account == null) return '';
+				const directProfit = this.account!.profit_amount;
+				if (Math.abs(directProfit) >= 0.005) {
+					const directSign = directProfit >= 0 ? '+' : '';
+					return `${directSign}¥${directProfit.toFixed(2)}`;
+				}
+				const rate = this.account!.profit_rate;
+				const value = this.account!.balance;
+				if (rate <= -100) return '';
+				const cost = value / (1 + rate / 100);
+				const profit = value - cost;
+				const sign = profit >= 0 ? '+' : '';
+				return `${sign}¥${profit.toFixed(2)}`;
+			},
+			profitDirection() : number {
+				if (this.account == null) return 0.0;
+				return Math.abs(this.account!.profit_amount) >= 0.005 ? this.account!.profit_amount : this.account!.profit_rate;
+			},
+			profitPillStyle() : string {
+				if (this.account == null) return 'background-color: rgba(22,163,74,0.12)';
+				return this.profitDirection >= 0 ? 'background-color: rgba(22,163,74,0.12)' : 'background-color: rgba(255,107,107,0.12)';
+			},
+			profitTextStyle() : string {
+				if (this.account == null) return 'color:#16a34a';
+				return this.profitDirection >= 0 ? 'color:#16a34a' : 'color:#ff6b6b';
+			},
+			tradeSheetTitle() : string {
+				return this.tradeMode == 'reduce' ? '卖出/减仓' : '买入/加仓';
+			},
+			tradeSubmitText() : string {
+				if (this.tradeSubmitting) return '处理中...';
+				return this.tradeMode == 'reduce' ? '确认卖出' : '确认买入';
+			},
+			tradePriceText() : string {
+				const price = this.currentTradePrice();
+				if (price <= 0) return '未取得净值，可手动同时填写金额和份额';
+				return `当前参考净值 ${price.toFixed(4)}`;
+			},
+			tradeCashAccountName() : string {
+				if (this.account == null) return '理财现金账户';
+				const provider = this.account!.provider.trim() == '' ? '默认账户' : this.account!.provider.trim();
+				return `${provider}可用资金`;
+			}
+		},
+		methods: {
+			loadTheme() {
+				const bg = uni.getStorageSync('theme_background_image');
+				if (bg != null) {
+					this.backgroundImage = bg.toString();
+				}
+				const t = uni.getStorageSync('theme_transparency');
+				if (t != null) {
+					const str = t.toString();
+					if (str != '') {
+						const val = parseFloat(str);
+						if (!isNaN(val)) {
+							this.transparency = val;
+						}
+					}
+				}
+			},
+			async loadData() {
+				this.books = await FinanceBiz.listBooks();
+				this.accounts = await FinanceBiz.listAccountNodes(null);
+				this.account = await FinanceBiz.getAccountNode(this.accountId);
+				if (this.account != null) {
+					uni.setNavigationBarTitle({ title: this.account?.name ?? '持仓详情' });
+				}
+				this.transactions = await FinanceBiz.listTransactionMountsByAccount(this.accountId);
+			},
+			formatTime(ts : number) : string {
+				const date = new Date(ts);
+				const m = (date.getMonth() + 1).toString().padStart(2, '0');
+				const d = date.getDate().toString().padStart(2, '0');
+				const h = date.getHours().toString().padStart(2, '0');
+				const min = date.getMinutes().toString().padStart(2, '0');
+				return `${m}-${d} ${h}:${min}`;
+			},
+			formatTransactionAmount(amount : number) : string {
+				return Math.abs(amount).toFixed(2);
+			},
+			getCategoryText(c : string | null) : string {
+				if (c == null || c == "") return "持仓调整";
+				return c;
+			},
+			hasDescription(d : string | null) : boolean {
+				return d != null && d != "";
+			},
+			goToRecord() {
+				this.openHoldingAction();
+			},
+			openHoldingAction() {
+				if (this.account == null) return;
+				uni.showActionSheet({
+					itemList: ['加仓', '减仓'],
+					success: (res) => {
+						this.openTradeSheet(res.tapIndex == 1 ? 'reduce' : 'add');
+					}
+				});
+			},
+			openTradeSheet(mode : string) {
+				this.tradeMode = mode;
+				this.tradeAmount = '';
+				this.tradeUnits = '';
+				this.tradeAmountTouched = false;
+				this.tradeUnitsTouched = false;
+				this.showTradeSheet = true;
+			},
+			closeTradeSheet() {
+				if (this.tradeSubmitting) return;
+				this.showTradeSheet = false;
+			},
+			sanitizeDecimal(raw : string, maxDecimals : number) : string {
+				let val = raw.replace(/[^0-9.]/g, "");
+				const dots = val.split('.').length - 1;
+				if (dots > 1) {
+					const firstDotIndex = val.indexOf('.');
+					val = val.substring(0, firstDotIndex + 1) + val.substring(firstDotIndex + 1).replace(/\./g, '');
+				}
+				if (val.includes('.')) {
+					const parts = val.split('.');
+					if (parts[1].length > maxDecimals) val = parts[0] + '.' + parts[1].substring(0, maxDecimals);
+				}
+				return val;
+			},
+			currentTradePrice() : number {
+				if (this.account == null) return 0.0;
+				const estimate = this.account!.estimate_nav;
+				const latest = this.account!.latest_nav;
+				if (estimate > 0) return estimate;
+				if (latest > 0) return latest;
+				if (this.account!.units > 0 && this.account!.balance > 0) return this.account!.balance / this.account!.units;
+				return 0.0;
+			},
+			onTradeAmountInput(e : InputEvent) {
+				const val = this.sanitizeDecimal(e.detail.value, 2);
+				setTimeout(() => {
+					this.tradeAmount = val;
+					this.tradeAmountTouched = true;
+					if (!this.tradeUnitsTouched) {
+						const amount = parseFloat(val);
+						const price = this.currentTradePrice();
+						if (!isNaN(amount) && amount > 0 && price > 0) this.tradeUnits = (amount / price).toFixed(4);
+					}
+				}, 0);
+			},
+			onTradeUnitsInput(e : InputEvent) {
+				const val = this.sanitizeDecimal(e.detail.value, 4);
+				setTimeout(() => {
+					this.tradeUnits = val;
+					this.tradeUnitsTouched = true;
+					if (!this.tradeAmountTouched) {
+						const units = parseFloat(val);
+						const price = this.currentTradePrice();
+						if (!isNaN(units) && units > 0 && price > 0) this.tradeAmount = (units * price).toFixed(2);
+					}
+				}, 0);
+			},
+			async submitTrade() {
+				if (this.account == null || this.tradeSubmitting) return;
+				let amount = parseFloat(this.tradeAmount);
+				let units = parseFloat(this.tradeUnits);
+				const price = this.currentTradePrice();
+				if ((isNaN(units) || units <= 0) && !isNaN(amount) && amount > 0 && price > 0) units = amount / price;
+				if ((isNaN(amount) || amount <= 0) && !isNaN(units) && units > 0 && price > 0) amount = units * price;
+				if (isNaN(amount) || amount <= 0 || isNaN(units) || units <= 0) {
+					uni.showToast({ title: '请输入有效金额或份额', icon: 'none' });
+					return;
+				}
+				if (this.tradeMode == 'reduce') {
+					if (this.account!.units > 0 && units - this.account!.units > 0.0001) {
+						uni.showToast({ title: '卖出份额超过持仓', icon: 'none' });
+						return;
+					}
+					if (amount - this.account!.balance > 0.01) {
+						uni.showToast({ title: '卖出金额超过市值', icon: 'none' });
+						return;
+					}
+				}
+				this.tradeSubmitting = true;
+				const ok = await FinanceBiz.tradeInvestmentHolding(
+					this.account!.id,
+					this.tradeMode,
+					amount,
+					units,
+					price,
+					this.account!.quote_time,
+					`${this.tradeMode == 'reduce' ? '卖出' : '买入'} ${this.account!.name}`
+				);
+				this.tradeSubmitting = false;
+				if (ok) {
+					this.showTradeSheet = false;
+					await this.loadData();
+					uni.showToast({ title: this.tradeMode == 'reduce' ? '卖出成功' : '买入成功', icon: 'success' });
+				} else {
+					uni.showToast({ title: this.tradeMode == 'reduce' ? '卖出失败' : '买入失败', icon: 'none' });
+				}
+			},
+			buildInvestAccountOptions() : string[] {
+				const options = [] as string[];
+				let raw = uni.getStorageSync('finance_invest_accounts');
+				if (raw == null || raw.toString() == '') raw = uni.getStorageSync('finance_invest_tabs');
+				if (raw != null && raw.toString() != '') {
+					try {
+						const parsed = JSON.parse(raw.toString()) as string[];
+						for (let i = 0; i < parsed.length; i++) {
+							const name = (parsed[i] ?? '').toString().trim();
+							if (name != '' && name != '全部' && name != '全部账户' && name != '默认' && options.indexOf(name) < 0) options.push(name);
+						}
+					} catch (_e) {}
+				}
+				for (let j = 0; j < this.accounts.length; j++) {
+					if (this.accounts[j].category != 'investment') continue;
+					const provider = (this.accounts[j].provider ?? '').toString().trim();
+					if (provider != '' && options.indexOf(provider) < 0) options.push(provider);
+				}
+				return options;
+			},
+			investAccountTailFor(provider : string) : string {
+				const target = provider.trim() == '' ? '默认账户' : provider.trim();
+				let raw = uni.getStorageSync('finance_invest_account_tails');
+				if (raw != null && raw.toString() != '') {
+					try {
+						const obj = JSON.parse(raw.toString()) as UTSJSONObject;
+						const saved = obj.get(target);
+						if (saved != null && saved.toString().trim() != '') return saved.toString().trim();
+					} catch (_e) {}
+				}
+				for (let i = 0; i < this.accounts.length; i++) {
+					const acc = this.accounts[i];
+					if (acc.category != 'investment') continue;
+					const name = (acc.provider ?? '').toString().trim() == '' ? '默认账户' : acc.provider.trim();
+					if (name == target && acc.card_no.trim() != '') return acc.card_no.trim();
+				}
+				return '';
+			},
+			investAccountDisplayName(provider : string) : string {
+				const name = provider.trim() == '' ? '默认账户' : provider.trim();
+				const tail = this.investAccountTailFor(name);
+				return tail == '' ? name : `${name}(${tail})`;
+			},
+			showProviderPicker() {
+				if (this.account == null) return;
+				const options = this.buildInvestAccountOptions();
+				const current = this.account!.provider.trim();
+				if (current != '' && options.indexOf(current) < 0) options.push(current);
+				const itemList = [] as string[];
+				for (let i = 0; i < options.length; i++) itemList.push(this.investAccountDisplayName(options[i]));
+				itemList.push('＋ 新建理财账户');
+				uni.showActionSheet({
+					itemList: itemList,
+					success: (res) => {
+						if (res.tapIndex == options.length) {
+							this.createProviderFromDialog(options);
+							return;
+						}
+						if (res.tapIndex >= 0 && res.tapIndex < options.length) {
+							this.updateFundProvider(options[res.tapIndex]);
+						}
+					}
+				});
+			},
+			createProviderFromDialog(existing : string[]) {
+				uni.showModal({
+					title: '新建理财账户',
+					editable: true,
+					placeholderText: '如 支付宝 / 天天基金 / 华泰证券',
+					success: (res) => {
+						if (!res.confirm) return;
+						const name = (res.content ?? '').toString().trim();
+						if (name == '') {
+							uni.showToast({ title: '账户名不能为空', icon: 'none' });
+							return;
+						}
+						if (existing.indexOf(name) < 0) {
+							existing.push(name);
+							uni.setStorageSync('finance_invest_accounts', JSON.stringify(existing));
+						}
+						this.updateFundProvider(name);
+					}
+				});
+			},
+			async updateFundProvider(provider : string) {
+				if (this.account == null) return;
+				const acc = this.account!;
+				const ok = await FinanceBiz.updateAssetAccount(acc.id, {
+					name: acc.name,
+					category: acc.category,
+					balance: acc.balance,
+					book_id: acc.book_id,
+					provider: provider,
+					include_in_total: acc.include_in_total,
+					code: acc.code,
+					sub_type: acc.sub_type,
+					profit_rate: acc.profit_rate,
+					profit_amount: acc.profit_amount,
+					market_value: acc.market_value,
+					units: acc.units,
+					latest_nav: acc.latest_nav,
+					estimate_nav: acc.estimate_nav,
+					quote_time: acc.quote_time,
+					data_source: acc.data_source,
+					credit_limit: acc.credit_limit
+				} as AssetAccountPayload);
+				if (ok) {
+					uni.showToast({ title: '所属账户已更新', icon: 'success' });
+					await this.loadData();
+				} else {
+					uni.showToast({ title: '更新失败', icon: 'none' });
+				}
+			},
+			confirmDeleteFund() {
+				if (this.account == null) return;
+				uni.showModal({
+					title: '删除基金',
+					content: `确定删除「${this.account!.name}」？相关持仓变动记录会保留在数据库但不再展示在该持仓下。`,
+					confirmText: '删除',
+					confirmColor: '#e11d48',
+					success: (res) => {
+						if (!res.confirm) return;
+						FinanceBiz.deleteAccountNode(this.account!.id).then((ok : boolean) => {
+							if (!ok) {
+								uni.showToast({ title: '删除失败', icon: 'none' });
+								return;
+							}
+							uni.showToast({ title: '已删除', icon: 'success' });
+							setTimeout(() => { uni.navigateBack(); }, 300);
+						});
+					}
+				});
+			},
+			async refreshQuote(showFeedback : boolean = true) {
+				if (this.account == null || this.account!.code == '') {
+					if (showFeedback) uni.showToast({ title: '没有可刷新代码', icon: 'none' });
+					return;
+				}
+				if (showFeedback) uni.showLoading({ title: '刷新行情...' });
+				try {
+					const quote = await FinanceMarketService.fetchQuote(this.account!.code);
+					if (quote == null) {
+						if (showFeedback) {
+							uni.hideLoading();
+							uni.showToast({ title: '暂无行情', icon: 'none' });
+						}
+						return;
+					}
+					const ok = await FinanceBiz.updateInvestmentQuote(this.account!.id, {
+						name: quote.name,
+						category: 'investment',
+						balance: this.account!.balance,
+						code: this.account!.code,
+						sub_type: this.account!.sub_type,
+						profit_rate: quote.estimate_rate,
+						profit_amount: this.account!.profit_amount,
+						market_value: this.account!.balance,
+						units: this.account!.units,
+						latest_nav: quote.nav,
+						estimate_nav: quote.estimate_nav,
+						quote_time: quote.estimate_time != '' ? quote.estimate_time : quote.nav_date,
+						data_source: quote.source
+					} as AssetAccountPayload);
+					if (showFeedback) uni.hideLoading();
+					if (ok) {
+						await this.loadData();
+						if (showFeedback) uni.showToast({ title: '行情已更新', icon: 'success' });
+					} else {
+						if (showFeedback) uni.showToast({ title: '更新失败', icon: 'none' });
+					}
+				} catch (_e) {
+					if (showFeedback) {
+						uni.hideLoading();
+						uni.showToast({ title: '行情刷新失败', icon: 'none' });
+					}
+				}
+			}
+		}
+	}
+</script>
+
+<style>
+	.page {
+		flex: 1;
+		position: relative;
+		background-color: rgba(245, 247, 250, 0.2);
+	}
+
+	.content-wrapper {
+		flex: 1;
+		flex-direction: column;
+		z-index: 1;
+		height: 100%;
+	}
+
+	.detail-scroll {
+		flex: 1;
+		padding: 0 15px;
+	}
+
+	.hero-card {
+		margin-top: 15px;
+		padding: 22px;
+		border-radius: 18px;
+		background-color: #0d6e6e;
+		box-shadow: 0 6px 16px rgba(13, 110, 110, 0.3);
+	}
+
+	.hero-top {
+		flex-direction: row;
+		align-items: center;
+		margin-bottom: 18px;
+	}
+
+	.hero-icon {
+		width: 46px;
+		height: 46px;
+		border-radius: 23px;
+		background-color: rgba(255, 255, 255, 0.18);
+		justify-content: center;
+		align-items: center;
+		margin-right: 12px;
+	}
+
+	.hero-icon-text {
+		font-size: 22px;
+	}
+
+	.hero-title-area {
+		flex: 1;
+	}
+
+	.hero-name {
+		font-size: 18px;
+		font-weight: bold;
+		color: #ffffff;
+		margin-bottom: 3px;
+	}
+
+	.hero-sub {
+		font-size: 12px;
+		color: rgba(255, 255, 255, 0.8);
+	}
+
+	.hero-label {
+		font-size: 13px;
+		color: rgba(255, 255, 255, 0.85);
+		margin-bottom: 4px;
+	}
+
+	.hero-value {
+		font-size: 34px;
+		font-weight: bold;
+		color: #ffffff;
+		margin-bottom: 14px;
+	}
+
+	.hero-profit-pill {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+		background-color: rgba(255, 255, 255, 0.16);
+		border-radius: 12px;
+		padding: 10px 14px;
+	}
+
+	.hero-profit-text {
+		font-size: 15px;
+		font-weight: bold;
+		color: #ffffff;
+	}
+
+	.hero-profit-amount {
+		font-size: 14px;
+		font-weight: bold;
+		color: #ffffff;
+	}
+
+	.stats-grid {
+		flex-direction: row;
+		flex-wrap: wrap;
+		justify-content: space-between;
+		margin-top: 14px;
+	}
+
+	.stat-card {
+		width: 48.5%;
+		background-color: rgba(255, 255, 255, 0.9);
+		border-radius: 14px;
+		padding: 14px;
+		margin-bottom: 12px;
+	}
+
+	.stat-label {
+		font-size: 12px;
+		color: #97a1ac;
+		margin-bottom: 6px;
+	}
+
+	.stat-value {
+		font-size: 16px;
+		font-weight: bold;
+		color: #1f2d3d;
+	}
+
+	.info-row {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+		background-color: rgba(255, 255, 255, 0.9);
+		border-radius: 14px;
+		padding: 14px;
+		margin-bottom: 8px;
+	}
+
+	.info-row-label {
+		font-size: 14px;
+		color: #6b7785;
+	}
+
+	.info-row-value {
+		font-size: 14px;
+		font-weight: bold;
+	}
+
+	.section-title-area {
+		padding: 14px 4px 10px 4px;
+	}
+
+	.section-title {
+		font-size: 16px;
+		font-weight: bold;
+		color: #1f2d3d;
+	}
+
+	.transaction-card {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+		padding: 15px;
+		margin-bottom: 10px;
+		border-radius: 12px;
+		background-color: rgba(255, 255, 255, 0.9);
+		box-shadow: 0 2px 6px rgba(0, 0, 0, 0.02);
+	}
+
+	.trans-left {
+		flex: 1;
+	}
+
+	.trans-category {
+		font-size: 16px;
+		font-weight: bold;
+		color: #333;
+		margin-bottom: 4px;
+	}
+
+	.trans-time {
+		font-size: 12px;
+		color: #999;
+		margin-bottom: 2px;
+	}
+
+	.trans-desc {
+		font-size: 13px;
+		color: #666;
+	}
+
+	.trans-right {
+		align-items: flex-end;
+	}
+
+	.trans-amount {
+		font-size: 18px;
+		font-weight: bold;
+	}
+
+	.amount-income {
+		color: #16a34a;
+	}
+
+	.amount-expense {
+		color: #f44336;
+	}
+
+	.trans-balance {
+		font-size: 12px;
+		color: #999;
+		margin-top: 4px;
+	}
+
+	.empty-tip {
+		align-items: center;
+		margin-top: 40px;
+	}
+
+	.empty-text {
+		color: #999;
+		font-size: 14px;
+	}
+
+	.list-bottom-spacer {
+		height: 30px;
+	}
+
+	.bottom-bar {
+		flex-direction: row;
+		padding: 12px 15px;
+		padding-bottom: 22px;
+		background-color: rgba(255, 255, 255, 0.6);
+	}
+
+	.bottom-btn {
+		flex: 1;
+		height: 48px;
+		border-radius: 24px;
+		justify-content: center;
+		align-items: center;
+		margin: 0 6px;
+	}
+
+	.record-btn {
+		background-color: #e7ebee;
+	}
+
+	.delete-btn {
+		background-color: #fff1f2;
+	}
+
+	.bottom-btn-text {
+		font-size: 15px;
+		font-weight: bold;
+		color: #4a5560;
+	}
+
+	.delete-btn-text {
+		color: #e11d48;
+	}
+
+	.trade-overlay {
+		position: fixed;
+		left: 0;
+		right: 0;
+		top: 0;
+		bottom: 0;
+		background-color: rgba(15, 23, 42, 0.28);
+		z-index: 20;
+		justify-content: flex-end;
+	}
+
+	.trade-sheet {
+		padding: 10px 16px 18px 16px;
+		border-radius: 18px 18px 0 0;
+		background-color: #ffffff;
+	}
+
+	.trade-handle {
+		width: 38px;
+		height: 4px;
+		border-radius: 2px;
+		background-color: #d5dce8;
+		align-self: center;
+		margin-bottom: 12px;
+	}
+
+	.trade-title {
+		font-size: 18px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.trade-sub {
+		margin-top: 5px;
+		font-size: 12px;
+		color: #7d879b;
+	}
+
+	.trade-input-row {
+		margin-top: 16px;
+		flex-direction: row;
+	}
+
+	.trade-input-card {
+		flex: 1;
+		padding: 12px;
+		border-radius: 12px;
+		background-color: #f5f7fb;
+		border-width: 1px;
+		border-color: #e3e8f2;
+		margin-right: 8px;
+	}
+
+	.trade-input-card-last {
+		margin-right: 0;
+	}
+
+	.trade-label {
+		font-size: 12px;
+		color: #6d7790;
+		margin-bottom: 8px;
+	}
+
+	.trade-amount-row {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.trade-symbol {
+		font-size: 16px;
+		color: #22304f;
+		margin-right: 4px;
+	}
+
+	.trade-input {
+		flex: 1;
+		height: 34px;
+		font-size: 20px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.trade-unit-input {
+		width: 100%;
+	}
+
+	.trade-tip {
+		margin-top: 10px;
+		font-size: 12px;
+		color: #64708a;
+	}
+
+	.trade-actions {
+		margin-top: 18px;
+		flex-direction: row;
+	}
+
+	.trade-cancel,
+	.trade-submit {
+		flex: 1;
+		height: 46px;
+		border-radius: 10px;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.trade-cancel {
+		background-color: #eef2f7;
+		margin-right: 10px;
+	}
+
+	.trade-submit {
+		background-color: #0d6e6e;
+	}
+
+	.trade-cancel-text {
+		font-size: 15px;
+		color: #526078;
+	}
+
+	.trade-submit-text {
+		font-size: 15px;
+		font-weight: bold;
+		color: #ffffff;
+	}
+
+</style>

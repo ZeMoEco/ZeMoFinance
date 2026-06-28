@@ -1,0 +1,39 @@
+export type MusicPlaylist = {
+  dissid: string;
+  dissname: string;
+  logo: string;
+  song_cnt: number;
+  listen_num: number;
+  creator_name?: string;
+  creator_avatar?: string;
+}
+
+export type MusicUserInfo = {
+    nickname: string;
+    avatar: string;
+    uin: string;
+}
+
+export type MusicUserPlaylistsResult = {
+    playlists: MusicPlaylist[];
+    userInfo: MusicUserInfo;
+}
+
+export type MusicSong = {
+  mid: string;
+  name: string;
+  singer: string;
+  album: string;
+  interval: number;
+  cover: string;
+  src: string;
+  lyric?: string;
+  source?: string;
+}
+
+export type MusicState = {
+    currentSong: MusicSong | null;
+    isPlaying: boolean;
+    playlist: MusicSong[];
+    currentIndex: number;
+}

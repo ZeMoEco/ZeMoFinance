@@ -1,0 +1,50 @@
+node_modules/
+unpackage/
+.hbuilderx/
+.DS_Store
+
+# Local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.keystore
+
+# Build/cache output
+dist/
+build/
+coverage/
+*.log
+*.tmp
+*.bak
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Archives and large generated artifacts
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+
+# Model weights, runtimes, and datasets
+model/
+static/models/
+harmony-configs/**/resources/rawfile/static/models/
+**/assets/model-*/
+**/static/model-*/
+*.onnx
+*.ms
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.parquet
+*.jsonl
+*.npy
+*.npz
+*.data

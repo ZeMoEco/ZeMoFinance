@@ -1,0 +1,47 @@
+// uni_modules/zemo-rpa/utssdk/utils/ScreenCaptureUtils.uts
+
+// #ifdef APP-ANDROID
+import { ScreenCaptureUtils as ScreenCaptureImpl } from '../app-android/exports.uts';
+import Context from 'android.content.Context';
+import Intent from 'android.content.Intent';
+// #endif
+
+export class ScreenCaptureUtils {
+	
+	/**
+	 * 初始化截图工具
+	 * @param context 
+	 * @param resultCode 
+	 * @param resultData 
+	 */
+	static init(context: any, resultCode: number, resultData: any | null) {
+		// #ifdef APP-ANDROID
+		if (resultData != null) {
+			ScreenCaptureImpl.init(context as Context, resultCode, resultData as Intent);
+		}
+		// #endif
+	}
+
+	/**
+	 * 获取当前屏幕截图 (Base64)
+	 * @param cropRect 可选裁剪区域
+	 */
+	static takeSnapshot(cropRect: any | null = null) : string | null {
+		// #ifdef APP-ANDROID
+		return ScreenCaptureImpl.takeSnapshot(cropRect);
+		// #endif
+		
+		// #ifndef APP-ANDROID
+		return null;
+		// #endif
+	}
+
+	/**
+	 * 停止录制并释放资源
+	 */
+	static stop() {
+		// #ifdef APP-ANDROID
+		ScreenCaptureImpl.stop();
+		// #endif
+	}
+}

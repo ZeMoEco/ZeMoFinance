@@ -1,0 +1,268 @@
+<template>
+	<view class="rpa-node-card" :class="[colorClass, { 'selected': isSelected, 'executing': isExecuting }]" @click.stop="$emit('click')">
+		
+		<!-- Input Port -->
+		<view class="port port-top"></view>
+
+		<!-- Header -->
+		<view class="card-header">
+			<text class="step-index" :style="{ fontSize: (12 * scale) + 'px' }">#{{ index + 1 }}</text>
+			<text class="step-type" :style="{ fontSize: (12 * scale) + 'px' }">{{ step.actionType }}</text>
+			
+			<!-- Badges -->
+			<view class="badge-container">
+				<text v-if="step.branches.length > 0" class="badge branch-badge">⑂{{ step.branches.length }}</text>
+				<text v-if="step.stepInputMode != null" class="badge mode-badge">{{ inputModeLabel }}</text>
+			</view>
+		</view>
+
+		<!-- Content -->
+		<view class="card-body">
+			<!-- Image Preview -->
+			<image v-if="step.templateImage != ''" class="step-image" :src="step.templateImage" mode="aspectFit" />
+			
+			<!-- Text Info -->
+			<view class="info-row" v-if="step.aiLabel != ''">
+				<text class="info-label">AI:</text>
+				<text class="info-value ai-text">{{ truncate(step.aiLabel) }}</text>
+			</view>
+			<view class="info-row" v-else-if="step.description != ''">
+				<text class="info-value desc-text">{{ truncate(step.description) }}</text>
+			</view>
+			<view class="info-row" v-else-if="step.widgetText != ''">
+				<text class="info-label">Title:</text>
+				<text class="info-value">{{ truncate(step.widgetText) }}</text>
+			</view>
+			<view class="info-row" v-else>
+				<text class="info-value dim-text">{{ step.actionType }} Action</text>
+			</view>
+		</view>
+
+		<!-- Control Buttons (Hover or Always visible) -->
+		<view class="card-footer" v-if="isSelected">
+			<view class="action-btn" @click.stop="$emit('edit')">✏️</view>
+			<view class="action-btn" @click.stop="$emit('add-child')">➕</view>
+			<view class="action-btn" @click.stop="$emit('delete')">🗑️</view> 
+		</view>
+
+		<!-- Output Port -->
+		<view class="port port-bottom" @touchstart.stop="$emit('link-start')"></view>
+
+	</view>
+</template>
+
+<script lang="uts">
+import { RPAStep, RPAActionType, StepInputMode } from '../utssdk/utils/RPAStep.uts';
+
+export default {
+	emits: ['click', 'edit', 'add-child', 'delete', 'link-start'],
+	props: {
+		step: {
+			type: Object as PropType<RPAStep>,
+			required: true
+		},
+		index: {
+			type: Number,
+			default: 0
+		},
+		isSelected: {
+			type: Boolean,
+			default: false
+		},
+		isExecuting: {
+			type: Boolean,
+			default: false
+		},
+		scale: {
+			type: Number,
+			default: 1.0
+		}
+	},
+	computed: {
+		colorClass(): string {
+			const type = this.step.actionType;
+			if (type == RPAActionType.CLICK) return 'card-blue';
+			if (type == RPAActionType.SWIPE) return 'card-purple';
+			if (type == RPAActionType.INPUT) return 'card-green';
+			if (type == RPAActionType.BRANCH) return 'card-orange';
+			if (type == RPAActionType.SCROLL) return 'card-purple';
+			if (type == RPAActionType.WAIT_RENDER) return 'card-yellow';
+			if (type == RPAActionType.OPEN_APP) return 'card-teal';
+			return 'card-gray';
+		},
+		inputModeLabel(): string {
+			const m = this.step.stepInputMode;
+			if (m == StepInputMode.ACCESSIBILITY) return "A11Y";
+			if (m == StepInputMode.BLUETOOTH_HID) return "HID";
+			if (m == StepInputMode.COORDINATE) return "XY";
+			return "AUTO";
+		}
+	},
+	methods: {
+		truncate(str: string): string {
+			if (str.length > 15) return str.substring(0, 15) + '...';
+			return str;
+		}
+	}
+}
+</script>
+
+<style scoped>
+.rpa-node-card {
+	width: 100%;
+	height: 100%;
+	border-radius: 12px;
+	background-color: #ffffff;
+	box-shadow: 0 4px 12px rgba(0,0,0,0.08); /* Softer shadow */
+	display: flex;
+	flex-direction: column;
+	overflow: hidden;
+	position: relative;
+	border: 2px solid transparent;
+	transition: all 0.2s ease;
+}
+
+.rpa-node-card.selected {
+	border-color: #2979ff;
+	box-shadow: 0 0 0 4px rgba(41, 121, 255, 0.2);
+	transform: translateY(-2px);
+}
+
+.rpa-node-card.executing {
+	border-color: #4caf50;
+	box-shadow: 0 0 15px rgba(76, 175, 80, 0.4);
+}
+
+/* Colors based on Action Type */
+.card-blue .card-header { background-color: rgba(64, 158, 255, 0.1); border-bottom: 1px solid rgba(64, 158, 255, 0.2); }
+.card-blue .step-type { color: #409eff; }
+
+.card-purple .card-header { background-color: rgba(156, 39, 176, 0.1); border-bottom: 1px solid rgba(156, 39, 176, 0.2); }
+.card-purple .step-type { color: #9c27b0; }
+
+.card-green .card-header { background-color: rgba(76, 175, 80, 0.1); border-bottom: 1px solid rgba(76, 175, 80, 0.2); }
+.card-green .step-type { color: #4caf50; }
+
+.card-orange .card-header { background-color: rgba(255, 152, 0, 0.1); border-bottom: 1px solid rgba(255, 152, 0, 0.2); }
+.card-orange .step-type { color: #ff9800; }
+
+.card-yellow .card-header { background-color: rgba(255, 235, 59, 0.1); border-bottom: 1px solid rgba(255, 235, 59, 0.2); }
+.card-yellow .step-type { color: #fbc02d; }
+
+.card-teal .card-header { background-color: rgba(0, 150, 136, 0.1); border-bottom: 1px solid rgba(0, 150, 136, 0.2); }
+.card-teal .step-type { color: #009688; }
+
+.card-gray .card-header { background-color: rgba(158, 158, 158, 0.1); border-bottom: 1px solid rgba(158, 158, 158, 0.2); }
+.card-gray .step-type { color: #757575; }
+
+/* Header Layout */
+.card-header {
+	height: 36px;
+	padding: 0 10px;
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	justify-content: space-between;
+}
+
+.step-index {
+	font-size: 12px;
+	color: #999;
+	font-weight: bold;
+	margin-right: 6px;
+}
+
+.step-type {
+	font-size: 14px;
+	font-weight: 600;
+	flex: 1;
+}
+
+.badge-container {
+	display: flex;
+	flex-direction: row;
+}
+
+.badge {
+	font-size: 10px;
+	padding: 2px 6px;
+	border-radius: 4px;
+	margin-left: 4px;
+}
+.branch-badge { background-color: #fff3e0; color: #ff9800; border: 1px solid #ffe0b2; }
+.mode-badge { background-color: #e3f2fd; color: #2196f3; border: 1px solid #bbdefb; }
+
+/* Body Layout */
+.card-body {
+	flex: 1;
+	padding: 10px;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+}
+
+.step-image {
+	width: 100%;
+	height: 60px;
+	border-radius: 6px;
+	margin-bottom: 6px;
+	background-color: #f0f0f0;
+}
+
+.info-row {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+}
+
+.info-label {
+	font-size: 12px;
+	color: #999;
+	margin-right: 6px;
+}
+
+.info-value {
+	font-size: 13px;
+	color: #333;
+	lines: 1;
+	text-overflow: ellipsis;
+}
+
+.ai-text { color: #673ab7; font-weight: 500; }
+.desc-text { color: #555; font-style: italic; }
+.dim-text { color: #bbb; }
+
+/* Footer Actions */
+.card-footer {
+	height: 32px;
+	border-top: 1px solid #eee;
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	justify-content: space-around;
+	background-color: #fafafa;
+}
+
+.action-btn {
+	padding: 4px 8px;
+	font-size: 14px;
+	opacity: 0.7;
+}
+.action-btn:active { opacity: 1; transform: scale(1.1); }
+
+/* Ports */
+.port {
+	position: absolute;
+	width: 12px;
+	height: 12px;
+	background-color: #fff;
+	border: 2px solid #ccc;
+	border-radius: 50%;
+	left: 50%;
+	transform: translateX(-50%);
+	z-index: 2;
+}
+.port-top { top: -6px; border-color: #aaa; }
+.port-bottom { bottom: -6px; border-color: #409eff; background-color: #409eff; }
+
+</style>

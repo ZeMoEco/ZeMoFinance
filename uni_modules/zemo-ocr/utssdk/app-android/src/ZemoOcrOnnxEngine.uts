@@ -1,0 +1,79 @@
+import ZemoOcrOnnxImpl from "uts.sdk.modules.zemoOcr.ZemoOcrOnnxImpl";
+
+export type NativeOnnxOcrBox = {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+}
+
+export type NativeOnnxOcrItem = {
+    text: string;
+    confidence: number;
+    box: NativeOnnxOcrBox;
+}
+
+export type NativeOnnxResult = {
+    ok: boolean;
+    message: string;
+    fullText: string;
+    items: NativeOnnxOcrItem[];
+}
+
+export class ZemoOcrOnnxEngine {
+    private impl: ZemoOcrOnnxImpl | null = null;
+
+    constructor() {
+        this.impl = new ZemoOcrOnnxImpl();
+    }
+
+    public isInitialized(): boolean {
+        const impl = this.impl;
+        if (impl == null) return false;
+        return impl.isInitialized();
+    }
+
+    public init(detModelPath: string, recModelPath: string, dict: UTSArray<string>): void {
+        const impl = this.impl;
+        if (impl == null) return;
+        impl.init(detModelPath, recModelPath, dict.toTypedArray());
+    }
+
+    public recognize(imagePath: string): NativeOnnxResult {
+        const impl = this.impl;
+        if (impl == null) {
+            return {
+                ok: false,
+                message: "ONNX impl is null",
+                fullText: "",
+                items: []
+            } as NativeOnnxResult;
+        }
+
+        const res = impl.recognize(imagePath);
+        const nativeItems: NativeOnnxOcrItem[] = [];
+        const sourceItems = res.items;
+
+        for (let i: Int = 0; i < sourceItems.size; i++) {
+            const item = sourceItems.get(i);
+            const box = item.box;
+            nativeItems.push({
+                text: item.text,
+                confidence: item.confidence,
+                box: {
+                    left: box.left,
+                    top: box.top,
+                    right: box.right,
+                    bottom: box.bottom
+                }
+            } as NativeOnnxOcrItem);
+        }
+
+        return {
+            ok: res.ok,
+            message: res.message,
+            fullText: res.fullText,
+            items: nativeItems
+        } as NativeOnnxResult;
+    }
+}

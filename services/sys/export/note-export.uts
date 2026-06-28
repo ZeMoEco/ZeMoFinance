@@ -1,0 +1,264 @@
+import { FileUtil } from '@/utils/file/file.uts'
+import { RUNTIME_FULL_EXPORT_DIR } from '@/utils/constant.uts'
+import { formatDateForFile, joinPath } from '@/utils/common/tools.uts'
+
+// #ifdef APP-ANDROID
+import File from 'java.io.File'
+import FileOutputStream from 'java.io.FileOutputStream'
+import PdfDocument from 'android.graphics.pdf.PdfDocument'
+import Paint from 'android.graphics.Paint'
+// #endif
+
+export type NoteExportResult = {
+  ok: boolean
+  type: 'word' | 'pdf'
+  path?: string
+  message?: string
+}
+
+export class NoteExportService {
+  // Public renderer for in-app preview (keeps export + preview consistent).
+  static renderHtml(markdown: string): string {
+    return NoteExportService.markdownToHtml(markdown)
+  }
+
+  static async exportWord(title: string, markdown: string): Promise<NoteExportResult> {
+    try {
+      await FileUtil.ensureRuntimeDirs()
+
+      const time = formatDateForFile(new Date())
+      const safeTitle = NoteExportService.sanitizeFileName(title)
+      const filePath = joinPath(RUNTIME_FULL_EXPORT_DIR, `Note_${safeTitle}_${time}.doc`)
+
+      const html = NoteExportService.markdownToHtml(markdown)
+      const doc = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${NoteExportService.escapeHtml(title)}</title></head><body>${html}</body></html>`
+
+      const ok = await FileUtil.writeTextFile(filePath, doc, 'utf8')
+      if (!ok) return { ok: false, type: 'word', message: '写入文件失败' }
+
+      return { ok: true, type: 'word', path: filePath }
+    } catch (e) {
+      return { ok: false, type: 'word', message: (e as Error).message }
+    }
+  }
+
+  static async exportPdf(title: string, markdown: string): Promise<NoteExportResult> {
+    // #ifdef APP-ANDROID
+    try {
+      await FileUtil.ensureRuntimeDirs()
+
+      const time = formatDateForFile(new Date())
+      const safeTitle = NoteExportService.sanitizeFileName(title)
+      const filePath = joinPath(RUNTIME_FULL_EXPORT_DIR, `Note_${safeTitle}_${time}.pdf`)
+
+      const text = NoteExportService.markdownToPlainText(markdown)
+      const lines = NoteExportService.wrapLines(text, 70)
+
+      const doc = new PdfDocument()
+      const paint = new Paint()
+      paint.setTextSize(12.0.toFloat())
+
+      // A4-ish at 72dpi: 595x842
+      const pageWidth: Int = 595
+      const pageHeight: Int = 842
+      const margin: Int = 40
+      const lineHeight: Int = 18
+
+      let lineIndex = 0
+      let pageNumber: Int = 1
+
+      while (lineIndex < lines.length) {
+        const pageInfo = new PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageNumber).create()
+        const page = doc.startPage(pageInfo)
+        const canvas = page.getCanvas()
+
+        let y: Int = margin
+        // title on first page
+        if (pageNumber == 1) {
+          paint.setTextSize(16.0.toFloat())
+          canvas.drawText(title, margin.toFloat(), y.toFloat(), paint)
+          paint.setTextSize(12.0.toFloat())
+          y += lineHeight + 10
+        }
+
+        while (lineIndex < lines.length && y <= pageHeight - margin) {
+          canvas.drawText(lines[lineIndex], margin.toFloat(), y.toFloat(), paint)
+          y += lineHeight
+          lineIndex++
+        }
+
+        doc.finishPage(page)
+        pageNumber++
+      }
+
+      const outFile = new File(filePath)
+      const fos = new FileOutputStream(outFile)
+      doc.writeTo(fos)
+      fos.flush()
+      fos.close()
+      doc.close()
+
+      return { ok: true, type: 'pdf', path: filePath }
+    } catch (e) {
+      return { ok: false, type: 'pdf', message: (e as Error).message }
+    }
+    // #endif
+
+    // #ifndef APP-ANDROID
+    return { ok: false, type: 'pdf', message: '当前平台暂不支持PDF导出（仅 Android 已实现）' }
+    // #endif
+  }
+
+  private static sanitizeFileName(name: string): string {
+    const raw = (name != null ? name : '').toString().trim()
+    if (raw == '') return 'Untitled'
+    // remove characters invalid for most filesystems
+    return raw.replace(/[\\/:*?"<>|\n\r\t]/g, '_').substring(0, 40)
+  }
+
+  private static escapeHtml(s: string): string {
+    return (s != null ? s : '').toString()
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+  }
+
+  // Minimal Markdown -> HTML (covers headings, lists, bold/italic, links, images, code blocks)
+  private static markdownToHtml(md: string): string {
+    const src = (md != null ? md : '').toString().replace(/\r\n/g, '\n')
+    const lines = src.split('\n')
+
+    let html = ''
+    let inCode = false
+    let inUl = false
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+
+      if (line.startsWith('```')) {
+        if (!inCode) {
+          if (inUl) { html += '</ul>'; inUl = false }
+          inCode = true
+          html += '<pre><code>'
+        } else {
+          inCode = false
+          html += '</code></pre>'
+        }
+        continue
+      }
+
+      if (inCode) {
+        html += NoteExportService.escapeHtml(line) + '\n'
+        continue
+      }
+
+      const trimmed = line.trim()
+      if (trimmed == '') {
+        if (inUl) { html += '</ul>'; inUl = false }
+        html += '<br/>'
+        continue
+      }
+
+      // headings
+      const h = /^(#{1,6})\s+(.+)$/.exec(trimmed)
+      if (h != null) {
+        if (inUl) { html += '</ul>'; inUl = false }
+        let marks: string = ''
+        if (h.length > 1 && h[1] != null) {
+          marks = h[1]!!
+        }
+        const level: Int = marks.length
+
+        let headingText: string = ''
+        if (h.length > 2 && h[2] != null) {
+          headingText = h[2]!!
+        }
+        html += `<h${level}>${NoteExportService.inlineMdToHtml(headingText)}</h${level}>`
+        continue
+      }
+
+      // list item
+      const li = /^[-*]\s+(.+)$/.exec(trimmed)
+      if (li != null) {
+        if (!inUl) { html += '<ul>'; inUl = true }
+        let itemText: string = ''
+        if (li.length > 1 && li[1] != null) {
+          itemText = li[1]!!
+        }
+        html += `<li>${NoteExportService.inlineMdToHtml(itemText)}</li>`
+        continue
+      }
+
+      if (inUl) { html += '</ul>'; inUl = false }
+      html += `<p>${NoteExportService.inlineMdToHtml(trimmed)}</p>`
+    }
+
+    if (inUl) html += '</ul>'
+    if (inCode) html += '</code></pre>'
+
+    return html
+  }
+
+  private static inlineMdToHtml(text: string): string {
+    let s = NoteExportService.escapeHtml(text)
+
+    // images: ![alt](url)
+    s = s.replace(/!\[([^\]]*)\]\(([^\)]+)\)/g, (_m, alt, url, _index, _src) => {
+      const a = NoteExportService.escapeHtml(alt != null ? alt.toString() : '')
+      const u = NoteExportService.escapeHtml(url != null ? url.toString() : '')
+      return `<img src="${u}" alt="${a}" style="max-width:100%;"/>`
+    })
+
+    // links: [text](url)
+    s = s.replace(/\[([^\]]+)\]\(([^\)]+)\)/g, (_m, t, url, _index, _src) => {
+      const tt = NoteExportService.escapeHtml(t != null ? t.toString() : '')
+      const u = NoteExportService.escapeHtml(url != null ? url.toString() : '')
+      // Explicit styling
+      return `<a href="${u}" style="color: #2979ff; text-decoration: underline; font-weight: bold; padding: 2px 0;">${tt}</a>`
+    })
+
+    // bold/italic
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>')
+
+    // inline code
+    s = s.replace(/`([^`]+)`/g, '<code>$1</code>')
+
+    return s
+  }
+
+  private static markdownToPlainText(md: string): string {
+    const src = (md != null ? md : '').toString().replace(/\r\n/g, '\n')
+    // Remove most markdown markers for PDF basic export
+    return src
+      // UTS replace(callback) overload is strict; simplest is removing all fences.
+      .replace(/```/g, '')
+      .replace(/!\[[^\]]*\]\(([^\)]+)\)/g, '[image: $1]')
+      .replace(/\[([^\]]+)\]\(([^\)]+)\)/g, '$1 ($2)')
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/\*([^*]+)\*/g, '$1')
+      .replace(/`([^`]+)`/g, '$1')
+  }
+
+  private static wrapLines(text: string, maxLen: number): string[] {
+    const out: string[] = []
+    const src = (text != null ? text : '').toString().replace(/\r\n/g, '\n')
+    const rawLines = src.split('\n')
+
+    for (let i = 0; i < rawLines.length; i++) {
+      const l = rawLines[i]
+      if (l.length <= maxLen) {
+        out.push(l)
+        continue
+      }
+      let start = 0
+      while (start < l.length) {
+        out.push(l.substring(start, Math.min(start + maxLen, l.length)))
+        start += maxLen
+      }
+    }
+    return out
+  }
+}

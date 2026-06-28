@@ -1,0 +1,428 @@
+<template>
+	<scroll-view class="page" scroll-y="true">
+		<view class="page-inner">
+			<view class="hero-card">
+				<text class="hero-title">调试工具</text>
+				<text class="hero-sub">用于 WebDAV 增量同步和屏幕理解链路调试。</text>
+				<text class="hero-state">{{ busy ? '运行中...' : '空闲' }}</text>
+			</view>
+
+			<view class="actions-card">
+				<button class="action-btn" :disabled="busy" @click="initDebugPage">初始化环境</button>
+				<button class="action-btn" :disabled="busy" @click="runWebDavSync">执行 WebDAV 同步</button>
+				<button class="action-btn action-btn-light" :disabled="busy" @click="runScreenUnderstanding">屏幕理解</button>
+				<button class="action-btn action-btn-light" :disabled="busy" @click="runScreenSnapshotSummary">截图总结</button>
+				<button class="action-btn action-btn-light" :disabled="busy" @click="runScreenActionExecution">执行屏幕动作</button>
+				<button class="action-btn action-btn-light" :disabled="busy" @click="refreshSnapshot">刷新快照</button>
+				<button class="action-btn action-btn-light" :disabled="busy" @click="clearLogs">清空日志</button>
+			</view>
+
+			<view class="card">
+				<text class="card-title">启动状态</text>
+				<text class="mono-text">{{ bootSummary }}</text>
+			</view>
+
+			<view class="card">
+				<text class="card-title">WebDAV 配置</text>
+				<text class="mono-text">{{ configSummary }}</text>
+			</view>
+
+			<view class="card">
+				<text class="card-title">最近一次同步</text>
+				<text class="mono-text">{{ resultSummary }}</text>
+			</view>
+
+			<view class="card">
+				<text class="card-title">屏幕模型</text>
+				<text class="mono-text">{{ modelSummary }}</text>
+			</view>
+
+			<view class="card">
+				<text class="card-title">截图总结</text>
+				<text class="mono-text">{{ snapshotSummary }}</text>
+			</view>
+
+			<view class="card">
+				<view class="card-title-row">
+					<text class="card-title">屏幕理解</text>
+					<button class="mini-btn" v-if="screenRecordQuery != ''" :disabled="busy" @click="openScreenRecord">确认记账</button>
+				</view>
+				<text class="mono-text">{{ screenSummary }}</text>
+			</view>
+
+			<view class="card">
+				<text class="card-title">执行结果</text>
+				<text class="mono-text">{{ executionSummary }}</text>
+			</view>
+
+			<view class="card">
+				<text class="card-title">调试日志</text>
+				<text class="mono-text">{{ logs }}</text>
+			</view>
+		</view>
+	</scroll-view>
+</template>
+
+<script lang="uts">
+	import { FINANCE_APP_PROFILE } from '@/services/ecosystem/AppProfiles.uts'
+	import { EcosystemAppBootstrap } from '@/services/ecosystem/EcosystemAppBootstrap.uts'
+	import { WebDavIncrementalSyncService } from '@/services/ecosystem/WebDavIncrementalSyncService.uts'
+	import { WebDavConfigService } from '@/services/sys/export/WebDavConfigService.uts'
+	import { ScreenUnderstandingService, ScreenUnderstandingResult } from '@/services/sys/ScreenUnderstandingService.uts'
+	import { ScreenActionExecutorService, ScreenActionExecutionResult } from '@/services/sys/ScreenActionExecutorService.uts'
+	import { ScreenOmniLiteModelService } from '@/services/sys/ScreenOmniLiteModelService.uts'
+	import { ScreenSnapshotSummaryService, ScreenSnapshotSummaryResult } from '@/services/sys/ScreenSnapshotSummaryService.uts'
+	import { AppDialogApi } from '@/components/sys/AppDialogApi.uts'
+	import { DB } from '@/utils/DB/DB.uts'
+
+	const ACTIVE_APP_PROFILE = FINANCE_APP_PROFILE
+
+	export default {
+		data() {
+			return {
+				busy: false,
+				bootSummary: '尚未初始化',
+				configSummary: '尚未读取配置',
+				resultSummary: '尚未执行同步',
+				modelSummary: '尚未读取屏幕模型',
+				snapshotSummary: '尚未执行截图总结',
+				screenSummary: '尚未执行屏幕理解',
+				executionSummary: '尚未执行屏幕动作',
+				screenRecordQuery: '',
+				logs: '',
+			}
+		},
+		onLoad() {
+			this.initDebugPage()
+		},
+		methods: {
+			log(message: string) {
+				const text = `[WebDavSyncDebug] ${message}`
+				console.log(text)
+				this.logs = this.logs == '' ? text : `${this.logs}\n${text}`
+			},
+			clearLogs() {
+				this.logs = ''
+			},
+			safeText(raw: any, fallback: string = ''): string {
+				if (raw == null) return fallback
+				const text = raw.toString()
+				return text == '' ? fallback : text
+			},
+			formatBool(value: boolean): string {
+				return value ? 'true' : 'false'
+			},
+			buildConfigSummary(): string {
+				const cfg = WebDavConfigService.load()
+				return [
+					`dbReady=${this.formatBool(DB.isReady)}`,
+					`enabled=${this.formatBool(cfg.enabled)}`,
+					`username=${this.safeText(cfg.username, '未设置')}`,
+					`passwordSet=${this.formatBool(this.safeText(cfg.password).trim() != '')}`,
+					`collabBaseUrl=${this.safeText(cfg.collabBaseUrl, '未设置')}`,
+					`backupUrl=${this.safeText(cfg.backupUrl, '未设置')}`,
+				].join('\n')
+			},
+			formatSyncResult(result: any): string {
+				return [
+					`available=${this.formatBool(result.available === true)}`,
+					`synced=${this.formatBool(result.synced === true)}`,
+					`remoteFound=${this.formatBool(result.remoteFound === true)}`,
+					`downloaded=${this.formatBool(result.downloaded === true)}`,
+					`imported=${this.formatBool(result.imported === true)}`,
+					`uploaded=${this.formatBool(result.uploaded === true)}`,
+					`reason=${this.safeText(result.reason, 'null')}`,
+				].join('\n')
+			},
+			formatScreenResult(result: ScreenUnderstandingResult): string {
+				const lines = [] as string[]
+				lines.push(`ok=${this.formatBool(result.ok)}`)
+				lines.push(`kind=${result.kind}`)
+				lines.push(`source=${this.safeText(result.source, 'unknown')}`)
+				lines.push(`title=${this.safeText(result.title, '未识别')}`)
+				if (result.message != '') lines.push(`message=${result.message}`)
+				if (result.summary != '') lines.push(`summary=${result.summary}`)
+				if (result.actions.length > 0) lines.push(`action=${result.actions[0].label}`)
+				if (result.content != '') {
+					lines.push('')
+					lines.push(result.content)
+				}
+				return lines.join('\n')
+			},
+			formatSnapshotSummary(result: ScreenSnapshotSummaryResult): string {
+				const lines = [] as string[]
+				lines.push(`ok=${this.formatBool(result.ok)}`)
+				lines.push(`source=${this.safeText(result.source, 'unknown')}`)
+				lines.push(`image=${this.safeText(result.imagePath, 'none')}`)
+				lines.push(`title=${this.safeText(result.title, '未识别')}`)
+				lines.push(`label=${this.safeText(result.modelLabel, 'none')}`)
+				lines.push(`kind=${this.safeText(result.modelKind, 'general')}`)
+				lines.push(`action=${this.safeText(result.modelAction, 'summarize_screen')}`)
+				lines.push(`modelReady=${this.formatBool(result.modelReady)}`)
+				lines.push(`confidence=${result.confidence}`)
+				lines.push(`method=${this.safeText(result.modelMethod, 'none')}`)
+				if (result.message != '') lines.push(`message=${result.message}`)
+				if (result.summary != '') lines.push(`summary=${result.summary}`)
+				if (result.content != '') {
+					lines.push('')
+					lines.push(result.content)
+				}
+				return lines.join('\n')
+			},
+			formatExecutionResult(result: ScreenActionExecutionResult): string {
+				const lines = [] as string[]
+				lines.push(`ok=${this.formatBool(result.ok)}`)
+				lines.push(`kind=${result.kind}`)
+				lines.push(`message=${this.safeText(result.message, '无')}`)
+				if (result.transactionId != '') lines.push(`transactionId=${result.transactionId}`)
+				const taskResult = result.taskResult
+				if (taskResult != null) {
+					lines.push(`createdTasks=${taskResult.created}`)
+					if (taskResult.candidates.length > 0) {
+						lines.push('todoCandidates=')
+						for (let i = 0; i < taskResult.candidates.length; i++) {
+							lines.push(`${i + 1}. ${taskResult.candidates[i].title}`)
+						}
+					}
+				}
+				const investmentResult = result.investmentResult
+				if (investmentResult != null) {
+					lines.push(`imported=${investmentResult.imported}`)
+					lines.push(`updated=${investmentResult.updated}`)
+					lines.push(`provider=${this.safeText(investmentResult.provider, 'unknown')}`)
+				}
+				return lines.join('\n')
+			},
+			async initDebugPage() {
+				if (this.busy) return
+				this.busy = true
+				try {
+					this.log('初始化 WebDAV 同步环境')
+					const context = EcosystemAppBootstrap.resolveNativeContext()
+					const result = await EcosystemAppBootstrap.init(ACTIVE_APP_PROFILE, context, 'sync-debug-open')
+					this.bootSummary = [
+						`app=${ACTIVE_APP_PROFILE.appId}`,
+						`dbReady=${this.formatBool(result.dbReady)}`,
+						`syncReady=${this.formatBool(result.syncReady)}`,
+						`syncReason=${this.safeText(result.syncReason, 'null')}`,
+					].join('\n')
+					this.log(`bootstrap: dbReady=${result.dbReady}, syncReady=${result.syncReady}, reason=${this.safeText(result.syncReason, 'null')}`)
+					await this.refreshSnapshot()
+				} catch (e) {
+					const message = e == null ? 'unknown error' : (e as Error).message
+					this.bootSummary = `初始化失败\n${message}`
+					this.log(`初始化失败: ${message}`)
+				} finally {
+					this.busy = false
+				}
+			},
+			async runWebDavSync() {
+				if (this.busy) return
+				this.busy = true
+				try {
+					await this.ensureReady('sync-debug-manual')
+					const context = EcosystemAppBootstrap.resolveNativeContext()
+					const result = await WebDavIncrementalSyncService.run(ACTIVE_APP_PROFILE, 'sync-debug-manual', context)
+					this.resultSummary = this.formatSyncResult(result)
+					this.log(`manual sync: synced=${result.synced}, downloaded=${result.downloaded}, imported=${result.imported}, uploaded=${result.uploaded}, reason=${this.safeText(result.reason, 'null')}`)
+					await this.refreshSnapshot()
+				} catch (e) {
+					const message = e == null ? 'unknown error' : (e as Error).message
+					this.resultSummary = `同步失败\n${message}`
+					this.log(`同步失败: ${message}`)
+				} finally {
+					this.busy = false
+				}
+			},
+			async runScreenSnapshotSummary() {
+				if (this.busy) return
+				this.busy = true
+				try {
+					this.log('执行截图总结')
+					const result = await ScreenSnapshotSummaryService.summarizeCurrentScreen(false, false)
+					this.snapshotSummary = this.formatSnapshotSummary(result)
+					this.log(`screen snapshot summary: ok=${result.ok}, label=${result.modelLabel}, confidence=${result.confidence}`)
+				} catch (e) {
+					const message = e == null ? 'unknown error' : (e as Error).message
+					this.snapshotSummary = `截图总结失败\n${message}`
+					this.log(`截图总结失败: ${message}`)
+				} finally {
+					this.busy = false
+				}
+			},
+			async runScreenUnderstanding() {
+				if (this.busy) return
+				this.busy = true
+				this.screenRecordQuery = ''
+				try {
+					this.log('执行屏幕理解')
+					const result = await ScreenUnderstandingService.analyzeCurrentScreen(false)
+					this.screenSummary = this.formatScreenResult(result)
+					if (result.actions.length > 0 && result.actions[0].type == 'open_record') {
+						this.screenRecordQuery = result.actions[0].query
+					}
+					this.log(`screen understanding: ok=${result.ok}, kind=${result.kind}, source=${this.safeText(result.source, 'unknown')}`)
+				} catch (e) {
+					const message = e == null ? 'unknown error' : (e as Error).message
+					this.screenSummary = `屏幕理解失败\n${message}`
+					this.log(`屏幕理解失败: ${message}`)
+				} finally {
+					this.busy = false
+				}
+			},
+			async runScreenActionExecution() {
+				if (this.busy) return
+				this.busy = true
+				this.screenRecordQuery = ''
+				try {
+					this.log('执行屏幕动作')
+					await this.ensureReady('screen-action-execute')
+					const result = await ScreenActionExecutorService.executeCurrentScreen(false)
+					this.executionSummary = this.formatExecutionResult(result)
+					this.screenSummary = this.formatScreenResult(result.screen)
+					if (result.screen.actions.length > 0 && result.screen.actions[0].type == 'open_record') {
+						this.screenRecordQuery = result.screen.actions[0].query
+					}
+					uni.showToast({
+						title: result.ok ? '执行完成' : this.safeText(result.message, '未执行'),
+						icon: result.ok ? 'success' : 'none',
+						duration: 2400
+					})
+					this.log(`screen action: ok=${result.ok}, kind=${result.kind}, message=${this.safeText(result.message, 'none')}`)
+				} catch (e) {
+					const message = e == null ? 'unknown error' : (e as Error).message
+					this.executionSummary = `执行失败\n${message}`
+					this.log(`屏幕动作执行失败: ${message}`)
+				} finally {
+					this.busy = false
+				}
+			},
+			openScreenRecord() {
+				if (this.screenRecordQuery == '') return
+				AppDialogApi.openFinanceRecordOnHome(this.screenRecordQuery)
+			},
+			async refreshSnapshot() {
+				this.configSummary = this.buildConfigSummary()
+				const latestSnapshotSummary = ScreenSnapshotSummaryService.readLatestSummaryText()
+				if (latestSnapshotSummary != '') this.snapshotSummary = latestSnapshotSummary
+				await this.refreshModelStatus()
+			},
+			async refreshModelStatus() {
+				this.modelSummary = await ScreenOmniLiteModelService.getStatus()
+			},
+			async ensureReady(source: string) {
+				if (DB.isReady) return
+				this.log(`DB 未就绪，执行 bootstrap: ${source}`)
+				const context = EcosystemAppBootstrap.resolveNativeContext()
+				const result = await EcosystemAppBootstrap.init(ACTIVE_APP_PROFILE, context, source)
+				if (!result.dbReady) {
+					throw new Error(`bootstrap failed: ${this.safeText(result.syncReason, 'db_init_failed')}`)
+				}
+			}
+		}
+	}
+</script>
+
+<style>
+.page {
+	flex: 1;
+	background-color: #f4efe6;
+}
+
+.page-inner {
+	padding: 16px;
+	gap: 14px;
+}
+
+.hero-card,
+.actions-card,
+.card {
+	padding: 16px;
+	border-radius: 18px;
+	background-color: #fffaf2;
+	border-width: 1px;
+	border-style: solid;
+	border-color: #e8d8bf;
+	box-shadow: 0 6px 16px rgba(120, 78, 34, 0.08);
+}
+
+.hero-card {
+	gap: 8px;
+	background-color: #f8e5c8;
+}
+
+.hero-title {
+	font-size: 24px;
+	font-weight: 700;
+	color: #5a3418;
+}
+
+.hero-sub {
+	font-size: 13px;
+	line-height: 20px;
+	color: #7c5432;
+}
+
+.hero-state {
+	font-size: 12px;
+	color: #9a5c2f;
+}
+
+.actions-card {
+	flex-direction: row;
+	flex-wrap: wrap;
+	gap: 10px;
+}
+
+.action-btn {
+	min-width: 148px;
+	height: 40px;
+	padding: 0 14px;
+	border-radius: 20px;
+	background-color: #bf6a2d;
+	color: #ffffff;
+	font-size: 13px;
+	border-width: 0;
+}
+
+.action-btn-light {
+	background-color: #ead7bf;
+	color: #5a3418;
+}
+
+.card {
+	gap: 10px;
+}
+
+.card-title-row {
+	flex-direction: row;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+}
+
+.card-title {
+	font-size: 16px;
+	font-weight: 600;
+	color: #5a3418;
+}
+
+.mini-btn {
+	height: 30px;
+	padding: 0 12px;
+	border-radius: 15px;
+	background-color: #bf6a2d;
+	color: #ffffff;
+	font-size: 12px;
+	border-width: 0;
+}
+
+.mono-text {
+	font-size: 12px;
+	line-height: 18px;
+	color: #47311f;
+	font-family: monospace;
+	white-space: pre-wrap;
+}
+</style>
+

@@ -1,0 +1,538 @@
+﻿// services/Alarm/AlarmScheduler.uts
+
+import { Task } from "@/services/biz/TaskBiz.uts";
+import { Permission, PermissionKey } from "@/services/sys/Permission.uts";
+
+// #ifdef APP-ANDROID
+import { UTSJSONObject } from 'io.dcloud.uts'
+// #endif
+
+// =========================================================
+// Android 平台依赖
+// =========================================================
+// #ifdef APP-ANDROID
+import UTSAndroid from "io.dcloud.uts.UTSAndroid";
+import Context from "android.content.Context";
+import Intent from "android.content.Intent";
+import Uri from "android.net.Uri";
+import AlarmManager from "android.app.AlarmManager";
+import PendingIntent from "android.app.PendingIntent";
+import Build from "android.os.Build";
+import { AlarmReceiver } from "./AlarmReceiver.uts";
+// #endif
+// =========================================================
+// HarmonyOS 平台依赖
+// =========================================================
+
+// #ifdef APP-HARMONY
+// 1. 使用 @ohos.reminderAgentManager 替代 @kit.BackgroundTasksKit
+// 注意：使用默认导入（无花括号）
+import reminderAgentManager from '@ohos.reminderAgentManager';
+
+// 2. 使用 @ohos.notificationManager 替代 @kit.NotificationKit
+// 注意：使用默认导入（无花括号），这是解决报错的关键
+import notificationManager from '@ohos.notificationManager';
+
+// 3. 基础错误类型
+import { BusinessError } from '@ohos.base';
+// #endif
+
+// =========================================================
+// iOS 平台依赖
+// =========================================================
+// #ifdef APP-IOS
+import { UNUserNotificationCenter, UNMutableNotificationContent, UNNotificationRequest, UNNotificationSound, UNTimeIntervalNotificationTrigger } from 'UserNotifications'
+// #endif
+
+export class AlarmScheduler {
+	private static toAndroidRequestCode(taskId: string): number {
+		const raw = taskId != null ? taskId.toString() : ''
+		if (raw.length == 0) return 1
+
+		const parsed = parseInt(raw)
+		if (!isNaN(parsed)) {
+			const normalized = Math.abs(parsed % 2147483647)
+			return normalized > 0 ? normalized : 1
+		}
+
+		let hash = 0
+		for (let i = 0; i < raw.length; i++) {
+			const cAny = raw.charCodeAt(i)
+			const c = cAny != null ? (cAny as number) : 0
+			hash = (hash * 31 + c) % 2147483647
+		}
+		if (hash <= 0) hash = 1
+		return hash
+	}
+
+	private static log(msg: string): void {
+		console.log(`[AlarmScheduler] ${msg}`)
+	}
+
+	private static promptPermissions(keys: PermissionKey[] | null = null): void {
+		try {
+			const list = (keys != null) ? keys : ['overlay', 'notification', 'exactAlarm', 'autoStart']
+			const states = Permission.statuses(list)
+			const missing: PermissionKey[] = []
+			for (let i = 0; i < states.length; i++) {
+				if (!states[i].granted) missing.push(states[i].key)
+			}
+			if (missing.length > 0) {
+				const params = new Map<string, any>();
+				params.set("show", true);
+				params.set("permissions", missing);
+				uni.$emit('permission-modal', params);
+			}
+		} catch (_e) { }
+	}
+
+	private static extractReminder(metaAny: any | null): number | null {
+		if (metaAny == null) return null
+		// 1) UTSJSONObject
+// #ifdef APP-ANDROID
+		try {
+			const v = (metaAny as UTSJSONObject).getNumber("reminder_time")
+			if (v != null) return v
+		} catch (_e) { }
+// #endif
+		return null
+	}
+
+	private static extractReminderFromRawMetadata(metadataAny: any): number | null {
+		// Be extremely defensive: metadata may be malformed JSON (or even not JSON at all).
+		// We only need reminder_time, so do a tolerant string scan instead of JSON.parse.
+		try {
+			if (metadataAny == null) return null
+			const raw = metadataAny.toString()
+			if (raw == null) return null
+			const s = raw.toString()
+			if (s.length == 0) return null
+			const key = 'reminder_time'
+			const idx = s.indexOf(key)
+			if (idx < 0) return null
+			// Scan forward for a number after the key.
+			let i = idx + key.length
+			// Skip non-digits (handles cases like: reminder_time\":123 or reminder_time": 123)
+			while (i < s.length) {
+				const chAny = s.charCodeAt(i)
+				const ch = (chAny != null) ? (chAny as number) : -1
+				if (ch >= 48 && ch <= 57) break
+				i++
+			}
+			if (i >= s.length) return null
+			let j = i
+			while (j < s.length) {
+				const ch2Any = s.charCodeAt(j)
+				const ch2 = (ch2Any != null) ? (ch2Any as number) : -1
+				if (ch2 < 48 || ch2 > 57) break
+				j++
+			}
+			const numStr = s.substring(i, j)
+			if (numStr.length == 0) return null
+			const v = parseInt(numStr)
+			if (isNaN(v)) return null
+			return v
+		} catch (_e: any) {
+			return null
+		}
+	}
+
+
+	static refreshTaskAlarm(task : Task) {
+		AlarmScheduler.log(`refresh task ${task.id} status=${task.status} start_at=${task.start_at} meta=${task.metadata}`)
+		if (task.status == 'done' || task.status == 'archived') {
+			AlarmScheduler.log(`cancel because status=${task.status}`)
+			AlarmScheduler.cancelAlarm(task.id);
+			return;
+		}
+		// 任务开始时间提醒
+		if (task.start_at > Date.now()) {
+			AlarmScheduler.log(`schedule start_at ${task.start_at}`)
+			AlarmScheduler.setAlarm(task.id, task.title, task.start_at);
+			return;
+		}
+		// 自定义提醒时间
+		const metaRaw = task.metadata
+		if (metaRaw != null) {
+			try {
+				const reminder = AlarmScheduler.extractReminderFromRawMetadata(metaRaw)
+				if (reminder != null && reminder > Date.now()) {
+					AlarmScheduler.log(`schedule reminder ${reminder} for task ${task.id}`)
+					AlarmScheduler.setAlarm(task.id, task.title, reminder);
+				} else {
+					AlarmScheduler.log(`no valid reminder for task ${task.id}`)
+				}
+			} catch (_e3) { }
+		}
+	}
+
+	static async setAlarm(taskId: string, title: string, triggerTime: number) {
+		AlarmScheduler.promptPermissions()
+		// #ifdef APP-ANDROID
+		AlarmScheduler.log(`setAlarm Android id=${taskId} at=${triggerTime}`)
+		AlarmScheduler.setAlarmAndroid(taskId, title, triggerTime);
+		// #endif
+
+		// #ifdef APP-HARMONY
+		console.log('setAlarmHarmony_1', taskId, title, triggerTime)
+		await AlarmScheduler.setAlarmHarmony(taskId, title, triggerTime);
+		// #endif
+
+		// #ifdef APP-IOS
+		await AlarmScheduler.setAlarmIOS(taskId, title, triggerTime)
+		// #endif
+	}
+
+	static cancelAlarm(taskId: string) {
+		// #ifdef APP-ANDROID
+		AlarmScheduler.log(`cancelAlarm Android id=${taskId}`)
+		AlarmScheduler.cancelAlarmAndroid(taskId);
+		// #endif
+
+		// #ifdef APP-HARMONY
+		AlarmScheduler.cancelAlarmHarmony(taskId);
+		// #endif
+
+		// #ifdef APP-IOS
+		AlarmScheduler.cancelAlarmIOS(taskId)
+		// #endif
+	}
+
+	// =================================================================================
+	// iOS 核心逻辑
+	// =================================================================================
+	// #ifdef APP-IOS
+	private static getIOSIdentifier(taskId: string): string {
+		return `zemo_alarm_${taskId}`
+	}
+
+	private static async ensureIOSNotificationPermission(): Promise<boolean> {
+		return await new Promise<boolean>((resolve) => {
+			try {
+				const center = UNUserNotificationCenter.current()
+				// alert=1, sound=2, badge=4
+				const options = (1 | 2 | 4) as any
+				center.requestAuthorizationWithOptionsCompletionHandler(options, (granted: boolean, _err: any | null) => {
+					resolve(granted)
+				})
+			} catch (_e) {
+				// 若桥接不可用，则不阻塞业务（但也可能无法响铃）
+				resolve(true)
+			}
+		})
+	}
+
+	private static async setAlarmIOS(taskId: string, title: string, triggerTime: number): Promise<void> {
+		try {
+			const ok = await AlarmScheduler.ensureIOSNotificationPermission()
+			if (!ok) {
+				try {
+					const emitData = new Map<string, any>();
+					emitData.set('show', true);
+					emitData.set('permissions', ['notification']);
+					uni.$emit('permission-modal', emitData)
+				} catch (_e2) { }
+				return
+			}
+		} catch (_e) { }
+
+		try {
+			const center = UNUserNotificationCenter.current()
+			const identifier = AlarmScheduler.getIOSIdentifier(taskId)
+
+			// 先移除旧的同 ID 通知，避免重复
+			try {
+				center.removePendingNotificationRequestsWithIdentifiers([identifier] as any)
+			} catch (_e2) { }
+
+			const content = UNMutableNotificationContent.new()
+			content.title = title
+			content.body = '时间到了'
+			content.sound = UNNotificationSound.defaultSound()
+
+			let seconds = Math.floor((triggerTime - Date.now()) / 1000)
+			if (seconds < 1) seconds = 1
+			const trigger = UNTimeIntervalNotificationTrigger.triggerWithTimeIntervalRepeats(seconds as any, false)
+			const request = UNNotificationRequest.requestWithIdentifierContentTrigger(identifier, content, trigger)
+			center.addNotificationRequestWithCompletionHandler(request, (_err: any | null) => {
+				// noop
+			})
+		} catch (e) {
+			console.error(e)
+		}
+	}
+
+	private static cancelAlarmIOS(taskId: string): void {
+		try {
+			const center = UNUserNotificationCenter.current()
+			const identifier = AlarmScheduler.getIOSIdentifier(taskId)
+			center.removePendingNotificationRequestsWithIdentifiers([identifier] as any)
+		} catch (_e) { }
+	}
+	// #endif
+
+	// =================================================================================
+	// HarmonyOS 核心逻辑
+	// =================================================================================
+	// #ifdef APP-HARMONY
+	private static getHarmonyBundleName(): string {
+		// 优先尝试从运行时读取（不同基座版本可能有差异），失败则使用已知 bundleName 兜底
+		let bundleName = "zenith.most.zemo.HUAWEI";
+		try {
+			const anyUni = uni as any;
+			if (anyUni != null && typeof anyUni.getAppBaseInfo === 'function') {
+				const baseInfo = anyUni.getAppBaseInfo() as any;
+				if (baseInfo != null && baseInfo.bundleName != null) {
+					bundleName = baseInfo.bundleName as string;
+				}
+			}
+		} catch (_e) { }
+		return bundleName;
+	}
+
+	private static getHarmonyReminderIdKey(taskId: number): string {
+		return `zemo_harmony_reminderId_${taskId}`;
+	}
+
+	static async checkNotificationPermission() : Promise<boolean> {
+		try {
+			const isEnabled = await notificationManager.isNotificationEnabled();
+			if (isEnabled) return true;
+
+			console.log("[HarmonyOS] 请求通知权限...");
+			await notificationManager.requestEnableNotification();
+
+			return await notificationManager.isNotificationEnabled();
+		} catch (err) {
+			console.error(`[HarmonyOS] 权限检查异常: ${err}`);
+			return false;
+		}
+	}
+
+	private static async setAlarmHarmony(taskId: string, title : string, triggerTime : number) {
+		// 1. 权限检查
+		const hasPermission = await AlarmScheduler.checkNotificationPermission();
+		if (!hasPermission) {
+			console.warn("[HarmonyOS] 用户拒绝通知权限，跳过提醒设置");
+			return; // 明确终止执行
+		}
+
+		// 2. ID 转换
+		let safeId = 1000000 - taskId;
+		console.log(`[HarmonyOS] 准备设置提醒: ${title}, ID: ${safeId}`);
+
+		try {
+			// 3.1 先取消旧提醒（publishReminder 返回 reminderId；需自行保存映射，否则 cancelReminder 可能失效）
+			try {
+				const key = AlarmScheduler.getHarmonyReminderIdKey(taskId);
+				const prevIdAny = uni.getStorageSync(key) as any;
+				const prevId = prevIdAny != null ? parseInt(prevIdAny.toString()) : 0;
+				if (prevId > 0) {
+					await reminderAgentManager.cancelReminder(prevId);
+				}
+			} catch (_eCancelPrev) {
+				// ignore
+			}
+			// 兜底：仍尝试按 safeId 再取消一次（兼容历史版本可能把 safeId 当 reminderId 的情况）
+			try {
+				await reminderAgentManager.cancelReminder(safeId);
+			} catch (_eCancelSafe) { }
+
+			const targetDate = new Date(triggerTime);
+			let targetUrl = `/pages/settings/alarm-trigger?taskId=${taskId}`;
+			try {
+				targetUrl = `/pages/settings/alarm-trigger?taskId=${taskId}&title=${encodeURIComponent(title)}`;
+			} catch (_eUrl) { }
+
+			// 让 UniEntryAbility 拿到 want.uri，并在 onShow/onNewIntent 透传到 options.appScheme
+			// const wantUri = `zemo://navigate?url=${encodeURIComponent(targetUrl)}`;
+			const wantUri = `zemo://navigate?url=test`; // Simplified URI for test
+			const bundleName = AlarmScheduler.getHarmonyBundleName();
+
+			console.log(`[HarmonyOS] Debug Bundle: ${bundleName}, Year: ${targetDate.getFullYear()}, Month: ${targetDate.getMonth() + 1}`);
+
+			// [Debug] Minimal Reminder Object
+			// Removing wantAgent to identifying if that is the cause of 401
+			const reminder : reminderAgentManager.ReminderRequestCalendar = {
+				reminderType: reminderAgentManager.ReminderType.REMINDER_TYPE_CALENDAR,
+				dateTime: {
+					year: targetDate.getFullYear(),
+					month: targetDate.getMonth() + 1,
+					day: targetDate.getDate(),
+					hour: targetDate.getHours(),
+					minute: targetDate.getMinutes(),
+					second: 0 // Ensure seconds are present
+				},
+				title: title,
+				content: "时间到了",
+				ringDuration: 15,
+				// notificationId: safeId, // Let system assign ID
+				// wantAgent: { ... } // Temporarily removed to debug 401
+				// slotType: ... // Temporarily removed
+			};
+
+			// 3.2 发布新提醒，并保存 reminderId 映射，保证后续 cancelAlarm 可用
+			try {
+				const id = await reminderAgentManager.publishReminder(reminder);
+				console.log(`[HarmonyOS] 提醒设置成功 reminderId: ${id}`);
+				try {
+					uni.setStorageSync(AlarmScheduler.getHarmonyReminderIdKey(taskId), id);
+				} catch (_eStore) { }
+			} catch (err) {
+				const bErr = err as BusinessError;
+				console.error(`[HarmonyOS] 设置失败 Code:${bErr.code}, Msg:${bErr.message}`);
+				
+				// 1700002: Limit exceeded (30 per app)
+				if (bErr.code == 1700002) {
+					console.warn("[HarmonyOS] 提醒数量超限，尝试清理所有旧提醒并重试...");
+					try {
+						await reminderAgentManager.cancelAllReminders();
+						console.log("[HarmonyOS] 全量清理完成，正在重试...");
+						const newId = await reminderAgentManager.publishReminder(reminder);
+						console.log(`[HarmonyOS] 重试成功 reminderId: ${newId}`);
+						try {
+							uni.setStorageSync(AlarmScheduler.getHarmonyReminderIdKey(taskId), newId);
+						} catch (_eStore) { }
+					} catch (retryErr) {
+						console.error(`[HarmonyOS] 重试失败: ${retryErr}`);
+					}
+				}
+			}
+
+		} catch (error) {
+			console.error(`[HarmonyOS] 运行时异常: ${error}`);
+		}
+	}
+
+	private static cancelAlarmHarmony(taskId: string) {
+		try {
+			const key = AlarmScheduler.getHarmonyReminderIdKey(taskId);
+			const storedAny = uni.getStorageSync(key) as any;
+			const storedId = storedAny != null ? parseInt(storedAny.toString()) : 0;
+			const safeId = 1000000 - taskId;
+
+			const cancelId = storedId > 0 ? storedId : safeId;
+			reminderAgentManager.cancelReminder(cancelId)
+				.then(() => {
+					try { uni.removeStorageSync(key); } catch (_eRm) { }
+					console.log(`[HarmonyOS] 取消提醒成功: ${cancelId}`)
+				})
+				.catch((e : BusinessError) => {
+					if (e.code != 1700005) { // 忽略 ID 不存在
+						console.warn(`[HarmonyOS] 取消失败: ${e.message}`);
+					}
+				});
+		} catch (e) { }
+	}
+	// #endif
+
+	// =================================================================================
+	// Android 核心逻辑
+	// =================================================================================
+	// #ifdef APP-ANDROID
+	private static setAlarmAndroid(taskId: string, title : string, triggerTime : number) {
+		const context = UTSAndroid.getAppContext();
+		if (context == null) return;
+		const am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager;
+		const requestCode = AlarmScheduler.toAndroidRequestCode(taskId)
+
+		const receiver = new AlarmReceiver();
+		const className = (receiver as java.lang.Object).getClass().getName();
+		try {
+			// 记录“当前版本实际使用的 Receiver 类名”，用于诊断 manifest 注册不匹配导致 onReceive 不触发
+			const sp = context.getSharedPreferences("zemo_alarm", Context.MODE_PRIVATE);
+			const ed = sp.edit();
+			ed.putString("alarm_sched_receiver_class", className);
+			ed.putLong("alarm_sched_receiver_ts", java.lang.System.currentTimeMillis());
+			try { ed.putString("alarm_sched_pkg", context.getPackageName()); } catch (_ePkg) {}
+			ed.commit();
+			console.log("[AlarmScheduler] scheduled receiver class=" + className);
+		} catch (_eSp) {}
+
+		const intent = new Intent();
+		intent.setClassName(context, className);
+		intent.putExtra("TASK_ID", taskId);
+		intent.putExtra("TASK_TITLE", title);
+		intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
+
+		const pendingIntent = PendingIntent.getBroadcast(
+			context, requestCode.toInt(), intent,
+			PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+		);
+
+		// Android 12+: 如果缺少精确闹钟权限，则提示用户前往设置，仍然降级为非精确
+		if (Build.VERSION.SDK_INT >= 31 && !am.canScheduleExactAlarms()) {
+			AlarmScheduler.log(`exact alarm not allowed, showing prompt and falling back id=${taskId}`)
+			try {
+				uni.showModal({
+					title: '需要精确闹钟权限',
+					content: '请开启“重要任务闹钟-精确闹钟”权限，确保提醒准时响铃。是否前往设置？',
+					confirmText: '去授权',
+					cancelText: '鏆備笉',
+					success: (res) => {
+						if (res.confirm) {
+							AlarmScheduler.openExactAlarmSettings()
+							const p = new Map<string, any>();
+							p.set("show", true);
+							p.set("permissions", ["exactAlarm", "notification", "overlay"]);
+							uni.$emit('permission-modal', p);
+						} else {
+							uni.showToast({ title: '已使用非精确模式，可能会延迟', icon: 'none' })
+						}
+					}
+				})
+			} catch (_eModal) { }
+			try {
+				am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerTime.toLong(), pendingIntent);
+			} catch (_e2) { }
+			return;
+		}
+
+		try {
+			if (Build.VERSION.SDK_INT >= 21) {
+				const info = new AlarmManager.AlarmClockInfo(triggerTime.toLong(), pendingIntent);
+				AlarmScheduler.log(`setAlarmClock id=${taskId} at=${triggerTime}`)
+				am.setAlarmClock(info, pendingIntent);
+			} else {
+				AlarmScheduler.log(`setExactAndAllowWhileIdle id=${taskId} at=${triggerTime}`)
+				am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerTime.toLong(), pendingIntent);
+			}
+		} catch (e) {
+			console.error(e);
+			// 兜底：尝试非精确闹钟
+			try {
+				AlarmScheduler.log(`fallback setAndAllowWhileIdle id=${taskId} at=${triggerTime}`)
+				am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerTime.toLong(), pendingIntent);
+			} catch (_e2) { }
+		}
+	}
+
+	private static cancelAlarmAndroid(taskId: string) {
+		const context = UTSAndroid.getAppContext();
+		if (context == null) return;
+		const am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager;
+		const requestCode = AlarmScheduler.toAndroidRequestCode(taskId)
+		const receiver = new AlarmReceiver();
+		const className = (receiver as java.lang.Object).getClass().getName();
+		const intent = new Intent();
+		intent.setClassName(context, className);
+		const pendingIntent = PendingIntent.getBroadcast(
+			context, requestCode.toInt(), intent,
+			PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+		);
+		am.cancel(pendingIntent);
+	}
+
+	private static openExactAlarmSettings(): void {
+		try {
+			const ctx = UTSAndroid.getAppContext()
+			if (ctx == null) return
+			const intentSettings = new Intent();
+			intentSettings.setAction("android.settings.REQUEST_SCHEDULE_EXACT_ALARM");
+			intentSettings.setData(Uri.parse("package:" + ctx.getPackageName()));
+			intentSettings.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+			ctx.startActivity(intentSettings);
+		} catch (_e) { }
+	}
+	// #endif
+}

@@ -1,0 +1,137 @@
+<template>
+	<scroll-view class="year-view" scroll-y="true">
+		<view class="year-mini-grid">
+			<view class="year-mini-month" v-for="(m, idx) in monthIndexes" :key="'ym-'+idx" :id="monthCardIdBy(m)">
+				<view class="year-mini-header" @click.stop="$emit('openMonth', m)">
+					<text class="year-mini-title" :class="m == currentMonth ? 'year-mini-title-active' : ''">{{ m }}月</text>
+				</view>
+
+				<view class="year-mini-weekdays">
+					<text class="year-mini-wd">一</text>
+					<text class="year-mini-wd">二</text>
+					<text class="year-mini-wd">三</text>
+					<text class="year-mini-wd">四</text>
+					<text class="year-mini-wd">五</text>
+					<text class="year-mini-wd">六</text>
+					<text class="year-mini-wd">日</text>
+				</view>
+
+				<view class="year-mini-rows">
+					<view class="year-mini-row" v-for="(row, rIdx) in typedYearMonthRows[idx]" :key="'yr-'+idx+'-'+rIdx">
+						<view class="year-mini-cell" v-for="(cell, cIdx) in row" :key="'yc-'+idx+'-'+rIdx+'-'+cIdx"
+							:class="yearCellClass(cell, m)" @click.stop="onTapCell(cell, m)">
+							<text class="year-mini-day" :class="yearDayTextClass(cell, m)">{{ yearDayLabel(cell) }}</text>
+							<view class="year-mini-marks" v-if="shouldShowMarks(cell)">
+								<view class="year-mini-dot year-mini-dot-pending" v-if="hasPending(cell)"></view>
+								<view class="year-mini-dot year-mini-dot-done" v-if="hasDone(cell)"></view>
+							</view>
+						</view>
+					</view>
+				</view>
+			</view>
+		</view>
+	</scroll-view>
+</template>
+
+<script lang="uts">
+	import { pad2 } from '@/utils/common/tools.uts'
+	import type { DateCellLike } from '@/services/biz/CalendarBiz.uts'
+
+	export default {
+		name: 'YearView',
+		emits: ['openMonth', 'selectDate'],
+		props: {
+			currentYear: { type: Number, default: 2025 },
+			currentMonth: { type: Number, default: 1 },
+			selectedDateStr: { type: String, default: '' },
+			yearMonthRows: { type: Array, default: () => [] },
+			monthCardId: { type: Function, default: (_m: number): string => '' },
+			doneByDate: { type: Object, default: null },
+			pendingByDate: { type: Object, default: null },
+		},
+		computed: {
+			typedYearMonthRows(): DateCellLike[][][] {
+				return this.yearMonthRows as DateCellLike[][][]
+			},
+			monthIndexes(): number[] {
+				const out: number[] = []
+				const len = this.typedYearMonthRows.length
+				for (let i = 0; i < len; i++) out.push(i + 1)
+				return out
+			},
+		},
+		methods: {
+			monthCardIdBy(m: number): string {
+				const fn = this.monthCardId as ((mm: number) => string)
+				return fn != null ? fn(m) : ''
+			},
+
+			yearDayLabel(cell: DateCellLike): string {
+				if (cell == null || cell.dateStr == '') return ''
+				try {
+					const parts = cell.dateStr.split('-')
+					if (parts.length == 3) return `${parseInt(parts[2])}`
+				} catch (_e) {}
+				return ''
+			},
+
+			yearCellClass(cell: DateCellLike, month: number): string {
+				if (cell == null || cell.dateStr == '') return 'year-mini-cell-empty'
+				let out = 'year-mini-cell'
+				if (!cell.inMonth) out += ' year-mini-cell-out'
+				if (this.selectedDateStr != '' && cell.dateStr == this.selectedDateStr) out += ' year-mini-cell-selected'
+				return out
+			},
+
+			yearDayTextClass(cell: DateCellLike, month: number): string {
+				if (cell == null || cell.dateStr == '') return ''
+				if (!cell.inMonth) return 'year-mini-day-out'
+				if (this.selectedDateStr != '' && cell.dateStr == this.selectedDateStr) return 'year-mini-day-selected'
+				// highlight "today"
+				try {
+					const now = new Date()
+					const todayStr = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`
+					if (cell.dateStr == todayStr) return 'year-mini-day-today'
+				} catch (_e) {}
+				return ''
+			},
+
+			onTapCell(cell: DateCellLike, month: number) {
+				if (cell == null || cell.dateStr == '') return
+				// allow tapping out-of-month days to jump into that month
+				this.$emit('selectDate', cell.dateStr)
+			},
+
+			shouldShowMarks(cell: DateCellLike): boolean {
+				return cell != null && cell.dateStr != '' && cell.inMonth
+			},
+
+			hasDone(cell: DateCellLike): boolean {
+				try {
+					const m = this.doneByDate as Map<string, any> | null
+					return m != null && m.has(cell.dateStr)
+				} catch (_e) {
+					return false
+				}
+			},
+
+			hasPending(cell: DateCellLike): boolean {
+				try {
+					const m = this.pendingByDate as Map<string, any> | null
+					return m != null && m.has(cell.dateStr)
+				} catch (_e) {
+					return false
+				}
+			},
+		}
+	}
+</script>
+
+<style>
+	.year-view {
+		flex: 1;
+		width: 100%;
+		height: 100%;
+		min-height: 0;
+	}
+</style>

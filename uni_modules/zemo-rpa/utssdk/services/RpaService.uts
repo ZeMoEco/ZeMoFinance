@@ -1,0 +1,53 @@
+﻿// uni_modules/zemo-rpa/utssdk/services/RpaService.uts
+// Lightweight stub  no @/ project-level dependency.
+// The DB-backed implementation is injected from root services/RpaService.uts
+// via setSaveCallback() during app init (before any recording session starts).
+
+/** 存储回调函数类型：将录制结果写入持久化层 */
+export type RpaSaveItemFn = (groupId : string, name : string, description : string, content : string, type : string, config : string) => Promise<string>;
+
+export class RpaServiceBridge {
+    static _saveCallback : RpaSaveItemFn | null = null;
+
+    /**
+     * 由应用层（services/RpaService.uts）注入真实 DB 实现。
+     * 必须在第一次录制结束前调用，否则保存操作会被跳过。
+     */
+    static setSaveCallback(fn : RpaSaveItemFn) {
+        RpaServiceBridge._saveCallback = fn;
+    }
+
+    static async createItem(
+        groupId : string,
+        name : string,
+        description : string,
+        content : string,
+        type : string = 'skill',
+        config : string = ''
+    ) : Promise<string> {
+        if (RpaServiceBridge._saveCallback == null) {
+            console.warn("[RpaServiceBridge] No save callback registered. "
+                + "Call ZemoRpa.registerSaveCallback() or RpaServiceBridge.setSaveCallback() "
+                + "before stopping a recording session.");
+            return "";
+        }
+        return await RpaServiceBridge._saveCallback!(groupId, name, description, content, type, config);
+    }
+}
+
+export class RpaService {
+    static setSaveCallback(fn : RpaSaveItemFn) {
+        RpaServiceBridge.setSaveCallback(fn);
+    }
+
+    static async createItem(
+        groupId : string,
+        name : string,
+        description : string,
+        content : string,
+        type : string = 'skill',
+        config : string = ''
+    ) : Promise<string> {
+        return await RpaServiceBridge.createItem(groupId, name, description, content, type, config);
+    }
+}

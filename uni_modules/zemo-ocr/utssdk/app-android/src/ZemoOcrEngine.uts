@@ -1,0 +1,85 @@
+import ZemoOcrImpl from "uts.sdk.modules.zemoOcr.ZemoOcrImpl";
+
+export type NativeOcrBox = {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+}
+
+export type NativeOcrItem = {
+    text: string;
+    confidence: number;
+    box: NativeOcrBox;
+}
+
+export type NativeResult = {
+    ok: boolean;
+    message: string;
+    fullText: string;
+    items: NativeOcrItem[];
+}
+
+export class ZemoOcrEngine {
+    private impl: ZemoOcrImpl | null = null;
+
+    constructor() {
+        this.impl = new ZemoOcrImpl();
+    }
+
+    public isInitialized(): boolean {
+        const impl = this.impl;
+        if (impl == null) return false;
+        return impl.isInitialized();
+    }
+
+    public init(detDir: string, recDir: string, dict: UTSArray<string>): void {
+        const impl = this.impl;
+        if (impl == null) return;
+        impl.init(detDir, recDir, dict.toTypedArray());
+    }
+
+    public recognize(imagePath: string): NativeResult {
+        const impl = this.impl;
+        if (impl == null) {
+            return {
+                ok: false,
+                message: "Impl is null",
+                fullText: "",
+                items: []
+            } as NativeResult;
+        }
+
+        const res = impl.recognize(imagePath);
+        
+        const nativeItems: NativeOcrItem[] = [];
+        const sourceItems = res.items;
+        
+        // Iterate over Kotlin List (sourceItems)
+        for (let i: Int = 0; i < sourceItems.size; i++) {
+            const item = sourceItems.get(i);
+            const box = item.box;
+            
+            const nativeBox: NativeOcrBox = {
+                left: box.left,
+                top: box.top,
+                right: box.right,
+                bottom: box.bottom
+            }
+            
+            const nativeItem: NativeOcrItem = {
+                text: item.text,
+                confidence: item.confidence,
+                box: nativeBox
+            }
+            nativeItems.push(nativeItem);
+        }
+
+        return {
+            ok: res.ok,
+            message: res.message,
+            fullText: res.fullText,
+            items: nativeItems
+        } as NativeResult;
+    }
+}

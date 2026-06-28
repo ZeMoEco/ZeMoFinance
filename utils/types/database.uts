@@ -1,0 +1,104 @@
+import { NodeType, LogAction, TransactionType } from './enums.uts';
+import { GraphRelationType, ContextEdgeStatus, EdgeSecondaryCategory, LogOwnerType } from './graph-types.uts';
+
+/**
+ * 核心本体：纯粹的不被污染的实体（1/7）
+ */
+export type Node = {
+  id: string;               // 节点UUID
+  type: NodeType;           // 基本类型（纯客观）
+  status?: string | null;   // 业务状态（todo/done/...）
+  content: string;          // 基础内容 / 标题或文本
+  properties?: string | null; // 扩展字段 JSON
+  due_at?: number | null;
+  completed_at?: number | null;
+  is_deleted?: number;
+  created_at: number;       // 创建时间戳
+  updated_at: number;       // 更新时间戳
+};
+
+/**
+ * 关系引擎：三态边结构（2/7）
+ * 包含：结构边、状态面具、资源挂载
+ */
+export type Edge = {
+  id: string;               // 关系边UUID
+  source_id: string;        // 起始节点UUID
+  target_id: string;        // 目标节点UUID
+  relation_type: GraphRelationType | string;
+  context_key?: string | null;
+  status?: ContextEdgeStatus | string | null;
+  secondary_category?: EdgeSecondaryCategory | string | null;
+  rank?: string | null;
+  properties: string | null;// JSON字符串字典（若为 Mask 类型，承载特有面具属性）
+  created_at: number;       // 创建时间戳
+  updated_at?: number;
+  is_deleted?: number;
+};
+
+/**
+ * 动态时序：日志记录挂载表（3/7）
+ */
+export type Log = {
+  id: string;               // 日志UUID
+  owner_type: LogOwnerType | string;
+  owner_id: string;
+  action: LogAction | string; // 具体的动作类型
+  text: string;             // 附加的消息或内容（JSON字符串快照）
+  parent_log_id?: string | null;
+  sync_block_id?: string | null;
+  source_log_id?: string | null;
+  timestamp?: number | null;
+  created_at: number;       // 记录时间戳
+  updated_at: number;       // 更新时间戳
+  properties?: string | null;
+  is_deleted?: number;
+};
+
+/**
+ * 资产：账户表（4/7）
+ */
+export type Account = {
+  id: string;               // 账户UUID
+  name: string;             // 账户名称
+  card_no?: string | null;  // 卡号 / 账户尾号
+  balance: number;          // 实时余额（精度可利用整数分处理）
+  created_at: number;       // 创建时间戳
+  updated_at: number;       // 更新时间戳
+};
+
+/**
+ * 流转：资金流失与记录挂载（5/7）
+ */
+export type Transaction = {
+  id: string;               // 流水单UUID
+  account_id: string;       // 所属主账户的UUID
+  type: TransactionType | string; // 流转类型
+  amount: number;           // 金额
+  created_at: number;       // 创建时间戳
+};
+
+/**
+ * 物理资源：附件挂载表（6/7）
+ */
+export type Attachment = {
+  id: string;               // 附件记录UUID
+  node_id: string;          // 挂载的宿主系统节点UUID
+  file_name: string;        // 文件显示名称
+  file_path: string;        // 本地/云端的真实路径标识
+  file_type?: string;       // image/document/video/...
+  file_hash?: string | null;
+  file_size: number;        // 文件大小（bytes）
+  created_at: number;       // 创建时间戳
+  updated_at?: number;
+  is_deleted?: number;
+};
+
+/**
+ * 配置项：图基座视图与上下文存储区（7/7）
+ */
+export type UserKV = {
+  key: string;              // 唯一键值
+  value: string;            // 序列化的 JSON 或字符串配置
+  updated_at: number;       // 更新时间戳
+};

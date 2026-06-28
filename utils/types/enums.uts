@@ -1,0 +1,52 @@
+export enum NodeType {
+    Task = 'TASK',
+    Note = 'NOTE',
+    SyncBlock = 'SYNC_BLOCK',
+    Project = 'PROJECT',
+    Tag = 'TAG',
+    Folder = 'FOLDER'
+}
+
+// 核心边类型：结构边 (Relational)
+export enum RelationalEdgeType {
+    Contains = 'CONTAINS',                   // 通用包含（迁移兼容）
+    ContainsTaskTree = 'CONTAINS_TASK_TREE', // 任务树包含
+    ContainsNoteBlock = 'CONTAINS_NOTE_BLOCK', // 笔记块顺序包含
+    ContainsCanvas = 'CONTAINS_CANVAS',      // 画布容器包含
+    DependsOn = 'DEPENDS_ON',                // 依赖（例如：任务 B 依赖任务 A）
+    References = 'REFERENCES'                // 引用（例如：笔记引用了某任务）
+}
+
+// 核心边类型：状态面具 (Mask / State)
+export enum MaskEdgeType {
+    HasStatus = 'HAS_STATUS',   // 状态面具（附带 properties: { status: 'done/todo' }）
+    HasRole = 'HAS_ROLE',       // 角色面具（附带 properties: { role: 'assignee' }）
+    HasPriority = 'HAS_PRIORITY',// 优先级面具（附带 properties: { priority: 'high' }）
+    HasPosition = 'HAS_POSITION' // 画布坐标面具（附带 properties: { x: 100, y: 200 }）
+}
+
+// 核心边类型：资源挂载 (Mounting)
+export enum MountingEdgeType {
+    HasAttachment = 'HAS_ATTACHMENT', // 挂载文件附件
+    HasTransaction = 'HAS_TRANSACTION',// 挂载资金流水
+    HasLog = 'HAS_LOG'                // 挂载操作日志
+}
+
+// 全局边类型集合
+export type EdgeType = RelationalEdgeType | MaskEdgeType | MountingEdgeType;
+
+// 动态时序日志操作类型
+export enum LogAction {
+    Create = 'CREATE',
+    Update = 'UPDATE',
+    Delete = 'DELETE',
+    Move = 'MOVE',
+    StatusChange = 'STATUS_CHANGE'
+}
+
+// 资金流水类型
+export enum TransactionType {
+    Income = 'INCOME',
+    Expense = 'EXPENSE',
+    Transfer = 'TRANSFER'
+}

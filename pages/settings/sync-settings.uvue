@@ -1,0 +1,772 @@
+﻿<template>
+	<scroll-view class="page" scroll-y="true">
+		<view class="page-inner">
+			<view class="hero-card">
+				<text class="hero-title">记账同步设置</text>
+				<text class="hero-sub">统一管理 WebDAV、本地共享目录和增量同步配置。</text>
+			</view>
+
+			<view class="card">
+				<view class="row-between">
+					<view class="row-copy">
+						<text class="card-title">启用 WebDAV</text>
+						<text class="field-hint">启用后，当前子应用会读取这里保存的增量同步配置。</text>
+					</view>
+					<switch :checked="enabled" @change="onEnabledChange" />
+				</view>
+			</view>
+
+			<view class="card">
+				<text class="field-label">协同根目录 URL</text>
+				<input class="text-input" v-model="collabBaseUrl" placeholder="https://example.com/dav/zemo-collab" />
+				<text class="field-hint">用于笔记协同和增量同步，建议填写目录地址。</text>
+
+				<text class="field-label">备份文件 URL</text>
+				<input class="text-input" v-model="backupUrl" placeholder="https://example.com/dav/zemo-finance.db" />
+				<text class="field-hint">用于手动备份上传下载，可填写 `.db` 或 `.zip` 完整地址。</text>
+
+				<text class="field-label">用户名</text>
+				<input class="text-input" v-model="username" placeholder="WebDAV 用户名" />
+
+				<text class="field-label">密码</text>
+				<input class="text-input" v-model="password" password placeholder="WebDAV 密码" />
+
+				<text class="field-label">WebDAV 自动同步频率（分钟）</text>
+				<input class="text-input" v-model="webdavSyncFrequencyMinutes" type="number" placeholder="0 表示每次打开/后台都同步" />
+				<text class="field-hint">仅限制自动生命周期同步；手动调试和确认移除会立即执行。</text>
+			</view>
+
+			<view class="card">
+				<view class="row-between">
+					<view class="row-copy">
+						<text class="card-title">启用本地共享同步</text>
+						<text class="field-hint">启用后优先读写两个固定 DB 文件；本地模式只同步数据库，资源仍走云端 WebDAV。</text>
+					</view>
+					<switch :checked="localSyncEnabled" @change="onLocalSyncEnabledChange" />
+				</view>
+				<text class="field-label">固定备份 DB</text>
+				<input class="text-input" v-model="localBackupFileUri" placeholder="zemo_backup.db" />
+				<text class="field-label">固定周同步 DB</text>
+				<input class="text-input" v-model="localSyncFileUri" placeholder="zemo_sync.db" />
+				<view class="inline-actions">
+					<button class="secondary-btn inline-btn" @click="createLocalSyncFiles">同时创建两个 DB</button>
+					<button class="secondary-btn inline-btn" @click="selectLocalSyncFiles">同时选择两个 DB</button>
+				</view>
+			</view>
+
+			<view class="card">
+				<view class="row-between">
+					<view class="row-copy">
+						<text class="card-title">屏幕 OCR 与屏幕模型</text>
+						<text class="field-hint">关闭屏幕 OCR 后，不再主动截屏识别文字；屏幕意图模型只处理画中画、缓存、剪贴板或手动传入的文本。</text>
+					</view>
+					<switch :checked="screenOcrEnabled" @change="onScreenOcrEnabledChange" />
+				</view>
+				<view class="row-between sub-switch-row">
+					<view class="row-copy">
+						<text class="field-label">优先使用 PP-OCRv6 离线 OCR</text>
+						<text class="field-hint">关闭时使用平台默认 OCR；账单和理财识别不再导入金融字段 SLM。</text>
+					</view>
+					<switch :checked="ppOcrV6Enabled" :disabled="!screenOcrEnabled" @change="onPpOcrV6EnabledChange" />
+				</view>
+				<view class="status-box">
+					<text class="status-text">{{ ocrModelStatus }}</text>
+				</view>
+				<view class="inline-actions">
+					<button class="secondary-btn inline-btn" @click="importPpOcrV6Model" :disabled="ocrImporting">{{ ocrImporting ? '导入中...' : '选择原文件导入' }}</button>
+					<button class="secondary-btn inline-btn" @click="refreshOcrStatus">刷新状态</button>
+				</view>
+				<text class="field-hint">不用 zip，直接一次多选原文件。OCR 选 det.ms、rec.ms、官方 inference.yml；屏幕意图模型选 screen_omni_intent.ms 和 label_map.json；MiniMind-O 正式模型选 zemo_screen_minimind_o_prefill_s192.ms，排查 Kit 兼容性可选 zemo_screen_minimind_o_text_s192.ms，会导入应用沙箱。</text>
+			</view>
+
+			<view class="card actions-card">
+				<button class="primary-btn" @click="saveConfig">保存配置</button>
+				<button class="secondary-btn" @click="testConnection">测试连接</button>
+				<button class="secondary-btn" @click="openSyncDebug">打开同步调试</button>
+			</view>
+
+			<view class="card">
+				<text class="card-title">当前快照</text>
+				<text class="mono-text">{{ summary }}</text>
+			</view>
+		</view>
+	</scroll-view>
+</template>
+
+<script lang="uts">
+	import { WebDAVService, type WebDavConfig } from '@/services/sys/export/WebDAVService.uts'
+	import { FileUtil } from '@/utils/file/file.uts'
+	import { OcrModelService } from '@/services/sys/office/OcrModelService.uts'
+	import { chooseSyncFile, chooseModelPackage } from '@/uni_modules/zemo-harmony-filepicker'
+
+	// #ifdef APP-ANDROID
+	import Intent from "android.content.Intent"
+	import UTSAndroid from "io.dcloud.uts.UTSAndroid"
+	import Activity from 'android.app.Activity'
+	import Uri from 'android.net.Uri'
+	import File from 'java.io.File'
+	import FileOutputStream from 'java.io.FileOutputStream'
+	import BufferedInputStream from 'java.io.BufferedInputStream'
+	import OpenableColumns from 'android.provider.OpenableColumns'
+	import InputStream from 'java.io.InputStream'
+	import Cursor from 'android.database.Cursor'
+	import ByteArray from "kotlin.ByteArray"
+	// #endif
+
+	const OCR_MODEL_PICK_REQUEST_CODE = 8876
+
+	export default {
+		data() {
+			return {
+				enabled: false,
+				collabBaseUrl: '',
+				backupUrl: '',
+				username: '',
+				password: '',
+				webdavSyncFrequencyMinutes: '0',
+				localSyncEnabled: false,
+				localSyncRootPath: '',
+				localBackupFileUri: '',
+				localSyncFileUri: '',
+				screenOcrEnabled: true,
+				ppOcrV6Enabled: false,
+				ocrModelStatus: '尚未检查 OCR 模型',
+				ocrImporting: false,
+				summary: '尚未加载配置',
+			}
+		},
+		onLoad() {
+			this.loadConfig()
+		},
+		mounted() {
+			// #ifdef APP-ANDROID
+			UTSAndroid.onAppActivityResult((requestCode: number, resultCode: number, data: Intent | null) => {
+				if (requestCode == OCR_MODEL_PICK_REQUEST_CODE && resultCode == Activity.RESULT_OK && data != null) {
+					this.handleAndroidOcrModelSelection(data)
+				}
+			})
+			// #endif
+		},
+		methods: {
+			loadConfig() {
+				try {
+					const enabled = uni.getStorageSync('webdav_enabled')
+					this.enabled = enabled != null && enabled.toString() == '1'
+				} catch (_e0) {
+					this.enabled = false
+				}
+				try {
+					const value = uni.getStorageSync('webdav_collab_base_url')
+					this.collabBaseUrl = value != null ? value.toString() : ''
+				} catch (_e1) {
+					this.collabBaseUrl = ''
+				}
+				try {
+					const value = uni.getStorageSync('webdav_url')
+					this.backupUrl = value != null ? value.toString() : ''
+				} catch (_e2) {
+					this.backupUrl = ''
+				}
+				try {
+					const value = uni.getStorageSync('webdav_username')
+					this.username = value != null ? value.toString() : ''
+				} catch (_e3) {
+					this.username = ''
+				}
+				try {
+					const value = uni.getStorageSync('webdav_password')
+					this.password = value != null ? value.toString() : ''
+				} catch (_e4) {
+					this.password = ''
+				}
+				try {
+					const value = uni.getStorageSync('webdav_sync_frequency_minutes')
+					this.webdavSyncFrequencyMinutes = value != null ? value.toString() : '0'
+				} catch (_e5) {
+					this.webdavSyncFrequencyMinutes = '0'
+				}
+				try {
+					const enabled = uni.getStorageSync('local_sync_enabled')
+					this.localSyncEnabled = enabled != null && enabled.toString() == '1'
+				} catch (_e6) {
+					this.localSyncEnabled = false
+				}
+				try {
+					const value = uni.getStorageSync('local_sync_root_path')
+					this.localSyncRootPath = value != null ? value.toString() : ''
+				} catch (_e7) {
+					this.localSyncRootPath = ''
+				}
+				try {
+					const value = uni.getStorageSync('local_sync_backup_file_uri')
+					this.localBackupFileUri = value != null ? value.toString() : ''
+				} catch (_e8) {
+					this.localBackupFileUri = ''
+				}
+				try {
+					const value = uni.getStorageSync('local_sync_week_file_uri')
+					this.localSyncFileUri = value != null ? value.toString() : ''
+				} catch (_e9) {
+					this.localSyncFileUri = ''
+				}
+				this.screenOcrEnabled = OcrModelService.isScreenOcrEnabled()
+				this.ppOcrV6Enabled = OcrModelService.isPpOcrV6Enabled()
+				this.refreshOcrStatus()
+				this.refreshSummary()
+			},
+			onEnabledChange(e: UniSwitchChangeEvent) {
+				this.enabled = e.detail.value
+				this.refreshSummary()
+			},
+			onLocalSyncEnabledChange(e: UniSwitchChangeEvent) {
+				this.localSyncEnabled = e.detail.value
+				this.refreshSummary()
+			},
+			onScreenOcrEnabledChange(e: UniSwitchChangeEvent) {
+				this.screenOcrEnabled = e.detail.value
+				OcrModelService.setScreenOcrEnabled(this.screenOcrEnabled)
+				this.refreshOcrStatus()
+				this.refreshSummary()
+			},
+			onPpOcrV6EnabledChange(e: UniSwitchChangeEvent) {
+				this.ppOcrV6Enabled = e.detail.value
+				OcrModelService.setPpOcrV6Enabled(this.ppOcrV6Enabled)
+				this.refreshOcrStatus()
+				this.refreshSummary()
+			},
+			resolveWebDavFrequencyMinutes(): number {
+				const raw = parseInt(this.webdavSyncFrequencyMinutes.toString())
+				if (isNaN(raw) || raw < 0) return 0
+				return raw
+			},
+			resolveDefaultLocalSyncRoot(): string {
+				// #ifdef APP-ANDROID
+				return '/storage/emulated/0/Documents/ZeMoSync'
+				// #endif
+				const base = uni.env.USER_DATA_PATH.replace(/\/+$/g, '')
+				return `${base}/zemo-shared-sync`
+			},
+			useDefaultLocalSyncRoot() {
+				this.localSyncRootPath = FileUtil.normalizePath(this.resolveDefaultLocalSyncRoot())
+				this.refreshSummary()
+			},
+			createLocalSyncFiles() { this.chooseLocalSyncFiles(true) },
+			selectLocalSyncFiles() { this.chooseLocalSyncFiles(false) },
+			chooseLocalSyncFiles(create: boolean) {
+				chooseSyncFile({
+					create,
+					success: (res: any) => {
+						const backupPath = res != null && res.backupPath != null ? res.backupPath.toString() : ''
+						const syncPath = res != null && res.syncPath != null ? res.syncPath.toString() : ''
+						if (backupPath == '' || syncPath == '') {
+							uni.showToast({ title: '未拿到两个文件路径', icon: 'none' })
+							return
+						}
+						this.localBackupFileUri = backupPath
+						this.localSyncFileUri = syncPath
+						this.saveConfig()
+						uni.showToast({ title: create ? '两个固定 DB 已创建' : '两个固定 DB 已授权', icon: 'success' })
+					},
+					fail: (err: any) => {
+						const message = err == null ? '固定 DB 文件选择失败' : err.toString()
+						uni.showModal({ title: '本地同步文件', content: message, showCancel: false })
+					}
+				})
+			},
+			async refreshOcrStatus() {
+				const status = await OcrModelService.getStatus()
+				let text = status.message
+				if (!status.screenOcrEnabled) {
+					text = `屏幕 OCR 已关闭；${text}`
+				}
+				// #ifdef APP-HARMONY
+				if (status.screenOcrEnabled && status.backend != 'mindspore-lite') {
+					text += '；鸿蒙 PP-OCRv6 需要导入 det.ms、rec.ms 和官方 inference.yml。'
+				}
+				// #endif
+				text += `；${status.screenOmniModelMessage}`
+				if (status.screenOcrEnabled && this.ppOcrV6Enabled && !status.ready) {
+					text += '；当前已开启，识别前请先导入完整模型或关闭开关。'
+				}
+				this.ocrModelStatus = text
+			},
+			importPpOcrV6Model() {
+				if (this.ocrImporting) return
+
+				// #ifdef APP-ANDROID
+				try {
+					const intent = new Intent(Intent.ACTION_GET_CONTENT)
+					intent.setType("*/*")
+					intent.addCategory(Intent.CATEGORY_OPENABLE)
+					intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+					const chooser = Intent.createChooser(intent, "选择 OCR/屏幕/MiniMind-O 模型原文件")
+					const activity = UTSAndroid.getUniActivity()
+					if (activity != null) activity.startActivityForResult(chooser, OCR_MODEL_PICK_REQUEST_CODE)
+				} catch (_e0) {
+					uni.showToast({ title: '启动文件选择器失败', icon: 'none' })
+				}
+				return
+				// #endif
+
+				// #ifdef APP-HARMONY
+				chooseModelPackage({
+					success: (res: any) => {
+						const path = res != null && res.path != null ? res.path.toString() : ''
+						const paths = [] as string[]
+						try {
+							if (res != null && res.paths != null) {
+								const arr = res.paths as string[]
+								for (let i = 0; i < arr.length; i++) paths.push(arr[i])
+							}
+						} catch (_e0) {}
+						if (paths.length > 0) {
+							this.handleOcrModelPackagePaths(paths)
+						} else {
+							this.handleOcrModelPackagePath(path)
+						}
+					},
+					fail: (err: any) => {
+						const message = err == null ? '模型包选择失败' : err.toString()
+						uni.showModal({ title: '模型导入', content: message, showCancel: false })
+					}
+				})
+				return
+				// #endif
+
+				// #ifndef APP-ANDROID || APP-HARMONY
+				uni.chooseFile({
+					count: 7,
+					success: (res) => {
+						if (res.tempFilePaths != null && res.tempFilePaths.length > 0) {
+							this.handleOcrModelPackagePaths(res.tempFilePaths)
+						}
+					},
+					fail: (_e: any) => {}
+				})
+				// #endif
+			},
+			handleAndroidOcrModelSelection(data: Intent | null) {
+				// #ifdef APP-ANDROID
+				const paths = [] as string[]
+				try {
+					if (data == null) return
+					const clipData = data.getClipData()
+					if (clipData != null) {
+						const count = clipData.getItemCount()
+						for (let i: Int = 0; i < count; i++) {
+							const item = clipData.getItemAt(i)
+							if (item != null) {
+								const itemUri = item.getUri()
+								const itemPath = this.copyAndroidUriToCache(itemUri)
+								if (itemPath != null && itemPath != '') paths.push(itemPath)
+							}
+						}
+					}
+					if (paths.length == 0) {
+						const uri = data.getData()
+						const path = this.copyAndroidUriToCache(uri)
+						if (path != null && path != '') paths.push(path)
+					}
+				} catch (_e0) {
+				}
+				if (paths.length == 0) {
+					uni.showToast({ title: '模型文件读取失败', icon: 'none' })
+					return
+				}
+				this.handleOcrModelPackagePaths(paths)
+				// #endif
+			},
+			async handleOcrModelPackagePath(path: string) {
+				const modelPath = FileUtil.normalizePath(path)
+				if (modelPath == '') {
+					uni.showToast({ title: '模型路径为空', icon: 'none' })
+					return
+				}
+				this.ocrImporting = true
+				uni.showLoading({ title: '导入模型...' })
+				try {
+					const result = await OcrModelService.installPpOcrV6ModelPackage(modelPath)
+					uni.hideLoading()
+					this.ocrImporting = false
+					await this.refreshOcrStatus()
+					if (result.ok) {
+						uni.showToast({ title: '模型已导入', icon: 'success' })
+						return
+					}
+					uni.showModal({ title: '模型导入失败', content: result.message, showCancel: false })
+				} catch (e) {
+					uni.hideLoading()
+					this.ocrImporting = false
+					const message = e == null ? '模型导入异常' : (e as Error).message
+					uni.showModal({ title: '模型导入异常', content: message, showCancel: false })
+				}
+			},
+			async handleOcrModelPackagePaths(paths: string[]) {
+				const modelPaths = [] as string[]
+				for (let i = 0; i < paths.length; i++) {
+					const path = FileUtil.normalizePath(paths[i])
+					if (path != '') modelPaths.push(path)
+				}
+				if (modelPaths.length == 0) {
+					uni.showToast({ title: '模型路径为空', icon: 'none' })
+					return
+				}
+				this.ocrImporting = true
+				uni.showLoading({ title: '导入模型...' })
+				try {
+					const result = await OcrModelService.installPpOcrV6ModelFiles(modelPaths)
+					uni.hideLoading()
+					this.ocrImporting = false
+					await this.refreshOcrStatus()
+					if (result.ok) {
+						uni.showToast({ title: '模型已导入', icon: 'success' })
+						return
+					}
+					uni.showModal({ title: '模型导入失败', content: result.message, showCancel: false })
+				} catch (e) {
+					uni.hideLoading()
+					this.ocrImporting = false
+					const message = e == null ? '模型导入异常' : (e as Error).message
+					uni.showModal({ title: '模型导入异常', content: message, showCancel: false })
+				}
+			},
+			copyAndroidUriToCache(uri: Object | null): string | null {
+				// #ifdef APP-ANDROID
+				let inputStream: InputStream | null = null
+				let bis: BufferedInputStream | null = null
+				let fos: FileOutputStream | null = null
+				try {
+					const androidUri = uri as Uri | null
+					if (androidUri == null) return null
+					const context = UTSAndroid.getUniActivity()
+					if (context == null) return null
+					const resolver = context.getContentResolver()
+					let name = "finance_model_" + Date.now() + ".zip"
+					let cursor: Cursor | null = null
+					try {
+						const projectionCols = [OpenableColumns.DISPLAY_NAME]
+						cursor = resolver.query(androidUri, projectionCols.toTypedArray(), null, null, null)
+						if (cursor != null && cursor!.moveToFirst()) {
+							const nameIndex = cursor!.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+							if (nameIndex >= 0) {
+								const n = cursor!.getString(nameIndex)
+								if (n != null && n != "") name = n
+							}
+						}
+					} catch (_e0) {
+					} finally {
+						if (cursor != null) cursor!.close()
+					}
+					try {
+						const uriPath = androidUri.getPath()
+						const hint = uriPath != null ? uriPath.toString().toLowerCase() : ''
+						const lowerName = name.toLowerCase()
+						if (hint != '' && (lowerName == 'model.onnx' || lowerName == 'model.ms' || lowerName == 'model.nb')) {
+							if (lowerName == 'model.ms' && (hint.indexOf('screen_omni') >= 0 || hint.indexOf('screen_intent') >= 0 || hint.indexOf('omni_intent') >= 0)) {
+								name = 'screen_omni_intent.ms'
+							} else if (hint.indexOf('det') >= 0) {
+								name = 'det_' + name
+							} else if (hint.indexOf('rec') >= 0) {
+								name = 'rec_' + name
+							}
+						}
+					} catch (_e1) {}
+					const file = new File(context.getExternalCacheDir(), "ppocrv6_" + Date.now() + "_" + name)
+					inputStream = resolver.openInputStream(androidUri)
+					if (inputStream == null) return null
+					bis = new BufferedInputStream(inputStream)
+					fos = new FileOutputStream(file)
+					const buffer = new ByteArray(8192)
+					let bytesRead = bis.read(buffer)
+					while (bytesRead != -1) {
+						fos.write(buffer, 0, bytesRead)
+						bytesRead = bis.read(buffer)
+					}
+					fos.flush()
+					return file.getAbsolutePath()
+				} catch (_e1) {
+					return null
+				} finally {
+					try { if (fos != null) fos.close() } catch (_e2) {}
+					try { if (bis != null) bis.close() } catch (_e3) {}
+					try { if (inputStream != null) inputStream.close() } catch (_e4) {}
+				}
+				// #endif
+				return null
+			},
+			async testLocalSyncRoot() {
+				const root = FileUtil.normalizePath(this.localSyncRootPath)
+				if (root == '') {
+					uni.showToast({ title: '请先填写目录', icon: 'none' })
+					return
+				}
+				const zemoRoot = `${root.replace(/\/+$/g, '')}/ZeMo`
+				await FileUtil.ensureDir(zemoRoot)
+				const ok = await FileUtil.isDir(zemoRoot)
+				if (ok) {
+					uni.showToast({ title: '本地目录可用', icon: 'success' })
+					return
+				}
+				uni.showModal({ title: '目录不可用', content: `无法创建或访问：${zemoRoot}`, showCancel: false })
+			},
+			safeText(value: string, fallback: string = '未设置'): string {
+				const text = (value ?? '').toString().trim()
+				return text == '' ? fallback : text
+			},
+			refreshSummary() {
+				this.summary = [
+					`enabled=${this.enabled ? 'true' : 'false'}`,
+					`webdavFrequencyMinutes=${this.resolveWebDavFrequencyMinutes()}`,
+					`collabBaseUrl=${this.safeText(this.collabBaseUrl)}`,
+					`backupUrl=${this.safeText(this.backupUrl)}`,
+					`username=${this.safeText(this.username)}`,
+					`passwordSet=${this.password.toString().trim() != '' ? 'true' : 'false'}`,
+					`localSyncEnabled=${this.localSyncEnabled ? 'true' : 'false'}`,
+					`localBackupFileUri=${this.safeText(this.localBackupFileUri)}`,
+					`localSyncFileUri=${this.safeText(this.localSyncFileUri)}`,
+					`screenOcrEnabled=${this.screenOcrEnabled ? 'true' : 'false'}`,
+					`ppOcrV6Enabled=${this.ppOcrV6Enabled ? 'true' : 'false'}`,
+					`ocrModelStatus=${this.safeText(this.ocrModelStatus)}`,
+				].join('\n')
+			},
+			saveConfig() {
+				uni.setStorageSync('webdav_enabled', this.enabled ? '1' : '0')
+				uni.setStorageSync('webdav_collab_base_url', this.collabBaseUrl.toString().trim())
+				uni.setStorageSync('webdav_url', this.backupUrl.toString().trim())
+				uni.setStorageSync('webdav_username', this.username.toString().trim())
+				uni.setStorageSync('webdav_password', this.password.toString())
+				uni.setStorageSync('webdav_sync_frequency_minutes', `${this.resolveWebDavFrequencyMinutes()}`)
+				uni.setStorageSync('local_sync_enabled', this.localSyncEnabled ? '1' : '0')
+				uni.setStorageSync('local_sync_root_path', FileUtil.normalizePath(this.localSyncRootPath))
+				uni.setStorageSync('local_sync_backup_file_uri', FileUtil.normalizePath(this.localBackupFileUri))
+				uni.setStorageSync('local_sync_week_file_uri', FileUtil.normalizePath(this.localSyncFileUri))
+				OcrModelService.setScreenOcrEnabled(this.screenOcrEnabled)
+				OcrModelService.setPpOcrV6Enabled(this.ppOcrV6Enabled)
+				this.refreshSummary()
+				uni.showToast({ title: '配置已保存', icon: 'success' })
+			},
+			resolveProbeUrl(): string {
+				const backup = this.backupUrl.toString().trim()
+				if (backup != '') return backup
+				return this.collabBaseUrl.toString().trim()
+			},
+			async testConnection() {
+				const probeUrl = this.resolveProbeUrl()
+				if (probeUrl == '') {
+					uni.showToast({ title: '请先填写 URL', icon: 'none' })
+					return
+				}
+				if (this.username.toString().trim() == '') {
+					uni.showToast({ title: '请先填写用户名', icon: 'none' })
+					return
+				}
+				uni.showLoading({ title: '测试中...' })
+				try {
+					const cfg = {
+						url: probeUrl,
+						username: this.username.toString().trim(),
+						password: this.password.toString(),
+					} as WebDavConfig
+					const result = await WebDAVService.checkConnection(cfg)
+					uni.hideLoading()
+					if (result.ok) {
+						uni.showToast({ title: '连接成功', icon: 'success' })
+						return
+					}
+					uni.showModal({ title: '连接失败', content: result.message, showCancel: false })
+				} catch (e) {
+					uni.hideLoading()
+					const message = e == null ? 'unknown error' : (e as Error).message
+					uni.showModal({ title: '连接异常', content: message, showCancel: false })
+				}
+			},
+			openSyncDebug() {
+				uni.navigateTo({ url: '/pages/debug/index' })
+			}
+		}
+	}
+</script>
+
+<style>
+.page {
+	flex: 1;
+	background-color: #f6f1e8;
+}
+
+.page-inner {
+	padding: 16px;
+	gap: 14px;
+}
+
+.hero-card,
+.card {
+	padding: 16px;
+	border-radius: 18px;
+	background-color: #fffaf4;
+	border-width: 1px;
+	border-style: solid;
+	border-color: #e7d5be;
+	box-shadow: 0 6px 16px rgba(95, 61, 31, 0.08);
+}
+
+.hero-card {
+	background-color: #f7e4ce;
+	gap: 6px;
+}
+
+.hero-title {
+	font-size: 24px;
+	font-weight: 700;
+	color: #5b3717;
+}
+
+.hero-sub {
+	font-size: 13px;
+	line-height: 20px;
+	color: #7b5534;
+}
+
+.row-between {
+	flex-direction: row;
+	justify-content: space-between;
+	align-items: center;
+	gap: 12px;
+}
+
+.sub-switch-row {
+	margin-top: 12px;
+	padding-top: 12px;
+	border-top-width: 1px;
+	border-top-style: solid;
+	border-top-color: #ead8c4;
+}
+
+.row-copy {
+	flex: 1;
+	gap: 6px;
+}
+
+.card-title,
+.field-label {
+	font-size: 15px;
+	font-weight: 600;
+	color: #4c2d12;
+}
+
+.field-label {
+	margin-top: 14px;
+	margin-bottom: 8px;
+}
+
+.field-hint {
+	font-size: 12px;
+	line-height: 18px;
+	color: #8a6b4f;
+}
+
+.text-input {
+	height: 42px;
+	padding: 0 12px;
+	border-radius: 12px;
+	background-color: #ffffff;
+	border-width: 1px;
+	border-style: solid;
+	border-color: #dcc4aa;
+	font-size: 14px;
+	color: #3a2412;
+}
+
+.actions-card {
+	gap: 10px;
+}
+
+.inline-actions {
+	flex-direction: row;
+	gap: 10px;
+	margin-top: 10px;
+}
+
+.inline-btn {
+	flex: 1;
+}
+
+.status-box {
+	margin-top: 12px;
+	padding: 10px 12px;
+	border-radius: 10px;
+	background-color: #f5eadc;
+}
+
+.status-text {
+	font-size: 12px;
+	line-height: 18px;
+	color: #6b4b30;
+}
+
+.primary-btn,
+.secondary-btn {
+	height: 42px;
+	border-radius: 21px;
+	font-size: 14px;
+	border-width: 0;
+}
+
+.primary-btn {
+	background-color: #b9682f;
+	color: #ffffff;
+}
+
+.secondary-btn {
+	background-color: #efe1d1;
+	color: #6a4523;
+}
+
+.mono-text {
+	margin-top: 10px;
+	font-size: 12px;
+	line-height: 19px;
+	color: #6b4b30;
+	font-family: monospace;
+}
+
+.status-active {
+	font-size: 14px;
+	font-weight: 700;
+	color: #2e7d32;
+	background-color: #e8f5e9;
+	padding: 4px 8px;
+	border-radius: 6px;
+}
+
+.status-inactive {
+	font-size: 14px;
+	font-weight: 700;
+	color: #c62828;
+	background-color: #ffebee;
+	padding: 4px 8px;
+	border-radius: 6px;
+}
+
+.guide-box {
+	margin-top: 12px;
+	padding: 12px;
+	border-radius: 10px;
+	background-color: #fff3e0;
+	border-width: 1px;
+	border-style: solid;
+	border-color: #ffe0b2;
+	gap: 6px;
+}
+
+.guide-title {
+	font-size: 13px;
+	font-weight: 700;
+	color: #e65100;
+}
+
+.guide-item {
+	font-size: 12px;
+	line-height: 18px;
+	color: #e65100;
+}
+</style>

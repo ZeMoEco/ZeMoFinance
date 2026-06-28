@@ -1,0 +1,1482 @@
+import { UserBiz } from '@/services/biz/UserBiz.uts'
+import { DB } from '@/utils/DB/DB.uts'
+import { type ExportPackageWindowMode, ExportImportService } from '@/services/sys/export/export-import.uts'
+import { WebDAVService, type WebDavConfig, type WebDavDownloadResult } from '@/services/sys/export/WebDAVService.uts'
+import { WebDavConfigService } from '@/services/sys/export/WebDavConfigService.uts'
+import { type AppRuntimeProfile } from '@/utils/app/AppRuntime.uts'
+import { FileUtil } from '@/utils/file/file.uts'
+import { RUNTIME_DB_EXPORT_DIR } from '@/utils/constant.uts'
+
+// #ifdef APP-HARMONY
+import { activatePersistedUriPermission } from '@/uni_modules/zemo-harmony-filepicker'
+// #endif
+
+// #ifdef APP-ANDROID
+import { UTSJSONObject } from 'io.dcloud.uts'
+// #endif
+
+type SyncBackendKind = 'webdav' | 'local' | 'local_file'
+
+type ResolveSyncConfigResult = {
+  ok: boolean
+  message: string
+  backendKind: SyncBackendKind
+  baseUrl: string
+  cfg: WebDavConfig | null
+  localBackupFileUri: string
+  localSyncFileUri: string
+}
+
+type WeeklyPackageArtifactFormat = 'zip' | 'db'
+
+type SyncRunMode = 'open' | 'background' | 'confirm_remove'
+
+type ImportRemotePackageResult = {
+  ok: boolean
+  downloaded: boolean
+  imported: boolean
+  message: string
+  missing?: boolean
+}
+
+type RemotePackageProbe = {
+  present: boolean
+  missing: boolean
+  inconclusive: boolean
+  signature: string
+  modifiedAtMs: number
+  message: string
+}
+
+type RemoteWeeklySyncPackage = {
+  url: string
+  weekStartMs: number
+  weekKey: string
+  probe: RemotePackageProbe
+}
+
+type AttachmentResourceRow = {
+  id: string
+  filePath: string
+  fileName: string
+  fileType: string
+  fileHash: string
+  createdAt: number
+  updatedAt: number
+}
+
+type ResourceTransferResult = {
+  ok: boolean
+  transferred: number
+  message: string
+}
+
+type DateParts = {
+  year: number
+  month: number
+  day: number
+}
+
+export type WebDavIncrementalSyncResult = {
+  available: boolean
+  synced: boolean
+  remoteFound: boolean
+  downloaded: boolean
+  imported: boolean
+  uploaded: boolean
+  reason: string | null
+  backupImported?: boolean
+  syncImported?: boolean
+  backupUploaded?: boolean
+  syncUploaded?: boolean
+  weekKey?: string
+  stage?: string
+  debugLog?: string
+  remoteRoot?: string
+  weekStartMs?: number
+  backupScope?: string
+  syncScope?: string
+  backupMissing?: boolean
+  transport?: string
+}
+
+export class WebDavIncrementalSyncService {
+  private static DAY_MS: number = 24 * 60 * 60 * 1000
+  private static WEEK_MS: number = 7 * 24 * 60 * 60 * 1000
+  private static REMOTE_SYNC_LOOKBACK_WEEKS: number = 12
+  private static activeDebugLines: string[] = [] as string[]
+  private static activeDebugPrefix: string = 'zemo.sync'
+  private static lastDebugLog: string = ''
+  private static activeStorageScope: SyncBackendKind = 'webdav'
+
+  private static resetDebug(profile: AppRuntimeProfile, source: string): void {
+    WebDavIncrementalSyncService.activeDebugLines = [] as string[]
+    WebDavIncrementalSyncService.activeDebugPrefix = `[${(profile.appId ?? 'zemo').toString()}|${source}]`
+  }
+
+  private static pushDebug(stage: string, message: string): void {
+    const line = `${WebDavIncrementalSyncService.activeDebugPrefix} [${stage}] ${message}`
+    WebDavIncrementalSyncService.activeDebugLines.push(line)
+  }
+
+  private static finalizeResult(result: WebDavIncrementalSyncResult, stage: string): WebDavIncrementalSyncResult {
+    result.stage = stage
+    result.debugLog = WebDavIncrementalSyncService.activeDebugLines.join('\n')
+    WebDavIncrementalSyncService.lastDebugLog = result.debugLog ?? ''
+    return result
+  }
+
+  static getLastDebugLog(): string {
+    return WebDavIncrementalSyncService.lastDebugLog
+  }
+
+  private static formatTs(ts: number): string {
+    if (ts <= 0) return '0'
+    const d = new Date(ts)
+    return `${d.getFullYear()}-${WebDavIncrementalSyncService.pad2(d.getMonth() + 1)}-${WebDavIncrementalSyncService.pad2(d.getDate())} ${WebDavIncrementalSyncService.pad2(d.getHours())}:${WebDavIncrementalSyncService.pad2(d.getMinutes())}:${WebDavIncrementalSyncService.pad2(d.getSeconds())}`
+  }
+
+  private static buildBackupScopeText(weekStartMs: number): string {
+    return `上周及之前: change_time < ${weekStartMs} (${WebDavIncrementalSyncService.formatTs(weekStartMs)})`
+  }
+
+  private static buildSyncScopeText(weekStartMs: number): string {
+    return `本周: change_time >= ${weekStartMs} (${WebDavIncrementalSyncService.formatTs(weekStartMs)})`
+  }
+
+  private static resolveSyncConfig(): ResolveSyncConfigResult {
+    const loaded = WebDavConfigService.load()
+    if (loaded.localSyncEnabled) {
+      const backupFileUri = WebDavIncrementalSyncService.normalizeLocalBasePath(loaded.localBackupFileUri)
+      const syncFileUri = WebDavIncrementalSyncService.normalizeLocalBasePath(loaded.localSyncFileUri)
+      if (backupFileUri != '' || syncFileUri != '') {
+        if (backupFileUri == '' || syncFileUri == '') {
+          return { ok: false, message: '本地固定同步需要同时选择备份 DB 和周同步 DB', backendKind: 'local_file', baseUrl: '', cfg: null, localBackupFileUri: backupFileUri, localSyncFileUri: syncFileUri } as ResolveSyncConfigResult
+        }
+        if (!WebDavIncrementalSyncService.isBackupDbFile(backupFileUri)) {
+          return { ok: false, message: '本地备份 DB 文件名需要包含 backup 且以 .db 结尾', backendKind: 'local_file', baseUrl: '', cfg: null, localBackupFileUri: backupFileUri, localSyncFileUri: syncFileUri } as ResolveSyncConfigResult
+        }
+        if (!WebDavIncrementalSyncService.isSyncDbFile(syncFileUri)) {
+          return { ok: false, message: '本地周同步 DB 文件名需要包含 sync 且以 .db 结尾', backendKind: 'local_file', baseUrl: '', cfg: null, localBackupFileUri: backupFileUri, localSyncFileUri: syncFileUri } as ResolveSyncConfigResult
+        }
+        return { ok: true, message: 'ok', backendKind: 'local_file', baseUrl: 'local-fixed-files', cfg: null, localBackupFileUri: backupFileUri, localSyncFileUri: syncFileUri } as ResolveSyncConfigResult
+      }
+
+      const localRoot = WebDavIncrementalSyncService.normalizeLocalBasePath(loaded.localSyncRootPath)
+      if (localRoot == '') {
+        return { ok: false, message: '本地固定同步文件为空，请先创建或选择两个 DB 文件', backendKind: 'local_file', baseUrl: '', cfg: null, localBackupFileUri: '', localSyncFileUri: '' } as ResolveSyncConfigResult
+      }
+      return { ok: true, message: 'ok', backendKind: 'local', baseUrl: localRoot, cfg: null, localBackupFileUri: '', localSyncFileUri: '' } as ResolveSyncConfigResult
+    }
+
+    if (!loaded.enabled) {
+      return { ok: false, message: '未启用 WebDAV 同步', backendKind: 'webdav', baseUrl: '', cfg: null, localBackupFileUri: '', localSyncFileUri: '' } as ResolveSyncConfigResult
+    }
+    if (loaded.username.toString().trim() == '') {
+      return { ok: false, message: 'WebDAV 用户名为空，请先配置', backendKind: 'webdav', baseUrl: '', cfg: null, localBackupFileUri: '', localSyncFileUri: '' } as ResolveSyncConfigResult
+    }
+
+    let baseUrl = loaded.collabBaseUrl.toString().trim()
+    if (baseUrl == '') {
+      baseUrl = WebDavIncrementalSyncService.resolveBaseUrlFromBackupUrl(loaded.backupUrl)
+    }
+    baseUrl = WebDavConfigService.normalizeBaseUrl(baseUrl)
+    if (baseUrl == '') {
+      return { ok: false, message: 'WebDAV 同步目录为空，请先配置协同目录或备份目录', backendKind: 'webdav', baseUrl: '', cfg: null, localBackupFileUri: '', localSyncFileUri: '' } as ResolveSyncConfigResult
+    }
+
+    return {
+      ok: true,
+      message: 'ok',
+      backendKind: 'webdav',
+      baseUrl,
+      cfg: {
+        url: '',
+        username: loaded.username,
+        password: loaded.password,
+      } as WebDavConfig,
+      localBackupFileUri: '',
+      localSyncFileUri: '',
+    } as ResolveSyncConfigResult
+  }
+
+  private static resolveBaseUrlFromBackupUrl(rawUrl: string): string {
+    const raw = (rawUrl ?? '').toString().trim()
+    if (raw == '') return ''
+    if (raw.endsWith('/')) return WebDavConfigService.normalizeBaseUrl(raw)
+
+    const lower = raw.toLowerCase()
+    if (lower.endsWith('.db') || lower.endsWith('.zip') || lower.endsWith('.bak') || lower.endsWith('.json')) {
+      const slashIdx = raw.lastIndexOf('/')
+      if (slashIdx > 0) {
+        return raw.substring(0, slashIdx)
+      }
+    }
+    return raw
+  }
+
+  private static normalizeLocalBasePath(rawPath: string): string {
+    let path = FileUtil.normalizePath(rawPath)
+    while (path.endsWith('/')) path = path.substring(0, path.length - 1)
+    return path
+  }
+
+  private static joinLocalPath(basePath: string, segment: string): string {
+    const base = WebDavIncrementalSyncService.normalizeLocalBasePath(basePath)
+    const cleanSegment = (segment ?? '').toString().trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
+    if (base == '') return cleanSegment
+    if (cleanSegment == '') return base
+    return `${base}/${cleanSegment}`
+  }
+
+  private static lowerFileIdentity(path: string): string {
+    const raw = FileUtil.normalizePath(path).toLowerCase()
+    try {
+      return decodeURIComponent(raw)
+    } catch (_e0) {
+      return raw
+    }
+  }
+
+  private static isBackupDbFile(path: string): boolean {
+    const name = WebDavIncrementalSyncService.lowerFileIdentity(path)
+    return name.indexOf('backup') >= 0 && name.endsWith('.db')
+  }
+
+  private static isSyncDbFile(path: string): boolean {
+    const name = WebDavIncrementalSyncService.lowerFileIdentity(path)
+    return name.indexOf('sync') >= 0 && name.endsWith('.db')
+  }
+
+  private static isLocalBackendActive(): boolean {
+    return WebDavIncrementalSyncService.activeStorageScope == 'local'
+  }
+
+  private static isLocalFileBackendActive(): boolean {
+    return WebDavIncrementalSyncService.activeStorageScope == 'local_file'
+  }
+
+  private static normalizeDomainKey(profile: AppRuntimeProfile): string {
+    let key = (profile.domainKey ?? '').toString().trim()
+    if (key == '') key = 'app'
+    return key.replace(/[^a-zA-Z0-9_-]/g, '_')
+  }
+
+  private static buildRemoteRoot(baseUrl: string): string {
+    if (WebDavIncrementalSyncService.isLocalFileBackendActive()) {
+      return 'local-fixed-files'
+    }
+    if (WebDavIncrementalSyncService.isLocalBackendActive()) {
+      return WebDavIncrementalSyncService.joinLocalPath(baseUrl, 'ZeMo')
+    }
+    const normalizedBase = WebDavConfigService.normalizeBaseUrl(baseUrl)
+    return `${normalizedBase}/ZeMo`
+  }
+
+  private static buildPackageStem(profile: AppRuntimeProfile, baseStem: string): string {
+    return baseStem
+  }
+
+  private static getArtifactExtension(format: WeeklyPackageArtifactFormat = 'zip'): string {
+    return format == 'db' ? 'db' : 'zip'
+  }
+
+  private static buildBackupUrl(remoteRoot: string, profile: AppRuntimeProfile, weekStartMs: number, format: WeeklyPackageArtifactFormat = 'zip'): string {
+    const parts = WebDavIncrementalSyncService.getLocalDateParts(weekStartMs)
+    const year = `${parts.year}`
+    const stem = WebDavIncrementalSyncService.buildPackageStem(profile, 'zemo_backup')
+    return `${remoteRoot}/backup/${stem}_${year}.${WebDavIncrementalSyncService.getArtifactExtension(format)}`
+  }
+
+  private static buildSyncUrl(remoteRoot: string, profile: AppRuntimeProfile, weekStartMs: number, format: WeeklyPackageArtifactFormat = 'zip'): string {
+    const parts = WebDavIncrementalSyncService.getLocalDateParts(weekStartMs)
+    const year = `${parts.year}`
+    const month = WebDavIncrementalSyncService.pad2(parts.month)
+    const weekKey = WebDavIncrementalSyncService.buildWeekKey(weekStartMs)
+    const stem = WebDavIncrementalSyncService.buildPackageStem(profile, 'zemo_sync')
+    return `${remoteRoot}/sync/${year}/${month}/${stem}_${weekKey}.${WebDavIncrementalSyncService.getArtifactExtension(format)}`
+  }
+
+  private static buildSyncCollectionSegments(weekStartMs: number): string[] {
+    const parts = WebDavIncrementalSyncService.getLocalDateParts(weekStartMs)
+    return ['ZeMo', 'sync', `${parts.year}`, WebDavIncrementalSyncService.pad2(parts.month)] as string[]
+  }
+
+  private static buildBackupCollectionSegments(): string[] {
+    return ['ZeMo', 'backup'] as string[]
+  }
+
+  private static buildResourceCollectionSegments(weekStartMs: number): string[] {
+    const parts = WebDavIncrementalSyncService.getLocalDateParts(weekStartMs)
+    return ['ZeMo', 'resource', `${parts.year}`, WebDavIncrementalSyncService.pad2(parts.month), WebDavIncrementalSyncService.buildWeekKey(weekStartMs)] as string[]
+  }
+
+  private static buildScopedConfig(url: string, cfg: WebDavConfig): WebDavConfig {
+    return {
+      url,
+      username: cfg.username,
+      password: cfg.password,
+    } as WebDavConfig
+  }
+
+  private static resolveRunMode(source: string): SyncRunMode {
+    const lower = (source ?? '').toString().toLowerCase()
+    if (lower.indexOf('confirm') >= 0 || lower.indexOf('purge') >= 0 || lower.indexOf('remove') >= 0) return 'confirm_remove'
+    if (lower.indexOf('hide') >= 0 || lower.indexOf('background') >= 0 || lower.indexOf('exit') >= 0) return 'background'
+    return 'open'
+  }
+
+  private static shouldSkipWebDavForFrequency(profile: AppRuntimeProfile, source: string, runMode: SyncRunMode): boolean {
+    if (WebDavIncrementalSyncService.activeStorageScope != 'webdav') return false
+    if (runMode == 'confirm_remove') return false
+    const lower = (source ?? '').toString().toLowerCase()
+    if (lower.indexOf('manual') >= 0 || lower.indexOf('debug') >= 0) return false
+    const loaded = WebDavConfigService.load()
+    const minutes = WebDavIncrementalSyncService.toSafeNumber(loaded.webdavSyncFrequencyMinutes, 0)
+    if (minutes <= 0) return false
+    const lastSuccessfulSyncAt = WebDavIncrementalSyncService.readStoredNumber(profile, 'last_successful_sync_at')
+    if (lastSuccessfulSyncAt <= 0) return false
+    return Date.now() - lastSuccessfulSyncAt < minutes * 60 * 1000
+  }
+
+  private static async ensureRemoteCollections(baseUrl: string, segments: string[], cfg: WebDavConfig | null): Promise<boolean> {
+    if (WebDavIncrementalSyncService.isLocalFileBackendActive()) return true
+
+    if (WebDavIncrementalSyncService.isLocalBackendActive()) {
+      let currentPath = WebDavIncrementalSyncService.normalizeLocalBasePath(baseUrl)
+      if (currentPath == '') return false
+      for (let i = 0; i < segments.length; i++) {
+        const segment = (segments[i] ?? '').toString().trim().replace(/^\/+|\/+$/g, '')
+        if (segment == '') continue
+        currentPath = WebDavIncrementalSyncService.joinLocalPath(currentPath, segment)
+        await FileUtil.ensureDir(currentPath)
+      }
+      const finalExists = await FileUtil.isDir(currentPath)
+      if (!finalExists) {
+        WebDavIncrementalSyncService.pushDebug('local.mkdir', `failed path=${currentPath}`)
+      }
+      return finalExists
+    }
+
+    if (cfg == null) return false
+    let currentUrl = WebDavConfigService.normalizeBaseUrl(baseUrl)
+    if (currentUrl == '') return false
+    for (let i = 0; i < segments.length; i++) {
+      const segment = (segments[i] ?? '').toString().trim().replace(/^\/+|\/+$/g, '')
+      if (segment == '') continue
+      currentUrl = `${currentUrl}/${segment}`
+      const res = await WebDAVService.ensureCollection(currentUrl, WebDavIncrementalSyncService.buildScopedConfig(currentUrl, cfg))
+      if (!res.ok) {
+        WebDavIncrementalSyncService.pushDebug('remote.mkdir', `failed url=${currentUrl} status=${res.statusCode} message=${res.message}`)
+        return false
+      }
+    }
+    return true
+  }
+
+  private static toSafeNumber(value: any, fallback: number = 0): number {
+    if (value == null) return fallback
+    const parsed = parseInt(value.toString())
+    return isNaN(parsed) ? fallback : parsed
+  }
+
+  private static toSafeText(value: any, fallback: string = ''): string {
+    if (value == null) return fallback
+    const text = value.toString()
+    return text == '' ? fallback : text
+  }
+
+  private static toSafeBool(value: any, fallback: boolean = false): boolean {
+    if (value == null) return fallback
+    const text = value.toString().toLowerCase()
+    if (text == 'true' || text == '1') return true
+    if (text == 'false' || text == '0') return false
+    return fallback
+  }
+
+  private static inferPackageFormatFromUrl(url: string, fallback: WeeklyPackageArtifactFormat = 'zip'): WeeklyPackageArtifactFormat {
+    const raw = (url ?? '').toString().trim().toLowerCase()
+    if (raw == 'db') return 'db'
+    if (raw == 'zip') return 'zip'
+    if (raw.endsWith('.db')) return 'db'
+    if (raw.endsWith('.zip')) return 'zip'
+    return fallback
+  }
+
+  private static resolvePreferredPackageFormat(): WeeklyPackageArtifactFormat {
+    // #ifdef APP-HARMONY
+    return 'db'
+    // #endif
+
+    return 'zip'
+  }
+
+  private static isNotFoundDownloadMessage(message: string): boolean {
+    const raw = (message ?? '').toString()
+    return raw.indexOf('HTTP 404') >= 0
+      || raw.indexOf('本地同步包不存在') >= 0
+      || raw.indexOf('本地固定同步文件不存在') >= 0
+      || raw.indexOf('本地固定同步文件为空') >= 0
+  }
+
+  private static getBufferByteLength(bytes: ArrayBuffer | null): number {
+    if (bytes == null) return 0
+    try {
+      return new Uint8Array(bytes).length
+    } catch (_e0) {
+      return 0
+    }
+  }
+
+  private static buildBufferChecksum(bytes: ArrayBuffer | null): string {
+    if (bytes == null) return '0'
+    try {
+      const view = new Uint8Array(bytes)
+      let hash = 0
+      for (let i = 0; i < view.length; i++) {
+        hash = (hash * 131 + view[i] + 1) % 2147483647
+      }
+      return `${hash}`
+    } catch (_e0) {
+      return '0'
+    }
+  }
+
+  private static async getReadableFileSize(path: string): Promise<number> {
+    let size = await FileUtil.getFileSize(path)
+    if (size > 0) return size
+    const bytes = await FileUtil.readBinaryFile(path)
+    size = WebDavIncrementalSyncService.getBufferByteLength(bytes)
+    return size > 0 ? size : 0
+  }
+
+  private static delayMs(ms: number): Promise<void> {
+    return new Promise(resolve => {
+      try {
+        setTimeout(() => resolve(), ms)
+      } catch (_e0) {
+        resolve()
+      }
+    })
+  }
+
+  private static async getLocalFileModifiedAt(path: string): Promise<number> {
+    const stats = await FileUtil.stat(path)
+    if (stats == null) return 0
+    const keys = ['mtimeMs', 'lastModified', 'lastModifiedTime', 'mtime', 'modifyTime'] as string[]
+    for (let i = 0; i < keys.length; i++) {
+      try {
+        const value = (stats as any)[keys[i]]
+        if (value != null) {
+          const n = parseInt(value.toString())
+          if (!isNaN(n) && n > 0) return n
+        }
+      } catch (_e0) {}
+
+      // #ifdef APP-ANDROID
+      try {
+        const obj = stats as UTSJSONObject
+        const v = obj.get(keys[i])
+        if (v != null) {
+          const n2 = parseInt(v.toString())
+          if (!isNaN(n2) && n2 > 0) return n2
+        }
+      } catch (_e1) {}
+      // #endif
+    }
+    return 0
+  }
+
+  private static async buildLocalPackageSignature(path: string): Promise<{ signature: string, modifiedAtMs: number }> {
+    const bytes = await FileUtil.readBinaryFile(path)
+    let size = WebDavIncrementalSyncService.getBufferByteLength(bytes)
+    if (size <= 0) size = await WebDavIncrementalSyncService.getReadableFileSize(path)
+    const checksum = WebDavIncrementalSyncService.buildBufferChecksum(bytes)
+    const modifiedAtMs = await WebDavIncrementalSyncService.getLocalFileModifiedAt(path)
+    return { signature: `local:size=${size}|hash=${checksum}|modified=${modifiedAtMs}`, modifiedAtMs } as { signature: string, modifiedAtMs: number }
+  }
+
+  private static async activateLocalFixedFilePermissions(backupFileUri: string, syncFileUri: string): Promise<string> {
+    let backupOk = false
+    let syncOk = false
+
+    // #ifdef APP-HARMONY
+    backupOk = await activatePersistedUriPermission(backupFileUri)
+    syncOk = await activatePersistedUriPermission(syncFileUri)
+    // #endif
+
+    // #ifndef APP-HARMONY
+    backupOk = await FileUtil.activatePersistedUriPermission(backupFileUri)
+    syncOk = await FileUtil.activatePersistedUriPermission(syncFileUri)
+    // #endif
+
+    if (!backupOk || !syncOk) return '本地固定同步文件权限未激活，请重新选择备份 DB 和周同步 DB'
+    return ''
+  }
+
+  private static buildTempDownloadPath(url: string, format: WeeklyPackageArtifactFormat): string {
+    const ext = WebDavIncrementalSyncService.inferPackageFormatFromUrl(url, format)
+    const stamp = `${Date.now()}_${Math.floor(Math.random() * 100000)}`
+    return `${RUNTIME_DB_EXPORT_DIR}/local_sync_download_${stamp}.${WebDavIncrementalSyncService.getArtifactExtension(ext)}`
+  }
+
+  private static async downloadRemoteFileToTemp(url: string, format: WeeklyPackageArtifactFormat, cfg: WebDavConfig | null): Promise<WebDavDownloadResult> {
+    if (WebDavIncrementalSyncService.isLocalFileBackendActive()) {
+      const bytes = await FileUtil.readBinaryFile(url)
+      if (bytes == null) return { ok: false, tempFilePath: '', message: `本地固定同步文件不存在: ${url}` } as WebDavDownloadResult
+      const size = WebDavIncrementalSyncService.getBufferByteLength(bytes)
+      if (size <= 0) return { ok: false, tempFilePath: '', message: `本地固定同步文件为空: ${url}` } as WebDavDownloadResult
+      const tempFilePath = WebDavIncrementalSyncService.buildTempDownloadPath(url, format)
+      const written = await FileUtil.writeBinaryFile(tempFilePath, bytes)
+      if (!written) return { ok: false, tempFilePath: '', message: `写入本地同步临时文件失败: ${tempFilePath}` } as WebDavDownloadResult
+      return { ok: true, tempFilePath, message: '本地固定同步文件读取成功' } as WebDavDownloadResult
+    }
+
+    if (WebDavIncrementalSyncService.isLocalBackendActive()) {
+      const exists = await FileUtil.exists(url)
+      if (!exists) return { ok: false, tempFilePath: '', message: `本地同步包不存在: ${url}` } as WebDavDownloadResult
+      const tempFilePath = WebDavIncrementalSyncService.buildTempDownloadPath(url, format)
+      await FileUtil.copyFile(url, tempFilePath, { overwrite: true })
+      const copied = await FileUtil.exists(tempFilePath)
+      if (!copied) return { ok: false, tempFilePath: '', message: `本地同步包复制失败: ${url}` } as WebDavDownloadResult
+      return { ok: true, tempFilePath, message: '本地同步包读取成功' } as WebDavDownloadResult
+    }
+    if (cfg == null) return { ok: false, tempFilePath: '', message: 'WebDAV 配置为空' } as WebDavDownloadResult
+    return await WebDAVService.downloadToTempFile(WebDavIncrementalSyncService.buildScopedConfig(url, cfg), null)
+  }
+
+  private static async putRemoteFile(localFilePath: string, targetPath: string, cfg: WebDavConfig | null): Promise<string> {
+    if (WebDavIncrementalSyncService.isLocalFileBackendActive()) {
+      const bytes = await FileUtil.readBinaryFile(localFilePath)
+      if (bytes == null) return `读取本地导出包失败: ${localFilePath}`
+      const sourceSize = WebDavIncrementalSyncService.getBufferByteLength(bytes)
+      if (sourceSize <= 0) return `本地导出同步包为空: ${localFilePath}`
+      let written = false
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        written = await FileUtil.writeBinaryFile(targetPath, bytes)
+        if (!written) {
+          written = FileUtil.copyBinaryFileDirect(localFilePath, targetPath)
+        }
+        if (written) break
+        WebDavIncrementalSyncService.pushDebug('localfile.write', `retry attempt=${attempt} target=${targetPath}`)
+        await WebDavIncrementalSyncService.delayMs(150 * attempt)
+      }
+      if (!written) return `写入本地固定同步文件失败: ${targetPath}`
+      return '本地同步写入成功'
+    }
+
+    if (WebDavIncrementalSyncService.isLocalBackendActive()) {
+      await FileUtil.copyFile(localFilePath, targetPath, { overwrite: true })
+      const copied = await FileUtil.exists(targetPath)
+      return copied ? '本地同步写入成功' : `本地同步写入失败: ${targetPath}`
+    }
+    if (cfg == null) return 'WebDAV 配置为空'
+    return await WebDAVService.putFile(localFilePath, WebDavIncrementalSyncService.buildScopedConfig(targetPath, cfg), null)
+  }
+
+  private static isPutRemoteFileSuccess(message: string): boolean {
+    return message == 'WebDAV 上传成功' || message == '本地同步写入成功'
+  }
+
+  private static async verifyRemotePackageVisible(url: string, cfg: WebDavConfig | null): Promise<{ ok: boolean, missing: boolean, message: string, signature: string, modifiedAtMs: number }> {
+    if (WebDavIncrementalSyncService.isLocalFileBackendActive()) {
+      const size = await WebDavIncrementalSyncService.getReadableFileSize(url)
+      if (size <= 0) return { ok: false, missing: true, message: `本地固定同步文件为空或不可读: ${url}`, signature: '', modifiedAtMs: 0 }
+      const sig = await WebDavIncrementalSyncService.buildLocalPackageSignature(url)
+      return { ok: true, missing: false, message: 'local-file-ok', signature: sig.signature, modifiedAtMs: sig.modifiedAtMs }
+    }
+
+    if (WebDavIncrementalSyncService.isLocalBackendActive()) {
+      const exists = await FileUtil.exists(url)
+      if (!exists) return { ok: false, missing: true, message: `本地同步包不可见: ${url}`, signature: '', modifiedAtMs: 0 }
+      const sig = await WebDavIncrementalSyncService.buildLocalPackageSignature(url)
+      return { ok: true, missing: false, message: 'local-file-ok', signature: sig.signature, modifiedAtMs: sig.modifiedAtMs }
+    }
+    if (cfg == null) return { ok: false, missing: false, message: 'WebDAV 配置为空', signature: '', modifiedAtMs: 0 }
+    const scopedCfg = WebDavIncrementalSyncService.buildScopedConfig(url, cfg)
+    const headResp = await WebDAVService.head(url, scopedCfg)
+    if (headResp.ok) {
+      return {
+        ok: true,
+        missing: false,
+        message: 'head-ok',
+        signature: WebDavIncrementalSyncService.buildRemotePackageSignature(headResp.etag, headResp.lastModified),
+        modifiedAtMs: WebDavIncrementalSyncService.parseRemoteModifiedAt(headResp.lastModified)
+      }
+    }
+    if (headResp.statusCode == 404) {
+      return { ok: false, missing: true, message: headResp.message != '' ? headResp.message : `远端包不存在: ${url}`, signature: '', modifiedAtMs: 0 }
+    }
+    if (headResp.statusCode > 0 && headResp.statusCode != 405) {
+      return { ok: true, missing: false, message: headResp.message, signature: '', modifiedAtMs: 0 }
+    }
+
+    let tempFilePath = ''
+    try {
+      const probe = await WebDAVService.downloadToTempFile(scopedCfg, null)
+      if (probe.ok) {
+        tempFilePath = probe.tempFilePath
+        return { ok: true, missing: false, message: 'download-ok', signature: '', modifiedAtMs: 0 }
+      }
+      if (WebDavIncrementalSyncService.isNotFoundDownloadMessage(probe.message)) {
+        return { ok: false, missing: true, message: probe.message, signature: '', modifiedAtMs: 0 }
+      }
+      return { ok: true, missing: false, message: probe.message, signature: '', modifiedAtMs: 0 }
+    } finally {
+      if (tempFilePath != '') {
+        await FileUtil.removeFile(tempFilePath)
+      }
+    }
+  }
+
+  private static buildStorageKey(profile: AppRuntimeProfile, suffix: string): string {
+    let scopedSuffix = suffix
+    if (WebDavIncrementalSyncService.isLocalBackendActive()) scopedSuffix = `local_${suffix}`
+    if (WebDavIncrementalSyncService.isLocalFileBackendActive()) scopedSuffix = `local_file_${suffix}`
+    return `zemo_weekly_pkg_sync_${WebDavIncrementalSyncService.normalizeDomainKey(profile)}_${scopedSuffix}`
+  }
+
+  private static readStoredNumber(profile: AppRuntimeProfile, suffix: string): number {
+    try {
+      const raw = uni.getStorageSync(WebDavIncrementalSyncService.buildStorageKey(profile, suffix))
+      return WebDavIncrementalSyncService.toSafeNumber(raw, 0)
+    } catch (_e0) {
+      return 0
+    }
+  }
+
+  private static writeStoredNumber(profile: AppRuntimeProfile, suffix: string, value: number): void {
+    try {
+      uni.setStorageSync(WebDavIncrementalSyncService.buildStorageKey(profile, suffix), `${value}`)
+    } catch (_e0) {}
+  }
+
+  private static readStoredText(profile: AppRuntimeProfile, suffix: string): string {
+    try {
+      const raw = uni.getStorageSync(WebDavIncrementalSyncService.buildStorageKey(profile, suffix))
+      return raw == null ? '' : raw.toString()
+    } catch (_e0) {
+      return ''
+    }
+  }
+
+  private static writeStoredText(profile: AppRuntimeProfile, suffix: string, value: string): void {
+    try {
+      uni.setStorageSync(WebDavIncrementalSyncService.buildStorageKey(profile, suffix), (value ?? '').toString())
+    } catch (_e0) {}
+  }
+
+  private static getWeekStartMs(nowMs: number = Date.now()): number {
+    const parts = WebDavIncrementalSyncService.getLocalDateParts(nowMs)
+    const midnightMs = WebDavIncrementalSyncService.getLocalMidnightMs(parts)
+    const day = WebDavIncrementalSyncService.getDayOfWeek(parts.year, parts.month, parts.day)
+    const offset = day == 0 ? 6 : (day - 1)
+    return midnightMs - offset * WebDavIncrementalSyncService.DAY_MS
+  }
+
+  private static pad2(value: number): string {
+    return value < 10 ? `0${value}` : `${value}`
+  }
+
+  private static getLocalDateParts(ts: number): DateParts {
+    const d = new Date(ts)
+    return {
+      year: d.getFullYear(),
+      month: d.getMonth() + 1,
+      day: d.getDate(),
+    } as DateParts
+  }
+
+  private static getLocalMidnightMs(parts: DateParts): number {
+    const dateText = `${parts.year}/${WebDavIncrementalSyncService.pad2(parts.month)}/${WebDavIncrementalSyncService.pad2(parts.day)} 00:00:00`
+    return new Date(dateText).getTime()
+  }
+
+  private static getDayOfWeek(year: number, month: number, day: number): number {
+    const monthOffsets = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4] as number[]
+    let y = year
+    if (month < 3) y -= 1
+    const value = y + Math.floor(y / 4) - Math.floor(y / 100) + Math.floor(y / 400) + monthOffsets[month - 1] + day
+    const weekday = value % 7
+    return weekday < 0 ? weekday + 7 : weekday
+  }
+
+  private static buildWeekKey(weekStartMs: number): string {
+    const parts = WebDavIncrementalSyncService.getLocalDateParts(weekStartMs)
+    return `${parts.year}${WebDavIncrementalSyncService.pad2(parts.month)}${WebDavIncrementalSyncService.pad2(parts.day)}`
+  }
+
+  private static shiftWeekStartMs(weekStartMs: number, deltaWeeks: number): number {
+    return weekStartMs + deltaWeeks * WebDavIncrementalSyncService.WEEK_MS
+  }
+
+  private static buildRemotePackageSignature(etag: string, lastModified: string): string {
+    const safeEtag = (etag ?? '').toString().trim()
+    const safeLastModified = (lastModified ?? '').toString().trim()
+    if (safeEtag != '' && safeLastModified != '') return `etag=${safeEtag}|lastModified=${safeLastModified}`
+    if (safeEtag != '') return `etag=${safeEtag}`
+    if (safeLastModified != '') return `lastModified=${safeLastModified}`
+    return ''
+  }
+
+  private static parseRemoteModifiedAt(lastModified: string): number {
+    const raw = (lastModified ?? '').toString().trim()
+    if (raw == '') return 0
+    const parsed = new Date(raw).getTime()
+    if (!isNaN(parsed) && parsed > 0) return parsed
+    return 0
+  }
+
+  private static async probeRemotePackage(url: string, format: WeeklyPackageArtifactFormat, cfg: WebDavConfig | null): Promise<RemotePackageProbe> {
+    if (WebDavIncrementalSyncService.isLocalFileBackendActive()) {
+      const size = await WebDavIncrementalSyncService.getReadableFileSize(url)
+      if (size <= 0) {
+        WebDavIncrementalSyncService.pushDebug('localfile.probe', `missing-or-empty path=${url} format=${format}`)
+        return { present: false, missing: true, inconclusive: false, signature: '', modifiedAtMs: 0, message: `本地固定同步文件为空或不可读: ${url}` } as RemotePackageProbe
+      }
+      const sig = await WebDavIncrementalSyncService.buildLocalPackageSignature(url)
+      WebDavIncrementalSyncService.pushDebug('localfile.probe', `ok path=${url} format=${format} modifiedAt=${sig.modifiedAtMs} signature=${sig.signature}`)
+      return { present: true, missing: false, inconclusive: false, signature: sig.signature, modifiedAtMs: sig.modifiedAtMs, message: 'ok' } as RemotePackageProbe
+    }
+
+    if (WebDavIncrementalSyncService.isLocalBackendActive()) {
+      const exists = await FileUtil.exists(url)
+      if (!exists) {
+        WebDavIncrementalSyncService.pushDebug('local.probe', `missing path=${url} format=${format}`)
+        return { present: false, missing: true, inconclusive: false, signature: '', modifiedAtMs: 0, message: `本地同步包不存在: ${url}` } as RemotePackageProbe
+      }
+      const sig = await WebDavIncrementalSyncService.buildLocalPackageSignature(url)
+      WebDavIncrementalSyncService.pushDebug('local.probe', `ok path=${url} format=${format} modifiedAt=${sig.modifiedAtMs} signature=${sig.signature}`)
+      return { present: true, missing: false, inconclusive: false, signature: sig.signature, modifiedAtMs: sig.modifiedAtMs, message: 'ok' } as RemotePackageProbe
+    }
+
+    if (cfg == null) {
+      return { present: false, missing: false, inconclusive: true, signature: '', modifiedAtMs: 0, message: 'WebDAV 配置为空' } as RemotePackageProbe
+    }
+    const scopedCfg = WebDavIncrementalSyncService.buildScopedConfig(url, cfg)
+    const headResp = await WebDAVService.head(url, scopedCfg)
+    if (headResp.ok) {
+      const signature = WebDavIncrementalSyncService.buildRemotePackageSignature(headResp.etag, headResp.lastModified)
+      const modifiedAtMs = WebDavIncrementalSyncService.parseRemoteModifiedAt(headResp.lastModified)
+      WebDavIncrementalSyncService.pushDebug('remote.probe', `ok url=${url} format=${format} modifiedAt=${modifiedAtMs} signature=${signature != '' ? signature : 'none'}`)
+      return { present: true, missing: false, inconclusive: false, signature, modifiedAtMs, message: 'ok' } as RemotePackageProbe
+    }
+    if (headResp.statusCode == 404) {
+      WebDavIncrementalSyncService.pushDebug('remote.probe', `missing url=${url} format=${format}`)
+      return { present: false, missing: true, inconclusive: false, signature: '', modifiedAtMs: 0, message: headResp.message } as RemotePackageProbe
+    }
+    WebDavIncrementalSyncService.pushDebug('remote.probe', `inconclusive url=${url} format=${format} status=${headResp.statusCode} message=${headResp.message}`)
+    return { present: false, missing: false, inconclusive: true, signature: '', modifiedAtMs: 0, message: headResp.message } as RemotePackageProbe
+  }
+
+  private static async probeRemoteSyncAtWeek(remoteRoot: string, profile: AppRuntimeProfile, weekStartMs: number, format: WeeklyPackageArtifactFormat, cfg: WebDavConfig | null): Promise<RemoteWeeklySyncPackage> {
+    const url = WebDavIncrementalSyncService.buildSyncUrl(remoteRoot, profile, weekStartMs, format)
+    const probe = await WebDavIncrementalSyncService.probeRemotePackage(url, format, cfg)
+    return {
+      url,
+      weekStartMs,
+      weekKey: WebDavIncrementalSyncService.buildWeekKey(weekStartMs),
+      probe,
+    } as RemoteWeeklySyncPackage
+  }
+
+  private static async probeLatestRemoteSyncPackage(remoteRoot: string, profile: AppRuntimeProfile, currentWeekStartMs: number, format: WeeklyPackageArtifactFormat, cfg: WebDavConfig | null): Promise<RemoteWeeklySyncPackage> {
+    const current = await WebDavIncrementalSyncService.probeRemoteSyncAtWeek(remoteRoot, profile, currentWeekStartMs, format, cfg)
+    if (current.probe.present || current.probe.inconclusive) return current
+
+    const storedWeekStartMs = WebDavIncrementalSyncService.readStoredNumber(profile, 'last_remote_sync_week_start_ms')
+    if (storedWeekStartMs > 0 && storedWeekStartMs != currentWeekStartMs) {
+      const stored = await WebDavIncrementalSyncService.probeRemoteSyncAtWeek(remoteRoot, profile, storedWeekStartMs, format, cfg)
+      if (stored.probe.present || stored.probe.inconclusive) return stored
+    }
+
+    for (let i = 1; i <= WebDavIncrementalSyncService.REMOTE_SYNC_LOOKBACK_WEEKS; i++) {
+      const candidateWeekStartMs = WebDavIncrementalSyncService.shiftWeekStartMs(currentWeekStartMs, -i)
+      if (candidateWeekStartMs == storedWeekStartMs) continue
+      const candidate = await WebDavIncrementalSyncService.probeRemoteSyncAtWeek(remoteRoot, profile, candidateWeekStartMs, format, cfg)
+      if (candidate.probe.present || candidate.probe.inconclusive) return candidate
+    }
+
+    return current
+  }
+
+  private static shouldImportRemotePackage(probe: RemotePackageProbe, appliedSignature: string): boolean {
+    if (probe.missing) return false
+    if (probe.inconclusive) return true
+    if (!probe.present) return false
+    if (probe.signature == '') return true
+    return probe.signature != appliedSignature
+  }
+
+  private static shouldImportObservedRemotePackage(probe: RemotePackageProbe, appliedRemoteModifiedAt: number, appliedSignature: string): boolean {
+    if (probe.missing) return false
+    if (probe.modifiedAtMs > 0) return probe.modifiedAtMs != appliedRemoteModifiedAt
+    return WebDavIncrementalSyncService.shouldImportRemotePackage(probe, appliedSignature)
+  }
+
+  private static isRemoteSyncPackageStale(probe: RemotePackageProbe, weekStartMs: number): boolean {
+    if (!probe.present) return false
+    if (probe.modifiedAtMs <= 0) return false
+    return probe.modifiedAtMs < weekStartMs
+  }
+
+  private static shouldImportRemotePackageByTime(probe: RemotePackageProbe, localChangedAt: number, appliedRemoteModifiedAt: number, appliedSignature: string): boolean {
+    if (probe.missing) return false
+    if (probe.modifiedAtMs > 0) {
+      if (probe.modifiedAtMs <= localChangedAt) return false
+      return probe.modifiedAtMs != appliedRemoteModifiedAt
+    }
+    return WebDavIncrementalSyncService.shouldImportRemotePackage(probe, appliedSignature)
+  }
+
+  private static shouldPublishLocalPackageByTime(localChangedAt: number, probe: RemotePackageProbe, fallbackDecision: boolean): boolean {
+    if (localChangedAt <= 0) return false
+    if (probe.missing) return true
+    if (probe.modifiedAtMs > 0) {
+      return localChangedAt > probe.modifiedAtMs
+    }
+    return fallbackDecision
+  }
+
+  private static async importRemotePackage(url: string, format: WeeklyPackageArtifactFormat, cfg: WebDavConfig | null, context: any | null = null): Promise<ImportRemotePackageResult> {
+    let tempFilePath = ''
+    let resolvedUrl = url
+    let resolvedFormat = format
+    try {
+      WebDavIncrementalSyncService.pushDebug('import.download', `start url=${url} format=${format}`)
+      const downloadResult = await WebDavIncrementalSyncService.downloadRemoteFileToTemp(url, format, cfg)
+      if (!downloadResult.ok) {
+        const missing = WebDavIncrementalSyncService.isNotFoundDownloadMessage(downloadResult.message)
+        const message = missing
+          ? `远端清单指向的数据包不存在: ${url}`
+          : (downloadResult.message != '' ? downloadResult.message : '下载远端包失败')
+        WebDavIncrementalSyncService.pushDebug('import.download', `failed url=${resolvedUrl} missing=${missing} message=${message}`)
+        return { ok: false, downloaded: false, imported: false, missing, message } as ImportRemotePackageResult
+      }
+      tempFilePath = downloadResult.tempFilePath
+      WebDavIncrementalSyncService.pushDebug('import.download', `ok url=${resolvedUrl} format=${resolvedFormat} temp=${tempFilePath}`)
+      const importResult = resolvedFormat == 'db'
+        ? await ExportImportService.importDbOnly(tempFilePath, context)
+        : await ExportImportService.importFull(tempFilePath, context)
+      if (!importResult.ok) {
+        WebDavIncrementalSyncService.pushDebug('import.apply', `failed url=${resolvedUrl} message=${importResult.message ?? '导入远端包失败'}`)
+        return { ok: false, downloaded: true, imported: false, message: importResult.message ?? '导入远端包失败' } as ImportRemotePackageResult
+      }
+      WebDavIncrementalSyncService.pushDebug('import.apply', `ok url=${resolvedUrl} format=${resolvedFormat}`)
+      return { ok: true, downloaded: true, imported: true, message: 'ok' } as ImportRemotePackageResult
+    } catch (e) {
+      WebDavIncrementalSyncService.pushDebug('import.exception', `url=${resolvedUrl} error=${(e as Error).message ?? ('' + e)}`)
+      return { ok: false, downloaded: tempFilePath != '', imported: false, message: (e as Error).message ?? ('' + e) } as ImportRemotePackageResult
+    } finally {
+      if (tempFilePath != '') {
+        await FileUtil.removeFile(tempFilePath)
+      }
+    }
+  }
+
+  private static async cleanupDeletedAttachmentFiles(): Promise<void> {
+    if (!DB.isReady) return
+    try {
+      const rows = await DB.query(`SELECT DISTINCT file_path FROM attachments WHERE COALESCE(is_deleted, 0) != 0 AND COALESCE(file_path, '') != ''`)
+      for (let i = 0; i < rows.length; i++) {
+        const rawPath = rows[i].get('file_path')
+        const filePath = rawPath == null ? '' : rawPath.toString().trim()
+        if (filePath == '') continue
+        const refs = await DB.query(`SELECT id FROM attachments WHERE file_path = ? AND COALESCE(is_deleted, 0) = 0 LIMIT 1`, [filePath])
+        if (refs.length > 0) continue
+        await FileUtil.removeFile(filePath)
+      }
+    } catch (_e0) {}
+  }
+
+  private static getResourceRowValue(row: Map<string, any | null>, key: string): string {
+    const raw = row.get(key)
+    return raw == null ? '' : raw.toString()
+  }
+
+  private static getResourceRowNumber(row: Map<string, any | null>, key: string): number {
+    const raw = row.get(key)
+    if (raw == null) return 0
+    const n = parseInt(raw.toString())
+    return isNaN(n) ? 0 : n
+  }
+
+  private static toAttachmentResourceRow(row: Map<string, any | null>): AttachmentResourceRow {
+    return {
+      id: WebDavIncrementalSyncService.getResourceRowValue(row, 'id'),
+      filePath: WebDavIncrementalSyncService.getResourceRowValue(row, 'file_path'),
+      fileName: WebDavIncrementalSyncService.getResourceRowValue(row, 'file_name'),
+      fileType: WebDavIncrementalSyncService.getResourceRowValue(row, 'file_type'),
+      fileHash: WebDavIncrementalSyncService.getResourceRowValue(row, 'file_hash'),
+      createdAt: WebDavIncrementalSyncService.getResourceRowNumber(row, 'created_at'),
+      updatedAt: WebDavIncrementalSyncService.getResourceRowNumber(row, 'updated_at'),
+    } as AttachmentResourceRow
+  }
+
+  private static async getAttachmentResourceRows(windowMode: ExportPackageWindowMode, cutoffMs: number): Promise<AttachmentResourceRow[]> {
+    const result = [] as AttachmentResourceRow[]
+    if (!DB.isReady) return result
+    try {
+      const changeExpr = `COALESCE(NULLIF(CAST(updated_at AS INTEGER), 0), NULLIF(CAST(created_at AS INTEGER), 0), 0)`
+      let sql = `SELECT id, file_path, file_name, file_type, file_hash, created_at, updated_at FROM attachments WHERE COALESCE(is_deleted, 0) = 0 AND COALESCE(file_path, '') != ''`
+      const args = [] as any[]
+      if (windowMode == 'before_cutoff' && cutoffMs > 0) {
+        sql += ` AND ${changeExpr} < ?`
+        args.push(cutoffMs)
+      } else if (windowMode == 'since_cutoff' && cutoffMs > 0) {
+        sql += ` AND ${changeExpr} >= ?`
+        args.push(cutoffMs)
+      }
+      sql += ` ORDER BY created_at ASC`
+      const rows = await DB.query(sql, args)
+      for (let i = 0; i < rows.length; i++) {
+        result.push(WebDavIncrementalSyncService.toAttachmentResourceRow(rows[i]))
+      }
+    } catch (e) {
+      WebDavIncrementalSyncService.pushDebug('resource.query', `failed message=${(e as Error).message ?? ('' + e)}`)
+    }
+    return result
+  }
+
+  private static getLastPathPart(path: string): string {
+    const normalized = (path ?? '').toString().replace(/\\/g, '/')
+    const clean = normalized.split('?')[0].split('#')[0]
+    const slash = clean.lastIndexOf('/')
+    if (slash >= 0 && slash < clean.length - 1) return clean.substring(slash + 1)
+    return clean
+  }
+
+  private static inferResourceExtension(row: AttachmentResourceRow): string {
+    const name = (row.fileName != '' ? row.fileName : WebDavIncrementalSyncService.getLastPathPart(row.filePath)).toLowerCase()
+    const dot = name.lastIndexOf('.')
+    if (dot >= 0 && dot < name.length - 1) {
+      const ext = name.substring(dot + 1).replace(/[^a-z0-9]/g, '')
+      if (ext.length > 0 && ext.length <= 8) return ext
+    }
+    const type = row.fileType.toLowerCase()
+    if (type.indexOf('image') >= 0) return 'png'
+    if (type.indexOf('video') >= 0) return 'mp4'
+    if (type.indexOf('music') >= 0 || type.indexOf('audio') >= 0) return 'mp3'
+    return 'bin'
+  }
+
+  private static buildResourceFileName(row: AttachmentResourceRow): string {
+    let key = row.fileHash.toString().trim()
+    if (key == '') key = row.id.toString().trim()
+    if (key == '') key = WebDavIncrementalSyncService.getLastPathPart(row.filePath)
+    key = key.replace(/[^a-zA-Z0-9_-]/g, '_')
+    if (key == '') key = `resource_${row.createdAt > 0 ? row.createdAt : Date.now()}`
+    return `${key}.${WebDavIncrementalSyncService.inferResourceExtension(row)}`
+  }
+
+  private static getResourceWeekStartMs(row: AttachmentResourceRow): number {
+    const ts = row.createdAt > 0 ? row.createdAt : (row.updatedAt > 0 ? row.updatedAt : Date.now())
+    return WebDavIncrementalSyncService.getWeekStartMs(ts)
+  }
+
+  private static buildResourceUrl(remoteRoot: string, row: AttachmentResourceRow): string {
+    const weekStartMs = WebDavIncrementalSyncService.getResourceWeekStartMs(row)
+    const parts = WebDavIncrementalSyncService.getLocalDateParts(weekStartMs)
+    const year = `${parts.year}`
+    const month = WebDavIncrementalSyncService.pad2(parts.month)
+    const weekKey = WebDavIncrementalSyncService.buildWeekKey(weekStartMs)
+    return `${remoteRoot}/resource/${year}/${month}/${weekKey}/${WebDavIncrementalSyncService.buildResourceFileName(row)}`
+  }
+
+  private static async uploadAttachmentResources(remoteRoot: string, baseUrl: string, cfg: WebDavConfig | null, windowMode: ExportPackageWindowMode, cutoffMs: number): Promise<ResourceTransferResult> {
+    const rows = await WebDavIncrementalSyncService.getAttachmentResourceRows(windowMode, cutoffMs)
+    let uploaded = 0
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]
+      if (row.filePath == '') continue
+      const exists = await FileUtil.exists(row.filePath)
+      if (!exists) continue
+      const resourceWeekStartMs = WebDavIncrementalSyncService.getResourceWeekStartMs(row)
+      const ensured = await WebDavIncrementalSyncService.ensureRemoteCollections(baseUrl, WebDavIncrementalSyncService.buildResourceCollectionSegments(resourceWeekStartMs), cfg)
+      if (!ensured) return { ok: false, transferred: uploaded, message: '创建资源目录失败' } as ResourceTransferResult
+      const resourceUrl = WebDavIncrementalSyncService.buildResourceUrl(remoteRoot, row)
+      const probe = await WebDavIncrementalSyncService.probeRemotePackage(resourceUrl, 'db', cfg)
+      if (probe.present) continue
+      const uploadMessage = await WebDavIncrementalSyncService.putRemoteFile(row.filePath, resourceUrl, cfg)
+      if (!WebDavIncrementalSyncService.isPutRemoteFileSuccess(uploadMessage)) {
+        WebDavIncrementalSyncService.pushDebug('resource.upload', `failed id=${row.id} url=${resourceUrl} message=${uploadMessage}`)
+        return { ok: false, transferred: uploaded, message: uploadMessage } as ResourceTransferResult
+      }
+      uploaded++
+      WebDavIncrementalSyncService.pushDebug('resource.upload', `ok id=${row.id} url=${resourceUrl}`)
+    }
+    return { ok: true, transferred: uploaded, message: 'ok' } as ResourceTransferResult
+  }
+
+  private static async restoreMissingAttachmentResources(remoteRoot: string, cfg: WebDavConfig | null): Promise<ResourceTransferResult> {
+    const rows = await WebDavIncrementalSyncService.getAttachmentResourceRows('all', 0)
+    let downloaded = 0
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]
+      if (row.filePath == '') continue
+      const exists = await FileUtil.exists(row.filePath)
+      if (exists) continue
+      const resourceUrl = WebDavIncrementalSyncService.buildResourceUrl(remoteRoot, row)
+      const downloadResult = await WebDavIncrementalSyncService.downloadRemoteFileToTemp(resourceUrl, 'db', cfg)
+      if (!downloadResult.ok) {
+        WebDavIncrementalSyncService.pushDebug('resource.download', `skip id=${row.id} url=${resourceUrl} message=${downloadResult.message}`)
+        continue
+      }
+      try {
+        await FileUtil.copyFile(downloadResult.tempFilePath, row.filePath, { overwrite: true })
+        downloaded++
+        WebDavIncrementalSyncService.pushDebug('resource.download', `ok id=${row.id} path=${row.filePath}`)
+      } finally {
+        await FileUtil.removeFile(downloadResult.tempFilePath)
+      }
+    }
+    return { ok: true, transferred: downloaded, message: 'ok' } as ResourceTransferResult
+  }
+
+  private static async purgeSoftDeletedRows(): Promise<number> {
+    if (!DB.isReady) return 0
+    const tables = ['attachments', 'logs', 'transactions', 'edges', 'accounts', 'nodes'] as string[]
+    let purged = 0
+    try {
+      await DB.beginTransaction()
+      for (let i = 0; i < tables.length; i++) {
+        const countRows = await DB.query(`SELECT COUNT(1) AS cnt FROM ${tables[i]} WHERE COALESCE(is_deleted, 0) != 0`)
+        if (countRows.length > 0) {
+          const raw = countRows[0].get('cnt')
+          const count = raw == null ? 0 : parseInt(raw.toString())
+          if (!isNaN(count)) purged += count
+        }
+        const ok = await DB.exec(`DELETE FROM ${tables[i]} WHERE COALESCE(is_deleted, 0) != 0`)
+        if (!ok) throw new Error(`purge failed: ${tables[i]}`)
+      }
+      await DB.setTransactionSuccessful()
+    } catch (e) {
+      WebDavIncrementalSyncService.pushDebug('purge.deleted', `failed message=${(e as Error).message ?? ('' + e)}`)
+      purged = 0
+    } finally {
+      await DB.endTransaction()
+    }
+    WebDavIncrementalSyncService.pushDebug('purge.deleted', `purged=${purged}`)
+    return purged
+  }
+
+  private static async publishPackage(url: string, packagePrefix: string, windowMode: ExportPackageWindowMode, cutoffMs: number, cfg: WebDavConfig | null, baseUrl: string, collectionSegments: string[]): Promise<{ error: string | null, format: WeeklyPackageArtifactFormat, signature: string, modifiedAtMs: number }> {
+    WebDavIncrementalSyncService.pushDebug('publish.package', `start prefix=${packagePrefix} mode=${windowMode} cutoffMs=${cutoffMs} url=${url}`)
+    const collectionsReady = await WebDavIncrementalSyncService.ensureRemoteCollections(baseUrl, collectionSegments, cfg)
+    if (!collectionsReady) {
+      return { error: WebDavIncrementalSyncService.isLocalBackendActive() ? '创建本地同步目录失败' : '创建 WebDAV 同步目录失败', format: 'zip', signature: '', modifiedAtMs: 0 }
+    }
+    const packageRes = await ExportImportService.exportPackageZip({
+      packagePrefix,
+      windowMode,
+      cutoffMs,
+    })
+    if (!packageRes.ok || packageRes.path == null || packageRes.path.toString().trim() == '') {
+      WebDavIncrementalSyncService.pushDebug('publish.package', `export failed prefix=${packagePrefix} message=${packageRes.message ?? '导出同步包失败'}`)
+      return { error: packageRes.message ?? '导出同步包失败', format: 'zip', signature: '', modifiedAtMs: 0 }
+    }
+
+    const packagePath = packageRes.path.toString()
+    const packageSize = await WebDavIncrementalSyncService.getReadableFileSize(packagePath)
+    WebDavIncrementalSyncService.pushDebug('publish.package', `artifact prefix=${packagePrefix} path=${packagePath} size=${packageSize}`)
+    if (packageSize <= 0) {
+      await ExportImportService.cleanupPackageArtifact(packagePath)
+      return { error: `本地导出同步包为空: ${packagePath}`, format: 'zip', signature: '', modifiedAtMs: 0 }
+    }
+
+    const artifactFormat = WebDavIncrementalSyncService.inferPackageFormatFromUrl(packageRes.artifactFormat ?? packageRes.path.toString(), 'zip')
+
+    try {
+      const uploadMessage = await WebDavIncrementalSyncService.putRemoteFile(packagePath, url, cfg)
+      if (!WebDavIncrementalSyncService.isPutRemoteFileSuccess(uploadMessage)) {
+        WebDavIncrementalSyncService.pushDebug('publish.package', `upload failed prefix=${packagePrefix} message=${uploadMessage}`)
+        return { error: uploadMessage, format: artifactFormat, signature: '', modifiedAtMs: 0 }
+      }
+      const verifyResult = await WebDavIncrementalSyncService.verifyRemotePackageVisible(url, cfg)
+      if (!verifyResult.ok && verifyResult.missing) {
+        WebDavIncrementalSyncService.pushDebug('publish.package', `verify missing prefix=${packagePrefix} url=${url} message=${verifyResult.message}`)
+        return { error: `远端包上传后不可见: ${url}`, format: artifactFormat, signature: '', modifiedAtMs: 0 }
+      }
+      if (verifyResult.message != '' && verifyResult.message != 'head-ok' && verifyResult.message != 'download-ok') {
+        WebDavIncrementalSyncService.pushDebug('publish.package', `verify inconclusive prefix=${packagePrefix} url=${url} message=${verifyResult.message}`)
+      }
+      WebDavIncrementalSyncService.pushDebug('publish.package', `upload ok prefix=${packagePrefix} format=${artifactFormat} local=${packagePath}`)
+      return { error: null, format: artifactFormat, signature: verifyResult.signature, modifiedAtMs: verifyResult.modifiedAtMs }
+    } finally {
+      await ExportImportService.cleanupPackageArtifact(packagePath)
+    }
+  }
+
+  private static async markSyncCompleted(profile: AppRuntimeProfile, weekStartMs: number, remoteSyncWeekStartMs: number, pulledAllData: boolean): Promise<number> {
+    const finalLocalMaxChangedAt = await ExportImportService.getMaxEntityChangeTime()
+    WebDavIncrementalSyncService.writeStoredNumber(profile, 'last_successful_sync_at', Date.now())
+    WebDavIncrementalSyncService.writeStoredNumber(profile, 'last_successful_week_start_ms', weekStartMs)
+    WebDavIncrementalSyncService.writeStoredNumber(profile, 'last_synced_local_max_changed_at', finalLocalMaxChangedAt)
+    if (remoteSyncWeekStartMs > 0) {
+      WebDavIncrementalSyncService.writeStoredNumber(profile, 'last_remote_sync_week_start_ms', remoteSyncWeekStartMs)
+    }
+    if (pulledAllData) {
+      WebDavIncrementalSyncService.writeStoredNumber(profile, 'last_full_pull_week_start_ms', weekStartMs)
+    }
+    return finalLocalMaxChangedAt
+  }
+
+  static async confirmRemoveSoftDeletedData(profile: AppRuntimeProfile, context: any | null = null): Promise<WebDavIncrementalSyncResult> {
+    return await WebDavIncrementalSyncService.run(profile, 'confirm-remove', context)
+  }
+
+  static async run(profile: AppRuntimeProfile, source: string, context: any | null = null): Promise<WebDavIncrementalSyncResult> {
+    WebDavIncrementalSyncService.resetDebug(profile, source)
+    const runMode = WebDavIncrementalSyncService.resolveRunMode(source)
+    const resolved = WebDavIncrementalSyncService.resolveSyncConfig()
+    WebDavIncrementalSyncService.activeStorageScope = resolved.backendKind
+    if (!resolved.ok || (resolved.backendKind == 'webdav' && resolved.cfg == null)) {
+      WebDavIncrementalSyncService.pushDebug('config', `unavailable message=${resolved.message}`)
+      return WebDavIncrementalSyncService.finalizeResult({
+        available: false,
+        synced: false,
+        remoteFound: false,
+        downloaded: false,
+        imported: false,
+        uploaded: false,
+        reason: resolved.message,
+      } as WebDavIncrementalSyncResult, 'config')
+    }
+
+    if (WebDavIncrementalSyncService.shouldSkipWebDavForFrequency(profile, source, runMode)) {
+      WebDavIncrementalSyncService.pushDebug('frequency', `skip source=${source}`)
+      return WebDavIncrementalSyncService.finalizeResult({
+        available: true,
+        synced: true,
+        remoteFound: false,
+        downloaded: false,
+        imported: false,
+        uploaded: false,
+        reason: null,
+        transport: resolved.backendKind,
+      } as WebDavIncrementalSyncResult, 'frequency.skip')
+    }
+
+    WebDavIncrementalSyncService.pushDebug('config', `transport=${resolved.backendKind} baseUrl=${resolved.baseUrl} mode=${runMode}`)
+
+    const deviceId = await UserBiz.ensureDeviceId()
+    WebDavIncrementalSyncService.pushDebug('identity', `deviceId=${deviceId}`)
+    const remoteRoot = WebDavIncrementalSyncService.buildRemoteRoot(resolved.baseUrl)
+    const preferredPackageFormat = WebDavIncrementalSyncService.resolvePreferredPackageFormat()
+
+    const result = {
+      available: true,
+      synced: false,
+      remoteFound: false,
+      downloaded: false,
+      imported: false,
+      uploaded: false,
+      reason: null,
+      backupImported: false,
+      syncImported: false,
+      backupUploaded: false,
+      syncUploaded: false,
+      weekKey: '',
+      remoteRoot,
+      transport: resolved.backendKind,
+    } as WebDavIncrementalSyncResult
+
+    try {
+      WebDavIncrementalSyncService.pushDebug('init.step', 'week.start')
+      const weekStartMs = WebDavIncrementalSyncService.getWeekStartMs()
+      const weekKey = WebDavIncrementalSyncService.buildWeekKey(weekStartMs)
+      WebDavIncrementalSyncService.pushDebug('init.step', `week.ok weekStartMs=${weekStartMs} weekKey=${weekKey}`)
+      const localFixedFiles = WebDavIncrementalSyncService.isLocalFileBackendActive()
+      const currentSyncUrl = localFixedFiles ? resolved.localSyncFileUri : WebDavIncrementalSyncService.buildSyncUrl(remoteRoot, profile, weekStartMs, preferredPackageFormat)
+      const backupUrl = localFixedFiles ? resolved.localBackupFileUri : WebDavIncrementalSyncService.buildBackupUrl(remoteRoot, profile, weekStartMs, preferredPackageFormat)
+      if (localFixedFiles) {
+        const permissionMessage = await WebDavIncrementalSyncService.activateLocalFixedFilePermissions(backupUrl, currentSyncUrl)
+        WebDavIncrementalSyncService.pushDebug('localfile.permission', permissionMessage == '' ? 'activated' : permissionMessage)
+        if (permissionMessage != '') {
+          if (runMode == 'background') {
+            result.synced = true
+            result.reason = null
+            WebDavIncrementalSyncService.pushDebug('localfile.permission', 'background skip; permission not active')
+            return WebDavIncrementalSyncService.finalizeResult(result, 'localfile.permission.skip')
+          }
+          result.reason = permissionMessage
+          return WebDavIncrementalSyncService.finalizeResult(result, 'localfile.permission')
+        }
+      }
+      WebDavIncrementalSyncService.pushDebug('init.step', 'url.ok')
+
+      const localMaxChangedAt = await ExportImportService.getMaxEntityChangeTime()
+      const currentWeekMaxChangedAt = await ExportImportService.getMaxEntityChangeTime(weekStartMs)
+      const previousWeekMaxChangedAt = await ExportImportService.getMaxEntityChangeTimeBefore(weekStartMs)
+      WebDavIncrementalSyncService.pushDebug('init.step', 'local.max.ok')
+      let decisionLocalMaxChangedAt = localMaxChangedAt
+      let decisionCurrentWeekMaxChangedAt = currentWeekMaxChangedAt
+      let decisionPreviousWeekMaxChangedAt = previousWeekMaxChangedAt
+      const lastSuccessfulSyncAt = WebDavIncrementalSyncService.readStoredNumber(profile, 'last_successful_sync_at')
+      const lastSyncedLocalMaxChangedAt = WebDavIncrementalSyncService.readStoredNumber(profile, 'last_synced_local_max_changed_at')
+      const lastFullPullWeekStartMs = WebDavIncrementalSyncService.readStoredNumber(profile, 'last_full_pull_week_start_ms')
+      WebDavIncrementalSyncService.pushDebug('init.step', 'storage.ok')
+
+      result.weekStartMs = weekStartMs
+      result.backupScope = WebDavIncrementalSyncService.buildBackupScopeText(weekStartMs)
+      result.syncScope = WebDavIncrementalSyncService.buildSyncScopeText(weekStartMs)
+      result.weekKey = weekKey
+      WebDavIncrementalSyncService.pushDebug('window', `weekKey=${weekKey} weekStartMs=${weekStartMs} backupScope=${result.backupScope} syncScope=${result.syncScope}`)
+      WebDavIncrementalSyncService.pushDebug('local.state', `localMaxChangedAt=${localMaxChangedAt} (${WebDavIncrementalSyncService.formatTs(localMaxChangedAt)}) currentWeekMaxChangedAt=${currentWeekMaxChangedAt} (${WebDavIncrementalSyncService.formatTs(currentWeekMaxChangedAt)}) previousWeekMaxChangedAt=${previousWeekMaxChangedAt} (${WebDavIncrementalSyncService.formatTs(previousWeekMaxChangedAt)}) lastSuccessfulSyncAt=${lastSuccessfulSyncAt} (${WebDavIncrementalSyncService.formatTs(lastSuccessfulSyncAt)}) lastSyncedLocalMaxChangedAt=${lastSyncedLocalMaxChangedAt} lastFullPullWeekStartMs=${lastFullPullWeekStartMs}`)
+
+      WebDavIncrementalSyncService.pushDebug('remote.layout', `root=${remoteRoot}`)
+      WebDavIncrementalSyncService.pushDebug('remote.layout', 'manifest=disabled')
+      WebDavIncrementalSyncService.pushDebug('remote.layout', 'lock=disabled')
+      WebDavIncrementalSyncService.pushDebug('remote.layout', `backupUrl=${backupUrl}`)
+      WebDavIncrementalSyncService.pushDebug('remote.layout', `currentSyncUrl=${currentSyncUrl}`)
+
+      const appliedBackupSignature = WebDavIncrementalSyncService.readStoredText(profile, 'applied_backup_signature')
+      const appliedSyncSignature = WebDavIncrementalSyncService.readStoredText(profile, 'applied_sync_signature')
+      const appliedBackupRemoteModifiedAt = WebDavIncrementalSyncService.readStoredNumber(profile, 'applied_backup_remote_modified_at')
+      const appliedSyncRemoteModifiedAt = WebDavIncrementalSyncService.readStoredNumber(profile, 'applied_sync_remote_modified_at')
+
+      const backupProbe = await WebDavIncrementalSyncService.probeRemotePackage(backupUrl, preferredPackageFormat, resolved.cfg)
+      const remoteSyncPackage = localFixedFiles
+        ? ({ url: currentSyncUrl, weekStartMs, weekKey, probe: await WebDavIncrementalSyncService.probeRemotePackage(currentSyncUrl, preferredPackageFormat, resolved.cfg) } as RemoteWeeklySyncPackage)
+        : await WebDavIncrementalSyncService.probeLatestRemoteSyncPackage(remoteRoot, profile, weekStartMs, preferredPackageFormat, resolved.cfg)
+      const syncProbe = remoteSyncPackage.probe
+      const remoteSyncWeekKnown = !syncProbe.missing && (syncProbe.present || syncProbe.inconclusive)
+      const observedLocalFileSyncWeekStartMs = localFixedFiles && syncProbe.modifiedAtMs > 0
+        ? WebDavIncrementalSyncService.getWeekStartMs(syncProbe.modifiedAtMs)
+        : weekStartMs
+      let completedRemoteSyncWeekStartMs = remoteSyncWeekKnown ? (localFixedFiles ? observedLocalFileSyncWeekStartMs : remoteSyncPackage.weekStartMs) : 0
+      const remoteSyncSameWeek = remoteSyncWeekKnown && completedRemoteSyncWeekStartMs == weekStartMs
+      const remoteSyncOlder = remoteSyncWeekKnown && completedRemoteSyncWeekStartMs > 0 && completedRemoteSyncWeekStartMs < weekStartMs
+      result.backupMissing = backupProbe.missing
+      result.remoteFound = backupProbe.present || syncProbe.present
+      WebDavIncrementalSyncService.pushDebug('remote.state', `backupPresent=${backupProbe.present} backupModifiedAt=${backupProbe.modifiedAtMs} appliedBackupRemoteModifiedAt=${appliedBackupRemoteModifiedAt} backupMissing=${backupProbe.missing} backupInconclusive=${backupProbe.inconclusive} syncUrl=${remoteSyncPackage.url} syncWeekStartMs=${completedRemoteSyncWeekStartMs} syncWeekKey=${remoteSyncPackage.weekKey} syncPresent=${syncProbe.present} syncModifiedAt=${syncProbe.modifiedAtMs} appliedSyncRemoteModifiedAt=${appliedSyncRemoteModifiedAt} syncMissing=${syncProbe.missing} syncInconclusive=${syncProbe.inconclusive} sameWeek=${remoteSyncSameWeek} olderWeek=${remoteSyncOlder}`)
+
+      let importedAny = false
+      let backupImportNeeded = false
+      let syncImportNeeded = false
+      const shouldPullOnOpen = runMode != 'background'
+      const needsInitialBackupPull = backupProbe.present && appliedBackupSignature == '' && appliedBackupRemoteModifiedAt <= 0
+      const shouldImportBackup = shouldPullOnOpen && backupProbe.present && (remoteSyncOlder || needsInitialBackupPull || runMode == 'confirm_remove')
+      const shouldImportSync = shouldPullOnOpen && remoteSyncWeekKnown && (remoteSyncSameWeek || remoteSyncOlder || runMode == 'confirm_remove')
+
+      if (shouldImportBackup) {
+        backupImportNeeded = WebDavIncrementalSyncService.shouldImportObservedRemotePackage(backupProbe, appliedBackupRemoteModifiedAt, appliedBackupSignature)
+      }
+      if (backupImportNeeded) {
+        const backupImport = await WebDavIncrementalSyncService.importRemotePackage(backupUrl, preferredPackageFormat, resolved.cfg, context)
+        if (!backupImport.ok) {
+          if (backupImport.missing === true) {
+            result.backupMissing = true
+            WebDavIncrementalSyncService.writeStoredText(profile, 'applied_backup_signature', '')
+            WebDavIncrementalSyncService.writeStoredNumber(profile, 'applied_backup_remote_modified_at', 0)
+            WebDavIncrementalSyncService.pushDebug('remote.apply', `backup missing during import url=${backupUrl}`)
+          } else {
+            result.reason = backupImport.message
+            WebDavIncrementalSyncService.pushDebug('remote.apply', `backup failed message=${backupImport.message}`)
+            return WebDavIncrementalSyncService.finalizeResult(result, 'remote.apply.backup')
+          }
+        } else {
+          result.remoteFound = true
+          result.downloaded = result.downloaded || backupImport.downloaded
+          result.imported = result.imported || backupImport.imported
+          result.backupImported = backupImport.imported
+          importedAny = importedAny || backupImport.imported
+          WebDavIncrementalSyncService.writeStoredText(profile, 'applied_backup_signature', backupProbe.signature)
+          WebDavIncrementalSyncService.writeStoredNumber(profile, 'applied_backup_remote_modified_at', backupProbe.modifiedAtMs)
+        }
+      } else if (shouldImportBackup) {
+        WebDavIncrementalSyncService.pushDebug('remote.apply', `backup already applied url=${backupUrl}`)
+      } else if (backupProbe.missing) {
+        WebDavIncrementalSyncService.writeStoredText(profile, 'applied_backup_signature', '')
+        WebDavIncrementalSyncService.writeStoredNumber(profile, 'applied_backup_remote_modified_at', 0)
+      }
+
+      if (shouldImportSync) {
+        syncImportNeeded = WebDavIncrementalSyncService.shouldImportObservedRemotePackage(syncProbe, appliedSyncRemoteModifiedAt, appliedSyncSignature)
+      }
+      if (syncImportNeeded) {
+        const syncImport = await WebDavIncrementalSyncService.importRemotePackage(remoteSyncPackage.url, preferredPackageFormat, resolved.cfg, context)
+        if (!syncImport.ok) {
+          if (syncImport.missing === true) {
+            WebDavIncrementalSyncService.writeStoredText(profile, 'applied_sync_signature', '')
+            WebDavIncrementalSyncService.writeStoredNumber(profile, 'applied_sync_remote_modified_at', 0)
+            WebDavIncrementalSyncService.pushDebug('remote.apply', `sync missing during import url=${remoteSyncPackage.url}`)
+          } else {
+            result.reason = syncImport.message
+            WebDavIncrementalSyncService.pushDebug('remote.apply', `sync failed message=${syncImport.message}`)
+            return WebDavIncrementalSyncService.finalizeResult(result, 'remote.apply.sync')
+          }
+        } else {
+          result.remoteFound = true
+          result.downloaded = result.downloaded || syncImport.downloaded
+          result.imported = result.imported || syncImport.imported
+          result.syncImported = syncImport.imported
+          importedAny = importedAny || syncImport.imported
+          WebDavIncrementalSyncService.writeStoredText(profile, 'applied_sync_signature', syncProbe.signature)
+          WebDavIncrementalSyncService.writeStoredNumber(profile, 'applied_sync_remote_modified_at', syncProbe.modifiedAtMs)
+          if (completedRemoteSyncWeekStartMs > 0) {
+            WebDavIncrementalSyncService.writeStoredNumber(profile, 'last_remote_sync_week_start_ms', completedRemoteSyncWeekStartMs)
+          }
+        }
+      } else if (shouldImportSync) {
+        WebDavIncrementalSyncService.pushDebug('remote.apply', `sync already applied url=${remoteSyncPackage.url}`)
+      } else if (syncProbe.missing) {
+        WebDavIncrementalSyncService.writeStoredText(profile, 'applied_sync_signature', '')
+        WebDavIncrementalSyncService.writeStoredNumber(profile, 'applied_sync_remote_modified_at', 0)
+      }
+
+      if (importedAny) {
+        await WebDavIncrementalSyncService.cleanupDeletedAttachmentFiles()
+        decisionLocalMaxChangedAt = await ExportImportService.getMaxEntityChangeTime()
+        decisionCurrentWeekMaxChangedAt = await ExportImportService.getMaxEntityChangeTime(weekStartMs)
+        decisionPreviousWeekMaxChangedAt = await ExportImportService.getMaxEntityChangeTimeBefore(weekStartMs)
+        WebDavIncrementalSyncService.pushDebug('local.state.after_pull', `localMaxChangedAt=${decisionLocalMaxChangedAt} (${WebDavIncrementalSyncService.formatTs(decisionLocalMaxChangedAt)}) currentWeekMaxChangedAt=${decisionCurrentWeekMaxChangedAt} (${WebDavIncrementalSyncService.formatTs(decisionCurrentWeekMaxChangedAt)}) previousWeekMaxChangedAt=${decisionPreviousWeekMaxChangedAt} (${WebDavIncrementalSyncService.formatTs(decisionPreviousWeekMaxChangedAt)})`)
+      }
+      if (shouldPullOnOpen && !localFixedFiles) {
+        const resourceRestore = await WebDavIncrementalSyncService.restoreMissingAttachmentResources(remoteRoot, resolved.cfg)
+        if (resourceRestore.transferred > 0) result.downloaded = true
+      }
+
+      let purgedSoftDeletedRows = 0
+      const pulledAllDataThisRun = shouldPullOnOpen && (backupProbe.missing || !backupImportNeeded || result.backupImported === true) && (!shouldImportSync || !syncImportNeeded || result.syncImported === true)
+      const hasCompletedFullPull = lastFullPullWeekStartMs > 0
+      const hasRemoteBootstrapData = backupProbe.present || backupProbe.inconclusive || remoteSyncWeekKnown
+      const needsInitialForegroundBootstrap = hasRemoteBootstrapData && !hasCompletedFullPull
+      if (runMode == 'confirm_remove') {
+        if (!pulledAllDataThisRun && lastFullPullWeekStartMs != weekStartMs) {
+          result.reason = '确认移除前需要先完成一次前台全量拉取'
+          WebDavIncrementalSyncService.pushDebug('purge.deleted', `blocked lastFullPullWeekStartMs=${lastFullPullWeekStartMs} currentWeekStartMs=${weekStartMs}`)
+          return WebDavIncrementalSyncService.finalizeResult(result, 'purge.blocked')
+        }
+        purgedSoftDeletedRows = await WebDavIncrementalSyncService.purgeSoftDeletedRows()
+      }
+
+      const firstOpenRemoteBootstrap = runMode == 'open' && needsInitialForegroundBootstrap && pulledAllDataThisRun
+      if (firstOpenRemoteBootstrap) {
+        result.synced = true
+        result.reason = null
+        const finalLocalMaxChangedAt = await WebDavIncrementalSyncService.markSyncCompleted(profile, weekStartMs, completedRemoteSyncWeekStartMs, true)
+        WebDavIncrementalSyncService.pushDebug('decision', `first open remote bootstrap; skip publish after pull finalLocalMaxChangedAt=${finalLocalMaxChangedAt}`)
+        return WebDavIncrementalSyncService.finalizeResult(result, 'done')
+      }
+
+      let shouldPublishBackup = false
+      let shouldPublishSync = false
+      const localHasUnpublishedChanges = decisionLocalMaxChangedAt > lastSyncedLocalMaxChangedAt
+      const lastSyncOlderThanWeek = lastSuccessfulSyncAt > 0 && lastSuccessfulSyncAt < weekStartMs
+      const localChangeWeekStartMs = decisionLocalMaxChangedAt > 0 ? WebDavIncrementalSyncService.getWeekStartMs(decisionLocalMaxChangedAt) : 0
+
+      if (runMode == 'background') {
+        if (needsInitialForegroundBootstrap) {
+          result.synced = true
+          result.reason = null
+          WebDavIncrementalSyncService.pushDebug('decision', 'background skip; waiting initial foreground pull')
+          return WebDavIncrementalSyncService.finalizeResult(result, 'bootstrap.wait')
+        }
+        if (!localHasUnpublishedChanges) {
+          result.synced = true
+          result.reason = null
+          WebDavIncrementalSyncService.pushDebug('decision', 'background skip; local data unchanged')
+          return WebDavIncrementalSyncService.finalizeResult(result, 'done')
+        }
+        shouldPublishSync = decisionLocalMaxChangedAt > 0
+        shouldPublishBackup = completedRemoteSyncWeekStartMs <= 0 || localChangeWeekStartMs != completedRemoteSyncWeekStartMs
+      } else {
+        if (lastSyncOlderThanWeek) {
+          shouldPublishSync = true
+          shouldPublishBackup = true
+        } else if (localHasUnpublishedChanges) {
+          shouldPublishSync = decisionLocalMaxChangedAt > 0
+          shouldPublishBackup = completedRemoteSyncWeekStartMs <= 0 || localChangeWeekStartMs != completedRemoteSyncWeekStartMs
+        }
+        if (runMode == 'confirm_remove' && purgedSoftDeletedRows > 0) {
+          shouldPublishSync = true
+          shouldPublishBackup = true
+        }
+      }
+
+      WebDavIncrementalSyncService.pushDebug('decision', `mode=${runMode} decisionLocalMaxChangedAt=${decisionLocalMaxChangedAt} localHasUnpublishedChanges=${localHasUnpublishedChanges} localChangeWeekStartMs=${localChangeWeekStartMs} remoteSyncWeekStartMs=${completedRemoteSyncWeekStartMs} lastSyncOlderThanWeek=${lastSyncOlderThanWeek} hasCompletedFullPull=${hasCompletedFullPull} needsInitialForegroundBootstrap=${needsInitialForegroundBootstrap} shouldImportBackup=${shouldImportBackup} backupImportNeeded=${backupImportNeeded} shouldImportSync=${shouldImportSync} syncImportNeeded=${syncImportNeeded} purgedSoftDeletedRows=${purgedSoftDeletedRows} shouldPublishBackup=${shouldPublishBackup} shouldPublishSync=${shouldPublishSync}`)
+
+      if (!shouldPublishBackup && !shouldPublishSync) {
+        result.synced = true
+        result.reason = null
+        await WebDavIncrementalSyncService.markSyncCompleted(profile, weekStartMs, completedRemoteSyncWeekStartMs, pulledAllDataThisRun)
+        WebDavIncrementalSyncService.pushDebug('decision', 'skip publish; rules did not require upload')
+        return WebDavIncrementalSyncService.finalizeResult(result, 'done')
+      }
+
+      let backupPublishResult: { error: string | null, format: WeeklyPackageArtifactFormat, signature: string, modifiedAtMs: number } | null = null
+      let syncPublishResult: { error: string | null, format: WeeklyPackageArtifactFormat, signature: string, modifiedAtMs: number } | null = null
+
+      if (shouldPublishSync) {
+        syncPublishResult = await WebDavIncrementalSyncService.publishPackage(
+          currentSyncUrl,
+          `${WebDavIncrementalSyncService.normalizeDomainKey(profile)}_sync`,
+          'since_cutoff',
+          weekStartMs,
+          resolved.cfg,
+          resolved.baseUrl,
+          WebDavIncrementalSyncService.buildSyncCollectionSegments(weekStartMs),
+        )
+        if (syncPublishResult.error != null) {
+          result.reason = syncPublishResult.error
+          return WebDavIncrementalSyncService.finalizeResult(result, 'publish.sync')
+        }
+        if (!localFixedFiles) {
+          const syncResourceUpload = await WebDavIncrementalSyncService.uploadAttachmentResources(remoteRoot, resolved.baseUrl, resolved.cfg, 'since_cutoff', weekStartMs)
+          if (!syncResourceUpload.ok) {
+            result.reason = syncResourceUpload.message
+            return WebDavIncrementalSyncService.finalizeResult(result, 'publish.sync.resource')
+          }
+        }
+        result.uploaded = true
+        result.syncUploaded = true
+        const publishedCurrentWeekMaxChangedAt = await ExportImportService.getMaxEntityChangeTime(weekStartMs)
+        WebDavIncrementalSyncService.writeStoredNumber(profile, 'published_sync_max_changed_at', publishedCurrentWeekMaxChangedAt)
+        WebDavIncrementalSyncService.writeStoredText(profile, 'applied_sync_signature', syncPublishResult.signature)
+        WebDavIncrementalSyncService.writeStoredNumber(profile, 'applied_sync_remote_modified_at', syncPublishResult.modifiedAtMs)
+        WebDavIncrementalSyncService.writeStoredNumber(profile, 'last_remote_sync_week_start_ms', weekStartMs)
+        completedRemoteSyncWeekStartMs = weekStartMs
+      }
+
+      if (shouldPublishBackup) {
+        backupPublishResult = await WebDavIncrementalSyncService.publishPackage(
+          backupUrl,
+          `${WebDavIncrementalSyncService.normalizeDomainKey(profile)}_backup`,
+          'before_cutoff',
+          weekStartMs,
+          resolved.cfg,
+          resolved.baseUrl,
+          WebDavIncrementalSyncService.buildBackupCollectionSegments(),
+        )
+        if (backupPublishResult.error != null) {
+          result.reason = backupPublishResult.error
+          return WebDavIncrementalSyncService.finalizeResult(result, 'publish.backup')
+        }
+        if (!localFixedFiles) {
+          const backupResourceUpload = await WebDavIncrementalSyncService.uploadAttachmentResources(remoteRoot, resolved.baseUrl, resolved.cfg, 'before_cutoff', weekStartMs)
+          if (!backupResourceUpload.ok) {
+            result.reason = backupResourceUpload.message
+            return WebDavIncrementalSyncService.finalizeResult(result, 'publish.backup.resource')
+          }
+        }
+        result.uploaded = true
+        result.backupUploaded = true
+        WebDavIncrementalSyncService.writeStoredNumber(profile, 'published_backup_week_start_ms', weekStartMs)
+        WebDavIncrementalSyncService.writeStoredText(profile, 'applied_backup_signature', backupPublishResult.signature)
+        WebDavIncrementalSyncService.writeStoredNumber(profile, 'applied_backup_remote_modified_at', backupPublishResult.modifiedAtMs)
+      }
+
+      result.synced = true
+      result.reason = null
+      const finalLocalMaxChangedAt = await WebDavIncrementalSyncService.markSyncCompleted(profile, weekStartMs, completedRemoteSyncWeekStartMs, pulledAllDataThisRun)
+      WebDavIncrementalSyncService.pushDebug('done', `synced=true uploaded=${result.uploaded} imported=${result.imported} finalLocalMaxChangedAt=${finalLocalMaxChangedAt}`)
+
+      return WebDavIncrementalSyncService.finalizeResult(result, 'done')
+    } catch (e) {
+      result.reason = (e as Error).message ?? ('' + e)
+      WebDavIncrementalSyncService.pushDebug('exception', `${result.reason}`)
+      return WebDavIncrementalSyncService.finalizeResult(result, 'exception')
+    }
+  }
+}

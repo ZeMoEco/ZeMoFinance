@@ -1,0 +1,224 @@
+<script setup lang="uts">
+	import { FINANCE_APP_PROFILE } from '@/services/ecosystem/AppProfiles.uts'
+	import { EcosystemAppBootstrap } from '@/services/ecosystem/EcosystemAppBootstrap.uts'
+	import { DeskPetBillCaptureService } from '@/services/sys/DeskPetBillCaptureService.uts'
+	import { WebDavConfigService } from '@/services/sys/export/WebDavConfigService.uts'
+	import { LOCAL_SYNC_AUTO_DEBOUNCE_MS, LOCAL_SYNC_AUTO_SOURCE, LOCAL_SYNC_DIRTY_EVENT, DESK_PET_BILL_CAPTURE_EVENT, DESK_PET_RECORD_OPEN_EVENT } from '@/utils/constant.uts'
+
+	type FullModalServiceRuntime = {
+		handlePendingDeskPetCaptureAutoRecord(allowManualFallback: boolean): Promise<boolean>
+	}
+
+	type FullModalServiceModule = {
+		FullModalScreenActionService: FullModalServiceRuntime
+	}
+
+	type AppBackgroundServiceRuntime = {
+		moveToBackground(): void
+	}
+
+	type AppBackgroundServiceModule = {
+		AppBackgroundService: AppBackgroundServiceRuntime
+	}
+
+	type ZemoAskRuntime = {
+		showFloatWindow(): void
+	}
+
+	let isDbReady = false
+	let localSyncAutoTimer: number = -1
+	let appSyncInFlight = false
+	let appSyncQueuedSource = ''
+	let isAppVisible = false
+	let deskPetPendingTimer: number = -1
+	function clearLocalSyncAutoTimer(): void {
+		if (localSyncAutoTimer != -1) {
+			clearTimeout(localSyncAutoTimer as number)
+			localSyncAutoTimer = -1
+		}
+	}
+
+	function clearDeskPetPendingTimer(): void {
+		if (deskPetPendingTimer != -1) {
+			clearTimeout(deskPetPendingTimer as number)
+			deskPetPendingTimer = -1
+		}
+	}
+
+	function schedulePendingDeskPetBillCapture(delayMs: number = 120): void {
+		clearDeskPetPendingTimer()
+		deskPetPendingTimer = (setTimeout(() => {
+			deskPetPendingTimer = -1
+			if (!isDbReady) {
+				schedulePendingDeskPetBillCapture(240)
+				return
+			}
+			void runPendingDeskPetBillCapture()
+		}, delayMs) as any) as number
+	}
+
+	function schedulePendingDeskPetAutoConfirm(delayMs: number = 180): void {
+		clearDeskPetPendingTimer()
+		deskPetPendingTimer = (setTimeout(() => {
+			deskPetPendingTimer = -1
+			if (!DeskPetBillCaptureService.hasPendingRecordAutoConfirm()) return
+			if (!isDbReady) {
+				schedulePendingDeskPetAutoConfirm(240)
+				return
+			}
+			void DeskPetBillCaptureService.handlePendingAutoConfirmOnly()
+		}, delayMs) as any) as number
+	}
+
+	function queueSyncSource(source: string): void {
+		if (appSyncQueuedSource == '' || appSyncQueuedSource == LOCAL_SYNC_AUTO_SOURCE || source == 'hide' || source == 'exit') {
+			appSyncQueuedSource = source
+		}
+	}
+
+	async function runAppSync(source: string): Promise<void> {
+		if (appSyncInFlight) {
+			queueSyncSource(source)
+			return
+		}
+		appSyncInFlight = true
+		try {
+			await EcosystemAppBootstrap.runForegroundSync(FINANCE_APP_PROFILE, source)
+		} finally {
+			appSyncInFlight = false
+			const queuedSource = appSyncQueuedSource
+			appSyncQueuedSource = ''
+			if (queuedSource != '') {
+				void runAppSync(queuedSource)
+			}
+		}
+	}
+
+	function scheduleLocalSyncFromMutation(): void {
+		if (!isDbReady) return
+		const cfg = WebDavConfigService.load()
+		if (!cfg.localSyncEnabled) return
+		clearLocalSyncAutoTimer()
+		localSyncAutoTimer = (setTimeout(() => {
+			localSyncAutoTimer = -1
+			const latestCfg = WebDavConfigService.load()
+			if (!latestCfg.localSyncEnabled) return
+			void runAppSync(LOCAL_SYNC_AUTO_SOURCE)
+		}, LOCAL_SYNC_AUTO_DEBOUNCE_MS) as any) as number
+	}
+
+	function handleDeskPetBillCapture(): void {
+		if (!isDbReady) {
+			schedulePendingDeskPetBillCapture()
+			return
+		}
+		void runPendingDeskPetBillCapture()
+	}
+
+	async function runPendingDeskPetBillCapture(): Promise<void> {
+		let fullModalHandled = false
+		try {
+			const module = await import('@/services/sys/FullModalScreenActionService.uts')
+			const service = (module as FullModalServiceModule).FullModalScreenActionService
+			if (service != null) fullModalHandled = await service.handlePendingDeskPetCaptureAutoRecord(isAppVisible)
+		} catch (e) {
+			console.warn('[App] FullModalScreenActionService load failed', e)
+		}
+		if (!fullModalHandled) {
+			await DeskPetBillCaptureService.handlePendingDeskPetCaptureAutoRecord(isAppVisible)
+		}
+	}
+
+	function handleDeskPetRecordOpen(): void {
+		if (!isAppVisible) {
+			if (DeskPetBillCaptureService.hasPendingRecordAutoConfirm()) {
+				if (isDbReady) {
+					void DeskPetBillCaptureService.handlePendingAutoConfirmOnly()
+				} else {
+					schedulePendingDeskPetAutoConfirm()
+				}
+			}
+			return
+		}
+		void DeskPetBillCaptureService.handlePendingDeskPetAction()
+	}
+
+	onLaunch(() => {
+		isAppVisible = true
+		uni.$on(LOCAL_SYNC_DIRTY_EVENT, () => {
+			scheduleLocalSyncFromMutation()
+		})
+		uni.$on(DESK_PET_BILL_CAPTURE_EVENT, handleDeskPetBillCapture)
+		uni.$on(DESK_PET_RECORD_OPEN_EVENT, handleDeskPetRecordOpen)
+		void (async () => {
+			const context = EcosystemAppBootstrap.resolveNativeContext()
+			const result = await EcosystemAppBootstrap.init(FINANCE_APP_PROFILE, context, 'launch')
+			isDbReady = result.dbReady
+			schedulePendingDeskPetBillCapture(220)
+		})()
+
+		// #ifdef APP-HARMONY
+		const petEnabled = uni.getStorageSync('desktop_pet_enabled');
+		if (petEnabled != null && petEnabled.toString() == '1') {
+			setTimeout(() => {
+				try {
+					void import('@/uni_modules/zemo-ask').then((module: Object): void => {
+						(module as ZemoAskRuntime).showFloatWindow();
+					}).catch((e: Error): void => {
+						console.error("Failed to load desktop pet floating window:", e);
+					})
+				} catch (e) {
+					console.error("Failed to auto-start desktop pet floating window:", e);
+				}
+			}, 1500);
+		}
+		// #endif
+	})
+
+	onAppShow(() => {
+		isAppVisible = true
+		schedulePendingDeskPetBillCapture(160)
+		if (isDbReady) {
+			void runAppSync('show')
+		}
+	})
+
+	onAppHide(() => {
+		isAppVisible = false
+		clearLocalSyncAutoTimer()
+		clearDeskPetPendingTimer()
+		if (isDbReady) {
+			void runAppSync('hide')
+		}
+	})
+
+	// #ifdef APP-ANDROID || APP-HARMONY
+	onLastPageBackPress(() => {
+		void import('@/services/sys/AppBackgroundService.uts').then((module: Object): void => {
+			(module as AppBackgroundServiceModule).AppBackgroundService.moveToBackground()
+		}).catch((e: Error): void => {
+			console.warn('[App] AppBackgroundService load failed', e)
+		})
+	})
+
+	onExit(() => {
+		clearLocalSyncAutoTimer()
+		clearDeskPetPendingTimer()
+		uni.$off(DESK_PET_BILL_CAPTURE_EVENT, handleDeskPetBillCapture)
+		uni.$off(DESK_PET_RECORD_OPEN_EVENT, handleDeskPetRecordOpen)
+		if (isDbReady) {
+			void runAppSync('exit')
+		}
+	})
+	// #endif
+</script>
+
+<style>
+	.uni-row {
+		flex-direction: row;
+	}
+
+	.uni-column {
+		flex-direction: column;
+	}
+</style>

@@ -1,0 +1,262 @@
+/**
+ * ZeMo AI - LiteRT 2.1.0 Native LLM Engine
+ * 
+ * 功能:
+ * - LLM推理（流式/同步）
+ * - 多轮对话上下文
+ * - 原生插件调用
+ * 
+ * 注意: RAG和FunctionCalling已移至UTS层
+ * - RAG: @/services/ai/RAGService.uts
+ * - FC:  @/services/ai/FunctionCallingService.uts
+ */
+
+// 引用 Android 实现
+// #ifdef APP-ANDROID
+import { 
+    initModel as androidInit,
+    initModelWithNpu as androidInitWithNpu, 
+    chatStream as androidChat, 
+    chatMultiModal as androidChatMultiModal,
+    chatSync as androidChatSync,
+    chatWithContext as androidChatWithContext,
+    clearHistory as androidClearHistory,
+    resetModel as androidReset,
+    setMaxTokens as androidSetMaxTokens,
+    isModelReady as androidIsReady,
+    invokeNativePlugin as androidInvokePlugin,
+    loadAuxModel as androidLoadAuxModel,
+    classifyImage as androidClassifyImage
+} from './app-android/index.uts';
+// #endif
+
+// 引用 HarmonyOS 原生实现
+// #ifdef APP-HARMONY
+import {
+    initModel as harmonyInit,
+    initModelWithNpu as harmonyInitWithNpu,
+    chatStream as harmonyChat,
+    chatMultiModal as harmonyChatMultiModal,
+    chatSync as harmonyChatSync,
+    chatWithContext as harmonyChatWithContext,
+    clearHistory as harmonyClearHistory,
+    resetModel as harmonyReset,
+    setMaxTokens as harmonySetMaxTokens,
+    isModelReady as harmonyIsReady,
+    invokeNativePlugin as harmonyInvokePlugin,
+    loadAuxModel as harmonyLoadAuxModel,
+    classifyImage as harmonyClassifyImage,
+    registerInMemoryImageValues as harmonyRegisterInMemoryImageValues
+} from './app-harmony/index.uts';
+// #endif
+
+// ========== LLM Core ==========
+
+/**
+ * 初始化LLM模型
+ * @param modelPath 模型文件路径 (.tflite)
+ */
+export function initModel(modelPath: string): boolean {
+    // #ifdef APP-ANDROID
+    return androidInit(modelPath);
+    // #endif
+    // #ifdef APP-HARMONY
+    return harmonyInit(modelPath);
+    // #endif
+    // #ifndef APP-ANDROID || APP-HARMONY
+    return false;
+    // #endif
+}
+
+/**
+ * 初始化LLM模型 (支持NPU选项)
+ * @param modelPath 模型文件路径 (.tflite)
+ * @param useNpu 是否尝试使用NPU加速
+ */
+export function initModelWithNpu(modelPath: string, useNpu: boolean): boolean {
+    // #ifdef APP-ANDROID
+    return androidInitWithNpu(modelPath, useNpu);
+    // #endif
+    // #ifdef APP-HARMONY
+    return harmonyInitWithNpu(modelPath, useNpu);
+    // #endif
+    // #ifndef APP-ANDROID || APP-HARMONY
+    return false;
+    // #endif
+}
+
+/**
+ * 流式对话
+ */
+export function chatStream(prompt: string, callback: (text: string, done: boolean) => void): void {
+    // #ifdef APP-ANDROID
+    androidChat(prompt, callback);
+    // #endif
+    // #ifdef APP-HARMONY
+    harmonyChat(prompt, callback);
+    // #endif
+    // #ifndef APP-ANDROID || APP-HARMONY
+    callback("Not supported", true);
+    // #endif
+}
+
+/**
+ * 多模态对话：上层把 OCR 文本放进 prompt，图片路径作为视觉上下文传入。
+ */
+export function chatMultiModal(prompt: string, imagePath: string, callback: (text: string, done: boolean) => void): void {
+    // #ifdef APP-ANDROID
+    androidChatMultiModal(prompt, imagePath, callback);
+    // #endif
+    // #ifdef APP-HARMONY
+    harmonyChatMultiModal(prompt, imagePath, callback);
+    // #endif
+    // #ifndef APP-ANDROID || APP-HARMONY
+    callback("Not supported", true);
+    // #endif
+}
+
+export function registerInMemoryImageValues(values: Float32Array): string {
+    // #ifdef APP-HARMONY
+    return harmonyRegisterInMemoryImageValues(values);
+    // #endif
+    // #ifndef APP-HARMONY
+    return "";
+    // #endif
+}
+
+/**
+ * 同步对话
+ */
+export function chatSync(prompt: string): string {
+    // #ifdef APP-ANDROID
+    return androidChatSync(prompt);
+    // #endif
+    // #ifdef APP-HARMONY
+    return harmonyChatSync(prompt);
+    // #endif
+    // #ifndef APP-ANDROID || APP-HARMONY
+    return "Not supported";
+    // #endif
+}
+
+/**
+ * 带上下文的多轮对话
+ */
+export function chatWithContext(userMessage: string, systemPrompt: string, callback: (text: string, done: boolean) => void): void {
+    // #ifdef APP-ANDROID
+    androidChatWithContext(userMessage, systemPrompt, callback);
+    // #endif
+    // #ifdef APP-HARMONY
+    harmonyChatWithContext(userMessage, systemPrompt, callback);
+    // #endif
+}
+
+/**
+ * 清除对话历史
+ */
+export function clearHistory(): void {
+    // #ifdef APP-ANDROID
+    androidClearHistory();
+    // #endif
+    // #ifdef APP-HARMONY
+    harmonyClearHistory();
+    // #endif
+}
+
+/**
+ * 重置模型
+ */
+export function resetModel(): void {
+    // #ifdef APP-ANDROID
+    androidReset();
+    // #endif
+    // #ifdef APP-HARMONY
+    harmonyReset();
+    // #endif
+}
+
+/**
+ * 设置最大生成token数
+ */
+export function setMaxTokens(tokens: number): void {
+    // #ifdef APP-ANDROID
+    androidSetMaxTokens(tokens);
+    // #endif
+    // #ifdef APP-HARMONY
+    harmonySetMaxTokens(tokens);
+    // #endif
+}
+
+/**
+ * 检查模型是否就绪
+ */
+export function isModelReady(): boolean {
+    // #ifdef APP-ANDROID
+    return androidIsReady();
+    // #endif
+    // #ifdef APP-HARMONY
+    return harmonyIsReady();
+    // #endif
+    // #ifndef APP-ANDROID || APP-HARMONY
+    return false;
+    // #endif
+}
+
+// ========== Native Plugin Invocation ==========
+
+/**
+ * 调用原生插件（反射方式）
+ */
+export function invokeNativePlugin(className: string, methodName: string, argsJson: string): string {
+    // #ifdef APP-ANDROID
+    return androidInvokePlugin(className, methodName, argsJson);
+    // #endif
+    // #ifdef APP-HARMONY
+    return harmonyInvokePlugin(className, methodName, argsJson);
+    // #endif
+    // #ifndef APP-ANDROID || APP-HARMONY
+    return "Not supported";
+    // #endif
+}
+
+/**
+ * 加载辅助模型，例如 embedding / vision。
+ */
+export function loadAuxModel(key: string, modelPath: string, useNpu: boolean): boolean {
+    // #ifdef APP-ANDROID
+    return androidLoadAuxModel(key, modelPath, useNpu);
+    // #endif
+    // #ifdef APP-HARMONY
+    return harmonyLoadAuxModel(key, modelPath, useNpu);
+    // #endif
+    // #ifndef APP-ANDROID || APP-HARMONY
+    return false;
+    // #endif
+}
+
+/**
+ * 单独调用视觉辅助模型分类。
+ */
+export function classifyImage(path: string): string {
+    // #ifdef APP-ANDROID
+    return androidClassifyImage(path);
+    // #endif
+    // #ifdef APP-HARMONY
+    return harmonyClassifyImage(path);
+    // #endif
+    // #ifndef APP-ANDROID || APP-HARMONY
+    return "";
+    // #endif
+}
+
+// ========== Legacy API (for compatibility) ==========
+// 这些API已废弃，请使用 @/services/ai/RAGService.uts
+
+export function syncDatabase(data: string[]): void {
+    console.warn("[zemo-ai] syncDatabase is deprecated. Use RAGService.addBatch() instead.");
+}
+
+export function registerPlugins(jsonConfig: string): boolean {
+    console.warn("[zemo-ai] registerPlugins is deprecated. Use FunctionCallingService.registerBatch() instead.");
+    return false;
+}

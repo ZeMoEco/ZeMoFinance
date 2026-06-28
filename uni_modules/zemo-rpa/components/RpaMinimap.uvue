@@ -1,0 +1,278 @@
+<template>
+	<view class="minimap" :style="minimapContainerStyle" 
+		@touchstart="onMapTouchStart" 
+		@touchmove="onMapTouchMove"
+		@touchend="onMapTouchEnd">
+		
+		<!-- Using absolute positioning calculation instead of CSS Transform for stability -->
+		<view class="minimap-container">
+			<!-- Getting size from container -->
+			<view id="minimap-metrics-probe" class="metrics-probe"></view>
+			
+			<view v-for="node in nodes" :key="node.id" class="mini-node"
+				:style="getMiniNodeStyle(node)">
+			</view>
+			
+			<view class="mini-viewport" :style="viewportStyle"></view>
+		</view>
+	</view>
+</template>
+
+<script lang="uts">
+	import { RpaMinimapNode, MinimapUpdateEvent } from './RpaTypes.uts';
+
+	export default {
+		name: "RpaMinimap",
+		props: {
+			nodes: {
+				type: Array as PropType<RpaMinimapNode[]>,
+				required: true
+			},
+			offsetX: { type: Number, default: 0 },
+			offsetY: { type: Number, default: 0 },
+			scale: { type: Number, default: 1 },
+			canvasWidth: { type: Number, default: 300 },
+			canvasHeight: { type: Number, default: 600 }
+		},
+		emits: ['update-view'],
+		data() {
+			return {
+				// Base size constraints
+				minMapSize: 80,
+				maxMapSize: 160,
+				viewPadding: 8,
+				lastTouchX: 0,
+				lastTouchY: 0,
+				isDragging: false
+			}
+		},
+		computed: {
+			// Calculate node bounds (without viewport)
+			nodeBounds(): number[] {
+				let minX = 100000;
+				let minY = 100000;
+				let maxX = -100000;
+				let maxY = -100000;
+				
+				if (this.nodes.length > 0) {
+					this.nodes.forEach(node => {
+						if (node.x < minX) minX = node.x;
+						if (node.y < minY) minY = node.y;
+						if (node.x + node.width > maxX) maxX = node.x + node.width;
+						if (node.y + node.height > maxY) maxY = node.y + node.height;
+					});
+				} else {
+					minX = 0; minY = 0; maxX = 500; maxY = 500;
+				}
+				
+				// Add small padding
+				const pad = 50;
+				return [minX - pad, minY - pad, maxX - minX + pad * 2, maxY - minY + pad * 2];
+			},
+			
+			// Adaptive minimap size based on content aspect ratio
+			adaptiveSize(): number[] {
+				const bounds = this.nodeBounds;
+				const contentW = bounds[2];
+				const contentH = bounds[3];
+				const aspectRatio = contentW / contentH;
+				
+				let mapW: number;
+				let mapH: number;
+				
+				if (aspectRatio > 1) {
+					// Wider than tall
+					mapW = this.maxMapSize;
+					mapH = Math.max(this.minMapSize, mapW / aspectRatio);
+				} else {
+					// Taller than wide
+					mapH = this.maxMapSize;
+					mapW = Math.max(this.minMapSize, mapH * aspectRatio);
+				}
+				
+				return [mapW, mapH];
+			},
+			
+			minimapContainerStyle(): string {
+				const size = this.adaptiveSize;
+				return `width: ${size[0]}px; height: ${size[1]}px;`;
+			},
+			
+			// World Bounds for rendering
+			worldBounds(): number[] {
+				const bounds = this.nodeBounds;
+				return bounds;
+			},
+			
+			// Calculation Factor
+			renderMetrics(): number[] {
+				const bounds = this.worldBounds;
+				const worldW = bounds[2];
+				const worldH = bounds[3];
+				
+				const size = this.adaptiveSize;
+				const innerW = size[0] - (this.viewPadding * 2);
+				const innerH = size[1] - (this.viewPadding * 2);
+				
+				// Determine scale to fit world into map
+				const sX = innerW / worldW;
+				const sY = innerH / worldH;
+				const s = Math.min(sX, sY);
+				
+				// Center offset
+				const visualW = worldW * s;
+				const visualH = worldH * s;
+				
+				const offX = this.viewPadding + (innerW - visualW) / 2;
+				const offY = this.viewPadding + (innerH - visualH) / 2;
+				
+				return [s, offX, offY, bounds[0], bounds[1]];
+			},
+			
+			viewportStyle(): string {
+				const m = this.renderMetrics;
+				const s = m[0];
+				const offX = m[1];
+				const offY = m[2];
+				const wMinX = m[3];
+				const wMinY = m[4];
+				
+				// Viewport in World Coords
+				const vl = -this.offsetX;
+				const vt = -this.offsetY;
+				const vw = this.canvasWidth / this.scale;
+				const vh = this.canvasHeight / this.scale;
+				
+				// Map to Mini Coords
+				const miniL = (vl - wMinX) * s + offX;
+				const miniT = (vt - wMinY) * s + offY;
+				const miniW = vw * s;
+				const miniH = vh * s;
+				
+				return `left: ${miniL}px; top: ${miniT}px; width: ${miniW}px; height: ${miniH}px; border: 1px solid rgba(100,200,255,0.8); background-color: rgba(100,200,255,0.2);`;
+			}
+		},
+		methods: {
+			getNodeColor(node: RpaMinimapNode): string {
+				return '#67C23A';
+			},
+			
+			getMiniNodeStyle(node: RpaMinimapNode): string {
+				const m = this.renderMetrics;
+				const s = m[0];
+				const offX = m[1];
+				const offY = m[2];
+				const wMinX = m[3];
+				const wMinY = m[4];
+				
+				const left = (node.x - wMinX) * s + offX;
+				const top = (node.y - wMinY) * s + offY;
+				const w = node.width * s;
+				const h = node.height * s;
+				
+				return `left: ${left}px; top: ${top}px; width: ${Math.max(3, w)}px; height: ${Math.max(3, h)}px; background-color: ${this.getNodeColor(node)};`;
+			},
+			
+			// Get viewport movement limits - viewport can only go until edge cards are at center
+			getViewportLimits(): number[] {
+				const bounds = this.nodeBounds;
+				const minX = bounds[0];
+				const minY = bounds[1];
+				const maxX = minX + bounds[2];
+				const maxY = minY + bounds[3];
+				
+				const vw = this.canvasWidth / this.scale;
+				const vh = this.canvasHeight / this.scale;
+				
+				// Viewport center can range from minX to maxX (for X)
+				// So viewport left can range from (minX - vw/2) to (maxX - vw/2)
+				// Which means offsetX = -viewportLeft ranges from (vw/2 - maxX) to (vw/2 - minX)
+				const minOffsetX = vw / 2 - maxX;
+				const maxOffsetX = vw / 2 - minX;
+				const minOffsetY = vh / 2 - maxY;
+				const maxOffsetY = vh / 2 - minY;
+				
+				return [minOffsetX, maxOffsetX, minOffsetY, maxOffsetY];
+			},
+			
+			onMapTouchStart(e: TouchEvent) {
+				if (e.touches.length > 0) {
+					this.lastTouchX = e.touches[0].clientX;
+					this.lastTouchY = e.touches[0].clientY;
+					this.isDragging = true;
+				}
+			},
+			
+			onMapTouchMove(e: TouchEvent) {
+				if (this.isDragging && e.touches.length > 0) {
+					const x = e.touches[0].clientX;
+					const y = e.touches[0].clientY;
+					
+					const dx = x - this.lastTouchX;
+					const dy = y - this.lastTouchY;
+					
+					// Convert Screen Delta (Minimap Px) -> World Delta
+					const m = this.renderMetrics;
+					const scale = m[0];
+					
+					if (scale > 0) {
+						const worldDx = dx / scale;
+						const worldDy = dy / scale;
+						
+						// Get limits and pass them along with the delta
+						const limits = this.getViewportLimits();
+						
+						const event = new MinimapUpdateEvent(
+							worldDx, 
+							worldDy,
+							limits[0],
+							limits[1],
+							limits[2],
+							limits[3]
+						);
+						this.$emit('update-view', event);
+					}
+					
+					this.lastTouchX = x;
+					this.lastTouchY = y;
+				}
+			},
+			
+			onMapTouchEnd(e: TouchEvent) {
+				this.isDragging = false;
+			}
+		}
+	}
+</script>
+
+<style>
+	.minimap {
+		position: relative;
+		width: 100%;
+		height: 100%;
+		background-color: rgba(30, 30, 30, 0.8); 
+		border-radius: 4px; /* Slightly reduced radius for inner content */
+		overflow: hidden;
+		/* Remove z-index and absolute offsets to allow container control */
+	}
+	
+	.minimap-container {
+		width: 100%;
+		height: 100%;
+		position: absolute;
+		top: 0;
+		left: 0;
+	}
+	
+	.mini-node {
+		position: absolute;
+		border-radius: 1px;
+	}
+	
+	.mini-viewport {
+		position: absolute;
+		box-sizing: border-box;
+		z-index: 10;
+		pointer-events: none;
+	}
+</style>

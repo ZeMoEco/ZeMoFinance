@@ -1,0 +1,3806 @@
+<template>
+	<view class="page">
+		<view class="content-wrapper" :style="bgStyle">
+			<view class="top-bar">
+				<view class="brand-mark" @click="openMenu">
+					<image class="brand-logo" :src="avatarUrl"></image>
+				</view>
+				<view class="main-tabs">
+					<view class="main-tab" v-for="(tab, idx) in pageTabs" :key="tab"
+						:class="activeMainTab == idx ? 'main-tab-active' : ''" @click="switchMainTab(idx)">
+						<text class="main-tab-text" :class="activeMainTab == idx ? 'main-tab-text-active' : ''">{{ tab }}</text>
+					</view>
+				</view>
+				<view class="top-action" @click="openSyncSettings">
+					<text class="top-action-icon">⌕</text>
+				</view>
+			</view>
+
+			<swiper class="page-swiper" :current="activeMainTab" :duration="260" :disable-touch="pageSwipeLocked"
+				@change="onMainSwiperChange">
+				<swiper-item class="page-swiper-item">
+					<FinanceHomePage :recentBills="recentBills" :billDaySummaries="billDaySummaries" :hideAmount="hideAmount"
+						cardMetricTitle="我的资产" :cardMetricValue="netWorth"
+						cardMetricBadge="CNY" cardMetricDesc="净资产总览"
+						cardMetricTail="ASSET" cardMetricHolder="ASSET CARD"
+						:billLoading="billLoading" :billHasMore="billHasMore"
+						@toggle-hide="toggleHideAmount" @record="goRecord" @load-more="loadMoreBills" @calendar="openCalendar" />
+				</swiper-item>
+
+				<swiper-item class="page-swiper-item">
+					<FinanceInvestPage :key="'invest-' + financeDataVersion.toString()" ref="investPage" :accounts="accounts" :hideAmount="hideAmount" @fund="goFund"
+						@edit-fund="editFund"
+						@toggle-hide="toggleHideAmount"
+						@refresh-market="refreshInvestmentQuotes"
+						@refresh-data="loadData"
+						@reconcile-total="openInvestmentTotalModal"
+						@gesture-lock="setPageSwipeLocked" />
+				</swiper-item>
+
+				<swiper-item class="page-swiper-item">
+					<FinanceAssetsPage :key="'assets-' + financeDataVersion.toString()" :accounts="accounts" :netWorth="netWorth" :hideAmount="hideAmount"
+						@account="goAccount" @fund="goFund" @invest-account="goInvestAccount" @gesture-lock="setPageSwipeLocked" />
+				</swiper-item>
+			</swiper>
+
+			<!-- Add Asset FAB (bottom-right) -->
+			<view class="fab-add" @click="openAddModal">
+				<text class="fab-icon">＋</text>
+			</view>
+
+			<!-- Add Asset Bottom Sheet -->
+			<view class="sheet-overlay" v-if="showModal" @click="closeModal">
+				<view class="sheet-content" @click.stop>
+					<view class="sheet-handle"></view>
+					<text class="sheet-title">{{ assetSheetTitle }}</text>
+
+					<!-- Category Tabs -->
+					<view class="tab-bar" v-if="editingAssetId == ''">
+						<view class="tab-item" v-for="cat in categories" :key="cat.key"
+							:class="formCategory == cat.key ? 'tab-item-active' : ''" @click="switchCategory(cat.key)">
+							<text class="tab-text" :class="formCategory == cat.key ? 'tab-text-active' : ''">{{ cat.label }}</text>
+						</view>
+					</view>
+
+					<scroll-view class="sheet-body" scroll-y="true">
+						<!-- 关联账单/账本 -->
+						<view class="field-block">
+							<text class="field-label">关联账单/账本</text>
+							<view class="field-select" @click="showModalBookPicker">
+								<text class="field-select-text">{{ formBookName }}</text>
+								<text class="field-select-arrow">⌄</text>
+							</view>
+						</view>
+
+						<!-- 信贷: 类型 -->
+						<view class="field-block" v-if="formCategory == 'credit'">
+							<text class="field-label">信贷/债务类型</text>
+							<view class="credit-kind-grid">
+								<view class="credit-kind-item" v-for="kind in creditKinds" :key="kind.key"
+									:class="formCreditKind == kind.key ? 'credit-kind-active' : ''" @click="applyCreditKind(kind.key)">
+									<text class="credit-kind-title" :class="formCreditKind == kind.key ? 'credit-kind-title-active' : ''">{{ kind.label }}</text>
+								</view>
+								<view class="credit-kind-item" :class="formCreditInstallmentEnabled ? 'credit-kind-active' : ''" @click="toggleCreditInstallment">
+									<text class="credit-kind-title" :class="formCreditInstallmentEnabled ? 'credit-kind-title-active' : ''">分期</text>
+								</view>
+							</view>
+							<text class="credit-kind-hint">{{ creditKindHint }}</text>
+						</view>
+
+						<!-- 名称 -->
+						<view class="field-block" v-if="formCategory != 'investment' && !isCreditDebtFlowKind">
+							<text class="field-label">{{ nameLabel }}</text>
+							<view class="name-card-row">
+								<input class="field-input name-row-main" v-model="formName" :placeholder="namePlaceholder" />
+								<input class="field-input card-no-input" v-if="showCardNoInput" v-model="formCardNo" :placeholder="cardNoPlaceholder" />
+							</view>
+						</view>
+
+						<view class="field-block" v-if="isCreditDebtFlowKind">
+							<view class="debt-person-note-row">
+								<view class="debt-person-note-col">
+									<text class="field-label">{{ providerLabel }}</text>
+									<input class="field-input" v-model="formProvider" :placeholder="providerPlaceholder" />
+								</view>
+								<view class="debt-person-note-col debt-note-col">
+									<text class="field-label">{{ nameLabel }}</text>
+									<input class="field-input" v-model="formName" :placeholder="namePlaceholder" />
+								</view>
+							</view>
+						</view>
+
+						<!-- 余额 / 市值 / 欠款 / 估值 -->
+						<view class="field-block">
+							<text class="field-label">{{ balanceLabel }}</text>
+							<view class="invest-amount-unit-row" v-if="formCategory == 'investment'">
+								<view class="invest-mini-input amount-input-row">
+									<text class="amount-symbol">¥</text>
+									<input class="field-input amount-input" v-model="formBalance" type="text"
+										placeholder="金额" @input="onBalanceInput" />
+								</view>
+								<view class="invest-mini-input unit-input-row">
+									<input class="field-input unit-input" v-model="formUnits" type="text" placeholder="份额/股数" @input="onUnitsInput" />
+								</view>
+							</view>
+							<view class="amount-input-row" v-if="formCategory != 'investment'">
+								<text class="amount-symbol">¥</text>
+								<input class="field-input amount-input" v-model="formBalance" type="text"
+									placeholder="0.00" @input="onBalanceInput" />
+							</view>
+						</view>
+
+						<!-- 信贷: 分期计划 -->
+						<view class="field-block" v-if="isCreditInstallmentEnabled">
+							<text class="field-label">配置分期计划</text>
+							<view class="installment-row">
+								<view class="installment-field">
+									<input class="field-input installment-input" v-model="formInstallmentCount" type="text" placeholder="总期数" @input="onInstallmentCountInput" />
+									<text class="installment-note">计划总期数</text>
+								</view>
+								<view class="installment-field">
+									<input class="field-input installment-input" v-model="formInstallmentPaid" type="text" placeholder="已还" @input="onInstallmentPaidInput" />
+									<text class="installment-note">已完成期数</text>
+								</view>
+								<view class="installment-field">
+									<input class="field-input installment-input" v-model="formInstallmentDueDay" type="text" placeholder="还款日" @input="onInstallmentDueDayInput" />
+									<text class="installment-note">每月 1-28 日</text>
+								</view>
+							</view>
+							<text class="installment-tip">{{ installmentPreview }}</text>
+						</view>
+
+						<view class="field-block credit-linked-block" v-if="isCreditDebtFlowKind && editingAssetId == ''">
+							<scroll-view class="credit-result-float" scroll-y="true" :show-scrollbar="false" v-if="selectedCreditLinkedTransactionId == '' && formCreditLinkedSearchText.trim() != ''">
+								<view class="credit-result-item" v-for="bill in filteredCreditLinkedBills" :key="bill.id" @click="selectCreditLinkedBill(bill)">
+									<text class="credit-result-main">{{ creditBillTitle(bill) }}</text>
+									<text class="credit-result-sub">{{ creditBillSubTitle(bill) }}</text>
+								</view>
+								<view class="credit-result-empty" v-if="filteredCreditLinkedBills.length == 0">
+									<text class="credit-result-empty-text">没有匹配账单</text>
+								</view>
+							</scroll-view>
+							<text class="field-label">{{ creditLinkedBillLabel }}</text>
+							<view class="field-input-row" v-if="selectedCreditLinkedTransactionId == ''">
+								<input class="field-input linked-input" v-model="formCreditLinkedSearchText" :placeholder="creditLinkedBillPlaceholder" />
+								<view class="linked-pick-btn" @click="showCreditLinkedBillPicker"><text class="linked-pick-text">⌄</text></view>
+							</view>
+							<view class="field-select linked-selected" v-if="selectedCreditLinkedTransactionId != ''">
+								<view class="linked-selected-main">
+									<text class="field-select-text">{{ selectedCreditLinkedTransactionName }}</text>
+									<text class="linked-selected-sub">已关联原账单</text>
+								</view>
+								<text class="linked-clear" @click.stop="clearCreditLinkedBill">×</text>
+							</view>
+						</view>
+
+						<view class="field-block" v-if="isCreditDebtFlowKind && editingAssetId == '' && selectedCreditLinkedTransactionId == ''">
+							<text class="field-label">{{ creditFundAccountLabel }}</text>
+							<view class="field-select" @click="showCreditFundAccountPicker">
+								<text class="field-select-text">{{ selectedCreditFundAccountName }}</text>
+								<text class="field-select-arrow">⌄</text>
+							</view>
+						</view>
+
+						<!-- 投资: 查询 + 持仓名 -->
+						<view class="field-block" v-if="formCategory == 'investment'">
+							<text class="field-label">基金/ETF/股票</text>
+							<view class="search-row">
+								<input class="field-input search-input" v-model="formCode" placeholder="代码或名称，例如：001234 / 沪深300" />
+								<view class="search-btn" @click="searchMarket"><text class="search-btn-text">{{ marketSearching ? '查询中' : '查询' }}</text></view>
+							</view>
+							<input class="holding-name-input" v-model="formName" :placeholder="holdingNamePlaceholder" />
+							<text class="holding-search-meta">{{ holdingSearchMeta }}</text>
+							<view class="market-result-list" v-if="marketResults.length > 0">
+								<view class="market-result" v-for="item in marketResults" :key="item.code" @click="selectMarketItem(item)">
+									<text class="market-result-name">{{ item.name }}</text>
+									<text class="market-result-code">{{ item.code }} · {{ item.type }}</text>
+								</view>
+							</view>
+							<text class="quote-tip" v-if="formQuoteTime != ''">行情 {{ formQuoteTime }} · 净值 {{ formLatestNav.toFixed(4) }} · 估值 {{ formEstimateNav.toFixed(4) }}</text>
+						</view>
+
+						<!-- 投资: 收益率 -->
+						<view class="field-block" v-if="formCategory == 'investment'">
+							<text class="field-label">收益率 (%)</text>
+							<input class="field-input" v-model="formProfitRate" type="text" placeholder="例如：8.45"
+								@input="onProfitInput" />
+						</view>
+
+						<!-- 信贷: 授信额度 -->
+						<view class="field-block" v-if="formCategory == 'credit' && formCreditKind == 'credit_card'">
+							<text class="field-label">授信额度</text>
+							<view class="amount-input-row">
+								<text class="amount-symbol">¥</text>
+								<input class="field-input amount-input" v-model="formCreditLimit" type="text"
+									placeholder="0.00" @input="onCreditLimitInput" />
+							</view>
+						</view>
+
+						<view class="field-block" v-if="formCategory == 'investment'">
+							<text class="field-label">{{ editingAssetId != '' || isSelectedInvestAccountOffsite ? '所属理财账户' : '所属理财账户 / 付款方式' }}</text>
+							<view class="account-pay-row">
+								<view class="field-select account-pay-select" @click="showInvestAccountPicker">
+									<text class="field-select-text account-pay-text">{{ formProvider == '' ? '请选择理财账户' : investAccountDisplayName(formProvider) }}</text>
+									<text class="field-select-arrow">⌄</text>
+								</view>
+								<view class="field-select account-pay-select pay-select" v-if="editingAssetId == '' && formProvider != '' && !isSelectedInvestAccountOffsite" @click="showInvestmentPayPicker">
+									<text class="field-select-text account-pay-text">{{ investmentPayDisplayName }}</text>
+									<text class="field-select-arrow">⌄</text>
+								</view>
+							</view>
+						</view>
+
+						<!-- 发卡机构/提供商 -->
+						<view class="field-block" v-if="formCategory != 'investment' && !isCreditDebtFlowKind">
+							<text class="field-label">{{ providerLabel }}</text>
+							<input class="field-input" v-model="formProvider" :placeholder="providerPlaceholder" />
+						</view>
+
+						<!-- 计入总资产 -->
+						<view class="toggle-block">
+							<view class="toggle-info">
+								<text class="toggle-title">计入总资产</text>
+								<text class="toggle-desc">{{ toggleDesc }}</text>
+							</view>
+							<switch :checked="formIncludeInTotal" @change="onToggleInclude" color="#3b73d9" />
+						</view>
+					</scroll-view>
+
+				<view class="sheet-footer">
+					<button class="save-btn" @click="confirmSubmit">{{ assetSaveText }}</button>
+				</view>
+			</view>
+		</view>
+		</view>
+
+		<view class="invest-account-overlay" v-if="showInvestAccountModal" @click="closeInvestAccountDialog">
+			<view class="invest-account-dialog" @click.stop>
+				<text class="invest-account-dialog-title">{{ investAccountDialogTitle }}</text>
+				<view class="invest-account-mode-row">
+					<view class="invest-account-mode-item" :class="investAccountDraftMode == 'security' ? 'invest-account-mode-active' : ''" @click="selectInvestAccountMode('security')">
+						<text class="invest-account-mode-text" :class="investAccountDraftMode == 'security' ? 'invest-account-mode-text-active' : ''">证券</text>
+					</view>
+					<view class="invest-account-mode-item" :class="investAccountDraftMode == 'otc' ? 'invest-account-mode-active' : ''" @click="selectInvestAccountMode('otc')">
+						<text class="invest-account-mode-text" :class="investAccountDraftMode == 'otc' ? 'invest-account-mode-text-active' : ''">场外</text>
+					</view>
+				</view>
+				<view class="invest-account-dialog-row">
+					<input class="invest-account-dialog-input invest-account-name-input" v-model="investAccountDraftName" placeholder="账户名" />
+					<input class="invest-account-dialog-input invest-account-no-input" v-model="investAccountDraftNo" placeholder="账号/尾号" />
+				</view>
+				<view class="invest-account-money-row" v-if="investAccountDraftMode == 'security'">
+					<view class="invest-account-money-card">
+						<text class="invest-account-money-label">现金余额</text>
+						<view class="invest-account-money-input-row">
+							<text class="invest-account-money-symbol">¥</text>
+							<input class="invest-account-money-input" v-model="investAccountDraftCash" type="text" placeholder="0.00" @input="onInvestAccountCashInput" />
+						</view>
+					</view>
+					<view class="invest-account-money-card invest-account-money-card-last">
+						<text class="invest-account-money-label">账户总额</text>
+						<view class="invest-account-money-input-row">
+							<text class="invest-account-money-symbol">¥</text>
+							<input class="invest-account-money-input" v-model="investAccountDraftTotal" type="text" placeholder="0.00" @input="onInvestAccountTotalInput" />
+						</view>
+					</view>
+				</view>
+				<view class="invest-account-dialog-actions">
+					<view class="invest-account-dialog-cancel" @click="closeInvestAccountDialog"><text class="invest-account-dialog-cancel-text">取消</text></view>
+					<view class="invest-account-dialog-submit" @click="submitInvestAccountDialog"><text class="invest-account-dialog-submit-text">确定</text></view>
+				</view>
+			</view>
+		</view>
+		<GlobalBackground />
+	</view>
+</template>
+
+<script lang="uts">
+	import { FinanceBiz, AccountNode, TransactionMount, BookNode, AssetAccountPayload, CreateTransactionForNodesPayload, CreditDebtEventPayload } from '@/services/biz/FinanceBiz.uts';
+	import { FinanceMarketService, MarketSearchItem, MarketQuote } from '@/services/market/FinanceMarketService.uts';
+	import { AppDialogApi } from '@/components/sys/AppDialogApi.uts';
+	import GlobalBackground from "@/components/GlobalBackground.uvue";
+	import FinanceHomePage from "@/components/finance/FinanceHomePage.uvue";
+	import FinanceInvestPage from "@/components/finance/FinanceInvestPage.uvue";
+	import FinanceAssetsPage from "@/components/finance/FinanceAssetsPage.uvue";
+	import { FinancePipSnapshotService } from '@/services/sys/FinancePipSnapshotService.uts';
+	import { FINANCE_HOME_PENDING_TRANSACTION_CHANGE_KEY } from '@/utils/constant.uts';
+
+	const FINANCE_HOME_SKIP_RELOAD_UNTIL_KEY = 'zemo_finance_home_skip_reload_until';
+	const FINANCE_HOME_DELETED_TRANSACTION_ID_KEY = 'zemo_finance_home_deleted_transaction_id';
+
+	function appendFinanceHomeDebug(stage : string) : void {
+		console.log(`[FinanceHome][Debug] ${stage}`);
+	}
+
+	type CategoryDef = {
+		key: string;
+		label: string;
+		icon: string;
+	};
+
+	type CreditKindDef = {
+		key: string;
+		label: string;
+		desc: string;
+	};
+
+	type BillDaySummary = {
+		dayKey: string;
+		income: number;
+		expense: number;
+	};
+
+	export default {
+		components: { GlobalBackground, FinanceHomePage, FinanceInvestPage, FinanceAssetsPage },
+		data() {
+			return {
+				accounts: [] as AccountNode[],
+				recentBills: [] as TransactionMount[],
+				billDaySummaries: [] as BillDaySummary[],
+				billLimit: 10,
+				billPageSize: 10,
+				billLoading: false,
+				billLoadToken: 0,
+				billHasMore: true,
+				financeDataVersion: 0,
+				skipShowReloadUntil: 0,
+				netWorth: 0.0,
+				monthlyIncome: 0.0,
+				todayExpense: 0.0,
+				weeklyDays: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] as number[],
+				weeklyTotal: 0.0,
+				weekLabels: ['一', '二', '三', '四', '五', '六', '日'] as string[],
+				pageTabs: ['首页', '理财', '资产'] as string[],
+				activeMainTab: 0,
+				pageSwipeLocked: false,
+				hideAmount: false,
+				cardMetricMode: 'net_worth',
+				avatarUrl: '/static/logo.png',
+				backgroundImage: "",
+				transparency: 0.3,
+				pendingRecordDialogRequested: false,
+				pendingRecordDialogQuery: '',
+				pendingRecordDialogTimer: -1,
+				pendingFinanceChangeTimer: -1,
+				pendingFinanceChangeApplying: false,
+				skipNextShowReload: false,
+				investmentQuoteRefreshing: false,
+
+				books: [] as BookNode[],
+				selectedBookId: '',
+				categories: [
+					{ key: 'cash', label: '资金', icon: '💰' },
+					{ key: 'investment', label: '投资', icon: '📈' },
+					{ key: 'credit', label: '信贷/债务', icon: '💳' },
+					{ key: 'heavy', label: '重资产', icon: '🏠' }
+				] as CategoryDef[],
+				creditKinds: [
+					{ key: 'credit_card', label: '信用卡/平台', desc: '账单/分期' },
+					{ key: 'borrowed', label: '借入', desc: '收入/收款' },
+					{ key: 'lent', label: '借出', desc: '支出/付款' }
+				] as CreditKindDef[],
+
+				showModal: false,
+				editingAssetId: '',
+				formCategory: "cash",
+				formName: "",
+				formBalance: "",
+				formBookId: '',
+				formProvider: "",
+				formCardNo: "",
+				formIncludeInTotal: true,
+				formCode: "",
+				formSubType: "",
+				formProfitRate: "",
+				formCreditLimit: "",
+				formCreditKind: "credit_card",
+				formCreditInstallmentEnabled: false,
+				formInstallmentCount: "",
+				formInstallmentPaid: "",
+				formInstallmentDueDay: "",
+				formInstallmentNextDueAt: 0,
+				formCreditLinkedSearchText: '',
+				formCreditLinkedCandidates: [] as TransactionMount[],
+				selectedCreditLinkedTransactionId: '',
+				selectedCreditLinkedTransactionName: '',
+				formCreditFundAccountId: '',
+				formUnits: "",
+				formBalanceTouched: false,
+				formUnitsTouched: false,
+				formEntryMode: "amount",
+				formLatestNav: 0.0,
+				formEstimateNav: 0.0,
+				formQuoteTime: "",
+				formDataSource: "",
+				formPayMode: "investment_cash",
+				formPayAccountId: "",
+				marketSearching: false,
+				marketResults: [] as MarketSearchItem[],
+				showInvestAccountModal: false,
+				investAccountDraftName: '',
+				investAccountDraftNo: '',
+				investAccountDraftMode: 'security',
+				investAccountDraftCash: '',
+				investAccountDraftTotal: '',
+				investAccountCashTouched: false,
+				investAccountTotalTouched: false,
+				investAccountEditingName: ''
+			}
+		},
+		async onShow() {
+			this.loadTheme();
+			const changed = await this.applyPendingHomeTransactionChange();
+			if (changed) {
+				this.schedulePendingRecordDialog();
+				return;
+			}
+			if (this.skipNextShowReload || Date.now() < this.skipShowReloadUntil) {
+				this.skipNextShowReload = false;
+				this.schedulePendingRecordDialog();
+				return;
+			}
+			await this.loadData();
+			await this.refreshInvestmentQuotes(false);
+			this.schedulePendingRecordDialog();
+		},
+		onLoad(options : OnLoadOptions) {
+			this.captureRecordDialogOptions(options);
+			this.startPendingFinanceChangeWatcher();
+			this.schedulePendingRecordDialog(220);
+			appendFinanceHomeDebug('onLoad-done');
+		},
+		onUnload() {
+			this.clearPendingRecordDialogTimer();
+			this.clearPendingFinanceChangeWatcher();
+		},
+		computed: {
+			bgStyle() : string {
+				return `background-color: rgba(245, 247, 250, ${this.transparency})`;
+			},
+			cashAccounts() : AccountNode[] {
+				return this.accounts.filter((a : AccountNode) : boolean => a.category == 'cash');
+			},
+			creditAccounts() : AccountNode[] {
+				return this.accounts.filter((a : AccountNode) : boolean => a.category == 'credit');
+			},
+			investAccounts() : AccountNode[] {
+				return this.accounts.filter((a : AccountNode) : boolean => a.category == 'investment');
+			},
+			investHoldingCount() : number {
+				let count = 0;
+				const list = this.investAccounts;
+				for (let i = 0; i < list.length; i++) {
+					if (list[i].sub_type != '账户现金') count++;
+				}
+				return count;
+			},
+			heavyAccounts() : AccountNode[] {
+				return this.accounts.filter((a : AccountNode) : boolean => a.category == 'heavy');
+			},
+			heavyTotal() : number {
+				let sum = 0.0;
+				const list = this.heavyAccounts;
+				for (let i = 0; i < list.length; i++) sum += list[i].balance;
+				return sum;
+			},
+			cashTotal() : number {
+				let sum = 0.0;
+				const list = this.cashAccounts;
+				for (let i = 0; i < list.length; i++) sum += list[i].balance;
+				return sum;
+			},
+			creditTotal() : number {
+				let sum = 0.0;
+				const list = this.creditAccounts;
+				for (let i = 0; i < list.length; i++) {
+					if (FinanceBiz.isReceivableCreditAccount(list[i])) continue;
+					sum += Math.abs(list[i].balance);
+				}
+				return sum;
+			},
+			investTotal() : number {
+				let sum = 0.0;
+				const list = this.investAccounts;
+				for (let i = 0; i < list.length; i++) sum += list[i].balance;
+				return sum;
+			},
+			cardMetricTitle() : string {
+				if (this.cardMetricMode == 'cash') return '资金账户';
+				if (this.cardMetricMode == 'investment') return '理财资产';
+				if (this.cardMetricMode == 'credit') return '信贷负债';
+				if (this.cardMetricMode == 'heavy') return '重资产';
+				if (this.cardMetricMode == 'today_expense') return '今日消耗';
+				return '我的资产';
+			},
+			cardMetricValue() : number {
+				if (this.cardMetricMode == 'cash') return this.cashTotal;
+				if (this.cardMetricMode == 'investment') return this.investTotal;
+				if (this.cardMetricMode == 'credit') return this.creditTotal;
+				if (this.cardMetricMode == 'heavy') return this.heavyTotal;
+				if (this.cardMetricMode == 'today_expense') return this.todayExpense;
+				return this.netWorth;
+			},
+			cardMetricBadge() : string {
+				if (this.cardMetricMode == 'today_expense') return 'TODAY';
+				if (this.cardMetricMode == 'credit') return `${this.creditAccounts.length} 张`;
+				if (this.cardMetricMode == 'investment') return `${this.investHoldingCount} 项`;
+				if (this.cardMetricMode == 'heavy') return `${this.heavyAccounts.length} 项`;
+				if (this.cardMetricMode == 'cash') return `${this.cashAccounts.length} 个`;
+				return 'CNY';
+			},
+			cardMetricDesc() : string {
+				if (this.cardMetricMode == 'today_expense') return '全部支出种类合计';
+				if (this.cardMetricMode == 'credit') return '当前欠款合计';
+				if (this.cardMetricMode == 'investment') return '理财账户合计';
+				if (this.cardMetricMode == 'heavy') return '固定资产估值';
+				if (this.cardMetricMode == 'cash') return '可用资金合计';
+				return '净资产总览';
+			},
+			cardMetricTail() : string {
+				if (this.cardMetricMode == 'today_expense') return 'TODAY';
+				if (this.cardMetricMode == 'credit') return 'DEBT';
+				if (this.cardMetricMode == 'investment') return 'FUND';
+				if (this.cardMetricMode == 'heavy') return 'HOME';
+				if (this.cardMetricMode == 'cash') return 'CASH';
+				return 'ASSET';
+			},
+			cardMetricHolder() : string {
+				return this.cardMetricMode == 'today_expense' ? 'DAILY COST' : 'ASSET CARD';
+			},
+			assetSheetTitle() : string {
+				return this.editingAssetId == '' ? '添加资产' : '编辑资产';
+			},
+			assetSaveText() : string {
+				return this.editingAssetId == '' ? '保存并添加 ✓' : '保存修改 ✓';
+			},
+			formBookName() : string {
+				if (this.formBookId == '') return '主账本 (默认)';
+				const b = this.books.find((x : BookNode) : boolean => x.id == this.formBookId);
+				return b != null ? b.name : '主账本 (默认)';
+			},
+			isCreditInstallmentEnabled() : boolean {
+				return this.formCategory == 'credit' && this.formCreditKind == 'credit_card' && this.formCreditInstallmentEnabled;
+			},
+			isCreditDebtFlowKind() : boolean {
+				return this.formCategory == 'credit' && (this.formCreditKind == 'borrowed' || this.formCreditKind == 'lent');
+			},
+			creditFundAccountCandidates() : AccountNode[] {
+				return this.accounts.filter((a : AccountNode) : boolean => a.category == 'cash');
+			},
+			selectedCreditFundAccountName() : string {
+				if (this.formCreditFundAccountId == '') return this.formCreditKind == 'borrowed' ? '选择收款账户' : '选择付款账户';
+				const acc = this.creditFundAccountCandidates.find((a : AccountNode) : boolean => a.id == this.formCreditFundAccountId);
+				return acc == null ? (this.formCreditKind == 'borrowed' ? '选择收款账户' : '选择付款账户') : acc.name;
+			},
+			creditFundAccountLabel() : string {
+				return this.formCreditKind == 'borrowed' ? '收款账户' : '付款账户';
+			},
+			creditLinkedBillLabel() : string {
+				return this.formCreditKind == 'borrowed' ? '关联收入账单' : '关联支出账单';
+			},
+			creditLinkedBillPlaceholder() : string {
+				return this.formCreditKind == 'borrowed' ? '搜索收入账单，留空则新建' : '搜索支出账单，留空则新建';
+			},
+			filteredCreditLinkedBills() : TransactionMount[] {
+				const q = this.formCreditLinkedSearchText.trim().toLowerCase();
+				let list = this.formCreditLinkedCandidates.filter((bill : TransactionMount) : boolean => {
+					return this.formCreditKind == 'borrowed' ? bill.type == 'income' : bill.type == 'expense';
+				});
+				if (q != '') {
+					list = list.filter((bill : TransactionMount) : boolean => {
+						const text = `${bill.description ?? ''} ${bill.category ?? ''} ${bill.account_name ?? ''} ${bill.amount.toString()}`.toLowerCase();
+						return text.indexOf(q) >= 0;
+					});
+				}
+				return list.slice(0, 20);
+			},
+			nameLabel() : string {
+				if (this.formCategory == 'investment' && (this.formEntryMode == 'cash' || this.formEntryMode == 'total')) return '证券账户';
+				if (this.formCategory == 'investment') return '持仓名称';
+				if (this.formCategory == 'heavy') return '资产名称';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'credit_card') return '卡片/平台名称';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'borrowed') return '借入备注（可选）';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'lent') return '借出备注（可选）';
+				if (this.formCategory == 'credit') return '信贷名称';
+				return '账户名称';
+			},
+			showCardNoInput() : boolean {
+				if (this.formCategory == 'credit') return this.formCreditKind == 'credit_card';
+				if (this.formCategory == 'heavy') return false;
+				return this.formCategory != 'investment';
+			},
+			cardNoPlaceholder() : string {
+				if (this.formCategory == 'credit') return '卡尾号';
+				return '账号/尾号';
+			},
+			namePlaceholder() : string {
+				if (this.formCategory == 'investment' && (this.formEntryMode == 'cash' || this.formEntryMode == 'total')) return '例如：泽墨账证券（88888）';
+				if (this.formCategory == 'investment') return '例如：沪深300ETF / 宁德时代';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'lent') return '可选：用途/说明';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'borrowed') return '可选：用途/说明';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'other') return '例如：经营贷 / 临时周转';
+				if (this.formCategory == 'credit') return '例如：招商信用卡 / 花呗';
+				if (this.formCategory == 'heavy') return '例如：家庭住房';
+				return '例如：招商银行储蓄卡';
+			},
+			balanceLabel() : string {
+				if (this.formCategory == 'investment' && this.formEntryMode == 'cash') return '现金余额';
+				if (this.formCategory == 'investment' && this.formEntryMode == 'total') return '账户总额';
+				if (this.formCategory == 'investment') return '金额 / 份额';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'borrowed') return '借入金额';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'lent') return '借出金额';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'credit_card') return '当前账单欠款';
+				if (this.formCategory == 'credit') return '当前欠款';
+				if (this.formCategory == 'heavy') return '当前估值';
+				return '初始余额';
+			},
+			providerLabel() : string {
+				if (this.formCategory == 'investment') return '所属理财账户';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'lent') return '借款人';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'borrowed') return '债权人/平台';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'other') return '机构/对象';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'credit_card') return '发卡银行/平台';
+				return '发卡机构/提供商';
+			},
+			providerPlaceholder() : string {
+				if (this.formCategory == 'investment') return '请选择理财账户';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'lent') return '例如：张三';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'borrowed') return '例如：李四 / 借呗';
+				if (this.formCategory == 'credit' && this.formCreditKind == 'other') return '例如：银行 / 亲友 / 平台';
+				return '例如：招商银行';
+			},
+			creditKindHint() : string {
+				if (this.formCreditKind == 'credit_card') return '记录信用卡、花呗、白条等平台欠款，可勾选分期。';
+				if (this.formCreditKind == 'borrowed') return '记录借入金额，可关联收入账单或选择收款账户。';
+				if (this.formCreditKind == 'lent') return '记录借出金额，可关联支出账单或选择付款账户。';
+				return '用于没有固定格式的信贷或债务，只保留核心字段。';
+			},
+			installmentPreview() : string {
+				if (!this.isCreditInstallmentEnabled) return '';
+				const balance = parseFloat(this.formBalance);
+				const count = parseInt(this.formInstallmentCount);
+				const paid = parseInt(this.formInstallmentPaid);
+				const dueDay = parseInt(this.formInstallmentDueDay);
+				if (isNaN(balance) || balance <= 0 || isNaN(count) || count <= 0) return '输入当前欠款和总期数后自动计算';
+				const safePaid = isNaN(paid) || paid < 0 ? 0 : paid;
+				const remain = count - safePaid;
+				if (remain <= 0) return '分期已还清';
+				const monthly = balance / remain;
+				const dayText = isNaN(dueDay) || dueDay <= 0 ? '未设还款日' : `每月 ${dueDay} 日`;
+				return `剩余 ${remain} 期，每期约 ¥${monthly.toFixed(2)}，${dayText}`;
+			},
+			holdingNamePlaceholder() : string {
+				if (this.formName.trim() != '') return this.formName.trim();
+				if (this.formCode.trim() != '') return this.formCode.trim();
+				return '持仓名称或基金代码';
+			},
+			holdingSearchMeta() : string {
+				const name = this.formName.trim();
+				const code = this.formCode.trim();
+				const type = this.formSubType.trim();
+				if (name == '' && code == '' && type == '') return '查询后自动带出持仓名称和类型';
+				const parts = [] as string[];
+				if (name != '') parts.push(name);
+				if (code != '') parts.push(code);
+				if (type != '') parts.push(type);
+				return parts.join(' · ');
+			},
+			investmentPayDisplayName() : string {
+				if (this.formProvider.trim() == '') return '请先选择理财账户';
+				if (this.isSelectedInvestAccountOffsite) return '场外账户';
+				if (this.formPayMode == 'none') return '无付款记录';
+				if (this.formPayMode == 'investment_cash') {
+					const cash = this.findInvestmentCashAccount(this.investAccountName());
+					return cash != null ? this.investAccountDisplayName(cash.provider == '' ? this.investAccountName() : cash.provider) : '理财账户现金';
+				}
+				const acc = this.cashAccounts.find((a : AccountNode) : boolean => a.id == this.formPayAccountId);
+				return acc != null ? acc.name : '请选择资金账户';
+			},
+			isSelectedInvestAccountOffsite() : boolean {
+				if (this.formProvider.trim() == '') return false;
+				return this.investAccountModeFor(this.investAccountName()) == 'otc';
+			},
+			investAccountDialogTitle() : string {
+				return this.investAccountEditingName == '' ? '新增理财账户' : '修改理财账户';
+			},
+			toggleDesc() : string {
+				if (this.formCategory == 'credit' && this.formCreditKind == 'lent') return '该应收款将计入净资产';
+				if (this.formCategory == 'credit') return '该负债将从净资产中扣除';
+				return '该账户余额将计算在净资产内';
+			}
+		},
+		methods: {
+			switchMainTab(idx : number) {
+				if (idx < 0 || idx >= this.pageTabs.length) return;
+				this.activeMainTab = idx;
+			},
+			onMainSwiperChange(e : SwiperChangeEvent) {
+				this.pageSwipeLocked = false;
+				this.activeMainTab = parseInt(e.detail.current.toString());
+			},
+			setPageSwipeLocked(locked : boolean) {
+				this.pageSwipeLocked = locked;
+			},
+			captureRecordDialogOptions(options : OnLoadOptions) {
+				const openParam = options['openRecordDialog'];
+				if (openParam == null || openParam.toString() != '1') return;
+				this.pendingRecordDialogRequested = true;
+				const queryParam = options['recordDialogQuery'];
+				if (queryParam == null) {
+					this.pendingRecordDialogQuery = '';
+					return;
+				}
+				let raw = queryParam.toString();
+				if (raw.indexOf('%3D') >= 0 || raw.indexOf('%3d') >= 0 || raw.indexOf('%26') >= 0) {
+					try {
+						raw = decodeURIComponent(raw);
+					} catch (_e) {}
+				}
+				this.pendingRecordDialogQuery = raw;
+			},
+			clearPendingRecordDialogTimer() {
+				if (this.pendingRecordDialogTimer != -1) {
+					clearTimeout(this.pendingRecordDialogTimer as number);
+					this.pendingRecordDialogTimer = -1;
+				}
+			},
+			startPendingFinanceChangeWatcher() {
+				this.clearPendingFinanceChangeWatcher();
+				this.pendingFinanceChangeTimer = (setInterval(() => {
+					void this.consumePendingFinanceChange();
+				}, 350) as any) as number;
+			},
+			clearPendingFinanceChangeWatcher() {
+				if (this.pendingFinanceChangeTimer != -1) {
+					clearInterval(this.pendingFinanceChangeTimer as number);
+					this.pendingFinanceChangeTimer = -1;
+				}
+			},
+			async consumePendingFinanceChange() {
+				if (this.pendingFinanceChangeApplying) return;
+				this.pendingFinanceChangeApplying = true;
+				try {
+					await this.applyPendingHomeTransactionChange();
+				} finally {
+					this.pendingFinanceChangeApplying = false;
+				}
+			},
+			schedulePendingRecordDialog(delayMs : number = 120) {
+				if (!this.pendingRecordDialogRequested) return;
+				this.clearPendingRecordDialogTimer();
+				this.pendingRecordDialogTimer = (setTimeout(() => {
+					this.pendingRecordDialogTimer = -1;
+					if (!this.pendingRecordDialogRequested) return;
+					const query = this.pendingRecordDialogQuery;
+					this.pendingRecordDialogRequested = false;
+					this.pendingRecordDialogQuery = '';
+					AppDialogApi.openFinanceRecord(query);
+				}, delayMs) as any) as number;
+			},
+			loadTheme() {
+				const bg = uni.getStorageSync('theme_background_image');
+				if (bg != null) {
+					this.backgroundImage = bg.toString();
+				}
+				const t = uni.getStorageSync('theme_transparency');
+				if (t != null) {
+					const str = t.toString();
+					if (str != '') {
+						const val = parseFloat(str);
+						if (!isNaN(val)) this.transparency = val;
+					}
+				}
+				const hide = uni.getStorageSync('finance_hide_amount');
+				if (hide != null && hide.toString() == 'true') this.hideAmount = true;
+				const metric = uni.getStorageSync('finance_home_card_metric');
+				if (metric != null && this.isValidCardMetric(metric.toString())) {
+					this.cardMetricMode = metric.toString();
+				}
+			},
+			async loadData() {
+				const nextAccounts = await FinanceBiz.listAccountNodes(null);
+				if (nextAccounts.length > 0 || this.accounts.length == 0) {
+					this.accounts = nextAccounts.slice(0);
+					this.netWorth = FinanceBiz.computeNetWorth(this.accounts);
+					this.financeDataVersion++;
+				}
+
+				const nextBooks = await FinanceBiz.listBooks();
+				if (nextBooks.length > 0 || this.books.length == 0) {
+					this.books = nextBooks;
+				}
+				if (this.books.length > 0 && (this.selectedBookId == '' || this.books.find((b : BookNode) : boolean => b.id == this.selectedBookId) == null)) {
+					this.selectedBookId = this.books[0].id;
+				}
+
+				const now = new Date();
+				const summary = await FinanceBiz.getMonthlySummary(now.getFullYear(), now.getMonth() + 1);
+				const inc = summary.get('income') ?? 0.0;
+				const exp = summary.get('expense') ?? 0.0;
+				this.monthlyIncome = inc - exp;
+
+				const daily = await FinanceBiz.getDailySummary(now.getTime());
+				this.todayExpense = daily.get('expense') ?? 0.0;
+
+				await this.loadRecentBills(true);
+				await this.syncDeskPetPipSnapshot();
+			},
+			async applyPendingHomeTransactionChange() : Promise<boolean> {
+				let changed = false;
+				const untilRaw = uni.getStorageSync(FINANCE_HOME_SKIP_RELOAD_UNTIL_KEY);
+				if (untilRaw != null && untilRaw.toString() != '') {
+					const until = parseFloat(untilRaw.toString());
+					if (!isNaN(until) && until > Date.now()) {
+						this.skipShowReloadUntil = until;
+					} else {
+						uni.removeStorageSync(FINANCE_HOME_SKIP_RELOAD_UNTIL_KEY);
+					}
+				}
+
+				const deletedRaw = uni.getStorageSync(FINANCE_HOME_DELETED_TRANSACTION_ID_KEY);
+				if (deletedRaw != null && deletedRaw.toString() != '') {
+					const deletedId = deletedRaw.toString();
+					this.recentBills = this.recentBills.filter((bill : TransactionMount) : boolean => bill.id != deletedId);
+					await this.refreshRecentBillDaySummaries();
+					uni.removeStorageSync(FINANCE_HOME_DELETED_TRANSACTION_ID_KEY);
+					uni.removeStorageSync(FINANCE_HOME_SKIP_RELOAD_UNTIL_KEY);
+					this.skipShowReloadUntil = 0;
+					await this.refreshAfterDeleteWithoutClearing();
+					setTimeout(() => {
+						void this.refreshAfterDeleteWithoutClearing();
+					}, 500);
+					changed = true;
+				}
+				const changeRaw = uni.getStorageSync(FINANCE_HOME_PENDING_TRANSACTION_CHANGE_KEY);
+				if (changeRaw != null && changeRaw.toString() != '') {
+					uni.removeStorageSync(FINANCE_HOME_PENDING_TRANSACTION_CHANGE_KEY);
+					await this.refreshAfterDeleteWithoutClearing();
+					setTimeout(() => {
+						void this.refreshAfterDeleteWithoutClearing();
+					}, 500);
+					changed = true;
+				}
+				return changed;
+			},
+			async refreshAfterDeleteWithoutClearing() {
+				await this.refreshBillMetrics();
+				await this.syncRecentBillsWithoutClearing();
+			},
+			async refreshBillMetrics() {
+				const nextAccounts = await FinanceBiz.listAccountNodes(null);
+				if (nextAccounts.length > 0 || this.accounts.length == 0) {
+					this.accounts = nextAccounts.slice(0);
+					this.netWorth = FinanceBiz.computeNetWorth(this.accounts);
+				}
+
+				const now = new Date();
+				const summary = await FinanceBiz.getMonthlySummary(now.getFullYear(), now.getMonth() + 1);
+				const inc = summary.get('income') ?? 0.0;
+				const exp = summary.get('expense') ?? 0.0;
+				this.monthlyIncome = inc - exp;
+
+				const daily = await FinanceBiz.getDailySummary(now.getTime());
+				this.todayExpense = daily.get('expense') ?? 0.0;
+				await this.syncDeskPetPipSnapshot();
+			},
+			async syncRecentBillsWithoutClearing() {
+				const token = this.billLoadToken + 1;
+				this.billLoadToken = token;
+				try {
+					const requestLimit = this.billLimit < 100 ? this.billLimit + 1 : this.billLimit;
+					const rows = await FinanceBiz.listRecentTransactions(requestLimit);
+					if (token != this.billLoadToken || rows.length == 0) return;
+					this.billHasMore = rows.length > this.billLimit;
+					this.recentBills = rows.slice(0, this.billLimit);
+					await this.refreshRecentBillDaySummaries(token);
+				} catch (_e) {
+				}
+			},
+			async loadRecentBills(reset : boolean = false) {
+				if (this.billLoading) return;
+				this.billLoading = true;
+				const token = this.billLoadToken + 1;
+				this.billLoadToken = token;
+				if (reset) {
+					this.billLimit = this.billPageSize;
+					this.billHasMore = true;
+				}
+				try {
+					const requestLimit = this.billLimit < 100 ? this.billLimit + 1 : this.billLimit;
+					const rows = await FinanceBiz.listRecentTransactions(requestLimit);
+					if (token != this.billLoadToken) return;
+					this.billHasMore = rows.length > this.billLimit;
+					if (rows.length == 0 && this.recentBills.length > 0) return;
+					this.recentBills = rows.slice(0, this.billLimit);
+					await this.refreshRecentBillDaySummaries(token);
+				} catch (_e) {
+					uni.showToast({ title: '账单加载失败', icon: 'none' });
+				} finally {
+					this.billLoading = false;
+				}
+			},
+			async refreshRecentBillDaySummaries(expectedToken : number = 0) {
+				const dayStarts = [] as number[];
+				for (let i = 0; i < this.recentBills.length; i++) {
+					const d = new Date(this.recentBills[i].transaction_time);
+					const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+					let exists = false;
+					for (let j = 0; j < dayStarts.length; j++) {
+						if (dayStarts[j] == dayStart) {
+							exists = true;
+							break;
+						}
+					}
+					if (!exists) dayStarts.push(dayStart);
+				}
+
+				if (dayStarts.length == 0) {
+					this.billDaySummaries = [] as BillDaySummary[];
+					return;
+				}
+
+				const nextSummaries = [] as BillDaySummary[];
+				for (let i = 0; i < dayStarts.length; i++) {
+					const daily = await FinanceBiz.getDailySummary(dayStarts[i]);
+					if (expectedToken != 0 && expectedToken != this.billLoadToken) return;
+					nextSummaries.push({
+						dayKey: dayStarts[i].toString(),
+						income: daily.get('income') ?? 0.0,
+						expense: daily.get('expense') ?? 0.0
+					} as BillDaySummary);
+				}
+				if (expectedToken != 0 && expectedToken != this.billLoadToken) return;
+				this.billDaySummaries = nextSummaries;
+			},
+			async loadMoreBills() {
+				if (this.billLoading || !this.billHasMore) return;
+				this.billLimit += this.billPageSize;
+				if (this.billLimit > 100) this.billLimit = 100;
+				await this.loadRecentBills(false);
+			},
+			isValidCardMetric(mode : string) : boolean {
+				return mode == 'net_worth' || mode == 'cash' || mode == 'investment' || mode == 'credit' || mode == 'heavy' || mode == 'today_expense';
+			},
+			openCardMetricPicker() {
+				const keys = ['net_worth', 'cash', 'investment', 'credit', 'heavy', 'today_expense'] as string[];
+				uni.showActionSheet({
+					itemList: ['净资产', '资金账户', '理财资产', '信贷负债', '重资产', '今日消耗'],
+					success: (res) => {
+						if (res.tapIndex < 0 || res.tapIndex >= keys.length) return;
+						this.cardMetricMode = keys[res.tapIndex];
+						uni.setStorageSync('finance_home_card_metric', this.cardMetricMode);
+					}
+				});
+			},
+			async syncDeskPetPipSnapshot() {
+				await FinancePipSnapshotService.syncSnapshot();
+			},
+			toggleHideAmount() {
+				this.hideAmount = !this.hideAmount;
+				uni.setStorageSync('finance_hide_amount', this.hideAmount ? 'true' : 'false');
+			},
+			goAccount(acc : AccountNode) {
+				uni.navigateTo({ url: `/pages/finance/account-detail?id=${acc.id}` });
+			},
+			goFund(inv : AccountNode) {
+				uni.navigateTo({ url: `/pages/finance/fund-detail?id=${inv.id}` });
+			},
+			editFund(inv : AccountNode) {
+				void this.openEditAssetModalById(inv.id);
+			},
+			goInvestAccount(name : string) {
+				this.activeMainTab = 1;
+				setTimeout(() => {
+					const page = this.$refs['investPage'] as ComponentPublicInstance;
+					if (page != null) page.$callMethod('selectInvestAccount', name);
+				}, 80);
+			},
+			goRecord() {
+				AppDialogApi.openFinanceRecord();
+			},
+			openCalendar() {
+				uni.navigateTo({ url: '/pages/calendar/index' });
+			},
+			async refreshInvestmentQuotes(showFeedback : boolean = true) {
+				if (this.investmentQuoteRefreshing) return;
+				const list = this.investAccounts;
+				if (list.length == 0) {
+					if (showFeedback) uni.showToast({ title: '暂无理财持仓', icon: 'none' });
+					return;
+				}
+				this.investmentQuoteRefreshing = true;
+				if (showFeedback) uni.showLoading({ title: '刷新行情...' });
+				let updated = 0;
+				try {
+					for (let i = 0; i < list.length; i++) {
+						const item = list[i];
+						if (item.sub_type == '账户现金') continue;
+						if (item.code == '') continue;
+						try {
+							const quote = await FinanceMarketService.fetchQuote(item.code);
+							if (quote == null) continue;
+							const ok = await FinanceBiz.updateInvestmentQuote(item.id, {
+								name: quote.name,
+								category: 'investment',
+								balance: item.balance,
+								code: item.code,
+								sub_type: item.sub_type,
+								profit_rate: quote.estimate_rate,
+								profit_amount: item.profit_amount,
+								market_value: item.balance,
+								units: item.units,
+								latest_nav: quote.nav,
+								estimate_nav: quote.estimate_nav,
+								quote_time: quote.estimate_time != '' ? quote.estimate_time : quote.nav_date,
+								data_source: quote.source
+							} as AssetAccountPayload);
+							if (ok) updated++;
+						} catch (_e) {}
+					}
+					if (showFeedback) uni.hideLoading();
+					await this.loadData();
+					if (showFeedback) uni.showToast({ title: updated > 0 ? `已刷新 ${updated} 项` : '暂无可刷新行情', icon: 'none' });
+				} catch (_e) {
+					if (showFeedback) {
+						uni.hideLoading();
+						uni.showToast({ title: '行情刷新失败', icon: 'none' });
+					}
+				} finally {
+					this.investmentQuoteRefreshing = false;
+				}
+			},
+			goAdd() {
+				AppDialogApi.openFinanceRecord();
+			},
+			goAddAsset() {
+				this.openAddModal();
+			},
+			resetAssetForm() {
+				this.formCategory = "cash";
+				this.formName = "";
+				this.formBalance = "";
+				this.formBookId = this.selectedBookId;
+				this.formProvider = "";
+				this.formCardNo = "";
+				this.formIncludeInTotal = true;
+				this.formCode = "";
+				this.formSubType = "";
+				this.formProfitRate = "";
+				this.formCreditLimit = "";
+				this.formCreditKind = "credit_card";
+				this.formCreditInstallmentEnabled = false;
+				this.formInstallmentCount = "";
+				this.formInstallmentPaid = "";
+				this.formInstallmentDueDay = "";
+				this.formInstallmentNextDueAt = 0;
+				this.formCreditLinkedSearchText = '';
+				this.formCreditLinkedCandidates = [] as TransactionMount[];
+				this.selectedCreditLinkedTransactionId = '';
+				this.selectedCreditLinkedTransactionName = '';
+				this.formCreditFundAccountId = '';
+				this.formUnits = "";
+				this.formBalanceTouched = false;
+				this.formUnitsTouched = false;
+				this.formEntryMode = "amount";
+				this.formLatestNav = 0.0;
+				this.formEstimateNav = 0.0;
+				this.formQuoteTime = "";
+				this.formDataSource = "";
+				this.formPayMode = "investment_cash";
+				this.formPayAccountId = "";
+				this.marketResults = [] as MarketSearchItem[];
+			},
+			openAddModal() {
+				this.editingAssetId = '';
+				this.resetAssetForm();
+				this.showModal = true;
+			},
+			async openEditAssetModalById(assetId : string) {
+				const id = assetId.trim();
+				if (id == '') return;
+				const latestAccounts = await FinanceBiz.listAccountNodes(null);
+				if (latestAccounts.length > 0 || this.accounts.length == 0) {
+					this.accounts = latestAccounts.slice(0);
+					this.netWorth = FinanceBiz.computeNetWorth(this.accounts);
+					this.financeDataVersion++;
+				}
+				const latestBooks = await FinanceBiz.listBooks();
+				if (latestBooks.length > 0 || this.books.length == 0) this.books = latestBooks;
+				if (this.books.length > 0 && (this.selectedBookId == '' || this.books.find((b : BookNode) : boolean => b.id == this.selectedBookId) == null)) {
+					this.selectedBookId = this.books[0].id;
+				}
+				let acc = this.accounts.find((item : AccountNode) : boolean => item.id == id);
+				if (acc == null) acc = await FinanceBiz.getAccountNode(id);
+				if (acc == null) {
+					uni.showToast({ title: '资产不存在', icon: 'none' });
+					return;
+				}
+				this.resetAssetForm();
+				this.editingAssetId = acc.id;
+				this.formCategory = acc.category;
+				this.formName = acc.name;
+				this.formBalance = acc.balance.toFixed(2);
+				this.formBookId = acc.book_id == '' ? this.selectedBookId : acc.book_id;
+				this.formProvider = acc.category == 'investment' && acc.provider.trim() == '' ? '默认账户' : acc.provider;
+				this.formCardNo = acc.card_no;
+				this.formIncludeInTotal = acc.include_in_total;
+				this.formCode = acc.code;
+				this.formSubType = acc.sub_type;
+				this.formProfitRate = acc.profit_rate.toString();
+				this.formCreditLimit = acc.credit_limit <= 0 ? '' : acc.credit_limit.toString();
+				const editCreditKind = acc.category == 'credit' ? FinanceBiz.normalizeCreditKind(acc.credit_kind, acc.sub_type) : 'credit_card';
+				this.formCreditKind = editCreditKind;
+				this.formCreditInstallmentEnabled = acc.category == 'credit' && editCreditKind == 'credit_card' && acc.installment_count > 0;
+				this.formInstallmentCount = acc.installment_count <= 0 ? '' : acc.installment_count.toString();
+				this.formInstallmentPaid = acc.installment_paid <= 0 ? '' : acc.installment_paid.toString();
+				this.formInstallmentDueDay = acc.installment_due_day <= 0 ? '' : acc.installment_due_day.toString();
+				this.formInstallmentNextDueAt = acc.installment_next_due_at;
+				this.formUnits = acc.units <= 0 ? '' : acc.units.toString();
+				this.formBalanceTouched = false;
+				this.formUnitsTouched = false;
+				this.formEntryMode = acc.category == 'investment' && acc.sub_type == '账户现金' ? 'cash' : 'amount';
+				this.formLatestNav = acc.latest_nav;
+				this.formEstimateNav = acc.estimate_nav;
+				this.formQuoteTime = acc.quote_time;
+				this.formDataSource = acc.data_source;
+				this.formPayMode = 'none';
+				this.formPayAccountId = '';
+				this.marketResults = [] as MarketSearchItem[];
+				this.showModal = true;
+			},
+			openInvestmentTotalModal(accountName : string) {
+				this.openInvestAccountDialog(accountName);
+			},
+			closeModal() {
+				this.showModal = false;
+				this.editingAssetId = '';
+			},
+			switchCategory(key : string) {
+				if (this.editingAssetId != '') return;
+				this.formCategory = key;
+				if (key != 'investment') this.switchInvestmentEntryMode('amount');
+				if (key == 'investment') this.syncInvestmentPayMode();
+				if (key == 'credit') this.applyCreditKind(this.formCreditKind);
+			},
+			creditKindText(kind : string) : string {
+				if (kind == 'borrowed') return '借入';
+				if (kind == 'lent') return '借出';
+				if (kind == 'other') return '其他信贷';
+				return '信用卡/平台';
+			},
+			creditKindSubType(kind : string) : string {
+				if (kind == 'borrowed') return '借入';
+				if (kind == 'lent') return '借出';
+				if (kind == 'other') return '其他信贷';
+				return '信用卡/平台';
+			},
+			applyCreditKind(kind : string) {
+				const safe = FinanceBiz.normalizeCreditKind(kind, '');
+				this.formCreditKind = safe;
+				if (this.formCreditKind != 'credit_card') this.formCreditInstallmentEnabled = false;
+				this.formSubType = this.creditKindSubType(this.formCreditKind);
+				if (this.formCreditKind != 'credit_card') this.formCreditLimit = '';
+				if (this.formCreditKind != 'credit_card') this.formCardNo = '';
+				if (this.isCreditInstallmentEnabled) this.ensureCreditInstallmentDefaults();
+				else this.clearCreditInstallmentFields();
+				this.clearCreditLinkedBill();
+				this.ensureCreditFundAccount();
+				if (this.isCreditDebtFlowKind) this.loadCreditLinkedCandidates();
+			},
+			ensureCreditInstallmentDefaults() {
+				if (this.formInstallmentCount.trim() == '') this.formInstallmentCount = '12';
+				if (this.formInstallmentPaid.trim() == '') this.formInstallmentPaid = '0';
+				if (this.formInstallmentDueDay.trim() == '') {
+					const d = new Date();
+					const day = d.getDate() > 28 ? 28 : d.getDate();
+					this.formInstallmentDueDay = day.toString();
+				}
+			},
+			clearCreditInstallmentFields() {
+				this.formInstallmentCount = '';
+				this.formInstallmentPaid = '';
+				this.formInstallmentDueDay = '';
+				this.formInstallmentNextDueAt = 0;
+			},
+			toggleCreditInstallment() {
+				if (this.formCategory != 'credit') return;
+				if (this.formCreditKind != 'credit_card') this.applyCreditKind('credit_card');
+				this.formCreditInstallmentEnabled = !this.formCreditInstallmentEnabled;
+				this.formSubType = this.creditKindSubType(this.formCreditKind);
+				if (this.formCreditInstallmentEnabled) this.ensureCreditInstallmentDefaults();
+				else this.clearCreditInstallmentFields();
+			},
+			normalizeIntegerText(raw : string, maxLen : number = 3) : string {
+				let val = (raw ?? '').toString().replace(/[^0-9]/g, '');
+				if (val.length > maxLen) val = val.substring(0, maxLen);
+				return val;
+			},
+			onInstallmentCountInput(e : InputEvent) {
+				const val = this.normalizeIntegerText(e.detail.value, 3);
+				setTimeout(() => { this.formInstallmentCount = val; }, 0);
+			},
+			onInstallmentPaidInput(e : InputEvent) {
+				const val = this.normalizeIntegerText(e.detail.value, 3);
+				setTimeout(() => { this.formInstallmentPaid = val; }, 0);
+			},
+			onInstallmentDueDayInput(e : InputEvent) {
+				const val = this.normalizeIntegerText(e.detail.value, 2);
+				setTimeout(() => { this.formInstallmentDueDay = val; }, 0);
+			},
+			nextDueAtForDay(day : number) : number {
+				let safeDay = day;
+				if (safeDay < 1) safeDay = 1;
+				if (safeDay > 28) safeDay = 28;
+				const now = new Date();
+				let due = new Date(now.getFullYear(), now.getMonth(), safeDay, 9, 0, 0, 0);
+				if (due.getTime() <= now.getTime()) due = new Date(now.getFullYear(), now.getMonth() + 1, safeDay, 9, 0, 0, 0);
+				return due.getTime();
+			},
+			ensureCreditFundAccount() {
+				if (!this.isCreditDebtFlowKind) return;
+				const candidates = this.creditFundAccountCandidates;
+				if (candidates.length == 0) {
+					this.formCreditFundAccountId = '';
+					return;
+				}
+				if (this.formCreditFundAccountId == '' || candidates.find((a : AccountNode) : boolean => a.id == this.formCreditFundAccountId) == null) {
+					this.formCreditFundAccountId = candidates[0].id;
+				}
+			},
+			async loadCreditLinkedCandidates() {
+				if (!this.isCreditDebtFlowKind) return;
+				this.formCreditLinkedCandidates = await FinanceBiz.listRecentTransactions(100);
+			},
+			creditBillTitle(bill : TransactionMount) : string {
+				const desc = (bill.description ?? '').toString().trim();
+				const cat = (bill.category ?? '').toString().trim();
+				const title = desc != '' ? desc : (cat != '' ? cat : '未命名账单');
+				const sign = bill.type == 'income' ? '+' : '-';
+				return `${title} ${sign}${Math.abs(bill.amount).toFixed(2)}`;
+			},
+			creditBillSubTitle(bill : TransactionMount) : string {
+				const d = new Date(bill.transaction_time);
+				const dateText = `${(d.getMonth() + 1).toString().padStart(2, '0')}-${d.getDate().toString().padStart(2, '0')}`;
+				const account = (bill.account_name ?? '').toString().trim();
+				const cat = (bill.category ?? '').toString().trim();
+				return `${dateText} ${account == '' ? '未知账户' : account}${cat == '' ? '' : ' · ' + cat}`;
+			},
+			selectCreditLinkedBill(bill : TransactionMount) {
+				this.selectedCreditLinkedTransactionId = bill.id;
+				this.selectedCreditLinkedTransactionName = this.creditBillTitle(bill);
+				this.formBalance = Math.abs(bill.amount).toFixed(2);
+				this.formCreditFundAccountId = bill.account_id;
+				if (this.formName.trim() == '') {
+					const desc = (bill.description ?? '').toString().trim();
+					this.formName = desc;
+				}
+			},
+			clearCreditLinkedBill() {
+				this.selectedCreditLinkedTransactionId = '';
+				this.selectedCreditLinkedTransactionName = '';
+				this.formCreditLinkedSearchText = '';
+			},
+			async showCreditLinkedBillPicker() {
+				if (!this.isCreditDebtFlowKind) return;
+				if (this.formCreditLinkedCandidates.length == 0) await this.loadCreditLinkedCandidates();
+				const list = this.filteredCreditLinkedBills.length > 0 ? this.filteredCreditLinkedBills : this.formCreditLinkedCandidates.filter((bill : TransactionMount) : boolean => {
+					return this.formCreditKind == 'borrowed' ? bill.type == 'income' : bill.type == 'expense';
+				}).slice(0, 12);
+				if (list.length == 0) {
+					uni.showToast({ title: '暂无可关联账单', icon: 'none' });
+					return;
+				}
+				const itemList = list.map((bill : TransactionMount) : string => this.creditBillTitle(bill));
+				uni.showActionSheet({
+					itemList: itemList,
+					success: (res) => {
+						if (res.tapIndex >= 0 && res.tapIndex < list.length) {
+							this.selectCreditLinkedBill(list[res.tapIndex]);
+						}
+					}
+				});
+			},
+			showCreditFundAccountPicker() {
+				const candidates = this.creditFundAccountCandidates;
+				if (candidates.length == 0) {
+					uni.showToast({ title: '请先创建资金账户', icon: 'none' });
+					return;
+				}
+				const itemList = candidates.map((a : AccountNode) : string => a.name);
+				uni.showActionSheet({
+					itemList: itemList,
+					success: (res) => {
+						if (res.tapIndex >= 0 && res.tapIndex < candidates.length) {
+							this.formCreditFundAccountId = candidates[res.tapIndex].id;
+						}
+					}
+				});
+			},
+			showModalBookPicker() {
+				if (this.books.length == 0) return;
+				const itemList = this.books.map((b : BookNode) : string => b.name);
+				itemList.push('＋ 新建账本');
+				uni.showActionSheet({
+					itemList: itemList,
+					success: (res) => {
+						if (res.tapIndex == this.books.length) {
+							this.createBookFromDialog();
+							return;
+						}
+						if (res.tapIndex >= 0 && res.tapIndex < this.books.length) {
+							this.formBookId = this.books[res.tapIndex].id;
+						}
+					}
+				});
+			},
+			buildInvestAccountOptions() : string[] {
+				const options = [] as string[];
+				let raw = uni.getStorageSync('finance_invest_accounts');
+				if (raw == null || raw.toString() == '') raw = uni.getStorageSync('finance_invest_tabs');
+				if (raw != null && raw.toString() != '') {
+					try {
+						const parsed = JSON.parse(raw.toString()) as string[];
+						for (let i = 0; i < parsed.length; i++) {
+							const name = (parsed[i] ?? '').toString().trim();
+							if (name != '' && name != '全部' && name != '全部账户' && name != '默认' && options.indexOf(name) < 0) {
+								options.push(name);
+							}
+						}
+					} catch (_e) {}
+				}
+				const list = this.accounts;
+				for (let j = 0; j < list.length; j++) {
+					if (list[j].category != 'investment') continue;
+					const provider = (list[j].provider ?? '').toString().trim();
+					if (provider != '' && options.indexOf(provider) < 0) options.push(provider);
+				}
+				return options;
+			},
+			investAccountTailFor(provider : string) : string {
+				const target = provider.trim() == '' ? '默认账户' : provider.trim();
+				let raw = uni.getStorageSync('finance_invest_account_tails');
+				if (raw != null && raw.toString() != '') {
+					try {
+						const obj = JSON.parse(raw.toString()) as UTSJSONObject;
+						const saved = obj.get(target);
+						if (saved != null && saved.toString().trim() != '') return saved.toString().trim();
+					} catch (_e) {}
+				}
+				const cash = this.findInvestmentCashAccount(target);
+				if (cash != null && cash.card_no.trim() != '') return cash.card_no.trim();
+				for (let i = 0; i < this.accounts.length; i++) {
+					const acc = this.accounts[i];
+					if (acc.category != 'investment') continue;
+					const name = (acc.provider ?? '').toString().trim() == '' ? '默认账户' : acc.provider.trim();
+					if (name == target && acc.card_no.trim() != '') return acc.card_no.trim();
+				}
+				return '';
+			},
+			saveInvestAccountTail(provider : string, tail : string) {
+				const target = provider.trim() == '' ? '默认账户' : provider.trim();
+				let obj = new UTSJSONObject();
+				const raw = uni.getStorageSync('finance_invest_account_tails');
+				if (raw != null && raw.toString() != '') {
+					try { obj = JSON.parse(raw.toString()) as UTSJSONObject; } catch (_e) { obj = new UTSJSONObject(); }
+				}
+				obj.set(target, tail.trim());
+				uni.setStorageSync('finance_invest_account_tails', JSON.stringify(obj));
+			},
+			investAccountModeFor(provider : string) : string {
+				const target = provider.trim() == '' ? '默认账户' : provider.trim();
+				let raw = uni.getStorageSync('finance_invest_account_modes');
+				if (raw != null && raw.toString() != '') {
+					try {
+						const obj = JSON.parse(raw.toString()) as UTSJSONObject;
+						const saved = obj.get(target);
+						if (saved != null && saved.toString() == 'otc') return 'otc';
+					} catch (_e) {}
+				}
+				return 'security';
+			},
+			saveInvestAccountMode(provider : string, mode : string) {
+				const target = provider.trim() == '' ? '默认账户' : provider.trim();
+				let obj = new UTSJSONObject();
+				const raw = uni.getStorageSync('finance_invest_account_modes');
+				if (raw != null && raw.toString() != '') {
+					try { obj = JSON.parse(raw.toString()) as UTSJSONObject; } catch (_e) { obj = new UTSJSONObject(); }
+				}
+				obj.set(target, mode == 'otc' ? 'otc' : 'security');
+				uni.setStorageSync('finance_invest_account_modes', JSON.stringify(obj));
+			},
+			investAccountDisplayName(provider : string) : string {
+				const name = provider.trim() == '' ? '默认账户' : provider.trim();
+				const tail = this.investAccountTailFor(name);
+				return tail == '' ? name : `${name}(${tail})`;
+			},
+			showInvestAccountPicker() {
+				const options = this.buildInvestAccountOptions();
+				const itemList = [] as string[];
+				for (let i = 0; i < options.length; i++) itemList.push(this.investAccountDisplayName(options[i]));
+				itemList.push('＋ 新建理财账户');
+				uni.showActionSheet({
+					itemList: itemList,
+					success: (res) => {
+						if (res.tapIndex == options.length) {
+							this.createInvestAccountFromDialog();
+							return;
+						}
+						if (res.tapIndex >= 0 && res.tapIndex < options.length) {
+							this.formProvider = options[res.tapIndex];
+							this.formCardNo = this.investAccountTailFor(this.formProvider);
+							this.syncInvestmentPayMode();
+						}
+					}
+				});
+			},
+			showInvestmentPayPicker() {
+				if (this.formProvider.trim() == '') {
+					uni.showToast({ title: '请先选择理财账户', icon: 'none' });
+					return;
+				}
+				if (this.isSelectedInvestAccountOffsite) {
+					uni.showToast({ title: '场外账户不记录现金', icon: 'none' });
+					return;
+				}
+				const investCash = this.findInvestmentCashAccount(this.investAccountName());
+				if (investCash != null) {
+					uni.showActionSheet({
+						itemList: [this.investAccountDisplayName(investCash.provider == '' ? this.investAccountName() : investCash.provider)],
+						success: (res) => {
+							if (res.tapIndex == 0) {
+								this.formPayMode = 'investment_cash';
+								this.formPayAccountId = '';
+							}
+						}
+					});
+					return;
+				}
+				const itemList = ['无付款记录'] as string[];
+				const list = this.cashAccounts;
+				for (let i = 0; i < list.length; i++) itemList.push(list[i].name);
+				uni.showActionSheet({
+					itemList: itemList,
+					success: (res) => {
+						if (res.tapIndex == 0) {
+							this.formPayMode = 'none';
+							this.formPayAccountId = '';
+							return;
+						}
+						const idx = res.tapIndex - 1;
+						if (idx >= 0 && idx < list.length) {
+							this.formPayMode = 'cash_account';
+							this.formPayAccountId = list[idx].id;
+						}
+					}
+				});
+			},
+			createInvestAccountFromDialog() {
+				this.openInvestAccountDialog('');
+			},
+			closeInvestAccountDialog() {
+				this.showInvestAccountModal = false;
+			},
+			selectInvestAccountMode(mode : string) {
+				this.investAccountDraftMode = mode == 'otc' ? 'otc' : 'security';
+			},
+			openInvestAccountDialog(accountName : string) {
+				const name = accountName.trim() == '' ? '' : accountName.trim();
+				this.investAccountEditingName = name;
+				this.investAccountDraftName = name;
+				this.investAccountDraftNo = name == '' ? '' : this.investAccountTailFor(name);
+				this.investAccountDraftMode = name == '' ? 'security' : this.investAccountModeFor(name);
+				const cash = name == '' ? null : this.findInvestmentCashAccount(name);
+				this.investAccountDraftCash = cash != null ? cash.balance.toFixed(2) : '';
+				this.investAccountDraftTotal = name == '' ? '' : this.investTotalForProvider(name).toFixed(2);
+				this.investAccountCashTouched = false;
+				this.investAccountTotalTouched = false;
+				this.showInvestAccountModal = true;
+			},
+			onInvestAccountCashInput(e : InputEvent) {
+				const val = this.sanitizeAmount(e.detail.value);
+				setTimeout(() => {
+					this.investAccountDraftCash = val;
+					this.investAccountCashTouched = true;
+				}, 0);
+			},
+			onInvestAccountTotalInput(e : InputEvent) {
+				const val = this.sanitizeAmount(e.detail.value);
+				setTimeout(() => {
+					this.investAccountDraftTotal = val;
+					this.investAccountTotalTouched = true;
+				}, 0);
+			},
+			async submitInvestAccountDialog() {
+				const name = this.investAccountDraftName.trim();
+				if (name == '') {
+					uni.showToast({ title: '账户名不能为空', icon: 'none' });
+					return;
+				}
+				if (this.investAccountEditingName != '' && name != this.investAccountEditingName) {
+					uni.showToast({ title: '修改账户名请用重命名', icon: 'none' });
+					return;
+				}
+				const options = this.buildInvestAccountOptions();
+				if (options.indexOf(name) < 0) {
+					options.push(name);
+					uni.setStorageSync('finance_invest_accounts', JSON.stringify(options));
+				}
+				this.saveInvestAccountTail(name, this.investAccountDraftNo);
+				this.saveInvestAccountMode(name, this.investAccountDraftMode);
+				this.formProvider = name;
+				this.formCardNo = this.investAccountDraftNo.trim();
+				if (this.investAccountDraftMode == 'security') {
+					const existing = this.findInvestmentCashAccount(name);
+					let nextCash = existing != null ? existing.balance : 0.0;
+					if (this.investAccountTotalTouched && this.investAccountDraftTotal.trim() != '') {
+						const total = parseFloat(this.investAccountDraftTotal);
+						if (isNaN(total)) {
+							uni.showToast({ title: '请输入有效账户总额', icon: 'none' });
+							return;
+						}
+						const holding = this.investHoldingBalanceForProvider(name);
+						nextCash = total - holding;
+						if (nextCash < 0) {
+							uni.showToast({ title: '账户总额小于持仓市值', icon: 'none' });
+							return;
+						}
+					} else if (this.investAccountCashTouched && this.investAccountDraftCash.trim() != '') {
+						const cash = parseFloat(this.investAccountDraftCash);
+						if (isNaN(cash)) {
+							uni.showToast({ title: '请输入有效现金余额', icon: 'none' });
+							return;
+						}
+						nextCash = cash;
+					}
+					const ok = await this.upsertInvestmentCashAccount(name, nextCash, 'account_dialog');
+					if (!ok) {
+						uni.showToast({ title: '理财账户保存失败', icon: 'none' });
+						return;
+					}
+				}
+				this.showInvestAccountModal = false;
+				this.syncInvestmentPayMode();
+				await this.loadData();
+				setTimeout(() => {
+					const page = this.$refs['investPage'] as ComponentPublicInstance;
+					if (page != null) page.$callMethod('selectInvestAccount', name);
+				}, 80);
+				uni.showToast({ title: '理财账户已保存', icon: 'success' });
+			},
+			createBookFromDialog() {
+				uni.showModal({
+					title: '新建账本',
+					editable: true,
+					placeholderText: '请输入账本名称',
+					success: (res) => {
+						if (!res.confirm) return;
+						const name = (res.content ?? '').toString().trim();
+						if (name == '') {
+							uni.showToast({ title: '账本名称不能为空', icon: 'none' });
+							return;
+						}
+						FinanceBiz.createBook(name).then((id) => {
+							if (id == null || id == '') {
+								uni.showToast({ title: '创建账本失败', icon: 'none' });
+								return;
+							}
+							this.loadData().then(() => {
+								this.formBookId = id!;
+								uni.showToast({ title: '账本已创建', icon: 'none' });
+							});
+						});
+					}
+				});
+			},
+			sanitizeAmount(raw : string) : string {
+				let val = raw.replace(/[^0-9.]/g, "");
+				const dots = val.split('.').length - 1;
+				if (dots > 1) {
+					const firstDotIndex = val.indexOf('.');
+					val = val.substring(0, firstDotIndex + 1) + val.substring(firstDotIndex + 1).replace(/\./g, '');
+				}
+				if (val.includes('.')) {
+					const parts = val.split('.');
+					if (parts[1].length > 2) {
+						val = parts[0] + '.' + parts[1].substring(0, 2);
+					}
+				}
+				return val;
+			},
+			onBalanceInput(e : InputEvent) {
+				const val = this.sanitizeAmount(e.detail.value);
+				setTimeout(() => {
+					this.formBalance = val;
+					this.formBalanceTouched = true;
+					if (!this.formUnitsTouched) this.recalculateInvestmentUnits();
+				}, 0);
+			},
+			onCreditLimitInput(e : InputEvent) {
+				const val = this.sanitizeAmount(e.detail.value);
+				setTimeout(() => { this.formCreditLimit = val; }, 0);
+			},
+			onUnitsInput(e : InputEvent) {
+				const val = this.sanitizeAmount(e.detail.value);
+				setTimeout(() => {
+					this.formUnits = val;
+					this.formUnitsTouched = true;
+					if (!this.formBalanceTouched) this.recalculateInvestmentAmount();
+				}, 0);
+			},
+			switchInvestmentEntryMode(mode : string) {
+				this.formEntryMode = mode;
+				if (mode == 'cash' || mode == 'total') {
+					this.formCode = '';
+					this.formSubType = '账户现金';
+					this.formProfitRate = '';
+					this.formUnits = '';
+					this.formBalanceTouched = false;
+					this.formUnitsTouched = false;
+					this.formLatestNav = 0.0;
+					this.formEstimateNav = 0.0;
+					this.formQuoteTime = '';
+					this.formDataSource = '';
+					this.marketResults = [] as MarketSearchItem[];
+				} else if (this.formSubType == '账户现金') {
+					this.formSubType = '';
+				}
+			},
+			onProfitInput(e : InputEvent) {
+				let val = e.detail.value.replace(/[^0-9.\-]/g, "");
+				setTimeout(() => { this.formProfitRate = val; }, 0);
+			},
+			async searchMarket() {
+				const keyword = this.formCode.trim() != '' ? this.formCode.trim() : this.formName.trim();
+				if (keyword == '') {
+					uni.showToast({ title: '请输入代码或名称', icon: 'none' });
+					return;
+				}
+				this.marketSearching = true;
+				try {
+					this.marketResults = await FinanceMarketService.search(keyword, 12);
+					if (this.marketResults.length == 0) {
+						uni.showToast({ title: '未查到基金，股票可手动录入', icon: 'none' });
+					}
+				} catch (_e) {
+					uni.showToast({ title: '行情查询失败，可手动录入', icon: 'none' });
+				}
+				this.marketSearching = false;
+			},
+			async selectMarketItem(item : MarketSearchItem) {
+				this.formCode = item.code;
+				this.formName = item.name;
+				if (item.source == 'eastmoney-push2') {
+					this.formSubType = (item.code.startsWith('5') || item.code.startsWith('1')) ? 'ETF' : '股票';
+				} else {
+					this.formSubType = item.type.indexOf('ETF') >= 0 ? 'ETF' : '基金';
+				}
+				this.formDataSource = item.source;
+				this.marketResults = [] as MarketSearchItem[];
+				await this.refreshQuoteByCode(item.code);
+			},
+			async refreshQuoteByCode(code : string) {
+				if (code.trim() == '') return;
+				try {
+					const quote = await FinanceMarketService.fetchQuote(code.trim());
+					if (quote == null) return;
+					this.applyQuote(quote);
+				} catch (_e) {}
+			},
+			applyQuote(quote : MarketQuote) {
+				if (quote.name != '' && (this.formName.trim() == '' || this.formName.trim() == quote.code)) this.formName = quote.name;
+				this.formLatestNav = quote.nav;
+				this.formEstimateNav = quote.estimate_nav;
+				this.formProfitRate = quote.estimate_rate == 0 ? this.formProfitRate : quote.estimate_rate.toString();
+				this.formQuoteTime = quote.estimate_time != '' ? quote.estimate_time : quote.nav_date;
+				this.formDataSource = quote.source;
+				if (this.formUnits.trim() != '' && !this.formBalanceTouched) {
+					this.recalculateInvestmentAmount();
+				} else if (this.formBalance.trim() != '' && !this.formUnitsTouched) {
+					this.recalculateInvestmentUnits();
+				}
+			},
+			investmentUnitPrice() : number {
+				const price = this.formEstimateNav > 0 ? this.formEstimateNav : this.formLatestNav;
+				return price;
+			},
+			recalculateInvestmentAmount() {
+				if (this.formCategory != 'investment') return;
+				if (this.formEntryMode == 'cash' || this.formEntryMode == 'total') return;
+				const units = parseFloat(this.formUnits);
+				const price = this.investmentUnitPrice();
+				if (isNaN(units) || units <= 0 || price <= 0) return;
+				this.formBalance = (units * price).toFixed(2);
+			},
+			recalculateInvestmentUnits() {
+				if (this.formCategory != 'investment') return;
+				if (this.formEntryMode == 'cash' || this.formEntryMode == 'total') return;
+				const amount = parseFloat(this.formBalance);
+				const price = this.investmentUnitPrice();
+				if (isNaN(amount) || amount <= 0 || price <= 0) return;
+				this.formUnits = (amount / price).toFixed(2);
+			},
+			onToggleInclude(e : UniSwitchChangeEvent) {
+				this.formIncludeInTotal = e.detail.value;
+			},
+			creditDebtDisplayName() : string {
+				const note = this.formName.trim();
+				if (note != '') return note;
+				const person = this.formProvider.trim();
+				if (person != '') return this.formCreditKind == 'borrowed' ? `向${person}借入` : `${person}借款`;
+				return this.formCreditKind == 'borrowed' ? '借入' : '借出';
+			},
+			buildPayload() : AssetAccountPayload {
+				const balance = parseFloat(this.formBalance);
+				const profit = parseFloat(this.formProfitRate);
+				const limit = parseFloat(this.formCreditLimit);
+				const units = parseFloat(this.formUnits);
+				const installmentCount = parseInt(this.formInstallmentCount);
+				const installmentPaid = parseInt(this.formInstallmentPaid);
+				const installmentDueDay = parseInt(this.formInstallmentDueDay);
+				const isInvestCash = this.formCategory == 'investment' && (this.formEntryMode == 'cash' || this.formEntryMode == 'total');
+				const holdingName = this.formName.trim() != '' ? this.formName.trim() : this.formCode.trim();
+				let holdingSubType = this.formSubType.trim() == '' ? '其他' : this.formSubType.trim();
+				if (this.formCategory == 'credit') holdingSubType = this.creditKindSubType(this.formCreditKind);
+				const editing = this.editingAssetId == '' ? null : this.accounts.find((a : AccountNode) : boolean => a.id == this.editingAssetId);
+				let nextProfitRate = isInvestCash || isNaN(profit) ? 0.0 : profit;
+				let nextProfitAmount = editing != null ? editing.profit_amount : 0.0;
+				const safeInstallmentCount = this.isCreditInstallmentEnabled && !isNaN(installmentCount) && installmentCount > 0 ? installmentCount : 0;
+				let safeInstallmentPaid = this.isCreditInstallmentEnabled && !isNaN(installmentPaid) && installmentPaid > 0 ? installmentPaid : 0;
+				if (safeInstallmentCount > 0 && safeInstallmentPaid > safeInstallmentCount) safeInstallmentPaid = safeInstallmentCount;
+				let safeInstallmentDueDay = this.isCreditInstallmentEnabled && !isNaN(installmentDueDay) ? installmentDueDay : 0;
+				if (safeInstallmentDueDay < 0) safeInstallmentDueDay = 0;
+				if (safeInstallmentDueDay > 28) safeInstallmentDueDay = 28;
+				const nextDueAt = safeInstallmentCount > 0 && safeInstallmentPaid < safeInstallmentCount && safeInstallmentDueDay > 0 ? this.nextDueAtForDay(safeInstallmentDueDay) : 0;
+				const nextCardNo = this.showCardNoInput ? this.formCardNo.trim() : '';
+				let installmentTotal = 0.0;
+				if (this.isCreditInstallmentEnabled && !isNaN(balance)) {
+					installmentTotal = editing != null && editing.installment_total > 0 ? editing.installment_total : balance;
+				}
+				const price = this.investmentUnitPrice();
+				if (!isInvestCash && !isNaN(balance) && balance > 0 && !isNaN(units) && units > 0 && price > 0) {
+					const actualUnitPrice = balance / units;
+					if (actualUnitPrice > 0) {
+						nextProfitAmount = Math.round((price - actualUnitPrice) * units * 100.0) / 100.0;
+						nextProfitRate = Math.round(((price - actualUnitPrice) / actualUnitPrice) * 100.0 * 10000.0) / 10000.0;
+					}
+				}
+				const accountName = this.formCategory == 'credit' && this.isCreditDebtFlowKind ? this.creditDebtDisplayName() : (isInvestCash ? this.formName.trim() : holdingName);
+				return {
+					name: accountName,
+					category: this.formCategory,
+					balance: isNaN(balance) ? 0.0 : balance,
+					book_id: this.formBookId == '' ? this.selectedBookId : this.formBookId,
+					provider: this.formProvider.trim(),
+					card_no: nextCardNo,
+					include_in_total: this.formIncludeInTotal,
+					code: isInvestCash ? '' : this.formCode.trim(),
+					sub_type: isInvestCash ? '账户现金' : holdingSubType,
+					profit_rate: nextProfitRate,
+					profit_amount: nextProfitAmount,
+					market_value: isNaN(balance) ? 0.0 : balance,
+					units: isInvestCash || isNaN(units) ? 0.0 : units,
+					latest_nav: isInvestCash ? 0.0 : this.formLatestNav,
+					estimate_nav: isInvestCash ? 0.0 : this.formEstimateNav,
+					quote_time: isInvestCash ? '' : this.formQuoteTime,
+					data_source: isInvestCash ? '' : this.formDataSource,
+					credit_limit: this.formCategory == 'credit' && this.formCreditKind == 'credit_card' && !isNaN(limit) ? limit : 0.0,
+					credit_kind: this.formCategory == 'credit' ? this.formCreditKind : '',
+					installment_total: installmentTotal,
+					installment_count: safeInstallmentCount,
+					installment_paid: safeInstallmentPaid,
+					installment_due_day: safeInstallmentDueDay,
+					installment_next_due_at: nextDueAt
+				} as AssetAccountPayload;
+			},
+			investAccountName() : string {
+				const name = this.formProvider.trim();
+				return name == '' ? '默认账户' : name;
+			},
+			investHoldingName() : string {
+				const name = this.formName.trim();
+				if (name != '') return name;
+				return this.formCode.trim();
+			},
+			syncInvestmentPayMode() {
+				if (this.formCategory != 'investment') return;
+				if (this.formProvider.trim() == '') {
+					this.formPayMode = 'none';
+					this.formPayAccountId = '';
+					return;
+				}
+				if (this.investAccountModeFor(this.investAccountName()) == 'otc') {
+					this.formPayMode = 'none';
+					this.formPayAccountId = '';
+					return;
+				}
+				const cash = this.findInvestmentCashAccount(this.investAccountName());
+				if (cash != null) {
+					this.formPayMode = 'investment_cash';
+					this.formPayAccountId = '';
+					return;
+				}
+				if (this.cashAccounts.length > 0) {
+					const current = this.cashAccounts.find((a : AccountNode) : boolean => a.id == this.formPayAccountId);
+					this.formPayMode = 'cash_account';
+					if (current == null) this.formPayAccountId = this.cashAccounts[0].id;
+				} else {
+					this.formPayMode = 'none';
+					this.formPayAccountId = '';
+				}
+			},
+			findInvestmentCashAccount(provider : string) : AccountNode | null {
+				const target = provider.trim() == '' ? '默认账户' : provider.trim();
+				for (let i = 0; i < this.accounts.length; i++) {
+					const acc = this.accounts[i];
+					if (acc.category != 'investment') continue;
+					if (acc.sub_type != '账户现金') continue;
+					const name = (acc.provider ?? '').toString().trim() == '' ? '默认账户' : acc.provider.trim();
+					if (name == target) return acc;
+				}
+				return null;
+			},
+			investHoldingBalanceForProvider(provider : string) : number {
+				const target = provider.trim() == '' ? '默认账户' : provider.trim();
+				let sum = 0.0;
+				for (let i = 0; i < this.accounts.length; i++) {
+					const acc = this.accounts[i];
+					if (acc.category != 'investment' || acc.sub_type == '账户现金') continue;
+					const name = (acc.provider ?? '').toString().trim() == '' ? '默认账户' : acc.provider.trim();
+					if (name == target) sum += acc.balance;
+				}
+				return sum;
+			},
+			investTotalForProvider(provider : string) : number {
+				const target = provider.trim() == '' ? '默认账户' : provider.trim();
+				let sum = 0.0;
+				for (let i = 0; i < this.accounts.length; i++) {
+					const acc = this.accounts[i];
+					if (acc.category != 'investment') continue;
+					const name = (acc.provider ?? '').toString().trim() == '' ? '默认账户' : acc.provider.trim();
+					if (name == target) sum += acc.balance;
+				}
+				return sum;
+			},
+			async upsertInvestmentCashAccount(provider : string, cashBalance : number, noteLabel : string) : Promise<boolean> {
+				const target = provider.trim() == '' ? '默认账户' : provider.trim();
+				const safeBalance = cashBalance < 0 ? 0.0 : cashBalance;
+				const existing = this.findInvestmentCashAccount(target);
+				const payload = {
+					name: `${target}可用资金`,
+					category: 'investment',
+					balance: safeBalance,
+					book_id: existing != null ? existing.book_id : (this.formBookId == '' ? this.selectedBookId : this.formBookId),
+					provider: target,
+					card_no: this.formCardNo.trim() != '' ? this.formCardNo.trim() : (existing != null ? existing.card_no : ''),
+					include_in_total: existing != null ? existing.include_in_total : this.formIncludeInTotal,
+					code: '',
+					sub_type: '账户现金',
+					profit_rate: 0.0,
+					profit_amount: 0.0,
+					market_value: safeBalance,
+					units: 0.0,
+					latest_nav: 0.0,
+					estimate_nav: 0.0,
+					quote_time: '',
+					data_source: noteLabel
+				} as AssetAccountPayload;
+				if (existing != null) {
+					return await FinanceBiz.updateAssetAccount(existing.id, payload);
+				}
+				const id = await FinanceBiz.createAssetAccount(payload);
+				return id != null && id != '';
+			},
+			canSettleInvestmentPayment(amount : number) : boolean {
+				if (amount <= 0) return true;
+				if (this.formCategory == 'investment' && this.investAccountModeFor(this.investAccountName()) == 'otc') return true;
+				if (this.formPayMode == 'none') return true;
+				if (this.formPayMode == 'investment_cash') {
+					const cash = this.findInvestmentCashAccount(this.investAccountName());
+					if (cash == null) {
+						uni.showToast({ title: '该理财账户无现金账户，请选择付款账户', icon: 'none' });
+						return false;
+					}
+					if (cash.balance < amount) {
+						uni.showToast({ title: '理财账户现金不足', icon: 'none' });
+						return false;
+					}
+					return true;
+				}
+				if (this.formPayAccountId == '') {
+					uni.showToast({ title: '请选择付款账户', icon: 'none' });
+					return false;
+				}
+				const acc = this.cashAccounts.find((a : AccountNode) : boolean => a.id == this.formPayAccountId);
+				if (acc != null && acc.balance < amount) {
+					uni.showToast({ title: '付款账户余额不足', icon: 'none' });
+					return false;
+				}
+				return true;
+			},
+			async settleInvestmentPayment(amount : number) : Promise<boolean> {
+				if (amount <= 0) return true;
+				if (this.formCategory == 'investment' && this.investAccountModeFor(this.investAccountName()) == 'otc') return true;
+				if (this.formPayMode == 'none') return true;
+				if (this.formPayMode == 'investment_cash') {
+					const cash = this.findInvestmentCashAccount(this.investAccountName());
+					if (cash == null) return false;
+					const id = await FinanceBiz.createTransactionForNodes({
+						account_id: cash.id,
+						amount: amount,
+						type: 'expense',
+						category: '理财买入',
+						description: `买入 ${this.investHoldingName()}`,
+						properties: JSON.stringify({ source: 'investment_purchase', holding_name: this.investHoldingName() })
+					} as CreateTransactionForNodesPayload);
+					return id != null && id != '';
+				}
+				const okId = await FinanceBiz.createTransactionForNodes({
+					account_id: this.formPayAccountId,
+					amount: amount,
+					type: 'expense',
+					category: '理财买入',
+					description: `买入 ${this.investHoldingName()}`,
+					properties: JSON.stringify({ source: 'investment_purchase', holding_name: this.investHoldingName(), invest_account: this.investAccountName() })
+				} as CreateTransactionForNodesPayload);
+				return okId != null && okId != '';
+			},
+			buildCreditDebtEventProperties() : string {
+				return JSON.stringify({
+					source: 'asset_credit_debt_create',
+					include_in_flow: false,
+					credit_kind: this.formCreditKind,
+					linked_transaction_id: this.selectedCreditLinkedTransactionId == '' ? null : this.selectedCreditLinkedTransactionId,
+					linked_transaction_name: this.selectedCreditLinkedTransactionName == '' ? null : this.selectedCreditLinkedTransactionName
+				});
+			},
+			async recordCreditDebtInitialEvent(creditAccountId : string, amount : number) : Promise<boolean> {
+				if (!this.isCreditDebtFlowKind) return true;
+				const payload = {
+					credit_account_id: creditAccountId,
+					fund_account_id: this.selectedCreditLinkedTransactionId == '' ? this.formCreditFundAccountId : null,
+					amount: amount,
+					action: this.formCreditKind == 'borrowed' ? 'borrow' : 'lend',
+					category: this.formCreditKind == 'borrowed' ? '债务借入' : '债务借出',
+					description: this.formName.trim() == '' ? this.creditDebtDisplayName() : this.formName.trim(),
+					location: null,
+					transaction_time: null,
+					linked_transaction_id: this.selectedCreditLinkedTransactionId == '' ? null : this.selectedCreditLinkedTransactionId,
+					properties: this.buildCreditDebtEventProperties()
+				} as CreditDebtEventPayload;
+				return await FinanceBiz.recordCreditDebtEvent(payload);
+			},
+			async confirmSubmit() {
+				if (this.formCategory == 'investment' && this.formProvider.trim() == '') {
+					uni.showToast({ title: '请选择理财账户', icon: 'none' });
+					return;
+				}
+				if (this.formCategory == 'investment' && this.formEntryMode != 'cash' && this.formEntryMode != 'total' && this.investHoldingName() == '') {
+					uni.showToast({ title: '请输入持仓名称或代码', icon: 'none' });
+					return;
+				}
+				if (this.formCategory != 'investment' && !this.isCreditDebtFlowKind && this.formName.trim() == "") {
+					uni.showToast({ title: '请输入名称', icon: 'none' });
+					return;
+				}
+				const balance = parseFloat(this.formBalance);
+				if (isNaN(balance)) {
+					uni.showToast({ title: '请输入有效金额', icon: 'none' });
+					return;
+				}
+				if (this.formCategory == 'credit' && this.isCreditDebtFlowKind && this.editingAssetId == '' && balance <= 0) {
+					uni.showToast({ title: '请输入大于 0 的金额', icon: 'none' });
+					return;
+				}
+				if (this.isCreditInstallmentEnabled) {
+					const count = parseInt(this.formInstallmentCount);
+					const paid = parseInt(this.formInstallmentPaid);
+					const dueDay = parseInt(this.formInstallmentDueDay);
+					if (isNaN(count) || count <= 0) {
+						uni.showToast({ title: '请输入分期期数', icon: 'none' });
+						return;
+					}
+					if (!isNaN(paid) && paid > count) {
+						uni.showToast({ title: '已还期数不能超过总期数', icon: 'none' });
+						return;
+					}
+					if (isNaN(dueDay) || dueDay < 1 || dueDay > 28) {
+						uni.showToast({ title: '还款日请输入 1-28', icon: 'none' });
+						return;
+					}
+				}
+				if (this.formCategory == 'credit' && this.isCreditDebtFlowKind && this.editingAssetId == '' && this.selectedCreditLinkedTransactionId == '') {
+					this.ensureCreditFundAccount();
+					if (this.formCreditFundAccountId == '') {
+						uni.showToast({ title: `请选择${this.creditFundAccountLabel}`, icon: 'none' });
+						return;
+					}
+				}
+				if (this.editingAssetId != '') {
+					const payload = this.buildPayload();
+					const ok = await FinanceBiz.updateAssetAccount(this.editingAssetId, payload);
+					if (ok) {
+						uni.showToast({ title: '保存成功', icon: 'success' });
+						this.closeModal();
+						await this.loadData();
+					} else {
+						uni.showToast({ title: '保存失败', icon: 'none' });
+					}
+					return;
+				}
+				if (this.formCategory == 'investment' && this.formEntryMode == 'total') {
+					const holdings = this.investHoldingBalanceForProvider(this.investAccountName());
+					const nextCash = balance - holdings;
+					if (nextCash < 0) {
+						uni.showToast({ title: '账户总额小于持仓市值', icon: 'none' });
+						return;
+					}
+					const ok = await this.upsertInvestmentCashAccount(this.investAccountName(), nextCash, 'total_reconcile');
+					if (ok) {
+						uni.showToast({ title: '账户总额已确认', icon: 'success' });
+						this.closeModal();
+						await this.loadData();
+					} else {
+						uni.showToast({ title: '操作失败', icon: 'none' });
+					}
+					return;
+				}
+				if (this.formCategory == 'investment' && this.formEntryMode == 'cash') {
+					const ok = await this.upsertInvestmentCashAccount(this.investAccountName(), balance, 'cash_reconcile');
+					if (ok) {
+						uni.showToast({ title: '现金余额已确认', icon: 'success' });
+						this.closeModal();
+						await this.loadData();
+					} else {
+						uni.showToast({ title: '操作失败', icon: 'none' });
+					}
+					return;
+				}
+				if (this.formCategory == 'investment') {
+					if (!this.canSettleInvestmentPayment(balance)) return;
+				}
+				const payload = this.buildPayload();
+				if (this.formCategory == 'credit' && this.isCreditDebtFlowKind) {
+					payload.balance = 0.0;
+				}
+				const newId = await FinanceBiz.createAssetAccount(payload);
+				if (newId != null) {
+					let payOk = true;
+					if (this.formCategory == 'investment' && this.formEntryMode != 'cash') {
+						const units = parseFloat(this.formUnits);
+						const price = this.formEstimateNav > 0 ? this.formEstimateNav : this.formLatestNav;
+						await FinanceBiz.recordInvestmentHoldingSnapshot(newId, payload.balance, isNaN(units) ? 0.0 : units, price, this.formQuoteTime, '新增理财持仓');
+						payOk = await this.settleInvestmentPayment(balance);
+						if (!payOk) {
+							uni.showToast({ title: '持仓已添加，扣款失败', icon: 'none' });
+						}
+					}
+					if (this.formCategory == 'credit' && this.isCreditDebtFlowKind) {
+						payOk = await this.recordCreditDebtInitialEvent(newId, balance);
+						if (!payOk) {
+							uni.showToast({ title: '信贷账户已添加，流水失败', icon: 'none' });
+						}
+					}
+					if (payOk) uni.showToast({ title: '添加成功', icon: 'success' });
+					this.closeModal();
+					await this.loadData();
+				} else {
+					uni.showToast({ title: '操作失败', icon: 'none' });
+				}
+			},
+			openMenu() {
+				uni.navigateTo({ url: '/uni_modules/zemo-ask/pages/setting/index' });
+			},
+			openSyncSettings() {
+				uni.navigateTo({ url: '/pages/settings/sync-settings' });
+			}
+		}
+	}
+</script>
+
+<style>
+	.page {
+		flex: 1;
+		position: relative;
+		background-color: rgba(242, 246, 248, 0.34);
+	}
+
+	.content-wrapper {
+		flex: 1;
+		flex-direction: column;
+		z-index: 1;
+		overflow: hidden;
+	}
+
+	.top-bar {
+		flex-direction: row;
+		align-items: center;
+		padding: 4px 14px 6px 14px;
+		padding-top: 30px;
+		background-color: rgba(255, 255, 255, 0.34);
+		border-bottom-width: 1px;
+		border-bottom-color: rgba(255, 255, 255, 0.48);
+		min-height: 70px;
+	}
+
+	.brand-mark {
+		width: 30px;
+		height: 30px;
+		border-radius: 15px;
+		justify-content: center;
+		align-items: center;
+		margin-right: 10px;
+		background-color: rgba(255, 255, 255, 0.62);
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.76);
+		box-shadow: 0 4px 12px rgba(40, 62, 80, 0.10);
+	}
+
+	.brand-logo {
+		width: 22px;
+		height: 22px;
+		border-radius: 11px;
+	}
+
+	.main-tabs {
+		flex: 1;
+		flex-direction: row;
+		align-items: center;
+		height: 34px;
+	}
+
+	.main-tab {
+		height: 34px;
+		justify-content: center;
+		align-items: center;
+		margin-right: 18px;
+		border-bottom-width: 2px;
+		border-bottom-color: transparent;
+	}
+
+	.main-tab-active {
+		border-bottom-color: #3b73d9;
+	}
+
+	.main-tab-text {
+		font-size: 17px;
+		color: #687289;
+	}
+
+	.main-tab-text-active {
+		color: #18233d;
+		font-weight: bold;
+	}
+
+	.top-action {
+		width: 30px;
+		height: 30px;
+		justify-content: center;
+		align-items: center;
+		border-radius: 15px;
+		background-color: rgba(255, 255, 255, 0.46);
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.62);
+	}
+
+	.top-action-icon {
+		font-size: 22px;
+		color: #33415f;
+	}
+
+	.page-swiper {
+		flex: 1;
+		width: 100%;
+		height: 0;
+	}
+
+	.page-swiper-item {
+		width: 100%;
+		height: 100%;
+		flex-direction: column;
+		overflow: hidden;
+	}
+
+	.assets-card {
+		flex-direction: column;
+		background-color: rgba(255, 255, 255, 0.62);
+		border-radius: 18px;
+		padding: 18px;
+		margin: 0 0 10px 0;
+		aspect-ratio: 1.586;
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.72);
+		box-shadow: 0 14px 32px rgba(44, 62, 92, 0.12);
+	}
+
+	.assets-tools {
+		flex-direction: row;
+		justify-content: flex-end;
+		align-items: center;
+	}
+
+	.tool-sync {
+		width: 34px;
+		height: 34px;
+		border-radius: 17px;
+		background-color: rgba(255, 255, 255, 0.56);
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.74);
+		justify-content: center;
+		align-items: center;
+		margin-left: 8px;
+		box-shadow: 0 5px 14px rgba(44, 62, 92, 0.10);
+	}
+
+	.tool-sync-icon {
+		font-size: 16px;
+		color: #33415f;
+	}
+
+	.assets-head {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: flex-start;
+		margin-bottom: 24px;
+	}
+
+	.assets-label {
+		font-size: 13px;
+		color: #748097;
+		margin-bottom: 6px;
+	}
+
+	.assets-bank-name {
+		font-size: 16px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.eye-btn {
+		width: 34px;
+		height: 34px;
+		border-radius: 17px;
+		background-color: rgba(255, 255, 255, 0.56);
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.74);
+		justify-content: center;
+		align-items: center;
+		box-shadow: 0 5px 14px rgba(44, 62, 92, 0.10);
+	}
+
+	.eye-icon {
+		font-size: 16px;
+	}
+
+	.assets-amount {
+		font-size: 31px;
+		font-weight: bold;
+		color: #243152;
+		margin-bottom: 12px;
+	}
+
+	.assets-sub-row {
+		flex-direction: row;
+		align-items: center;
+		flex: 1;
+	}
+
+	.assets-chip {
+		border-radius: 10px;
+		padding: 4px 9px;
+		background-color: rgba(59, 115, 217, 0.12);
+		border-width: 1px;
+		border-color: rgba(59, 115, 217, 0.14);
+		margin-right: 8px;
+	}
+
+	.assets-chip-text {
+		font-size: 11px;
+		color: #3b73d9;
+		font-weight: bold;
+	}
+
+	.assets-sub-text {
+		font-size: 12px;
+		color: #758097;
+	}
+
+	.card-bottom-row {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+	}
+
+	.card-number,
+	.card-holder {
+		font-size: 12px;
+		color: #758097;
+		font-weight: bold;
+	}
+
+	.section-head {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+		margin-top: 22px;
+		margin-bottom: 12px;
+	}
+
+	.section-title {
+		font-size: 17px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.section-title-row {
+		flex-direction: row;
+		align-items: baseline;
+	}
+
+	.section-total {
+		font-size: 15px;
+		font-weight: bold;
+		color: #3b73d9;
+		margin-left: 10px;
+	}
+
+	.section-action {
+		font-size: 13px;
+		color: #3b73d9;
+	}
+
+	.accounts-head {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: flex-end;
+		margin-top: 22px;
+		margin-bottom: 12px;
+	}
+
+	.account-columns {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: flex-start;
+		overflow: visible;
+	}
+
+	.cash-col {
+		width: 53%;
+		overflow: visible;
+	}
+
+	.debt-col {
+		width: 42%;
+		overflow: visible;
+	}
+
+	.cash-stack {
+		flex-direction: column;
+		position: relative;
+		overflow: visible;
+	}
+
+	.credit-stack {
+		flex-direction: column;
+		position: relative;
+		height: 240rpx;
+		overflow: visible;
+	}
+
+	.cash-account-card {
+		background-color: #ffffff;
+		border-radius: 16px;
+		padding: 22rpx;
+		border-width: 1px;
+		border-color: rgba(13, 77, 84, 0.08);
+		box-shadow: 0 4px 12px rgba(13, 77, 84, 0.1);
+	}
+
+	.cash-stack .cash-account-card {
+		min-height: 150rpx;
+		padding: 22rpx;
+	}
+
+	.credit-stack .cash-account-card {
+		min-height: 190rpx;
+		padding: 22rpx;
+		justify-content: flex-start;
+	}
+
+	.credit-top-info {
+		align-items: flex-end;
+	}
+
+	.cash-expanded-card {
+		margin-bottom: 14px;
+	}
+
+	.stack-dots {
+		flex-direction: row;
+		justify-content: center;
+		align-items: center;
+		margin-top: 16rpx;
+	}
+
+	.stack-dots-v {
+		margin-top: 56rpx;
+	}
+
+	.stack-dot {
+		width: 6px;
+		height: 6px;
+		border-radius: 3px;
+		background-color: #cdd8dc;
+		margin: 0 3px;
+	}
+
+	.stack-dot-active {
+		width: 16px;
+		background-color: #3b73d9;
+	}
+
+	.credit-card {
+		background-color: rgba(59, 115, 217, 0.82);
+		border-radius: 18px;
+		box-shadow: 0 8px 22px rgba(59, 115, 217, 0.24);
+	}
+
+	.account-top {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+		margin-bottom: 7px;
+	}
+
+	.account-icon-box {
+		width: 30px;
+		height: 30px;
+		border-radius: 9px;
+		background-color: #eef2f4;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.account-icon-box-credit {
+		background-color: rgba(255, 255, 255, 0.16);
+	}
+
+	.account-icon {
+		font-size: 16px;
+	}
+
+	.account-tag {
+		background-color: #eef2f4;
+		padding: 3px 10px;
+		border-radius: 8px;
+	}
+
+	.account-tag-credit {
+		background-color: rgba(255, 255, 255, 0.18);
+	}
+
+	.account-tag-text {
+		font-size: 11px;
+		color: #7a8a92;
+	}
+
+	.account-tag-text-credit {
+		color: rgba(255, 255, 255, 0.9);
+	}
+
+	.account-name {
+		font-size: 12px;
+		color: #8a97a0;
+		margin-bottom: 2px;
+	}
+
+	.account-balance {
+		font-size: 16px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.credit-row {
+		flex-direction: row;
+		justify-content: space-between;
+	}
+
+	.credit-col {
+		flex: 1;
+	}
+
+	.credit-col-right {
+		align-items: flex-end;
+	}
+
+	.credit-label {
+		font-size: 11px;
+		color: rgba(255, 255, 255, 0.7);
+		margin-bottom: 1px;
+	}
+
+	.credit-label-gap {
+		margin-top: 5px;
+	}
+
+	.credit-value-light {
+		font-size: 16px;
+		font-weight: bold;
+		color: #ffffff;
+	}
+
+	.invest-scroll {
+		width: 100%;
+		height: 220rpx;
+		flex-direction: row;
+		white-space: nowrap;
+	}
+
+	.invest-row {
+		flex-direction: row;
+		flex-wrap: nowrap;
+	}
+
+	.invest-card {
+		min-width: 200rpx;
+		height: 200rpx;
+		flex-shrink: 0;
+		background-color: rgba(255, 255, 255, 0.95);
+		border-radius: 28rpx;
+		padding: 24rpx;
+		margin-right: 20rpx;
+		justify-content: center;
+		box-shadow: 0 3px 10px rgba(0, 0, 0, 0.03);
+	}
+
+	.invest-icon-box {
+		width: 72rpx;
+		height: 72rpx;
+		border-radius: 20rpx;
+		background-color: #eef6f5;
+		justify-content: center;
+		align-items: center;
+		margin-bottom: 16rpx;
+	}
+
+	.invest-icon {
+		font-size: 20px;
+	}
+
+	.invest-name {
+		font-size: 13px;
+		color: #6b7b83;
+		margin-bottom: 5px;
+	}
+
+	.invest-value {
+		font-size: 17px;
+		font-weight: bold;
+		color: #1b2846;
+		white-space: nowrap;
+	}
+
+	.invest-add {
+		justify-content: center;
+		align-items: center;
+	}
+
+	.invest-add-icon {
+		font-size: 26px;
+		color: #3b73d9;
+		margin-bottom: 4px;
+	}
+
+	.invest-add-text {
+		font-size: 12px;
+		color: #3b73d9;
+	}
+
+	.trend-card {
+		background-color: rgba(255, 255, 255, 0.95);
+		border-radius: 16px;
+		padding: 18px;
+		box-shadow: 0 3px 10px rgba(0, 0, 0, 0.03);
+	}
+
+	.trend-head {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+		margin-bottom: 16px;
+	}
+
+	.trend-total {
+		font-size: 20px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.trend-sub {
+		font-size: 12px;
+		color: #9aa6ac;
+	}
+
+	.trend-chart {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: flex-end;
+		height: 100px;
+	}
+
+	.trend-bar-col {
+		flex: 1;
+		align-items: center;
+		justify-content: flex-end;
+	}
+
+	.trend-bar {
+		width: 14px;
+		border-radius: 7px;
+		background-color: #3b73d9;
+		margin-bottom: 6px;
+	}
+
+	.trend-bar-label {
+		font-size: 11px;
+		color: #9aa6ac;
+	}
+
+	.bill-card {
+		flex-direction: row;
+		align-items: center;
+		background-color: rgba(255, 255, 255, 0.58);
+		border-radius: 14px;
+		padding: 14px;
+		margin-bottom: 10px;
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.70);
+		box-shadow: 0 8px 20px rgba(44, 62, 92, 0.08);
+	}
+
+	.bill-icon-box {
+		width: 38px;
+		height: 38px;
+		border-radius: 19px;
+		background-color: rgba(245, 248, 251, 0.74);
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.72);
+		justify-content: center;
+		align-items: center;
+		margin-right: 12px;
+	}
+
+	.bill-icon {
+		font-size: 18px;
+	}
+
+	.bill-info {
+		flex: 1;
+	}
+
+	.bill-category {
+		font-size: 15px;
+		font-weight: bold;
+		color: #1b2846;
+		margin-bottom: 2px;
+	}
+
+	.bill-time {
+		font-size: 12px;
+		color: #9aa6ac;
+	}
+
+	.bill-amount {
+		font-size: 16px;
+		font-weight: bold;
+	}
+
+	.bill-income {
+		color: #16a34a;
+	}
+
+	.bill-expense {
+		color: #1b2846;
+	}
+
+	.empty-tip {
+		align-items: center;
+		padding: 20px;
+	}
+
+	.empty-text {
+		color: #9aa6ac;
+		font-size: 13px;
+	}
+
+	.list-bottom-spacer {
+		height: 90px;
+	}
+
+	.fab-add {
+		position: absolute;
+		bottom: 26px;
+		right: 18px;
+		width: 52px;
+		height: 52px;
+		border-radius: 26px;
+		justify-content: center;
+		align-items: center;
+		background-color: rgba(59, 115, 217, 0.86);
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.68);
+		box-shadow: 0 8px 22px rgba(59, 115, 217, 0.28);
+		z-index: 100;
+	}
+
+	.fab-icon {
+		font-size: 28px;
+		color: #ffffff;
+		font-weight: bold;
+		margin-top: -2px;
+	}
+
+	.sheet-overlay {
+		position: fixed;
+		top: 0;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		background-color: rgba(0, 0, 0, 0.45);
+		justify-content: flex-end;
+		z-index: 999;
+	}
+
+	.sheet-content {
+		background-color: rgba(246, 249, 251, 0.94);
+		border-top-left-radius: 22px;
+		border-top-right-radius: 22px;
+		padding: 12px 18px 24px 18px;
+		max-height: 86%;
+	}
+
+	.sheet-handle {
+		width: 40px;
+		height: 4px;
+		border-radius: 2px;
+		background-color: #d0d5da;
+		align-self: center;
+		margin-bottom: 10px;
+	}
+
+	.sheet-title {
+		font-size: 18px;
+		font-weight: bold;
+		color: #1b2846;
+		text-align: center;
+		margin-bottom: 14px;
+	}
+
+	.tab-bar {
+		flex-direction: row;
+		background-color: rgba(255, 255, 255, 0.48);
+		border-radius: 12px;
+		padding: 4px;
+		margin-bottom: 16px;
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.62);
+	}
+
+	.tab-item {
+		flex: 1;
+		height: 34px;
+		border-radius: 9px;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.tab-item-active {
+		background-color: rgba(255, 255, 255, 0.76);
+		box-shadow: 0 6px 14px rgba(44, 62, 92, 0.08);
+	}
+
+	.tab-text {
+		font-size: 13px;
+		color: #7a8694;
+	}
+
+	.tab-text-active {
+		color: #3b73d9;
+		font-weight: bold;
+	}
+
+	.sheet-body {
+		max-height: 460px;
+	}
+
+	.field-block {
+		margin-bottom: 14px;
+	}
+
+	.field-label {
+		font-size: 13px;
+		color: #6b7785;
+		margin-bottom: 6px;
+	}
+
+	.name-card-row {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.debt-person-note-row {
+		flex-direction: row;
+		align-items: flex-start;
+	}
+
+	.debt-person-note-col {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.debt-note-col {
+		margin-left: 8px;
+	}
+
+	.name-row-main {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.card-no-input {
+		width: 118px;
+		margin-left: 8px;
+	}
+
+	.field-input {
+		height: 46px;
+		border-radius: 12px;
+		background-color: #ffffff;
+		padding: 0 14px;
+		font-size: 15px;
+		color: #1f2d3d;
+	}
+
+	.field-select {
+		height: 46px;
+		border-radius: 12px;
+		background-color: #ffffff;
+		padding: 0 14px;
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+	}
+
+	.field-select-text {
+		font-size: 15px;
+		color: #1f2d3d;
+		font-weight: bold;
+	}
+
+	.field-select-arrow {
+		font-size: 16px;
+		color: #9aa4b0;
+	}
+
+	.field-input-row {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.linked-input {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.linked-pick-btn {
+		width: 46px;
+		height: 46px;
+		border-radius: 12px;
+		background-color: #3b73d9;
+		justify-content: center;
+		align-items: center;
+		margin-left: 8px;
+	}
+
+	.linked-pick-text {
+		font-size: 16px;
+		color: #ffffff;
+		font-weight: bold;
+	}
+
+	.credit-kind-grid {
+		flex-direction: row;
+		flex-wrap: wrap;
+	}
+
+	.credit-kind-item {
+		height: 34px;
+		min-width: 72px;
+		border-radius: 17px;
+		background-color: #ffffff;
+		border-width: 1px;
+		border-color: #e1e8f0;
+		padding: 0 12px;
+		margin-right: 8px;
+		margin-bottom: 8px;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.credit-kind-active {
+		background-color: #eaf2ff;
+		border-color: #3b73d9;
+	}
+
+	.credit-kind-title {
+		font-size: 13px;
+		font-weight: bold;
+		color: #1f2d3d;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.credit-kind-title-active {
+		color: #245ab4;
+	}
+
+	.credit-kind-hint {
+		font-size: 12px;
+		color: #687289;
+		margin-top: 2px;
+	}
+
+	.credit-linked-block {
+		position: relative;
+		z-index: 30;
+		overflow: visible;
+	}
+
+	.credit-result-float {
+		position: absolute;
+		left: 0;
+		right: 0;
+		bottom: 52px;
+		height: 146px;
+		z-index: 40;
+		background-color: #ffffff;
+		border-radius: 12px;
+		border-width: 1px;
+		border-color: #dbe5f0;
+		padding: 5px;
+		box-shadow: 0 10px 24px rgba(44, 62, 92, 0.12);
+	}
+
+	.credit-result-item {
+		min-height: 44px;
+		border-radius: 10px;
+		padding: 6px 8px;
+		margin-bottom: 4px;
+		background-color: #f7f9fc;
+	}
+
+	.credit-result-main {
+		font-size: 12px;
+		font-weight: bold;
+		color: #1f2d3d;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.credit-result-sub {
+		margin-top: 3px;
+		font-size: 10px;
+		color: #7a8694;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.credit-result-empty {
+		height: 44px;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.credit-result-empty-text {
+		font-size: 12px;
+		color: #8a97a0;
+	}
+
+	.linked-selected {
+		height: 52px;
+	}
+
+	.linked-selected-main {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.linked-selected-sub {
+		margin-top: 3px;
+		font-size: 11px;
+		color: #7a8694;
+	}
+
+	.linked-clear {
+		width: 28px;
+		height: 28px;
+		line-height: 28px;
+		text-align: center;
+		border-radius: 14px;
+		background-color: #edf2f7;
+		font-size: 16px;
+		color: #3b73d9;
+		font-weight: bold;
+	}
+
+	.installment-row {
+		flex-direction: row;
+		align-items: flex-start;
+		justify-content: space-between;
+	}
+
+	.installment-field {
+		width: 31%;
+	}
+
+	.installment-input {
+		width: 100%;
+		height: 42px;
+		text-align: center;
+	}
+
+	.installment-note {
+		margin-top: 5px;
+		font-size: 10px;
+		color: #8a97a0;
+		text-align: center;
+		lines: 2;
+	}
+
+	.installment-tip {
+		margin-top: 8px;
+		font-size: 12px;
+		color: #687289;
+	}
+
+	.search-row {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.search-input {
+		flex: 1;
+	}
+
+	.search-btn {
+		width: 70px;
+		height: 46px;
+		border-radius: 12px;
+		background-color: #3b73d9;
+		justify-content: center;
+		align-items: center;
+		margin-left: 8px;
+	}
+
+	.search-btn-text {
+		font-size: 13px;
+		color: #ffffff;
+		font-weight: bold;
+	}
+
+	.market-result-list {
+		margin-top: 8px;
+		background-color: #ffffff;
+		border-radius: 12px;
+		overflow: hidden;
+		border-width: 1px;
+		border-color: #e8eef6;
+	}
+
+	.market-result {
+		padding: 10px 12px;
+		border-bottom-width: 1px;
+		border-bottom-color: #eef2f6;
+	}
+
+	.market-result-name {
+		font-size: 14px;
+		font-weight: bold;
+		color: #1f2d3d;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.market-result-code,
+	.quote-tip {
+		font-size: 12px;
+		color: #7a8694;
+		margin-top: 4px;
+	}
+
+	.holding-name-input {
+		height: 30px;
+		background-color: transparent;
+		padding: 0 2px;
+		font-size: 12px;
+		color: #1f2d3d;
+		margin-top: 6px;
+	}
+
+	.holding-search-meta {
+		font-size: 12px;
+		color: #7a8694;
+		margin-top: 2px;
+	}
+
+	.entry-switch {
+		flex-direction: row;
+		width: 180px;
+		height: 30px;
+		border-radius: 15px;
+		background-color: #edf2f7;
+		padding: 3px;
+		margin-bottom: 8px;
+	}
+
+	.entry-switch-item {
+		flex: 1;
+		height: 24px;
+		border-radius: 12px;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.entry-switch-active {
+		background-color: #ffffff;
+	}
+
+	.entry-switch-text {
+		font-size: 12px;
+		color: #7a8694;
+		font-weight: bold;
+	}
+
+	.entry-switch-text-active {
+		color: #3b73d9;
+	}
+
+	.amount-input-row {
+		flex-direction: row;
+		align-items: center;
+		height: 46px;
+		border-radius: 12px;
+		background-color: #ffffff;
+		padding: 0 14px;
+	}
+
+	.invest-amount-unit-row {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.invest-mini-input {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.unit-input-row {
+		height: 46px;
+		border-radius: 12px;
+		background-color: #ffffff;
+		padding: 0 12px;
+		margin-left: 8px;
+		justify-content: center;
+	}
+
+	.amount-symbol {
+		font-size: 18px;
+		color: #3b73d9;
+		font-weight: bold;
+		margin-right: 8px;
+	}
+
+	.amount-input {
+		flex: 1;
+		height: 46px;
+		background-color: transparent;
+		padding: 0;
+		font-size: 18px;
+		font-weight: bold;
+	}
+
+	.unit-input {
+		height: 46px;
+		background-color: transparent;
+		padding: 0;
+		font-size: 16px;
+		font-weight: bold;
+		color: #1f2d3d;
+	}
+
+	.account-pay-row {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.account-pay-select {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.pay-select {
+		margin-left: 8px;
+	}
+
+	.account-pay-text {
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.toggle-block {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+		background-color: #ffffff;
+		border-radius: 12px;
+		padding: 12px 14px;
+		margin-top: 4px;
+		margin-bottom: 8px;
+	}
+
+	.toggle-info {
+		flex: 1;
+		margin-right: 10px;
+	}
+
+	.toggle-title {
+		font-size: 15px;
+		color: #1f2d3d;
+		font-weight: bold;
+		margin-bottom: 2px;
+	}
+
+	.toggle-desc {
+		font-size: 12px;
+		color: #97a1ac;
+	}
+
+	.sheet-footer {
+		margin-top: 14px;
+	}
+
+	.save-btn {
+		height: 50px;
+		border-radius: 25px;
+		background-color: #3b73d9;
+		color: #ffffff;
+		font-size: 16px;
+		font-weight: bold;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.finance-page,
+	.asset-page {
+		padding-top: 8px;
+	}
+
+	.finance-summary,
+	.asset-total-card {
+		background-color: rgba(255, 255, 255, 0.62);
+		border-radius: 16px;
+		padding: 16px;
+		margin: 0 14px 12px 14px;
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.72);
+		box-shadow: 0 12px 28px rgba(44, 62, 92, 0.10);
+	}
+
+	.finance-summary {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+	}
+
+	.summary-label,
+	.asset-total-label {
+		font-size: 12px;
+		color: #748097;
+		margin-bottom: 6px;
+	}
+
+	.summary-amount,
+	.asset-total-amount {
+		font-size: 28px;
+		font-weight: bold;
+		color: #243152;
+	}
+
+	.note-switch {
+		height: 34px;
+		padding: 0 14px;
+		border-radius: 17px;
+		background-color: rgba(59, 115, 217, 0.14);
+		border-width: 1px;
+		border-color: rgba(59, 115, 217, 0.16);
+		justify-content: center;
+		align-items: center;
+	}
+
+	.note-switch-text {
+		font-size: 13px;
+		color: #3b73d9;
+		font-weight: bold;
+	}
+
+	.finance-tab-scroll {
+		height: 44px;
+		flex-direction: row;
+		white-space: nowrap;
+		margin-bottom: 10px;
+	}
+
+	.finance-sub-tab {
+		height: 34px;
+		flex-shrink: 0;
+		padding: 0 14px;
+		margin-right: 8px;
+		border-radius: 17px;
+		background-color: rgba(255, 255, 255, 0.48);
+		justify-content: center;
+		align-items: center;
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.62);
+	}
+
+	.finance-sub-tab-active {
+		background-color: rgba(255, 255, 255, 0.72);
+		border-color: rgba(59, 115, 217, 0.22);
+	}
+
+	.finance-sub-tab-text {
+		font-size: 13px;
+		color: #687782;
+	}
+
+	.finance-sub-tab-text-active {
+		color: #3b73d9;
+		font-weight: bold;
+	}
+
+	.holding-header,
+	.holding-row {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.holding-header {
+		padding: 6px 4px;
+	}
+
+	.holding-header-text,
+	.holding-header-num {
+		font-size: 12px;
+		color: #8a97a0;
+	}
+
+	.holding-header-text {
+		flex: 1;
+	}
+
+	.holding-header-num {
+		width: 82px;
+		text-align: right;
+	}
+
+	.holding-row {
+		min-height: 70px;
+		padding: 12px 4px;
+		border-bottom-width: 1px;
+		border-bottom-color: rgba(15, 23, 42, 0.06);
+	}
+
+	.holding-icon {
+		width: 34px;
+		height: 34px;
+		border-radius: 17px;
+		background-color: #e8f3f1;
+		justify-content: center;
+		align-items: center;
+		margin-right: 10px;
+	}
+
+	.holding-icon-text {
+		font-size: 17px;
+	}
+
+	.holding-info {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.holding-name {
+		font-size: 14px;
+		font-weight: bold;
+		color: #1f2d3d;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.holding-code {
+		font-size: 11px;
+		color: #8a97a0;
+		margin-top: 3px;
+	}
+
+	.holding-note {
+		margin-top: 8px;
+	}
+
+	.holding-note-input {
+		height: 32px;
+		border-radius: 8px;
+		background-color: #ffffff;
+		padding: 0 10px;
+		font-size: 12px;
+		color: #1f2d3d;
+		border-width: 1px;
+		border-color: rgba(59, 115, 217, 0.16);
+	}
+
+	.holding-value {
+		width: 82px;
+		text-align: right;
+		font-size: 14px;
+		font-weight: bold;
+		color: #243152;
+	}
+
+	.holding-profit {
+		width: 74px;
+		align-items: flex-end;
+	}
+
+	.holding-profit-text {
+		font-size: 14px;
+		font-weight: bold;
+	}
+
+	.profit-up {
+		color: #16a34a;
+	}
+
+	.profit-down {
+		color: #e11d48;
+	}
+
+	.asset-total-row {
+		flex-direction: row;
+		margin-top: 12px;
+	}
+
+	.asset-total-sub {
+		font-size: 12px;
+		color: #758097;
+		margin-right: 16px;
+	}
+
+	.asset-tabs {
+		flex-direction: row;
+		background-color: rgba(255, 255, 255, 0.42);
+		border-radius: 12px;
+		padding: 4px;
+		margin: 0 14px 14px 14px;
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.58);
+	}
+
+	.asset-tab {
+		flex: 1;
+		height: 32px;
+		border-radius: 9px;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.asset-tab-active {
+		background-color: rgba(255, 255, 255, 0.72);
+		box-shadow: 0 6px 14px rgba(44, 62, 92, 0.08);
+	}
+
+	.asset-tab-text {
+		font-size: 13px;
+		color: #6b7785;
+	}
+
+	.asset-tab-text-active {
+		color: #3b73d9;
+		font-weight: bold;
+	}
+
+	.asset-deck-list {
+		flex-direction: column;
+	}
+
+	.asset-deck-block {
+		margin-bottom: 16px;
+	}
+
+	.asset-deck-title-row {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+		padding: 0 18px;
+		margin-bottom: 8px;
+	}
+
+	.asset-deck-title {
+		font-size: 16px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.asset-deck-total {
+		font-size: 14px;
+		font-weight: bold;
+		color: #3b73d9;
+	}
+
+	.asset-deck {
+		position: relative;
+		overflow: visible;
+		padding: 0;
+	}
+
+	.asset-deck-frame {
+		margin: 0;
+		border-radius: 0;
+		overflow: visible;
+		background-color: transparent;
+	}
+
+	.asset-deck-card {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+		height: 143px;
+		padding: 14px 14px 14px 11px;
+		border-radius: 19px;
+		background-color: #ffffff;
+		border-width: 1px;
+		border-color: #edf2f7;
+		box-shadow: 0 14px 26px rgba(44, 62, 92, 0.16);
+	}
+
+	.asset-card-rail {
+		width: 44px;
+		height: 112px;
+		justify-content: flex-start;
+		align-items: center;
+		margin-right: 12px;
+		border-radius: 15px;
+		background-color: #f5f8fc;
+		border-width: 1px;
+		border-color: #e8eef6;
+		padding-top: 9px;
+	}
+
+	.asset-card-icon {
+		width: 30px;
+		height: 30px;
+		border-radius: 10px;
+		background-color: #ffffff;
+		border-width: 1px;
+		border-color: #e7edf5;
+		justify-content: center;
+		align-items: center;
+		margin-bottom: 7px;
+	}
+
+	.asset-card-icon-text {
+		font-size: 15px;
+	}
+
+	.asset-card-vertical {
+		font-size: 10px;
+		line-height: 12px;
+		color: #738099;
+		font-weight: bold;
+		text-align: center;
+	}
+
+	.asset-card-main {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.asset-card-name {
+		font-size: 14px;
+		font-weight: bold;
+		color: #1b2846;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.asset-card-sub {
+		font-size: 12px;
+		color: #8a97a0;
+		margin-top: 5px;
+	}
+
+	.asset-card-right {
+		align-items: flex-end;
+		margin-left: 8px;
+	}
+
+	.asset-card-value {
+		font-size: 14px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.asset-card-tag {
+		font-size: 11px;
+		color: #3b73d9;
+		margin-top: 5px;
+	}
+
+	.invest-account-overlay {
+		position: fixed;
+		left: 0;
+		right: 0;
+		top: 0;
+		bottom: 0;
+		background-color: rgba(15, 23, 42, 0.28);
+		z-index: 3000;
+		justify-content: center;
+		align-items: center;
+		padding: 18px;
+	}
+
+	.invest-account-dialog {
+		width: 100%;
+		padding: 18px;
+		border-radius: 14px;
+		background-color: #ffffff;
+	}
+
+	.invest-account-dialog-title {
+		font-size: 17px;
+		font-weight: bold;
+		color: #1b2846;
+		margin-bottom: 14px;
+	}
+
+	.invest-account-mode-row {
+		flex-direction: row;
+		height: 34px;
+		padding: 3px;
+		border-radius: 12px;
+		background-color: #edf2f7;
+		margin-bottom: 12px;
+	}
+
+	.invest-account-mode-item {
+		flex: 1;
+		border-radius: 9px;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.invest-account-mode-active {
+		background-color: #ffffff;
+	}
+
+	.invest-account-mode-text {
+		font-size: 13px;
+		color: #7a8694;
+		font-weight: bold;
+	}
+
+	.invest-account-mode-text-active {
+		color: #0d6e6e;
+	}
+
+	.invest-account-dialog-row {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.invest-account-dialog-input {
+		height: 42px;
+		padding: 0 11px;
+		border-radius: 10px;
+		background-color: #f5f7fb;
+		border-width: 1px;
+		border-color: #e3e8f2;
+		font-size: 14px;
+		color: #1b2846;
+	}
+
+	.invest-account-name-input {
+		flex: 1;
+		margin-right: 8px;
+	}
+
+	.invest-account-no-input {
+		width: 112px;
+	}
+
+	.invest-account-money-row {
+		margin-top: 12px;
+		flex-direction: row;
+	}
+
+	.invest-account-money-card {
+		flex: 1;
+		margin-right: 8px;
+		padding: 10px;
+		border-radius: 10px;
+		background-color: #f5f7fb;
+		border-width: 1px;
+		border-color: #e3e8f2;
+	}
+
+	.invest-account-money-card-last {
+		margin-right: 0;
+	}
+
+	.invest-account-money-label {
+		font-size: 12px;
+		color: #6d7790;
+		margin-bottom: 6px;
+	}
+
+	.invest-account-money-input-row {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.invest-account-money-symbol {
+		font-size: 14px;
+		color: #22304f;
+		margin-right: 3px;
+	}
+
+	.invest-account-money-input {
+		flex: 1;
+		height: 30px;
+		font-size: 17px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.invest-account-dialog-actions {
+		margin-top: 16px;
+		flex-direction: row;
+	}
+
+	.invest-account-dialog-cancel,
+	.invest-account-dialog-submit {
+		flex: 1;
+		height: 42px;
+		border-radius: 10px;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.invest-account-dialog-cancel {
+		margin-right: 10px;
+		background-color: #eef2f7;
+	}
+
+	.invest-account-dialog-submit {
+		background-color: #0d6e6e;
+	}
+
+	.invest-account-dialog-cancel-text {
+		font-size: 14px;
+		color: #526078;
+	}
+
+	.invest-account-dialog-submit-text {
+		font-size: 14px;
+		font-weight: bold;
+		color: #ffffff;
+	}
+</style>

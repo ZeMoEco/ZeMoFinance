@@ -1,0 +1,72 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "c:\\Users\\zoneX\\AppData\\Roaming\\HBuilder X\\extensions\\launcher\\agc-certs\\1778860327305.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001B5F4915767D6893E84695445DC112EF482F82D56C2C626BDF0E90805E3BF94779FC2E8F5F41FCDD",
+          "profile": "c:\\Users\\zoneX\\AppData\\Roaming\\HBuilder X\\extensions\\launcher\\agc-certs\\1778860327305.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "c:\\Users\\zoneX\\AppData\\Roaming\\HBuilder X\\extensions\\launcher\\agc-certs\\1778860327305.p12",
+          "storePassword": "0000001B5F4915767D6893E84695445DC112EF482F82D56C2C626BDF0E90805E3BF94779FC2E8F5F41FCDD"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "compatibleSdkVersion": "5.0.1(13)",
+        "compatibleSdkVersionStage": "beta6",
+        "runtimeOS": "HarmonyOS",
+        "targetSdkVersion": "6.1.0(23)",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      },
+      {
+        "name": "release",
+        "signingConfig": "release",
+        "compatibleSdkVersion": "5.0.1(13)",
+        "compatibleSdkVersionStage": "beta6",
+        "runtimeOS": "HarmonyOS",
+        "targetSdkVersion": "6.1.0(23)",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug"
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default",
+            "release"
+          ]
+        }
+      ]
+    }
+  ]
+}

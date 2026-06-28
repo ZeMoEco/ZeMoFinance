@@ -1,0 +1,2738 @@
+import { Node, Log, Attachment, NodeType, RelationalEdgeType, LogAction, GraphRelationType, ContextEdgeStatus, LogOwnerType } from '../../utils/types/index.uts';
+import { NodeService } from '../graph/NodeService.uts';
+import { LogService } from '../graph/LogService.uts';
+import { AttachmentService } from '../graph/AttachmentService.uts';
+import { DB, SqlArgs } from '@/utils/DB/DB.uts';
+import { NoteBiz } from './NoteBiz.uts';
+import { UserBiz } from './UserBiz.uts';
+import { genId } from '@/utils/common/id.uts';
+
+type JsonObject = any;
+
+export type CreateTaskPayload = {
+  parent_id?: string | null,
+  title: string,
+  description?: string | null,
+  status?: string | null,
+  priority?: number | null,
+  difficulty?: number | null,
+  entity_type?: string | null,
+  repeat_rule?: string | null,
+  metadata?: any | null,
+  start_at?: number,
+  end_at?: number,
+  tags?: string[],
+  contexts?: ContextPayload[],
+};
+
+export type ContextPayload = {
+  relation_type: GraphRelationType | string,
+  target_id?: string | null,
+  context_key?: string | null,
+  status?: ContextEdgeStatus | string | null,
+  secondary_category?: string | null,
+  properties?: string | null,
+};
+
+export type ListContextEdgeFilters = {
+  status?: string | null,
+  secondary_category?: string | null,
+  page?: number,
+  pageSize?: number,
+};
+
+export type UpdateContextEdgePayload = {
+  status?: ContextEdgeStatus | string | null,
+  context_key?: string | null,
+  secondary_category?: string | null,
+  properties?: string | null,
+};
+
+export type CreateNodeWithContextsResult = {
+  nodeId: string,
+  edgeIds: string[],
+};
+
+export type UpdateTaskPayload = {
+  title?: string,
+  description?: string | null,
+  status?: string,
+  priority?: number,
+  difficulty?: number,
+  repeat_rule?: string | null,
+  metadata?: any | null,
+  start_at?: number,
+  end_at?: number,
+  tags?: string[],
+};
+
+export type Task = {
+  id: string,
+  parent_id: string | null,
+  title: string,
+  description: string | null,
+  status: string,
+  priority: number,
+  difficulty: number,
+  entity_type: string,
+  repeat_rule: string | null,
+  metadata: string | null,
+  total_duration: number,
+  start_at: number,
+  end_at: number,
+  tags: string[],
+  created_at: number,
+  updated_at: number,
+};
+
+export type CreateSubtaskPayload = {
+  title: string,
+  description?: string | null,
+  status?: string | null,
+  priority?: number | null,
+  difficulty?: number | null,
+  repeat_rule?: string | null,
+  metadata?: any | null,
+  start_at?: number,
+  end_at?: number,
+  tags?: string[],
+  contexts?: ContextPayload[],
+};
+
+export type CreateSubtaskResult = {
+  nodeId: string,
+  edgeId: string,
+};
+
+export type SubtaskListResult = {
+  tasks: Task[],
+  total: number,
+};
+
+export type TaskLog = {
+  id: string,
+  task_id: string,
+  parent_log_id: string | null,
+  type: string,
+  content: string | null,
+  media_paths: string[],
+  created_at: number,
+  sync_block_id?: string | null,
+  source_log_id?: string | null,
+  sync_block_content?: string | null,
+  source_log_created_at?: number | null,
+  source_deleted?: boolean,
+};
+
+export type CreateStorageItemPayload = {
+  item_name: string,
+  note?: string | null,
+  amount?: number | null,
+  expiry_date?: string | null,
+  attachments?: string[],
+  source_task_id?: string | null,
+  source_task_title?: string | null,
+};
+
+export type StorageItem = {
+  id: string,
+  location_task_id: string,
+  location_task_title: string,
+  item_name: string,
+  note: string | null,
+  amount: number | null,
+  expiry_date: string | null,
+  source_task_id: string | null,
+  source_task_title: string | null,
+  cover_path: string | null,
+  attachment_paths: string[],
+  created_at: number,
+  updated_at: number,
+};
+
+export type StorageLink = {
+  location_task_id: string,
+  item_task_id: string,
+};
+
+export type TreeNode = {
+  id: string,
+  parent_id: string | null,
+  title: string,
+  status: string,
+  priority: number,
+  difficulty: number,
+  children: TreeNode[],
+  data: Task,
+  expanded?: boolean,
+  start_at?: number,
+  end_at?: number,
+};
+
+export type TaskItem = {
+  node: Node,
+  status: string,
+};
+
+export type TaskOverviewStats = {
+  total_tasks: number,
+  active_tasks: number,
+  completed_tasks: number,
+  completion_rate: number,
+};
+
+export type ContextStatistics = {
+  relation_type: string,
+  total: number,
+  todo: number,
+  in_progress: number,
+  done: number,
+  archived: number,
+  abandoned: number,
+  byStatus: Map<string, number>,
+  byCategory: Map<string, number>,
+  trend: Map<string, number>,
+};
+
+export type ContextStatisticsTimeRange = {
+  startAt?: number | null,
+  endAt?: number | null,
+};
+
+export type TaskDetail = {
+  node: Node,
+  status: string,
+  logs: Log[],
+  attachments: Attachment[],
+  subTasks: TaskItem[],
+};
+
+export type TaskCompleteResult = {
+  success: boolean,
+  reward: any | null,
+};
+
+export type TaskActionOpts = {
+  isLoop?: boolean,
+  nextDate?: string,
+  nextTime?: string,
+  typeIndex?: number,
+  archiveProgress?: boolean,
+};
+
+export class TaskBiz {
+  static readonly DEFAULT_CATEGORIES: string[] = ['烹饪', '学习', '购物', '收纳'];
+  static readonly DEFAULT_CATEGORY: string = '学习';
+  static readonly DEFAULT_GROUPS: string[] = ['全部', '学习', '工作', '生活', '其他'];
+  static readonly GROUP_PREFIX: string = 'group:';
+  private static taskCache: Task[] = [] as Task[];
+
+  private static nextTaskId(): string {
+    return genId('tsk');
+  }
+
+  private static nextEdgeId(suffix: string | null = null): string {
+    const base = genId('edge');
+    const safeSuffix = suffix == null ? '' : suffix.toString().trim();
+    return safeSuffix == '' ? base : `${base}_${safeSuffix}`;
+  }
+
+  private static nextLogId(): string {
+    return genId('log');
+  }
+
+  private static nextAttachmentId(): string {
+    return genId('att');
+  }
+
+  private static createJsonObject(value: any | null = null): JsonObject {
+    return value == null ? {} as JsonObject : value as JsonObject;
+  }
+
+  private static jsonGetString(obj: JsonObject, key: string): string | null {
+    if (obj == null) return null;
+    const value = obj[key];
+    return value == null ? null : value.toString();
+  }
+
+  private static jsonGetNumber(obj: JsonObject, key: string): number | null {
+    if (obj == null) return null;
+    const value = obj[key];
+    if (value == null) return null;
+    if (typeof value == 'number') return value;
+    const parsed = parseFloat(value.toString());
+    return isNaN(parsed) ? null : parsed;
+  }
+
+  private static jsonGetBoolean(obj: JsonObject, key: string): boolean | null {
+    if (obj == null) return null;
+    const value = obj[key];
+    if (value == null) return null;
+    if (typeof value == 'boolean') return value;
+    const text = value.toString().trim().toLowerCase();
+    if (text == 'true' || text == '1') return true;
+    if (text == 'false' || text == '0') return false;
+    return null;
+  }
+
+  private static jsonGetArray(obj: JsonObject, key: string): any[] | null {
+    if (obj == null) return null;
+    const value = obj[key];
+    if (value == null || !Array.isArray(value)) return null;
+    return value as any[];
+  }
+
+  private static jsonSet(obj: JsonObject, key: string, value: any): void {
+    if (obj == null) return;
+    obj[key] = value;
+  }
+
+  private static normalizeStatusValue(rawStatus: string | null): string {
+    const raw = rawStatus == null ? '' : rawStatus.toString().trim().toLowerCase();
+    if (raw == '' || raw == 'pending' || raw == '0' || raw == '1') return 'todo';
+    if (raw == 'inprogress' || raw == 'in-progress') return 'in_progress';
+    if (raw == 'completed' || raw == '2') return 'done';
+    if (raw == '3') return 'archived';
+    return raw;
+  }
+
+  private static isActiveTaskStatus(status: string): boolean {
+    const normalized = this.normalizeStatusValue(status);
+    return normalized != 'done' && normalized != 'archived' && normalized != 'abandoned';
+  }
+
+  private static toSafeString(value: any | null, fallback: string = ''): string {
+    if (value == null) return fallback;
+    const text = value.toString();
+    return text == 'null' ? fallback : text;
+  }
+
+  private static toSafeNumber(value: any | null, fallback: number = 0): number {
+    if (value == null) return fallback;
+    const n = parseInt(value.toString());
+    return isNaN(n) ? fallback : n;
+  }
+
+  private static normalizeContextStatus(rawStatus: string | null): string {
+    const normalized = this.normalizeStatusValue(rawStatus);
+    if (normalized == '') return ContextEdgeStatus.Todo.toString();
+    return normalized;
+  }
+
+  private static inferDefaultContexts(tags: string[] | null = null): ContextPayload[] {
+    if (tags == null || tags.length == 0) return [] as ContextPayload[];
+    const contexts = [] as ContextPayload[];
+
+    for (let i = 0; i < tags.length; i++) {
+      const tag = tags[i] == null ? '' : tags[i].toString().trim();
+      if (tag == '') continue;
+
+      if (tag == 'category:烹饪') {
+        contexts.push({ relation_type: GraphRelationType.ContextCooking, status: ContextEdgeStatus.Todo } as ContextPayload);
+        break;
+      }
+      if (tag == 'category:购物') {
+        contexts.push({ relation_type: GraphRelationType.ContextShopping, status: ContextEdgeStatus.Todo } as ContextPayload);
+        break;
+      }
+      if (tag == 'category:收纳' || tag == 'category:整理') {
+        contexts.push({ relation_type: GraphRelationType.ContextOrganizing, status: ContextEdgeStatus.Todo } as ContextPayload);
+        break;
+      }
+      if (tag == 'category:记账' || tag == 'category:财务') {
+        contexts.push({ relation_type: GraphRelationType.ContextFinance, status: ContextEdgeStatus.Todo } as ContextPayload);
+        break;
+      }
+    }
+
+    return contexts;
+  }
+
+  private static inferContextRelationTypeFromCategory(category: string): GraphRelationType | null {
+    const cat = (category ?? '').toString().trim();
+    if (cat == '烹饪') return GraphRelationType.ContextCooking;
+    if (cat == '购物') return GraphRelationType.ContextShopping;
+    if (cat == '收纳' || cat == '整理') return GraphRelationType.ContextOrganizing;
+    if (cat == '记账' || cat == '财务') return GraphRelationType.ContextFinance;
+    return null;
+  }
+
+  private static inferPrimaryContextRelationFromTask(task: Task | null): GraphRelationType | null {
+    const category = this.getTaskCategory(task);
+    return this.inferContextRelationTypeFromCategory(category);
+  }
+
+  private static sameStringArray(a: string[] | null, b: string[] | null): boolean {
+    if (a == null && b == null) return true;
+    if (a == null || b == null) return false;
+    if (a.length != b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if ((a[i] ?? '') != (b[i] ?? '')) return false;
+    }
+    return true;
+  }
+
+  private static async findLatestContextEdgeId(taskId: string, relationType: GraphRelationType | string, includeDeleted: boolean = false): Promise<string | null> {
+    const deletedClause = includeDeleted ? '' : 'AND is_deleted = 0';
+    const rows = await DB.query(
+      `SELECT id
+       FROM edges
+       WHERE source_id = ?
+         AND relation_type = ?
+         ${deletedClause}
+       ORDER BY updated_at DESC, created_at DESC
+       LIMIT 1`,
+      [taskId, relationType.toString()]
+    );
+    if (rows.length == 0) return null;
+    const id = rows[0].get('id')?.toString() ?? '';
+    return id == '' ? null : id;
+  }
+
+  public static async ensureTaskContextEdge(taskId: string, relationType: GraphRelationType | string, initialStatus: ContextEdgeStatus | string = ContextEdgeStatus.Todo): Promise<string | null> {
+    const relation = relationType.toString();
+    const normalizedStatus = this.normalizeContextStatus(initialStatus.toString());
+
+    const existing = await this.findLatestContextEdgeId(taskId, relation, false);
+    if (existing != null && existing != '') return existing;
+
+    // Unique index on (source_id, target_id, relation_type) can block re-insert after soft delete.
+    // Prefer reviving the latest historical edge before attempting a new insert.
+    const deletedEdge = await this.findLatestContextEdgeId(taskId, relation, true);
+    if (deletedEdge != null && deletedEdge != '') {
+      const revived = await DB.exec(
+        `UPDATE edges
+         SET is_deleted = 0,
+             status = ?,
+             updated_at = ?
+         WHERE id = ?`,
+        [normalizedStatus, Date.now(), deletedEdge]
+      );
+      if (revived) return deletedEdge;
+    }
+
+    const now = Date.now();
+    const edgeId = this.nextEdgeId('ctx');
+    await DB.exec(
+      `INSERT OR IGNORE INTO edges (id, source_id, target_id, relation_type, context_key, status, secondary_category, rank, properties, created_at, updated_at, is_deleted)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+      [
+        edgeId,
+        taskId,
+        taskId,
+        relation,
+        null,
+        normalizedStatus,
+        null,
+        '500',
+        '',
+        now,
+        now
+      ]
+    );
+
+    const inserted = await this.findLatestContextEdgeId(taskId, relation, false);
+    return inserted == null || inserted == '' ? null : inserted;
+  }
+
+  public static async addTaskContextLog(taskId: string, relationType: GraphRelationType | string, action: string, content: string, attachments: string[] = [] as string[]): Promise<string | null> {
+    const edgeId = await this.ensureTaskContextEdge(taskId, relationType);
+    if (edgeId == null || edgeId == '') return null;
+    return await this.addContextLog(edgeId, action, content, attachments);
+  }
+
+  public static async addTaskContextLogByCategory(taskId: string, action: string, content: string, attachments: string[] = [] as string[]): Promise<string | null> {
+    const task = await this.getTask(taskId);
+    const relation = this.inferPrimaryContextRelationFromTask(task);
+    if (relation == null) {
+      const log = await this.addNodeLog(taskId, action, content, attachments);
+      return log == null ? null : log.id;
+    }
+    return await this.addTaskContextLog(taskId, relation, action, content, attachments);
+  }
+
+  public static async setTaskContextStatus(taskId: string, status: ContextEdgeStatus | string, relationType: GraphRelationType | string | null = null, reason: string | null = null): Promise<boolean> {
+    let relation = relationType == null ? null : relationType.toString();
+    if (relation == null || relation == '') {
+      const task = await this.getTask(taskId);
+      const inferred = this.inferPrimaryContextRelationFromTask(task);
+      relation = inferred == null ? '' : inferred.toString();
+    }
+
+    const normalized = this.normalizeContextStatus(status.toString());
+    if (relation == '') {
+      return await this.updateTask(taskId, { status: normalized } as UpdateTaskPayload);
+    }
+
+    const edgeId = await this.ensureTaskContextEdge(taskId, relation);
+    if (edgeId == null || edgeId == '') return false;
+
+    const edgeOk = await this.updateContextEdge(edgeId, {
+      status: normalized
+    } as UpdateContextEdgePayload);
+    if (!edgeOk) return false;
+
+    const text = (reason ?? '').toString().trim() == '' ? `状态更新为 ${normalized}` : reason!.toString();
+    const logId = await this.addContextLog(edgeId, 'status_change', text, [] as string[]);
+    if (logId == null) return false;
+
+    return await this.updateTask(taskId, { status: normalized } as UpdateTaskPayload);
+  }
+
+  private static buildTaskNodeProperties(payload: CreateTaskPayload, status: string): string {
+    const props = this.createJsonObject({
+      status: status,
+      description: payload.description ?? '',
+      start_at: payload.start_at ?? 0,
+      end_at: payload.end_at ?? 0,
+      repeat_rule: payload.repeat_rule ?? null,
+      tags: payload.tags ?? ([] as string[]),
+      metadata: payload.metadata == null ? null : payload.metadata.toString(),
+      priority: payload.priority ?? 0,
+      difficulty: payload.difficulty ?? 0
+    });
+    return JSON.stringify(props);
+  }
+
+  public static async createNodeWithContexts(payload: CreateTaskPayload, contexts: ContextPayload[] = [] as ContextPayload[]): Promise<CreateNodeWithContextsResult | null> {
+    const type = payload.entity_type == 'note' ? NodeType.Note : NodeType.Task;
+    if (type == NodeType.Note && payload.parent_id != null && payload.parent_id != '') {
+      console.warn('[TaskBiz] blocked note creation with parent_id; use NoteBiz REFERENCES flow instead.');
+      return null;
+    }
+    const status = this.normalizeStatusValue(payload.status ?? ContextEdgeStatus.Todo.toString());
+    const nodeProps = this.buildTaskNodeProperties(payload, status);
+
+    const normalizedContexts = contexts.length > 0
+      ? contexts
+      : this.inferDefaultContexts(payload.tags ?? null);
+
+    const maxAttempts = 5;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const now = Date.now();
+      const id = this.nextTaskId();
+      const edgeIds = [] as string[];
+      try {
+        await DB.beginTransaction();
+
+        const nodeOk = await DB.exec(
+          `INSERT INTO nodes (id, type, status, content, properties, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+          [id, type.toString(), status, payload.title, nodeProps, now, now]
+        );
+        if (!nodeOk) throw new Error('create node failed');
+
+        if (payload.parent_id != null && payload.parent_id != '') {
+          const parentEdgeId = this.nextEdgeId('parent');
+          const parentOk = await DB.exec(
+            `INSERT INTO edges (id, source_id, target_id, relation_type, status, rank, properties, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+            [
+              parentEdgeId,
+              payload.parent_id,
+              id,
+              RelationalEdgeType.ContainsTaskTree.toString(),
+              this.normalizeContextStatus(ContextEdgeStatus.Todo.toString()),
+              '500',
+              '',
+              now,
+              now
+            ]
+          );
+          if (!parentOk) throw new Error('bind parent edge failed');
+        }
+
+        for (let i = 0; i < normalizedContexts.length; i++) {
+          const ctx = normalizedContexts[i];
+          const relationType = (ctx.relation_type ?? '').toString().trim();
+          if (relationType == '') continue;
+
+          const edgeId = this.nextEdgeId(i.toString());
+          const targetId = ctx.target_id != null && ctx.target_id != '' ? ctx.target_id : id;
+          const contextStatus = this.normalizeContextStatus(ctx.status == null ? ContextEdgeStatus.Todo.toString() : ctx.status.toString());
+          const contextKey = ctx.context_key == null || ctx.context_key == '' ? null : ctx.context_key;
+          const secondaryCategory = ctx.secondary_category == null || ctx.secondary_category == '' ? null : ctx.secondary_category;
+          const contextProps = ctx.properties == null ? '' : ctx.properties.toString();
+
+          const edgeOk = await DB.exec(
+            `INSERT INTO edges (id, source_id, target_id, relation_type, context_key, status, secondary_category, rank, properties, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+            [edgeId, id, targetId, relationType, contextKey, contextStatus, secondaryCategory, '500', contextProps, now, now]
+          );
+          if (!edgeOk) throw new Error('create context edge failed');
+          edgeIds.push(edgeId);
+        }
+
+        const createLog = await LogService.recordOwnedLogAsync(
+          LogOwnerType.Node,
+          id,
+          LogAction.Create,
+          `Created task: ${payload.title}`
+        );
+        if (createLog == null) throw new Error('create node log failed');
+
+        await DB.setTransactionSuccessful();
+        return {
+          nodeId: id,
+          edgeIds: edgeIds
+        } as CreateNodeWithContextsResult;
+      } catch (e) {
+        if (attempt >= maxAttempts - 1) {
+          console.error('[TaskBiz] createNodeWithContexts failed', e);
+          return null;
+        }
+      } finally {
+        await DB.endTransaction();
+      }
+    }
+
+    return null;
+  }
+  private static rowToNode(row: Map<string, any | null>): Node {
+    const rawType = this.toSafeString(row.get('type')).toUpperCase();
+    const nodeType = rawType.indexOf('NOTE') >= 0 ? NodeType.Note : NodeType.Task;
+    return {
+      id: this.toSafeString(row.get('id')),
+      type: nodeType,
+      status: this.toSafeString(row.get('status'), 'todo'),
+      content: this.toSafeString(row.get('content')),
+      properties: this.toSafeString(row.get('properties'), ''),
+      due_at: this.toSafeNumber(row.get('due_at'), 0),
+      completed_at: this.toSafeNumber(row.get('completed_at'), 0),
+      is_deleted: this.toSafeNumber(row.get('is_deleted'), 0),
+      created_at: this.toSafeNumber(row.get('created_at'), Date.now()),
+      updated_at: this.toSafeNumber(row.get('updated_at'), Date.now())
+    } as Node;
+  }
+
+  private static async queryTaskNodes(): Promise<Node[]> {
+    const sql = `SELECT * FROM nodes WHERE is_deleted = 0 AND UPPER(COALESCE(type, '')) LIKE '%TASK%' ORDER BY created_at DESC`;
+    const rows = await DB.query(sql);
+    const nodes = [] as Node[];
+    for (let i = 0; i < rows.length; i++) {
+      nodes.push(this.rowToNode(rows[i]));
+    }
+    return nodes;
+  }
+
+  private static async queryNodeById(id: string): Promise<Node | null> {
+    const rows = await DB.query(`SELECT * FROM nodes WHERE id = ? AND is_deleted = 0 LIMIT 1`, [id]);
+    if (rows.length == 0) return null;
+    return this.rowToNode(rows[0]);
+  }
+
+  public static async init(): Promise<void> {
+    return;
+  }
+
+  private static parseNodeProps(node: Node): JsonObject {
+    const merged = this.createJsonObject({
+      status: 'todo',
+      description: '',
+      start_at: 0,
+      end_at: 0,
+      total_duration: 0,
+      repeat_rule: null,
+      tags: [] as string[],
+      metadata: null,
+      priority: 0,
+      difficulty: 0
+    });
+
+    const raw = node.properties;
+    if (raw != null && raw != '') {
+      try {
+        const parsed = JSON.parse(raw) as JsonObject;
+        const description = this.jsonGetString(parsed, 'description');
+        const repeatRule = this.jsonGetString(parsed, 'repeat_rule');
+        const metadata = this.jsonGetString(parsed, 'metadata');
+        const startAt = this.jsonGetNumber(parsed, 'start_at');
+        const endAt = this.jsonGetNumber(parsed, 'end_at');
+        const totalDuration = this.jsonGetNumber(parsed, 'total_duration');
+        const priority = this.jsonGetNumber(parsed, 'priority');
+        const difficulty = this.jsonGetNumber(parsed, 'difficulty');
+        const tags = this.jsonGetArray(parsed, 'tags');
+
+        if (description != null) this.jsonSet(merged, 'description', description);
+        if (repeatRule != null) this.jsonSet(merged, 'repeat_rule', repeatRule);
+        if (metadata != null) this.jsonSet(merged, 'metadata', metadata);
+        if (startAt != null) this.jsonSet(merged, 'start_at', startAt);
+        if (endAt != null) this.jsonSet(merged, 'end_at', endAt);
+        if (totalDuration != null) this.jsonSet(merged, 'total_duration', totalDuration);
+        if (priority != null) this.jsonSet(merged, 'priority', priority);
+        if (difficulty != null) this.jsonSet(merged, 'difficulty', difficulty);
+        if (tags != null) this.jsonSet(merged, 'tags', tags);
+
+        const parsedStatus = this.jsonGetString(parsed, 'status');
+        if (parsedStatus != null && parsedStatus != '') this.jsonSet(merged, 'status', this.normalizeStatusValue(parsedStatus));
+      } catch (_e) {}
+    }
+
+    if (node.status != null && node.status != '') {
+      this.jsonSet(merged, 'status', this.normalizeStatusValue(node.status));
+    }
+
+    return merged;
+  }
+
+  private static inferAttachmentType(path: string): string {
+    const lower = path.toLowerCase();
+    if (
+      lower.endsWith('.jpg') ||
+      lower.endsWith('.jpeg') ||
+      lower.endsWith('.png') ||
+      lower.endsWith('.gif') ||
+      lower.endsWith('.webp') ||
+      lower.endsWith('.bmp')
+    ) {
+      return 'image';
+    }
+    if (
+      lower.endsWith('.mp4') ||
+      lower.endsWith('.mov') ||
+      lower.endsWith('.mkv') ||
+      lower.endsWith('.avi') ||
+      lower.endsWith('.webm')
+    ) {
+      return 'video';
+    }
+    return 'document';
+  }
+
+  private static async queryParentMap(): Promise<Map<string, string>> {
+    const map = new Map<string, string>();
+    const rows = await DB.query(
+      `SELECT source_id, target_id, relation_type
+       FROM edges
+       WHERE is_deleted = 0
+         AND (
+           relation_type IN (?, ?)
+           OR relation_type LIKE 'meal_plan_recipe:%'
+         )
+       ORDER BY created_at DESC`,
+      [RelationalEdgeType.ContainsTaskTree.toString(), RelationalEdgeType.Contains.toString()]
+    );
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const sourceId = this.toSafeString(row.get('source_id'));
+      const targetId = this.toSafeString(row.get('target_id'));
+      const relationType = this.toSafeString(row.get('relation_type')).toUpperCase();
+      if (sourceId == '' || targetId == '') continue;
+
+      // rows 已按 created_at DESC 排序：首次命中的即最新父关系，后续旧关系不应覆盖。
+      if (!map.has(targetId) && relationType == RelationalEdgeType.ContainsTaskTree.toString()) {
+        map.set(targetId, sourceId);
+      } else if (!map.has(targetId)) {
+        map.set(targetId, sourceId);
+      }
+    }
+
+    return map;
+  }
+
+  private static mapNodeToTask(node: Node, parentId: string | null = null): Task {
+    const obj = this.parseNodeProps(node);
+    const tags = [] as string[];
+    const rawTags = this.jsonGetArray(obj, 'tags');
+    if (rawTags != null) {
+      for (let i = 0; i < rawTags.length; i++) {
+        tags.push((rawTags[i] as string) ?? '');
+      }
+    }
+
+    const resolvedParentId = parentId != null && parentId != '' ? parentId : null;
+
+    const nodeStatus = this.normalizeStatusValue(
+      node.status != null && node.status != '' ? node.status : (this.jsonGetString(obj, 'status') ?? 'todo')
+    );
+
+    return {
+      id: node.id,
+      parent_id: resolvedParentId,
+      title: node.content,
+      description: this.jsonGetString(obj, 'description'),
+      status: nodeStatus,
+      priority: this.jsonGetNumber(obj, 'priority') ?? 0,
+      difficulty: this.jsonGetNumber(obj, 'difficulty') ?? 0,
+      entity_type: (node.type == NodeType.Note ? 'note' : 'task'),
+      repeat_rule: this.jsonGetString(obj, 'repeat_rule'),
+      metadata: this.jsonGetString(obj, 'metadata'),
+      total_duration: this.jsonGetNumber(obj, 'total_duration') ?? 0,
+      start_at: this.jsonGetNumber(obj, 'start_at') ?? 0,
+      end_at: this.jsonGetNumber(obj, 'end_at') ?? 0,
+      tags: tags,
+      created_at: node.created_at,
+      updated_at: node.updated_at
+    } as Task;
+  }
+
+  public static async createTaskItem(payload: CreateTaskPayload): Promise<TaskItem | null> {
+    const createRes = await this.createNodeWithContexts(payload, payload.contexts ?? ([] as ContextPayload[]));
+    if (createRes == null) return null;
+
+    const node = await this.queryNodeById(createRes.nodeId);
+    if (node == null) return null;
+
+    const props = this.parseNodeProps(node);
+    return { node: node, status: this.jsonGetString(props, 'status') ?? ContextEdgeStatus.Todo.toString() } as TaskItem;
+  }
+
+  public static async createTask(payload: CreateTaskPayload): Promise<string | null> {
+    const createRes = await this.createNodeWithContexts(payload, payload.contexts ?? ([] as ContextPayload[]));
+    if (createRes == null) return null;
+
+    const now = Date.now();
+    const id = createRes.nodeId;
+    const status = this.normalizeStatusValue(payload.status ?? ContextEdgeStatus.Todo.toString());
+
+    this.taskCache.unshift({
+      id: id,
+      parent_id: payload.parent_id ?? null,
+      title: payload.title,
+      description: payload.description ?? null,
+      status: status,
+      priority: payload.priority ?? 0,
+      difficulty: payload.difficulty ?? 0,
+      entity_type: (payload.entity_type == 'note' ? 'note' : 'task'),
+      repeat_rule: payload.repeat_rule ?? null,
+      metadata: payload.metadata == null ? null : payload.metadata.toString(),
+      total_duration: 0,
+      start_at: payload.start_at ?? 0,
+      end_at: payload.end_at ?? 0,
+      tags: payload.tags ?? ([] as string[]),
+      created_at: now,
+      updated_at: now
+    } as Task);
+
+    console.log('[TaskBiz] createTask ok id=', id, 'status=', status, 'title=', payload.title);
+    uni.$emit('task-updated', { id: id, action: 'create' });
+    return id;
+  }
+
+  public static getTaskList(statusFilter: string | null = null): TaskItem[] {
+    const nodes = this.taskCache;
+    const result = [] as TaskItem[];
+    const normalizedFilter = statusFilter == null ? null : this.normalizeStatusValue(statusFilter);
+    for (let i = 0; i < nodes.length; i++) {
+      const task = nodes[i];
+      if (normalizedFilter == null || this.normalizeStatusValue(task.status) == normalizedFilter) {
+        result.push({
+          node: {
+            id: task.id,
+            type: task.entity_type == 'note' ? NodeType.Note : NodeType.Task,
+            status: task.status,
+            content: task.title,
+            properties: task.metadata,
+            created_at: task.created_at,
+            updated_at: task.updated_at
+          } as Node,
+          status: task.status
+        } as TaskItem);
+      }
+    }
+    return result;
+  }
+
+  public static async getAllTasks(): Promise<Task[]> {
+    const nodes = await this.queryTaskNodes();
+    const parentMap = await this.queryParentMap();
+    const list = nodes.map((n) => this.mapNodeToTask(n, parentMap.get(n.id) ?? null));
+    this.taskCache = list;
+    return list;
+  }
+
+  public static async getTask(id: string): Promise<Task | null> {
+    const n = await this.queryNodeById(id);
+    if (n == null) return null;
+    const parentMap = await this.queryParentMap();
+    return this.mapNodeToTask(n, parentMap.get(id) ?? null);
+  }
+
+  public static async getFocusTasks(): Promise<Task[]> {
+    const all = await this.getAllTasks();
+    const taskById = new Map<string, Task>();
+    for (let i = 0; i < all.length; i++) taskById.set(all[i].id, all[i]);
+
+    const activeRows = await DB.query(
+      `SELECT DISTINCT source_id
+       FROM edges
+       WHERE relation_type LIKE 'context:%'
+         AND is_deleted = 0
+         AND status IN ('todo', 'in_progress')`
+    );
+
+    const activeById = new Map<string, Task>();
+    for (let i = 0; i < activeRows.length; i++) {
+      const id = activeRows[i].get('source_id')?.toString() ?? '';
+      if (id == '') continue;
+      const task = taskById.get(id);
+      if (task != null) activeById.set(id, task);
+    }
+
+    // Fallback to legacy node-status logic when no context edge is available.
+    if (activeById.size == 0) {
+      for (let i = 0; i < all.length; i++) {
+        const t = all[i];
+        if (this.isActiveTaskStatus(t.status) && !this.isStorageEntityTask(t)) activeById.set(t.id, t);
+      }
+    } else {
+      for (let i = 0; i < all.length; i++) {
+        const t = all[i];
+        if (this.isStorageEntityTask(t)) activeById.delete(t.id);
+      }
+    }
+
+    // Keep finished parent visible when direct child is still active.
+    const displayById = new Map<string, Task>();
+    for (let i = 0; i < all.length; i++) {
+      const t = all[i];
+      if (activeById.has(t.id)) displayById.set(t.id, t);
+    }
+    for (let i = 0; i < all.length; i++) {
+      const entry = all[i];
+      if (!activeById.has(entry.id)) continue;
+      const parentId = entry.parent_id ?? '';
+      if (parentId == '') continue;
+      const parent = taskById.get(parentId);
+      if (parent == null) continue;
+      const parentStatus = this.normalizeStatusValue(parent.status);
+      if (parentStatus == 'done' || parentStatus == 'abandoned') {
+        displayById.set(parent.id, parent);
+      }
+    }
+
+    const focus = [] as Task[];
+    const activeList = [] as Task[];
+    for (let i = 0; i < all.length; i++) {
+      const t = all[i];
+      if (displayById.has(t.id)) activeList.push(t);
+    }
+
+    for (let i = 0; i < activeList.length; i++) {
+      const entry = activeList[i];
+      if (entry.parent_id == null || entry.parent_id == '') {
+        focus.push(entry);
+        continue;
+      }
+      const parent = displayById.get(entry.parent_id);
+      if (parent == null) focus.push(entry);
+    }
+
+    console.log('[TaskBiz] getFocusTasks all=', all.length, 'focus=', focus.length);
+    return focus;
+  }
+
+  public static async getGlobalTaskOverview(): Promise<TaskOverviewStats> {
+    const totalRows = await DB.query(
+      `SELECT COUNT(*) as c
+       FROM nodes
+       WHERE is_deleted = 0
+         AND UPPER(COALESCE(type, '')) LIKE '%TASK%'`
+    );
+    const totalTasks = parseInt(totalRows[0]?.get('c')?.toString() ?? '0');
+
+    const activeRows = await DB.query(
+      `SELECT COUNT(DISTINCT source_id) as c
+       FROM edges
+       WHERE relation_type LIKE 'context:%'
+         AND is_deleted = 0
+         AND status IN ('todo', 'in_progress')`
+    );
+    const activeTasks = parseInt(activeRows[0]?.get('c')?.toString() ?? '0');
+
+    const completedRows = await DB.query(
+      `SELECT COUNT(*) as c
+       FROM (
+         SELECT source_id
+         FROM edges
+         WHERE relation_type LIKE 'context:%' AND is_deleted = 0
+         GROUP BY source_id
+         HAVING SUM(CASE WHEN status IN ('done', 'archived') THEN 0 ELSE 1 END) = 0
+       ) t`
+    );
+    let completedTasks = parseInt(completedRows[0]?.get('c')?.toString() ?? '0');
+
+    if (completedTasks == 0) {
+      const fallbackRows = await DB.query(
+        `SELECT COUNT(*) as c
+         FROM nodes
+         WHERE is_deleted = 0
+           AND UPPER(COALESCE(type, '')) LIKE '%TASK%'
+           AND LOWER(COALESCE(status, '')) IN ('done', 'completed', 'archived')`
+      );
+      completedTasks = parseInt(fallbackRows[0]?.get('c')?.toString() ?? '0');
+    }
+
+    const rateBase = totalTasks > 0 ? totalTasks : 1;
+    const completionRate = Math.floor((completedTasks * 100.0) / rateBase).toInt();
+
+    return {
+      total_tasks: isNaN(totalTasks) ? 0 : totalTasks,
+      active_tasks: isNaN(activeTasks) ? 0 : activeTasks,
+      completed_tasks: isNaN(completedTasks) ? 0 : completedTasks,
+      completion_rate: isNaN(completionRate) ? 0 : completionRate,
+    } as TaskOverviewStats;
+  }
+
+  public static async getContextStatistics(
+    relationType: GraphRelationType | string,
+    timeRange: ContextStatisticsTimeRange | null = null,
+    groupBy: string = 'day'
+  ): Promise<ContextStatistics> {
+    const relation = relationType.toString();
+    const startAt = timeRange?.startAt ?? null;
+    const endAt = timeRange?.endAt ?? null;
+    const useMonth = groupBy == 'month';
+
+    const rows = await DB.query(
+      `SELECT
+         COUNT(*) as total,
+         SUM(CASE WHEN status = 'todo' THEN 1 ELSE 0 END) as todo,
+         SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress,
+         SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as done,
+         SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END) as archived,
+         SUM(CASE WHEN status = 'abandoned' THEN 1 ELSE 0 END) as abandoned
+       FROM edges
+       WHERE relation_type = ?
+         AND is_deleted = 0
+         AND (? IS NULL OR created_at >= ?)
+         AND (? IS NULL OR created_at <= ?)`,
+      [relation, startAt, startAt, endAt, endAt]
+    );
+
+    const statusRows = await DB.query(
+      `SELECT LOWER(COALESCE(status, 'unknown')) as status_key, COUNT(*) as c
+       FROM edges
+       WHERE relation_type = ?
+         AND is_deleted = 0
+         AND (? IS NULL OR created_at >= ?)
+         AND (? IS NULL OR created_at <= ?)
+       GROUP BY LOWER(COALESCE(status, 'unknown'))`,
+      [relation, startAt, startAt, endAt, endAt]
+    );
+
+    const categoryRows = await DB.query(
+      `SELECT COALESCE(NULLIF(TRIM(secondary_category), ''), '(none)') as category_key, COUNT(*) as c
+       FROM edges
+       WHERE relation_type = ?
+         AND is_deleted = 0
+         AND (? IS NULL OR created_at >= ?)
+         AND (? IS NULL OR created_at <= ?)
+       GROUP BY COALESCE(NULLIF(TRIM(secondary_category), ''), '(none)')
+       ORDER BY c DESC`,
+      [relation, startAt, startAt, endAt, endAt]
+    );
+
+    const trendRows = await DB.query(
+      `SELECT
+         strftime(?, datetime(created_at / 1000, 'unixepoch', 'localtime')) as bucket_key,
+         COUNT(*) as c
+       FROM edges
+       WHERE relation_type = ?
+         AND is_deleted = 0
+         AND (? IS NULL OR created_at >= ?)
+         AND (? IS NULL OR created_at <= ?)
+       GROUP BY bucket_key
+       ORDER BY bucket_key ASC`,
+      [useMonth ? '%Y-%m' : '%Y-%m-%d', relation, startAt, startAt, endAt, endAt]
+    );
+
+    const row = rows.length > 0 ? rows[0] : new Map<string, any | null>();
+    const byStatus = new Map<string, number>();
+    const byCategory = new Map<string, number>();
+    const trend = new Map<string, number>();
+
+    for (let i = 0; i < statusRows.length; i++) {
+      const key = statusRows[i].get('status_key')?.toString() ?? 'unknown';
+      const count = this.toSafeNumber(statusRows[i].get('c'), 0);
+      byStatus.set(key, count);
+    }
+
+    for (let i = 0; i < categoryRows.length; i++) {
+      const key = categoryRows[i].get('category_key')?.toString() ?? '(none)';
+      const count = this.toSafeNumber(categoryRows[i].get('c'), 0);
+      byCategory.set(key, count);
+    }
+
+    for (let i = 0; i < trendRows.length; i++) {
+      const key = trendRows[i].get('bucket_key')?.toString() ?? '';
+      if (key == '') continue;
+      const count = this.toSafeNumber(trendRows[i].get('c'), 0);
+      trend.set(key, count);
+    }
+
+    return {
+      relation_type: relation,
+      total: this.toSafeNumber(row.get('total'), 0),
+      todo: this.toSafeNumber(row.get('todo'), 0),
+      in_progress: this.toSafeNumber(row.get('in_progress'), 0),
+      done: this.toSafeNumber(row.get('done'), 0),
+      archived: this.toSafeNumber(row.get('archived'), 0),
+      abandoned: this.toSafeNumber(row.get('abandoned'), 0),
+      byStatus,
+      byCategory,
+      trend,
+    } as ContextStatistics;
+  }
+
+  public static async getEntitiesByCategory(category: string): Promise<Task[]> {
+    const all = await this.getAllTasks();
+    return all.filter((t) => this.getTaskCategory(t) == category);
+  }
+
+  public static getTaskCategory(task: Task | null): string {
+    if (task == null) return this.DEFAULT_CATEGORY;
+    for (let i = 0; i < task.tags.length; i++) {
+      const tag = task.tags[i];
+      if (tag.indexOf('category:') == 0) {
+        const c = tag.substring(9).trim();
+        if (c != '') return c;
+      }
+    }
+    return this.DEFAULT_CATEGORY;
+  }
+
+  public static async setTaskCategory(taskId: string, category: string): Promise<boolean> {
+    const t = await this.getTask(taskId);
+    if (t == null) return false;
+    const nextTags = t.tags.filter((x) => x.indexOf('category:') != 0);
+    nextTags.push(`category:${category}`);
+    return await this.updateTask(taskId, { tags: nextTags } as UpdateTaskPayload);
+  }
+
+  public static async updateTask(nodeId: string, payload: UpdateTaskPayload): Promise<boolean> {
+    const node = await this.queryNodeById(nodeId);
+    if (node == null) return false;
+
+    const obj = this.parseNodeProps(node);
+    const prevTitle = node.content;
+    const prevStatus = this.normalizeStatusValue(node.status != null && node.status != '' ? node.status : (this.jsonGetString(obj, 'status') ?? 'todo'));
+    const prevDescription = this.jsonGetString(obj, 'description') ?? '';
+    const prevRepeatRule = this.jsonGetString(obj, 'repeat_rule') ?? '';
+    const prevStartAt = this.jsonGetNumber(obj, 'start_at') ?? 0;
+    const prevEndAt = this.jsonGetNumber(obj, 'end_at') ?? 0;
+    const prevPriority = this.jsonGetNumber(obj, 'priority') ?? 0;
+    const prevDifficulty = this.jsonGetNumber(obj, 'difficulty') ?? 0;
+    const prevMetadata = this.jsonGetString(obj, 'metadata') ?? '';
+    const prevTagsRaw = this.jsonGetArray(obj, 'tags');
+    const prevTags = [] as string[];
+    if (prevTagsRaw != null) {
+      for (let i = 0; i < prevTagsRaw.length; i++) {
+        prevTags.push(prevTagsRaw[i]?.toString() ?? '');
+      }
+    }
+
+    const normalizedPayloadStatus = payload.status != null ? this.normalizeStatusValue(payload.status) : null;
+    if (normalizedPayloadStatus != null) this.jsonSet(obj, 'status', normalizedPayloadStatus);
+    if (payload.description != null) this.jsonSet(obj, 'description', payload.description);
+    if (payload.repeat_rule != null) this.jsonSet(obj, 'repeat_rule', payload.repeat_rule);
+    if (payload.start_at != null) this.jsonSet(obj, 'start_at', payload.start_at);
+    if (payload.end_at != null) this.jsonSet(obj, 'end_at', payload.end_at);
+    if (payload.priority != null) this.jsonSet(obj, 'priority', payload.priority);
+    if (payload.difficulty != null) this.jsonSet(obj, 'difficulty', payload.difficulty);
+    if (payload.tags != null) this.jsonSet(obj, 'tags', payload.tags);
+    if (payload.metadata != null) this.jsonSet(obj, 'metadata', payload.metadata.toString());
+
+    const nextTitle = payload.title != null && payload.title != '' ? payload.title : node.content;
+    const nextStatus = normalizedPayloadStatus != null && normalizedPayloadStatus != ''
+      ? normalizedPayloadStatus
+      : prevStatus;
+    this.jsonSet(obj, 'status', nextStatus);
+
+    const now = Date.now();
+    const sql = `UPDATE nodes SET content = ?, status = ?, properties = ?, completed_at = CASE WHEN ? IN ('done','completed') THEN COALESCE(completed_at, ?) ELSE completed_at END, updated_at = ? WHERE id = ?`;
+    const ok = await DB.exec(sql, [
+      nextTitle,
+      nextStatus,
+      JSON.stringify(obj),
+      nextStatus,
+      now,
+      now,
+      nodeId
+    ]);
+
+    if (ok) {
+      if (nextTitle != prevTitle) {
+        await this.addNodeFactLog(nodeId, 'rename', `改名: ${prevTitle} -> ${nextTitle}`);
+      }
+
+      if (nextStatus != prevStatus) {
+        if (nextStatus == 'done' || nextStatus == 'completed') {
+          await this.addNodeFactLog(nodeId, 'complete', '任务已完成');
+        } else {
+          await this.addNodeFactLog(nodeId, 'progress', `任务进展: ${prevStatus} -> ${nextStatus}`);
+        }
+      }
+    }
+
+    return ok;
+  }
+
+  public static async deleteTask(nodeId: string, hardDelete: boolean = false): Promise<boolean> {
+    void hardDelete;
+    const ok = await DB.exec('UPDATE nodes SET is_deleted = 1, updated_at = ? WHERE id = ?', [Date.now(), nodeId]);
+    if (ok) this.taskCache = this.taskCache.filter((t) => t.id != nodeId);
+    return ok;
+  }
+
+  public static async getTaskLogs(taskId: string, includeArchived: boolean = false): Promise<TaskLog[]> {
+    void includeArchived;
+
+    const sql = `
+      SELECT
+        l.id,
+        l.owner_id,
+        l.parent_log_id,
+        l.action,
+        l.text,
+        l.properties,
+        l.created_at,
+        l.sync_block_id,
+        l.source_log_id,
+        sb.content AS sync_block_content,
+        sb.properties AS sync_block_props,
+        src.created_at AS source_log_created_at,
+        src.is_deleted AS source_log_deleted
+      FROM logs l
+      LEFT JOIN nodes sb
+        ON sb.id = l.sync_block_id
+       AND sb.is_deleted = 0
+      LEFT JOIN logs src
+        ON src.id = l.source_log_id
+      WHERE l.owner_type = 'node'
+        AND l.owner_id = ?
+        AND l.is_deleted = 0
+        AND UPPER(COALESCE(l.action, '')) NOT IN ('CREATE', 'UPDATE', 'DELETE', 'MOVE', 'STATUS_CHANGE')
+      ORDER BY l.created_at DESC
+    `;
+
+    const rows = await DB.query(sql, [taskId]);
+    const list = [] as TaskLog[];
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const mediaPaths = [] as string[];
+
+      const rawLogProps = row.get('properties')?.toString() ?? '';
+      if (rawLogProps != '' && rawLogProps != 'null') {
+        try {
+          const props = JSON.parse(rawLogProps) as JsonObject;
+          const mediaArr = this.jsonGetArray(props, 'media_paths');
+          if (mediaArr != null) {
+            for (let m = 0; m < mediaArr.length; m++) {
+              const mediaPath = mediaArr[m] != null ? mediaArr[m]!.toString() : '';
+              if (mediaPath != '') mediaPaths.push(mediaPath);
+            }
+          }
+        } catch (_e) { }
+      }
+
+      const syncBlockId = row.get('sync_block_id')?.toString() ?? null;
+      const sourceLogId = row.get('source_log_id')?.toString() ?? null;
+      const syncBlockContent = row.get('sync_block_content')?.toString() ?? null;
+      const sourceLogCreatedRaw = row.get('source_log_created_at');
+      let sourceLogCreatedAt : number | null = null;
+      if (sourceLogCreatedRaw != null) {
+        const parsed = parseInt(sourceLogCreatedRaw.toString());
+        sourceLogCreatedAt = isNaN(parsed) ? null : parsed;
+      }
+
+      let sourceDeleted = false;
+      const sourceDeletedRaw = row.get('source_log_deleted');
+      if (sourceDeletedRaw != null) {
+        const sourceDeletedText = sourceDeletedRaw.toString().toLowerCase();
+        sourceDeleted = sourceDeletedText == '1' || sourceDeletedText == 'true';
+      }
+
+      const syncPropsRaw = row.get('sync_block_props')?.toString() ?? '';
+      if (syncPropsRaw != '' && syncPropsRaw != 'null') {
+        try {
+          const props = JSON.parse(syncPropsRaw) as JsonObject;
+          const propDeleted = this.jsonGetBoolean(props, 'source_deleted');
+          if (propDeleted != null && propDeleted == true) sourceDeleted = true;
+        } catch (_e) { }
+      }
+
+      const fallbackContent = row.get('text')?.toString() ?? null;
+      const content = syncBlockContent != null && syncBlockContent != ''
+        ? syncBlockContent
+        : fallbackContent;
+
+      list.push({
+        id: row.get('id')?.toString() ?? '',
+        task_id: row.get('owner_id')?.toString() ?? taskId,
+        parent_log_id: row.get('parent_log_id')?.toString() ?? null,
+        type: row.get('action')?.toString() ?? 'LOG',
+        content: content,
+        media_paths: mediaPaths,
+        created_at: parseInt(row.get('created_at')?.toString() ?? '0'),
+        sync_block_id: syncBlockId,
+        source_log_id: sourceLogId,
+        sync_block_content: syncBlockContent,
+        source_log_created_at: sourceLogCreatedAt,
+        source_deleted: sourceDeleted
+      } as TaskLog);
+    }
+
+    return list;
+  }
+
+  public static async getTaskContextLogs(taskId: string, relationType: GraphRelationType | string): Promise<TaskLog[]> {
+    const rows = await DB.query(
+      `SELECT
+        l.id,
+        l.action,
+        l.text,
+        l.properties,
+        l.parent_log_id,
+        l.sync_block_id,
+        l.source_log_id,
+        l.created_at,
+        e.source_id
+       FROM logs l
+       INNER JOIN edges e
+         ON e.id = l.owner_id
+        AND e.is_deleted = 0
+       WHERE l.owner_type = 'edge'
+         AND e.source_id = ?
+         AND e.relation_type = ?
+         AND l.is_deleted = 0
+       ORDER BY l.created_at DESC`,
+      [taskId, relationType.toString()]
+    );
+
+    const list = [] as TaskLog[];
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const mediaPaths = [] as string[];
+
+      const rawProps = row.get('properties')?.toString() ?? '';
+      if (rawProps != '' && rawProps != 'null') {
+        try {
+          const props = JSON.parse(rawProps) as JsonObject;
+          const mediaArr = this.jsonGetArray(props, 'media_paths');
+          if (mediaArr != null) {
+            for (let m = 0; m < mediaArr.length; m++) {
+              const mediaPath = mediaArr[m] != null ? mediaArr[m]!.toString() : '';
+              if (mediaPath != '') mediaPaths.push(mediaPath);
+            }
+          }
+        } catch (_e) { }
+      }
+
+      list.push({
+        id: row.get('id')?.toString() ?? '',
+        task_id: row.get('source_id')?.toString() ?? taskId,
+        parent_log_id: row.get('parent_log_id')?.toString() ?? null,
+        type: row.get('action')?.toString() ?? 'context',
+        content: row.get('text')?.toString() ?? null,
+        media_paths: mediaPaths,
+        created_at: parseInt(row.get('created_at')?.toString() ?? '0'),
+        sync_block_id: row.get('sync_block_id')?.toString() ?? null,
+        source_log_id: row.get('source_log_id')?.toString() ?? null
+      } as TaskLog);
+    }
+
+    return list;
+  }
+
+  public static isStorageItemLog(log: TaskLog | null): boolean {
+    if (log == null) return false;
+
+    const rawType = (log.type ?? '').toString().trim().toLowerCase();
+    if (rawType == 'storage' || rawType == 'storage_entry') return true;
+
+    if (
+      rawType == 'status_change' ||
+      rawType == 'restart' ||
+      rawType == 'archive' ||
+      rawType == 'abandon' ||
+      rawType == 'auto_storage' ||
+      rawType == 'auto_storage_failed' ||
+      rawType == 'auto_storage_error' ||
+      rawType == 'create' ||
+      rawType == 'update' ||
+      rawType == 'delete' ||
+      rawType == 'move'
+    ) {
+      return false;
+    }
+
+    const content = (log.content ?? '').toString();
+    if (content.trim() == '') return false;
+
+    const compact = content.replace(/\s+/g, '');
+    if (compact.indexOf('任务状态更新为') >= 0 || compact.indexOf('状态更新为') >= 0) {
+      return false;
+    }
+
+    if (
+      content.indexOf('物品名称') >= 0 ||
+      content.indexOf('储存箱') >= 0 ||
+      content.indexOf('收纳位置') >= 0 ||
+      content.indexOf('存放位置') >= 0 ||
+      content.indexOf('[自动存入]') >= 0
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  public static async getTaskStorageLogs(taskId: string): Promise<TaskLog[]> {
+    const contextLogs = await this.getTaskContextLogs(taskId, GraphRelationType.ContextOrganizing);
+    const contextStorageLogs = contextLogs.filter((log: TaskLog): boolean => this.isStorageItemLog(log));
+    if (contextStorageLogs.length > 0) return contextStorageLogs;
+
+    const nodeLogs = await this.getTaskLogs(taskId, true);
+    return nodeLogs.filter((log: TaskLog): boolean => this.isStorageItemLog(log));
+  }
+
+  public static async listTasksByContext(relationType: GraphRelationType | string, filters: ListContextEdgeFilters | null = null): Promise<Task[]> {
+    const rows = await this.listContextEdgesByType(relationType, filters);
+    if (rows.length == 0) return [] as Task[];
+
+    const parentMap = await this.queryParentMap();
+    const result = [] as Task[];
+    const seen = new Set<string>();
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const sourceId = row.get('source_id')?.toString() ?? '';
+      if (sourceId == '' || seen.has(sourceId)) continue;
+
+      const node = await this.queryNodeById(sourceId);
+      if (node == null) continue;
+
+      const task = this.mapNodeToTask(node, parentMap.get(sourceId) ?? null);
+      const edgeStatus = this.normalizeContextStatus(row.get('status')?.toString() ?? ContextEdgeStatus.Todo.toString());
+      task.status = edgeStatus;
+
+      result.push(task);
+      seen.add(sourceId);
+    }
+
+    return result;
+  }
+
+  public static async getNodeLogs(nodeId: string): Promise<Log[]> {
+    return await LogService.getNodeLogsAsync(nodeId);
+  }
+
+  public static async listContextEdgesByType(relationType: GraphRelationType | string, filters: ListContextEdgeFilters | null = null): Promise<Array<Map<string, any | null>>> {
+    let sql = `SELECT * FROM edges WHERE relation_type = ? AND is_deleted = 0`;
+    const args = [relationType.toString()] as SqlArgs;
+
+    if (filters != null) {
+      const statusFilter = filters.status;
+      if (statusFilter != null && statusFilter != '') {
+        sql += ' AND status = ?';
+        args.push(this.normalizeContextStatus(statusFilter));
+      }
+      const secondaryCategory = filters.secondary_category;
+      if (secondaryCategory != null && secondaryCategory != '') {
+        sql += ' AND secondary_category = ?';
+        args.push(secondaryCategory);
+      }
+    }
+
+    sql += ' ORDER BY updated_at DESC, created_at DESC';
+
+    if (filters != null && filters.pageSize != null && filters.pageSize > 0) {
+      const pageSize = filters.pageSize;
+      const page = filters.page != null && filters.page > 0 ? filters.page : 1;
+      const offset = (page - 1) * pageSize;
+      sql += ' LIMIT ? OFFSET ?';
+      args.push(pageSize);
+      args.push(offset);
+    }
+
+    return await DB.query(sql, args);
+  }
+
+  public static async listTaskContextRelations(taskId: string): Promise<GraphRelationType[]> {
+    const rows = await DB.query(
+      `SELECT relation_type
+       FROM edges
+       WHERE source_id = ?
+         AND relation_type LIKE 'context:%'
+         AND is_deleted = 0
+       ORDER BY updated_at DESC, created_at DESC`,
+      [taskId]
+    );
+
+    const result = [] as GraphRelationType[];
+    const seen = new Set<string>();
+    for (let i = 0; i < rows.length; i++) {
+      const raw = rows[i].get('relation_type')?.toString() ?? '';
+      if (raw == '' || seen.has(raw)) continue;
+      if (
+        raw == GraphRelationType.ContextCooking.toString() ||
+        raw == GraphRelationType.ContextShopping.toString() ||
+        raw == GraphRelationType.ContextOrganizing.toString() ||
+        raw == GraphRelationType.ContextFinance.toString()
+      ) {
+        result.push(raw as GraphRelationType);
+        seen.add(raw);
+      }
+    }
+    return result;
+  }
+
+  public static async updateContextEdge(edgeId: string, payload: UpdateContextEdgePayload): Promise<boolean> {
+    const sets = [] as string[];
+    const args: SqlArgs = [];
+
+    if (payload.status != null) {
+      sets.push('status = ?');
+      args.push(this.normalizeContextStatus(payload.status.toString()));
+    }
+    if (payload.context_key != null) {
+      sets.push('context_key = ?');
+      args.push(payload.context_key == null || payload.context_key == '' ? null : payload.context_key);
+    }
+    if (payload.secondary_category != null) {
+      sets.push('secondary_category = ?');
+      args.push(payload.secondary_category == null || payload.secondary_category == '' ? null : payload.secondary_category);
+    }
+    if (payload.properties != null) {
+      sets.push('properties = ?');
+      args.push(payload.properties == null ? '' : payload.properties.toString());
+    }
+
+    if (sets.length == 0) return true;
+    sets.push('updated_at = ?');
+    args.push(Date.now());
+    args.push(edgeId);
+
+    const sql = `UPDATE edges SET ${sets.join(', ')} WHERE id = ? AND is_deleted = 0`;
+    return await DB.exec(sql, args);
+  }
+
+  public static async addContextLog(edgeId: string, action: string, content: string, attachments: string[] = [] as string[]): Promise<string | null> {
+    const now = Date.now();
+    const id = this.nextLogId();
+    const actionText = (action ?? '').toString().trim() == '' ? 'context' : action.toString();
+    const logProps = this.serializeLogMediaProps(attachments);
+
+    try {
+      return await DB.tx(async () => {
+        const logEventId = genId('evt');
+        const ok = await DB.exec(
+          `INSERT INTO logs (id, owner_type, owner_id, action, text, timestamp, created_at, updated_at, properties, is_deleted, entity_version, last_event_id) VALUES (?, 'edge', ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+          [id, edgeId, actionText, content, now, now, now, logProps, 1, logEventId]
+        );
+        if (!ok) throw new Error('create context log failed');
+
+        const edgeRows = await DB.query(`SELECT source_id FROM edges WHERE id = ? AND is_deleted = 0 LIMIT 1`, [edgeId]);
+        const hostNodeId = edgeRows.length > 0 ? edgeRows[0].get('source_id')?.toString() ?? '' : '';
+        if (hostNodeId != '') {
+          await this.mountTaskAttachments(hostNodeId, attachments, logEventId);
+        }
+
+
+        return id;
+      });
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  public static async listContextLogs(edgeId: string, page: number = 1, pageSize: number = 20): Promise<Log[]> {
+    const safePage = page > 0 ? page : 1;
+    const safePageSize = pageSize > 0 ? pageSize : 20;
+    const offset = (safePage - 1) * safePageSize;
+
+    const rows = await DB.query(
+      `SELECT * FROM logs WHERE owner_type = 'edge' AND owner_id = ? AND is_deleted = 0 ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+      [edgeId, safePageSize, offset]
+    );
+
+    const list = [] as Log[];
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      list.push({
+        id: row.get('id')?.toString() ?? '',
+        owner_type: row.get('owner_type')?.toString() ?? 'edge',
+        owner_id: row.get('owner_id')?.toString() ?? edgeId,
+        action: row.get('action')?.toString() ?? '',
+        text: row.get('text')?.toString() ?? '',
+        parent_log_id: row.get('parent_log_id')?.toString() ?? null,
+        sync_block_id: row.get('sync_block_id')?.toString() ?? null,
+        source_log_id: row.get('source_log_id')?.toString() ?? null,
+        timestamp: parseInt(row.get('timestamp')?.toString() ?? '0'),
+        created_at: parseInt(row.get('created_at')?.toString() ?? '0'),
+        updated_at: parseInt(row.get('updated_at')?.toString() ?? '0'),
+        properties: row.get('properties')?.toString() ?? null,
+        is_deleted: parseInt(row.get('is_deleted')?.toString() ?? '0'),
+      } as Log);
+    }
+
+    return list;
+  }
+
+  public static async bindItemToLocation(locationNodeId: string, itemNodeId: string, relationType: GraphRelationType | string = GraphRelationType.StoredIn): Promise<string | null> {
+    if (locationNodeId == null || locationNodeId == '') return null;
+    if (itemNodeId == null || itemNodeId == '') return null;
+
+    const relation = relationType.toString();
+    const existing = await DB.query(
+      `SELECT id FROM edges WHERE source_id = ? AND target_id = ? AND relation_type = ? AND is_deleted = 0 LIMIT 1`,
+      [locationNodeId, itemNodeId, relation]
+    );
+    if (existing.length > 0) {
+      return existing[0].get('id')?.toString() ?? null;
+    }
+
+    const now = Date.now();
+    const edgeId = this.nextEdgeId('storage');
+    const ok = await DB.exec(
+      `INSERT INTO edges (id, source_id, target_id, relation_type, status, rank, properties, created_at, updated_at, is_deleted)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+      [edgeId, locationNodeId, itemNodeId, relation, ContextEdgeStatus.Todo.toString(), '500', '', now, now]
+    );
+
+    return ok ? edgeId : null;
+  }
+
+  public static async unbindItemFromLocation(locationNodeId: string, itemNodeId: string, relationType: GraphRelationType | string = GraphRelationType.StoredIn): Promise<boolean> {
+    if (locationNodeId == null || locationNodeId == '') return false;
+    if (itemNodeId == null || itemNodeId == '') return false;
+
+    return await DB.exec(
+      `UPDATE edges SET is_deleted = 1, updated_at = ? WHERE source_id = ? AND target_id = ? AND relation_type = ? AND is_deleted = 0`,
+      [Date.now(), locationNodeId, itemNodeId, relationType.toString()]
+    );
+  }
+
+  public static isStorageBoxTask(task: Task | null): boolean {
+    if (task == null) return false;
+    const category = this.getTaskCategory(task);
+    return category == '收纳' || category == '整理';
+  }
+
+  public static isStorageItemTask(task: Task | null): boolean {
+    if (task == null) return false;
+
+    const tags = task.tags ?? ([] as string[]);
+    for (let i = 0; i < tags.length; i++) {
+      const tag = (tags[i] ?? '').toString().trim().toLowerCase();
+      if (tag == 'scene:storage_item' || tag == 'category:物品') return true;
+    }
+
+    if (task.metadata != null && task.metadata!.trim() != '') {
+      try {
+        const metadata = JSON.parse(task.metadata!) as JsonObject;
+        const source = metadata['source'];
+        if (source != null && source.toString().trim() == 'storage_item_node') return true;
+      } catch (_e) { }
+    }
+
+    return false;
+  }
+
+  public static isStorageEntityTask(task: Task | null): boolean {
+    return this.isStorageBoxTask(task) || this.isStorageItemTask(task);
+  }
+
+  public static async getStorageLocationTaskId(itemTaskId: string): Promise<string | null> {
+    const id = (itemTaskId ?? '').toString().trim();
+    if (id == '') return null;
+
+    const rows = await DB.query(
+      `SELECT source_id
+       FROM edges
+       WHERE target_id = ?
+         AND relation_type = ?
+         AND is_deleted = 0
+       ORDER BY updated_at DESC, created_at DESC
+       LIMIT 1`,
+      [id, GraphRelationType.StoredIn.toString()]
+    );
+    if (rows.length == 0) return null;
+
+    const sourceId = rows[0].get('source_id')?.toString() ?? '';
+    if (sourceId == '') return null;
+    const sourceTask = await this.getTask(sourceId);
+    return this.isStorageBoxTask(sourceTask) ? sourceId : null;
+  }
+
+  public static async listStorageLinks(): Promise<StorageLink[]> {
+    const rows = await DB.query(
+      `SELECT source_id, target_id
+       FROM edges
+       WHERE relation_type = ?
+         AND is_deleted = 0
+       ORDER BY updated_at DESC, created_at DESC`,
+      [GraphRelationType.StoredIn.toString()]
+    );
+    if (rows.length == 0) return [] as StorageLink[];
+
+    const allTasks = await this.getAllTasks();
+    const taskById = new Map<string, Task>();
+    for (let i = 0; i < allTasks.length; i++) {
+      taskById.set(allTasks[i].id, allTasks[i]);
+    }
+
+    const links = [] as StorageLink[];
+    const seen = new Set<string>();
+
+    for (let i = 0; i < rows.length; i++) {
+      const locationId = rows[i].get('source_id')?.toString() ?? '';
+      const itemId = rows[i].get('target_id')?.toString() ?? '';
+      if (locationId == '' || itemId == '') continue;
+
+      const key = `${locationId}->${itemId}`;
+      if (seen.has(key)) continue;
+
+      const locationTask = taskById.get(locationId) ?? null;
+      const itemTask = taskById.get(itemId) ?? null;
+      if (!this.isStorageBoxTask(locationTask) || !this.isStorageItemTask(itemTask)) continue;
+
+      links.push({
+        location_task_id: locationId,
+        item_task_id: itemId,
+      } as StorageLink);
+      seen.add(key);
+    }
+
+    return links;
+  }
+
+  private static pickStorageCoverPath(paths: string[]): string | null {
+    for (let i = 0; i < paths.length; i++) {
+      const path = (paths[i] ?? '').toString().trim();
+      if (path == '') continue;
+      const lower = path.toLowerCase();
+      if (
+        lower.endsWith('.jpg') ||
+        lower.endsWith('.jpeg') ||
+        lower.endsWith('.png') ||
+        lower.endsWith('.gif') ||
+        lower.endsWith('.webp') ||
+        lower.endsWith('.bmp')
+      ) {
+        return path;
+      }
+    }
+
+    if (paths.length > 0) {
+      const fallback = (paths[0] ?? '').toString().trim();
+      return fallback == '' ? null : fallback;
+    }
+    return null;
+  }
+
+  public static async createStorageItem(locationTaskId: string, payload: CreateStorageItemPayload): Promise<string | null> {
+    const targetId = (locationTaskId ?? '').toString().trim();
+    if (targetId == '') return null;
+
+    const locationTask = await this.getTask(targetId);
+    if (!this.isStorageBoxTask(locationTask)) return null;
+
+    const itemName = (payload.item_name ?? '').toString().replace(/\s+/g, ' ').trim();
+    if (itemName == '') return null;
+
+    const note = payload.note == null ? '' : payload.note.toString().trim();
+    let amount: number | null = null;
+    if (payload.amount != null) {
+      const parsedAmount = parseFloat(payload.amount.toString());
+      if (!isNaN(parsedAmount)) amount = parsedAmount;
+    }
+    const expiryDate = payload.expiry_date == null ? '' : payload.expiry_date.toString().trim();
+    const sourceTaskId = payload.source_task_id == null ? '' : payload.source_task_id.toString().trim();
+    const sourceTaskTitle = payload.source_task_title == null ? '' : payload.source_task_title.toString().trim();
+
+    const metadataObj = this.createJsonObject({
+      source: 'storage_item_node',
+      item_name: itemName,
+      amount: amount,
+      expiry_date: expiryDate == '' ? null : expiryDate,
+      location_task_id: targetId,
+      location_task_title: (locationTask!.title ?? '').toString(),
+      source_task_id: sourceTaskId == '' ? null : sourceTaskId,
+      source_task_title: sourceTaskTitle == '' ? null : sourceTaskTitle
+    });
+
+    const now = Date.now();
+    const itemId = await this.createTask({
+      title: itemName,
+      description: note == '' ? null : note,
+      status: 'todo',
+      start_at: now,
+      end_at: now + 24 * 60 * 60 * 1000,
+      tags: ['category:物品', 'scene:storage_item'],
+      metadata: JSON.stringify(metadataObj)
+    } as CreateTaskPayload);
+    if (itemId == null || itemId == '') return null;
+
+    const bindEdgeId = await this.bindItemToLocation(targetId, itemId, GraphRelationType.StoredIn);
+    if (bindEdgeId == null || bindEdgeId == '') {
+      await this.deleteTask(itemId, true);
+      return null;
+    }
+
+    const attachments = payload.attachments ?? ([] as string[]);
+    if (attachments.length > 0) {
+      await this.mountTaskAttachments(itemId, attachments);
+    }
+
+    return itemId;
+  }
+
+  public static async listStorageItemsByLocation(locationTaskId: string): Promise<StorageItem[]> {
+    const targetId = (locationTaskId ?? '').toString().trim();
+    if (targetId == '') return [] as StorageItem[];
+
+    const locationTask = await this.getTask(targetId);
+    if (!this.isStorageBoxTask(locationTask)) return [] as StorageItem[];
+
+    const rows = await DB.query(
+      `SELECT n.*
+       FROM edges e
+       INNER JOIN nodes n
+         ON n.id = e.target_id
+        AND n.is_deleted = 0
+       WHERE e.source_id = ?
+         AND e.relation_type = ?
+         AND e.is_deleted = 0
+       ORDER BY e.updated_at DESC, e.created_at DESC`,
+      [targetId, GraphRelationType.StoredIn.toString()]
+    );
+
+    const items = [] as StorageItem[];
+    const locationTitle = (locationTask!.title ?? '').toString();
+
+    for (let i = 0; i < rows.length; i++) {
+      const node = this.rowToNode(rows[i]);
+      const itemTask = this.mapNodeToTask(node, null);
+      if (!this.isStorageItemTask(itemTask)) continue;
+
+      let itemName = (itemTask.title ?? '').toString().trim();
+      let amount: number | null = null;
+      let expiryDate: string | null = null;
+      let sourceTaskId: string | null = null;
+      let sourceTaskTitle: string | null = null;
+
+      if (itemTask.metadata != null && itemTask.metadata!.trim() != '') {
+        try {
+          const metadata = JSON.parse(itemTask.metadata!) as JsonObject;
+          const mdItemName = metadata['item_name'];
+          if (mdItemName != null && mdItemName.toString().trim() != '') itemName = mdItemName.toString().trim();
+
+          const mdAmount = metadata['amount'];
+          if (mdAmount != null) {
+            const parsedAmount = parseFloat(mdAmount.toString());
+            if (!isNaN(parsedAmount)) amount = parsedAmount;
+          }
+
+          const mdExpiryDate = metadata['expiry_date'];
+          if (mdExpiryDate != null && mdExpiryDate.toString().trim() != '') expiryDate = mdExpiryDate.toString().trim();
+
+          const mdSourceTaskId = metadata['source_task_id'];
+          if (mdSourceTaskId != null && mdSourceTaskId.toString().trim() != '') sourceTaskId = mdSourceTaskId.toString().trim();
+
+          const mdSourceTaskTitle = metadata['source_task_title'];
+          if (mdSourceTaskTitle != null && mdSourceTaskTitle.toString().trim() != '') sourceTaskTitle = mdSourceTaskTitle.toString().trim();
+        } catch (_e) { }
+      }
+
+      const attachments = await AttachmentService.getNodeAttachmentsAsync(itemTask.id);
+      const attachmentPaths = [] as string[];
+      for (let a = 0; a < attachments.length; a++) {
+        const path = (attachments[a].file_path ?? '').toString().trim();
+        if (path != '') attachmentPaths.push(path);
+      }
+
+      items.push({
+        id: itemTask.id,
+        location_task_id: targetId,
+        location_task_title: locationTitle,
+        item_name: itemName,
+        note: itemTask.description,
+        amount: amount,
+        expiry_date: expiryDate,
+        source_task_id: sourceTaskId,
+        source_task_title: sourceTaskTitle,
+        cover_path: this.pickStorageCoverPath(attachmentPaths),
+        attachment_paths: attachmentPaths,
+        created_at: itemTask.created_at,
+        updated_at: itemTask.updated_at,
+      } as StorageItem);
+    }
+
+    return items;
+  }
+
+  public static async addOrganizingLog(edgeId: string, action: string, text: string, attachments: string[] = [] as string[]): Promise<string | null> {
+    return await this.addContextLog(edgeId, action, text, attachments);
+  }
+
+  public static async addNodeFactLog(nodeId: string, action: string, text: string): Promise<string | null> {
+    const log = await this.addNodeLog(nodeId, action, text, [] as string[]);
+    return log == null ? null : log.id;
+  }
+
+  private static serializeLogMediaProps(media: string[]): string {
+    const safeMedia = [] as string[];
+    for (let i = 0; i < media.length; i++) {
+      const p = media[i] == null ? '' : media[i].toString();
+      if (p != '') safeMedia.push(p);
+    }
+
+    return JSON.stringify(this.createJsonObject({
+      media_paths: safeMedia
+    }));
+  }
+
+  private static async mountTaskAttachments(nodeId: string, attachments: string[], syncEventId: string | null = null): Promise<void> {
+    for (let i = 0; i < attachments.length; i++) {
+      const filePath = attachments[i];
+      if (filePath == null || filePath == '') continue;
+
+      const parts = filePath.split(/\\|\//);
+      const fallback = `file_${i + 1}`;
+      let fileName = fallback;
+      if (parts.length > 0) {
+        const candidate = parts[parts.length - 1];
+        if (candidate.length > 0) fileName = candidate;
+      }
+
+      const fileType = this.inferAttachmentType(filePath);
+      const attachmentId = this.nextAttachmentId();
+      await AttachmentService.mountAttachmentAsync(nodeId, fileName, filePath, 0, fileType, {
+        id: attachmentId,
+        entityVersion: 1,
+        syncEventId,
+      });
+    }
+  }
+
+  public static async addNodeLog(nodeId: string, action: string, content: string, attachments: string[] = [], parentLogId: string | null = null): Promise<Log | null> {
+    const now = Date.now();
+    const id = this.nextLogId();
+    const actionText = (action ?? '').toString().trim() == '' ? 'text' : action.toString();
+    const logProps = this.serializeLogMediaProps(attachments);
+
+    try {
+      return await DB.tx(async () => {
+        const logEventId = genId('evt');
+        const ok = await DB.exec(
+          `INSERT INTO logs (id, owner_type, owner_id, action, text, parent_log_id, timestamp, created_at, updated_at, properties, is_deleted, entity_version, last_event_id) VALUES (?, 'node', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+          [id, nodeId, actionText, content, parentLogId, now, now, now, logProps, 1, logEventId]
+        );
+        if (!ok) throw new Error('create node log failed');
+
+        await this.mountTaskAttachments(nodeId, attachments, logEventId);
+
+
+        return {
+          id: id,
+          owner_type: 'node',
+          owner_id: nodeId,
+          action: actionText,
+          text: content,
+          parent_log_id: parentLogId,
+          created_at: now,
+          updated_at: now,
+          properties: logProps
+        } as Log;
+      });
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  public static async addTaskLog(taskId: string, type: string, content: string, attachments: string[], parentLogId: string | null = null, annotation: string = 'Task Log'): Promise<string | null> {
+    void annotation;
+    const log = await this.addNodeLog(taskId, type, content, attachments, parentLogId);
+    return log == null ? null : log.id;
+  }
+
+  public static async updateTaskLog(logId: string, content: string): Promise<boolean> {
+    const sql = `UPDATE logs SET text = ?, updated_at = ? WHERE id = ?`;
+    return await DB.exec(sql, [content, Date.now(), logId]);
+  }
+
+  public static async updateTaskLogMedia(logId: string, media: string[]): Promise<boolean> {
+    const rows = await DB.query(`SELECT properties, owner_id FROM logs WHERE id = ? AND is_deleted = 0 LIMIT 1`, [logId]);
+    if (rows.length == 0) return false;
+
+    const row = rows[0];
+    const taskId = row.get('owner_id')?.toString() ?? '';
+
+    const mergedMedia = [] as string[];
+    for (let i = 0; i < media.length; i++) {
+      const item = media[i] == null ? '' : media[i].toString();
+      if (item != '') mergedMedia.push(item);
+    }
+
+    const logProps = this.serializeLogMediaProps(mergedMedia);
+    const ok = await DB.exec(`UPDATE logs SET properties = ?, updated_at = ? WHERE id = ? AND is_deleted = 0`, [logProps, Date.now(), logId]);
+    if (!ok) return false;
+
+    if (taskId != '') {
+      await this.mountTaskAttachments(taskId, mergedMedia);
+    }
+
+    return true;
+  }
+
+  public static async deleteTaskLog(logId: string): Promise<boolean> {
+    const sql = `UPDATE logs SET is_deleted = 1, updated_at = ? WHERE id = ?`;
+    return await DB.exec(sql, [Date.now(), logId]);
+  }
+
+  public static async searchAllLogs(keyword: string): Promise<TaskLog[]> {
+    const sql = `SELECT id, owner_id, parent_log_id, action, text, created_at FROM logs WHERE owner_type = 'node' AND text LIKE ? AND is_deleted = 0 ORDER BY created_at DESC`;
+    const rows = await DB.query(sql, [`%${keyword}%`]);
+    const list = [] as TaskLog[];
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      list.push({
+        id: row.get('id')?.toString() ?? '',
+        task_id: row.get('owner_id')?.toString() ?? '',
+        parent_log_id: row.get('parent_log_id')?.toString() ?? null,
+        type: row.get('action')?.toString() ?? '',
+        content: row.get('text')?.toString() ?? null,
+        media_paths: [] as string[],
+        created_at: parseInt(row.get('created_at')?.toString() ?? '0')
+      } as TaskLog);
+    }
+
+    return list;
+  }
+
+  public static async bindSubtask(parentId: string, childId: string): Promise<boolean> {
+    if (parentId == null || parentId == '' || childId == null || childId == '') return false;
+    if (parentId == childId) return false;
+
+    const clearOk = await DB.exec(
+      `DELETE FROM edges WHERE target_id = ? AND relation_type IN (?, ?)`,
+      [childId, RelationalEdgeType.ContainsTaskTree.toString(), RelationalEdgeType.Contains.toString()]
+    );
+    if (!clearOk) return false;
+
+    const now = Date.now();
+    const edgeId = this.nextEdgeId();
+    return await DB.exec(
+      `INSERT INTO edges (id, source_id, target_id, relation_type, properties, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+      [edgeId, parentId, childId, RelationalEdgeType.ContainsTaskTree.toString(), '', now]
+    );
+  }
+
+  public static async unbindSubtask(childId: string): Promise<boolean> {
+    const sql = `DELETE FROM edges WHERE target_id = ? AND relation_type IN (?, ?)`;
+    return await DB.exec(sql, [childId, RelationalEdgeType.ContainsTaskTree.toString(), RelationalEdgeType.Contains.toString()]);
+  }
+
+  public static async createSubtask(parentNodeId: string, payload: CreateSubtaskPayload): Promise<CreateSubtaskResult | null> {
+    if (parentNodeId == null || parentNodeId == '') return null;
+
+    const createdId = await this.createTask({
+      parent_id: parentNodeId,
+      title: payload.title,
+      description: payload.description ?? null,
+      status: payload.status ?? null,
+      priority: payload.priority ?? null,
+      difficulty: payload.difficulty ?? null,
+      repeat_rule: payload.repeat_rule ?? null,
+      metadata: payload.metadata ?? null,
+      start_at: payload.start_at,
+      end_at: payload.end_at,
+      tags: payload.tags ?? ([] as string[]),
+      contexts: payload.contexts ?? ([] as ContextPayload[])
+    } as CreateTaskPayload);
+    if (createdId == null || createdId == '') return null;
+
+    const edgeRows = await DB.query(
+      `SELECT id
+       FROM edges
+       WHERE source_id = ?
+         AND target_id = ?
+         AND relation_type IN (?, ?)
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [parentNodeId, createdId, RelationalEdgeType.ContainsTaskTree.toString(), RelationalEdgeType.Contains.toString()]
+    );
+    const edgeId = edgeRows.length > 0 ? (edgeRows[0].get('id')?.toString() ?? '') : '';
+    if (edgeId == '') return null;
+
+    return { nodeId: createdId, edgeId } as CreateSubtaskResult;
+  }
+
+  public static async listSubtasks(parentNodeId: string): Promise<SubtaskListResult> {
+    if (parentNodeId == null || parentNodeId == '') return { tasks: [] as Task[], total: 0 } as SubtaskListResult;
+    const tree = await this.listAllTasksAsTree(parentNodeId);
+    if (tree.length == 0) return { tasks: [] as Task[], total: 0 } as SubtaskListResult;
+    const children = tree[0].children;
+    const tasks = [] as Task[];
+    for (let i = 0; i < children.length; i++) {
+      tasks.push(children[i].data);
+    }
+    return { tasks, total: tasks.length } as SubtaskListResult;
+  }
+
+  public static async updateEntityType(id: string, entityType: string): Promise<boolean> {
+    const node = await NodeService.getNodeAsync(id);
+    if (node == null) return false;
+    return true;
+  }
+
+  public static async getNotesByTask(taskId: string): Promise<Task[]> {
+    const notes = await NoteBiz.getNotesByTaskAsync(taskId);
+    const res = [] as Task[];
+    for (let i = 0; i < notes.length; i++) {
+      const n = notes[i].node;
+      res.push({
+        id: n.id,
+        parent_id: taskId,
+        title: n.content,
+        description: n.content,
+        status: 'note',
+        priority: 0,
+        difficulty: 0,
+        entity_type: 'note',
+        repeat_rule: null,
+        metadata: null,
+        total_duration: 0,
+        start_at: 0,
+        end_at: 0,
+        tags: [] as string[],
+        created_at: n.created_at,
+        updated_at: n.updated_at
+      } as Task);
+    }
+    return res;
+  }
+
+  public static buildTaskTree(tasks: Task[]): TreeNode[] {
+    const nodeMap = new Map<string, TreeNode>();
+    const roots = [] as TreeNode[];
+
+    for (let i = 0; i < tasks.length; i++) {
+      const t = tasks[i];
+      nodeMap.set(t.id, {
+        id: t.id,
+        parent_id: t.parent_id,
+        title: t.title,
+        status: t.status,
+        priority: t.priority,
+        difficulty: t.difficulty,
+        children: [] as TreeNode[],
+        data: t,
+        expanded: true,
+        start_at: t.start_at,
+        end_at: t.end_at
+      } as TreeNode);
+    }
+
+    for (let i = 0; i < tasks.length; i++) {
+      const t = tasks[i];
+      const current = nodeMap.get(t.id);
+      if (current == null) continue;
+      if (t.parent_id != null && t.parent_id != '' && nodeMap.has(t.parent_id)) {
+        nodeMap.get(t.parent_id)!.children.push(current);
+      } else {
+        roots.push(current);
+      }
+    }
+
+    return roots;
+  }
+
+  public static findSubtree(nodes: TreeNode[], targetId: string): TreeNode | null {
+    for (let i = 0; i < nodes.length; i++) {
+      if (nodes[i].id == targetId) return nodes[i];
+      const found = this.findSubtree(nodes[i].children, targetId);
+      if (found != null) return found;
+    }
+    return null;
+  }
+
+  public static async listAllTasksAsTree(rootId: string = ''): Promise<TreeNode[]> {
+    const all = await this.getAllTasks();
+    const roots = this.buildTaskTree(all);
+    if (rootId == null || rootId == '') return roots;
+    const found = this.findSubtree(roots, rootId);
+    return found == null ? ([] as TreeNode[]) : [found];
+  }
+
+  private static shouldCountAsProgressLog(log: TaskLog): boolean {
+    const type = (log.type ?? '').toString().toLowerCase();
+    if (type == '' || type == 'restart' || type == 'archive' || type == 'abandon') return false;
+
+    const content = (log.content ?? '').toString().trim();
+    const hasMedia = log.media_paths != null && log.media_paths.length > 0;
+    return content != '' || hasMedia;
+  }
+
+  private static makeArchiveTitle(prefix: string = '归档'): string {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = (now.getMonth() + 1).toString().padStart(2, '0');
+    const d = now.getDate().toString().padStart(2, '0');
+    const hh = now.getHours().toString().padStart(2, '0');
+    const mm = now.getMinutes().toString().padStart(2, '0');
+    return `${prefix} ${y}-${m}-${d} ${hh}:${mm}`;
+  }
+
+  private static async updateTaskStatusWithContext(task: Task | null, status: string, reason: string): Promise<boolean> {
+    if (task == null) return false;
+    const relation = this.inferPrimaryContextRelationFromTask(task);
+    if (relation == null) {
+      return await this.updateTask(task.id, { status: status } as UpdateTaskPayload);
+    }
+    return await this.setTaskContextStatus(task.id, status, relation, reason);
+  }
+
+  public static async completeTask(id: string, opts: any | null = null): Promise<TaskCompleteResult> {
+    let archiveProgress = false;
+    if (opts != null) {
+      try {
+        const typed = opts as TaskActionOpts;
+        archiveProgress = typed.archiveProgress == true;
+      } catch (_e) { }
+    }
+
+    const current = await this.getTask(id);
+    if (current == null) return { success: false, reward: null } as TaskCompleteResult;
+
+    const currentStatus = this.normalizeStatusValue(current.status);
+    if (currentStatus == 'done' || currentStatus == 'archived' || currentStatus == 'abandoned') {
+      return { success: true, reward: null } as TaskCompleteResult;
+    }
+
+    let logs = await this.getTaskLogs(id, true);
+    const relation = this.inferPrimaryContextRelationFromTask(current);
+    if (relation != null) {
+      const contextLogs = await this.getTaskContextLogs(id, relation);
+      if (contextLogs.length > 0) {
+        logs = contextLogs;
+      }
+    }
+    let recordCount = 0;
+    for (let i = 0; i < logs.length; i++) {
+      if (this.shouldCountAsProgressLog(logs[i])) recordCount++;
+    }
+
+    let gain = recordCount;
+    if (gain <= 0) gain = 1;
+    if (gain > 200) gain = 200;
+
+    const ok = await this.updateTaskStatusWithContext(current, 'done', '任务状态更新为 done');
+    if (!ok) return { success: false, reward: null } as TaskCompleteResult;
+
+    if (archiveProgress) {
+      await this.addTaskLog(id, 'restart', this.makeArchiveTitle('完成归档'), [] as string[]);
+    }
+
+    let pMetadataObj = this.createJsonObject({});
+    try {
+      if (current.metadata != null && current.metadata!.trim() != '') {
+        pMetadataObj = JSON.parse(current.metadata!) as JsonObject;
+      }
+    } catch (_e) {}
+    pMetadataObj['skip_archive_on_restart'] = !archiveProgress;
+    current.metadata = JSON.stringify(pMetadataObj);
+    await this.updateTask(id, {
+      metadata: current.metadata
+    } as UpdateTaskPayload);
+
+    try {
+      if (current.metadata != null && current.metadata!.trim() != '') {
+        const metadata = JSON.parse(current.metadata!) as JsonObject;
+        const rawStoreToId = metadata['store_to_target_id'] as string | null;
+        if (rawStoreToId != null && rawStoreToId != '') {
+          let storeToId = rawStoreToId.toString().trim();
+          let storeToName = metadata['store_to_target_name'] as string | null ?? '储物箱';
+          storeToName = storeToName.toString().trim();
+          if (storeToName == '') storeToName = '储物箱';
+
+          let targetTask = await this.getTask(storeToId);
+          if (targetTask != null) {
+            const targetCategory = this.getTaskCategory(targetTask);
+            if (targetCategory != '收纳' && targetCategory != '整理') {
+              targetTask = null;
+            }
+          }
+          if (targetTask == null) {
+            const allTasks = await this.getAllTasks();
+            const expectedName = storeToName;
+            const expectedCoreName = expectedName.replace('储物箱:', '').trim();
+            for (let i = 0; i < allTasks.length; i++) {
+              const candidate = allTasks[i];
+              const category = this.getTaskCategory(candidate);
+              if (category != '收纳' && category != '整理') continue;
+              const candidateTitle = (candidate.title ?? '').toString().trim();
+              if (candidateTitle == '') continue;
+              if (candidateTitle == expectedName) {
+                targetTask = candidate;
+                break;
+              }
+              const candidateCoreName = candidateTitle.replace('储物箱:', '').trim();
+              if (expectedCoreName != '' && candidateCoreName == expectedCoreName) {
+                targetTask = candidate;
+                break;
+              }
+            }
+            if (targetTask != null) {
+              storeToId = targetTask.id;
+              if ((targetTask.title ?? '').toString().trim() != '') {
+                storeToName = targetTask.title;
+              }
+              metadata['store_to_target_id'] = storeToId;
+              metadata['store_to_target_name'] = storeToName;
+              await this.updateTask(id, {
+                metadata: JSON.stringify(metadata)
+              } as UpdateTaskPayload);
+            }
+          } else {
+            const validTitle = (targetTask.title ?? '').toString().trim();
+            if (validTitle != '') {
+              storeToName = validTitle;
+            }
+          }
+
+          if (targetTask == null) {
+            await this.addTaskLog(id, 'auto_storage_failed', `自动存入失败: 未找到目标储物箱(${storeToName})`, [] as string[]);
+          } else {
+            const sourceTitle = (current.title ?? '').toString().trim();
+            let itemName = sourceTitle.replace('日常:', '').trim();
+            if (itemName == '') itemName = sourceTitle;
+            if (itemName == '') itemName = '未命名物品';
+
+            const noteLines = [] as string[];
+            noteLines.push(`来源任务: ${sourceTitle == '' ? id : sourceTitle}`);
+            noteLines.push(this.makeArchiveTitle('存入时间'));
+
+            const createdItemId = await this.createStorageItem(storeToId, {
+              item_name: itemName,
+              note: noteLines.join('\n'),
+              source_task_id: id,
+              source_task_title: sourceTitle == '' ? null : sourceTitle,
+              attachments: [] as string[]
+            } as CreateStorageItemPayload);
+
+            if (createdItemId != null && createdItemId != '') {
+              await this.addTaskLog(id, 'auto_storage', `已自动存入储物箱: ${storeToName}`, [] as string[]);
+            } else {
+              await this.addTaskLog(id, 'auto_storage_failed', `自动存入失败: ${storeToName}`, [] as string[]);
+            }
+          }
+        }
+      }
+    } catch (e: any) {
+      try {
+        const errText = e == null ? 'unknown' : e.toString();
+        await this.addTaskLog(id, 'auto_storage_error', `自动存入异常: ${errText}`, [] as string[]);
+      } catch (_logErr) {}
+    }
+
+    const expResult = await UserBiz.addExp(gain);
+    const coinOk = await UserBiz.addCoins(gain);
+
+    const reward = this.createJsonObject({
+      exp: gain,
+      coins: gain,
+      recordCount: recordCount,
+      leveledUp: expResult.leveledUp,
+      newLevel: expResult.newLevel,
+      coinsApplied: coinOk
+    });
+
+    return { success: true, reward: reward } as TaskCompleteResult;
+  }
+
+  public static async abandonTask(id: string, opts: any | null = null): Promise<boolean> {
+    let archiveProgress = false;
+    if (opts != null) {
+      try {
+        const typed = opts as TaskActionOpts;
+        archiveProgress = typed.archiveProgress == true;
+      } catch (_e) { }
+    }
+
+    const current = await this.getTask(id);
+    const ok = await this.updateTaskStatusWithContext(current, 'abandoned', '任务状态更新为 abandoned');
+    if (ok) {
+      let pMetadataObj = this.createJsonObject({});
+      try {
+        if (current != null && current.metadata != null && current.metadata!.trim() != '') {
+          pMetadataObj = JSON.parse(current.metadata!) as JsonObject;
+        }
+      } catch (_e) {}
+      pMetadataObj['skip_archive_on_restart'] = !archiveProgress;
+      await this.updateTask(id, {
+        metadata: JSON.stringify(pMetadataObj)
+      } as UpdateTaskPayload);
+
+      if (archiveProgress) {
+        await this.addTaskLog(id, 'restart', this.makeArchiveTitle('放弃归档'), [] as string[]);
+      }
+    }
+    return ok;
+  }
+
+  public static async restartTask(id: string, title: string | null = null): Promise<boolean> {
+    const current = await this.getTask(id);
+    if (current == null) return false;
+
+    let skipArchive = false;
+    try {
+      if (current.metadata != null && current.metadata!.trim() != '') {
+        const metadataObj = JSON.parse(current.metadata!) as JsonObject;
+        if (metadataObj['skip_archive_on_restart'] == true) {
+          skipArchive = true;
+        }
+      }
+    } catch (_e) {}
+
+    const ok = await this.updateTaskStatusWithContext(current, 'todo', '任务状态更新为 todo');
+    if (ok) {
+      if (!skipArchive && title != null && title.trim() != '') {
+        await this.addTaskLog(id, 'restart', title, [] as string[]);
+      }
+
+      // Reset the skip_archive_on_restart flag in metadata for future runs
+      let metadataObj = this.createJsonObject({});
+      try {
+        if (current.metadata != null && current.metadata!.trim() != '') {
+          metadataObj = JSON.parse(current.metadata!) as JsonObject;
+        }
+      } catch (_e) {}
+      
+      if (metadataObj['skip_archive_on_restart'] == true) {
+        metadataObj['skip_archive_on_restart'] = false;
+        await this.updateTask(id, {
+          metadata: JSON.stringify(metadataObj)
+        } as UpdateTaskPayload);
+      }
+    }
+    return ok;
+  }
+
+  public static async archiveTask(id: string): Promise<boolean> {
+    const current = await this.getTask(id);
+    return await this.updateTaskStatusWithContext(current, 'archived', '任务状态更新为 archived');
+  }
+
+  public static async setTaskTime(id: string, startAt: number, endAt: number, repeatRule: string | null = null): Promise<boolean> {
+    return await this.updateTask(id, {
+      start_at: startAt,
+      end_at: endAt,
+      repeat_rule: repeatRule
+    } as UpdateTaskPayload);
+  }
+
+  private static buildMealPlanContextKey(dateStr: string, mealType: string): string {
+    return `meal_date:${dateStr}_${mealType}`;
+  }
+
+  private static buildMealPlanScheduleKey(dateStr: string, mealType: string): string {
+    return `${dateStr}_${mealType}`;
+  }
+
+  private static normalizeMealType(mealType: string): string {
+    const meal = (mealType ?? '').toString().trim();
+    if (meal == '早餐' || meal == '午餐' || meal == '晚餐' || meal == '夜宵') return meal;
+    return '早餐';
+  }
+
+  private static buildFixedMealTaskId(mealType: string): string {
+    const meal = this.normalizeMealType(mealType);
+    if (meal == '早餐') return 'meal_fixed_breakfast';
+    if (meal == '午餐') return 'meal_fixed_lunch';
+    if (meal == '晚餐') return 'meal_fixed_dinner';
+    return 'meal_fixed_late_night';
+  }
+
+  private static buildMealPlanRecipeRelationType(dateStr: string, mealType: string): string {
+    const scheduleKey = this.buildMealPlanScheduleKey(dateStr, mealType);
+    return `meal_plan_recipe:${scheduleKey}`;
+  }
+
+  private static async ensureFixedMealTask(mealType: string, taskProps: string, now: number): Promise<string | null> {
+    const meal = this.normalizeMealType(mealType);
+    const mealTaskId = this.buildFixedMealTaskId(meal);
+
+    const nodeInsertOk = await DB.exec(
+      `INSERT OR IGNORE INTO nodes (id, type, status, content, properties, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+      [mealTaskId, NodeType.Task.toString(), ContextEdgeStatus.Todo.toString(), meal, taskProps, now, now]
+    );
+    if (!nodeInsertOk) return null;
+
+    const nodeUpdateOk = await DB.exec(
+      `UPDATE nodes
+       SET status = ?, content = ?, properties = ?, updated_at = ?, is_deleted = 0
+       WHERE id = ?`,
+      [ContextEdgeStatus.Todo.toString(), meal, taskProps, now, mealTaskId]
+    );
+    if (!nodeUpdateOk) return null;
+
+    const contextEdgeId = this.nextEdgeId('ctx_fixed_meal');
+    const contextInsertOk = await DB.exec(
+      `INSERT OR IGNORE INTO edges (id, source_id, target_id, relation_type, context_key, status, secondary_category, rank, properties, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+      [
+        contextEdgeId,
+        mealTaskId,
+        mealTaskId,
+        GraphRelationType.ContextCooking.toString(),
+        'meal_fixed',
+        ContextEdgeStatus.Todo.toString(),
+        null,
+        '500',
+        '',
+        now,
+        now
+      ]
+    );
+    if (!contextInsertOk) return null;
+
+    const contextUpdateOk = await DB.exec(
+      `UPDATE edges
+       SET context_key = ?, status = ?, updated_at = ?, is_deleted = 0
+       WHERE source_id = ?
+         AND target_id = ?
+         AND relation_type = ?`,
+      [
+        'meal_fixed',
+        ContextEdgeStatus.Todo.toString(),
+        now,
+        mealTaskId,
+        mealTaskId,
+        GraphRelationType.ContextCooking.toString()
+      ]
+    );
+    if (!contextUpdateOk) return null;
+
+    return mealTaskId;
+  }
+
+  public static async saveMealPlan(dateStr: string, mealType: string, timeStr: string, triggerAt: number, recipeIds: string[]): Promise<boolean> {
+    const dateText = (dateStr ?? '').toString().trim();
+    const mealText = this.normalizeMealType(mealType);
+    if (dateText == '' || mealText == '') return false;
+
+    const uniqueRecipeIds = [] as string[];
+    for (let i = 0; i < recipeIds.length; i++) {
+      const id = recipeIds[i] == null ? '' : recipeIds[i].toString().trim();
+      if (id == '' || uniqueRecipeIds.indexOf(id) >= 0) continue;
+      uniqueRecipeIds.push(id);
+    }
+    if (uniqueRecipeIds.length == 0) return false;
+
+    const now = Date.now();
+    const safeTriggerAt = triggerAt > 0 ? triggerAt : now;
+    const endAt = safeTriggerAt + 2 * 60 * 60 * 1000;
+    const contextKey = this.buildMealPlanContextKey(dateText, mealText);
+    const scheduleKey = this.buildMealPlanScheduleKey(dateText, mealText);
+    const relationType = this.buildMealPlanRecipeRelationType(dateText, mealText);
+
+    const tags = [
+      'category:烹饪',
+      'scene:cooking_plan',
+      `meal:${mealText}`,
+      `date:${dateText}`,
+      `meal_date:${scheduleKey}`
+    ] as string[];
+
+    const metadata = this.createJsonObject({
+      source: 'cooking_planner_modal',
+      schedule_date: dateText,
+      schedule_time: timeStr,
+      meal_type: mealText,
+      schedule_key: scheduleKey,
+      selected_recipe_ids: uniqueRecipeIds,
+      recipe_count: uniqueRecipeIds.length,
+      reminder_time: safeTriggerAt,
+      reminder_alarm: true
+    });
+
+    const payload = {
+      title: mealText,
+      description: `${dateText} ${timeStr} ${mealText} 烹饪计划`,
+      status: ContextEdgeStatus.Todo.toString(),
+      repeat_rule: null,
+      metadata: JSON.stringify(metadata),
+      start_at: safeTriggerAt,
+      end_at: endAt,
+      tags: tags
+    } as CreateTaskPayload;
+    const taskProps = this.buildTaskNodeProperties(payload, ContextEdgeStatus.Todo.toString());
+
+    try {
+      await DB.beginTransaction();
+
+      const mealTaskId = await this.ensureFixedMealTask(mealText, taskProps, now);
+      if (mealTaskId == null || mealTaskId == '') throw new Error('ensure fixed meal task failed');
+
+      const clearOk = await DB.exec(
+        `UPDATE edges
+         SET is_deleted = 1, updated_at = ?
+         WHERE source_id = ?
+           AND relation_type = ?
+           AND is_deleted = 0`,
+        [now, mealTaskId, relationType]
+      );
+      if (!clearOk) throw new Error('clear old recipe edges failed');
+
+      for (let i = 0; i < uniqueRecipeIds.length; i++) {
+        const edgeId = this.nextEdgeId(`meal_${i}`);
+        const edgeProps = JSON.stringify(this.createJsonObject({
+          meal_time: timeStr,
+          trigger_at: safeTriggerAt,
+          schedule_key: scheduleKey
+        }));
+        const insertOk = await DB.exec(
+          `INSERT OR IGNORE INTO edges (id, source_id, target_id, relation_type, context_key, status, rank, properties, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+          [
+            edgeId,
+            mealTaskId,
+            uniqueRecipeIds[i],
+            relationType,
+            contextKey,
+            ContextEdgeStatus.Todo.toString(),
+            '500',
+            edgeProps,
+            now,
+            now
+          ]
+        );
+        if (!insertOk) throw new Error('create recipe edge failed');
+
+        const reviveOk = await DB.exec(
+          `UPDATE edges
+           SET context_key = ?, status = ?, rank = ?, properties = ?, updated_at = ?, is_deleted = 0
+           WHERE source_id = ? AND target_id = ? AND relation_type = ?`,
+          [
+            contextKey,
+            ContextEdgeStatus.Todo.toString(),
+            '500',
+            edgeProps,
+            now,
+            mealTaskId,
+            uniqueRecipeIds[i],
+            relationType
+          ]
+        );
+        if (!reviveOk) throw new Error('revive recipe edge failed');
+      }
+
+      const log = await LogService.recordOwnedLogAsync(
+        LogOwnerType.Node,
+        mealTaskId,
+        LogAction.Update,
+        `更新固定餐次[${mealText}]计划（${dateText}），食谱数: ${uniqueRecipeIds.length}`
+      );
+      if (log == null) throw new Error('write meal plan log failed');
+
+      await DB.setTransactionSuccessful();
+      uni.$emit('task-updated', { id: mealTaskId, action: 'meal-plan-save' });
+      return true;
+    } catch (_e) {
+      return false;
+    } finally {
+      await DB.endTransaction();
+    }
+  }
+
+  public static async getMealPlanIdsForDate(dateStr: string, mealType: string): Promise<string[]> {
+    const dateText = (dateStr ?? '').toString().trim();
+    const mealText = this.normalizeMealType(mealType);
+    if (dateText == '' || mealText == '') return [] as string[];
+
+    const mealTaskId = this.buildFixedMealTaskId(mealText);
+    if (mealTaskId == '') return [] as string[];
+
+    const contextKey = this.buildMealPlanContextKey(dateText, mealText);
+    const relationType = this.buildMealPlanRecipeRelationType(dateText, mealText);
+    const rows = await DB.query(
+      `SELECT target_id
+       FROM edges
+       WHERE source_id = ?
+         AND relation_type = ?
+         AND context_key = ?
+         AND is_deleted = 0
+       ORDER BY created_at ASC`,
+      [mealTaskId, relationType, contextKey]
+    );
+
+    const ids = [] as string[];
+    for (let i = 0; i < rows.length; i++) {
+      const targetId = rows[i].get('target_id')?.toString() ?? '';
+      if (targetId == '' || ids.indexOf(targetId) >= 0) continue;
+      ids.push(targetId);
+    }
+    return ids;
+  }
+
+  public static async getDayMeals(dateStr: string): Promise<Map<string, Task[]>> {
+    const out = new Map<string, Task[]>();
+    const meals = ['早餐', '午餐', '晚餐', '夜宵'] as string[];
+    for (let i = 0; i < meals.length; i++) {
+      out.set(meals[i], [] as Task[]);
+    }
+
+    const dateText = (dateStr ?? '').toString().trim();
+    if (dateText == '') return out;
+
+    for (let i = 0; i < meals.length; i++) {
+      const meal = meals[i];
+      const ids = await this.getMealPlanIdsForDate(dateText, meal);
+      if (ids.length == 0) continue;
+
+      const tasks = [] as Task[];
+      for (let j = 0; j < ids.length; j++) {
+        const t = await this.getTask(ids[j]);
+        if (t != null) tasks.push(t);
+      }
+      out.set(meal, tasks);
+    }
+
+    return out;
+  }
+
+  public static summarizeTitleFromText(text: string): string {
+    const raw = text == null ? '' : text.toString().trim();
+    if (raw == '') return '';
+    const firstLine = raw.split(/\n|\r/)[0];
+    return firstLine.length > 20 ? firstLine.substring(0, 20) : firstLine;
+  }
+
+  public static extractKeyPhrase(text: string): string {
+    return this.summarizeTitleFromText(text);
+  }
+
+  public static parseMetadata(metadata: string | null): JsonObject {
+    if (metadata != null && metadata != '') {
+      try {
+        return JSON.parse(metadata) as JsonObject;
+      } catch (e) {}
+    }
+    return this.createJsonObject();
+  }
+
+  public static parseShoppingContent(content: string | null): JsonObject | null {
+    if (content == null || content == '') return null;
+    try {
+      return JSON.parse(content) as JsonObject;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  public static async updateShoppingSummaryIfNeeded(taskId: string, content: string): Promise<void> {
+    return;
+  }
+
+  public static async inferTaskFromText(text: string): Promise<JsonObject> {
+    const title = this.summarizeTitleFromText(text);
+    return this.createJsonObject({
+      title: title,
+      category: this.DEFAULT_CATEGORY,
+      group: null,
+      parentId: null,
+      tags: [`category:${this.DEFAULT_CATEGORY}`]
+    });
+  }
+}

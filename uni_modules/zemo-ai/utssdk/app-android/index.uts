@@ -1,0 +1,225 @@
+/**
+ * ZeMo AI - LiteRT 2.1.0 Native LLM Engine (Hybrid Architecture)
+ * 
+ * Functions:
+ * - RTLM Engine (GenAI)
+ * - TFL3 Engine (AuxAI)
+ * - Automatic RAG (UTS Layer Orchestration)
+ * - Visual Context (UTS Layer Orchestration)
+ */
+
+import {AuxAIEngineImpl, GenAIEngineImpl}  from "uts.sdk.modules.zemoAi";
+
+// ========== 1. Engine Definitions ==========
+
+const genAi = new GenAIEngineImpl();
+const auxAi = new AuxAIEngineImpl();
+
+// Keys for Aux Models
+const KEY_EMBEDDING = "embedding";
+const KEY_VISION = "vision";
+
+// ========== 2. RAG System (UTS Implementation) ==========
+
+type KnowledgeItem = {
+    text: string;
+    vector: number[];
+}
+
+type ScoredItem = {
+    text: string;
+    score: number;
+}
+
+// In-Memory Vector Store
+const vectorStore: KnowledgeItem[] = [];
+let ragEnabledState = true;
+
+/**
+ * Add text to RAG knowledge base.
+ * Automatically computes embedding using AuxAI.
+ */
+export function addKnowledge(text: string): boolean {
+    const vectorFloatArray = auxAi.computeEmbedding(KEY_EMBEDDING, text);
+    // Convert FloatArray to number[]
+    if (vectorFloatArray.size == 0) return false;
+    
+    const vector: number[] = [];
+    for (let i = 0; i < vectorFloatArray.size; i++) {
+        vector.push(vectorFloatArray.get(i.toInt()));
+    }
+    
+    vectorStore.push({ text: text, vector: vector });
+    return true;
+}
+
+/**
+ * findContext: Cosine Similarity Search
+ */
+export function findContext(query: string, topK: number): string {
+    const queryVecFloat = auxAi.computeEmbedding(KEY_EMBEDDING, query);
+    if (queryVecFloat.size == 0) return "";
+    
+    const queryVec: number[] = [];
+    for (let i = 0; i < queryVecFloat.size; i++) queryVec.push(queryVecFloat.get(i.toInt()));
+    
+    // Calculate Scores & Sort
+    const scored: ScoredItem[] = [];
+    for (let i=0; i < vectorStore.length; i++) {
+        scored.push({
+             text: vectorStore[i].text,
+             score: cosineSimilarity(queryVec, vectorStore[i].vector)
+        } as ScoredItem);
+    }
+    
+    scored.sort((a,b) => b.score - a.score);
+    
+    // Take TopK
+    const top = scored.slice(0, Math.min(topK, scored.length));
+    if (top.length == 0) return "";
+    
+    let result = "";
+    top.forEach(item => {
+        result += item.text + "\n---\n"; 
+    });
+    return result;
+}
+
+function cosineSimilarity(v1: number[], v2: number[]): number {
+    let dot = 0.0;
+    let mag1 = 0.0;
+    let mag2 = 0.0;
+    const len = Math.min(v1.length, v2.length);
+    for(let i=0; i<len; i++) {
+        dot += v1[i] * v2[i];
+        mag1 += v1[i] * v1[i];
+        mag2 += v2[i] * v2[i];
+    }
+    if (mag1 == 0 || mag2 == 0) return 0;
+    return dot / (Math.sqrt(mag1) * Math.sqrt(mag2));
+}
+
+export function setRagEnabled(enable: boolean): void {
+    ragEnabledState = enable;
+}
+
+export function clearKnowledge(): void {
+    vectorStore.splice(0, vectorStore.length);
+}
+
+export function getKnowledgeSize(): number {
+    return vectorStore.length;
+}
+
+// ========== 3. Vision Logic (UTS Implementation) ==========
+
+/**
+ * Automatic Active Image Classification
+ */
+function processImageInternal(path: string): string {
+    console.log(`[zemo-ai][vision] classify_start image=${path}`);
+    const result = auxAi.classify(KEY_VISION, path);
+    console.log(`[zemo-ai][vision] classify_done image=${path}, result=${result}`);
+    return result;
+}
+
+export function classifyImage(path: string): string {
+    return processImageInternal(path);
+}
+
+// ========== 4. Unified Chat (Orchestrator) ==========
+
+/**
+ * Initialize RTLM
+ */
+export function initModel(modelPath: string): boolean {
+    return genAi.initModel(modelPath, true);
+}
+
+export function initModelWithNpu(modelPath: string, useNpu: boolean): boolean {
+    return genAi.initModel(modelPath, useNpu);
+}
+
+/**
+ * Initialize Aux Model
+ */
+export function loadAuxModel(key: string, modelPath: string, useNpu: boolean): boolean {
+    return auxAi.loadModel(key, modelPath, useNpu);
+}
+
+/**
+ * Main Chat Entry Point
+ */
+export function chatStream(prompt: string, callback: (text: string, done: boolean) => void): void {
+     doChat(prompt, null, callback);
+}
+
+export function chatMultiModal(prompt: string, imagePath: string, callback: (text: string, done: boolean) => void): void {
+    console.log(`[zemo-ai][chatMultiModal] start promptLength=${prompt.length}, image=${imagePath}`);
+    doChat(prompt, imagePath, callback);
+}
+
+function doChat(prompt: string, imagePath: string | null, callback: (text: string, done: boolean) => void): void {
+    // 1. Build Context (RAG)
+    let contextStr = "";
+    if (ragEnabledState) {
+        // Try finding context
+        const ctx = findContext(prompt, 2);
+        if (ctx.length > 0) {
+            contextStr = ctx;
+        }
+    }
+    
+    // 2. Build Visual Context
+    let visualStr = "";
+    if (imagePath != null) {
+        visualStr = processImageInternal(imagePath);
+    }
+    console.log(`[zemo-ai][doChat] promptLength=${prompt.length}, ragLength=${contextStr.length}, visualLength=${visualStr.length}, hasImage=${imagePath != null ? 'true' : 'false'}`);
+    
+    // 3. Construct Final Prompt
+    let finalPrompt = "";
+    if (contextStr.length > 0) {
+        finalPrompt += "[Context Info]:\n" + contextStr + "\n\n";
+    }
+    if (visualStr.length > 0) {
+        finalPrompt += "[Visual Context]: " + visualStr + "\n\n";
+    }
+    finalPrompt += "User: " + prompt;
+    
+    // 4. Send to GenAI
+    genAi.chatAsync(finalPrompt, callback);
+}
+
+export function chatWithContext(userMessage: string, systemPrompt: string, callback: (text: string, done: boolean) => void): void {
+    const fullMsg = (systemPrompt.length > 0) ? systemPrompt + "\n" + userMessage : userMessage;
+    doChat(fullMsg, null, callback);
+}
+
+export function chatSync(prompt: string): string {
+   return "Error: Use chatStream for async response"; 
+}
+
+export function setMaxTokens(tokens: number): void {
+    // No-op for now unless exposed in Engine
+}
+
+export function clearHistory(): void {
+    genAi.clearHistory();
+}
+
+export function resetModel(): void {
+    genAi.clearHistory();
+    clearKnowledge();
+}
+
+export function isModelReady(): boolean {
+    return genAi.isReady();
+}
+
+// ========== Legacy/Compat ==========
+export function invokeNativePlugin(className: string, methodName: string, argsJson: string): string {
+    return genAi.invokeNativePlugin(className, methodName, argsJson);
+}
+
+

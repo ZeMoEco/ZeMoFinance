@@ -1,0 +1,790 @@
+﻿<template>
+  <view v-if="visible" class="modal-mask" @click="close">
+    <view class="modal-content" @click.stop="">
+      <view class="cooking-handle-wrap">
+        <view class="cooking-handle"></view>
+      </view>
+
+      <view class="cooking-header">
+        <text class="cooking-title">创建烹饪任务</text>
+        <view class="cooking-close" @click="close">
+          <text class="cooking-close-text">✕</text>
+        </view>
+      </view>
+
+      <scroll-view class="cooking-scroll" scroll-y="true" :show-scrollbar="false">
+        <view class="cooking-time-row">
+          <view class="cooking-picker" @click="openCookingDatePicker">
+            <text class="cooking-picker-icon">📅</text>
+            <text class="cooking-picker-text">{{ cookingDateLabel }}</text>
+            <text class="cooking-picker-arrow">›</text>
+          </view>
+          <view class="cooking-picker" @click="openCookingTimePicker">
+            <text class="cooking-picker-icon">🕒</text>
+            <text class="cooking-picker-text">{{ cookingTimeStr }}</text>
+            <text class="cooking-picker-arrow">›</text>
+          </view>
+        </view>
+
+        <view class="cooking-meal-row">
+          <view
+            class="meal-chip"
+            :class="selectedCookingMeal == meal ? 'meal-chip-active' : ''"
+            v-for="(meal, idx) in cookingMealOptions"
+            :key="idx"
+            :style="idx == cookingMealOptions.length - 1 ? 'margin-right:0;' : ''"
+            @click="setCookingMeal(meal)"
+          >
+            <text class="meal-chip-text" :class="selectedCookingMeal == meal ? 'meal-chip-text-active' : ''">{{ meal }}</text>
+          </view>
+        </view>
+        
+        <text class="cooking-time-hint">预计完成时间</text>
+
+        <view class="cooking-section-head">
+          <text class="cooking-section-title">选择食谱</text>
+          <text class="cooking-section-link" @click="activeCookingRecipeTab = '推荐'">查看全部</text>
+        </view>
+
+        <view class="recipe-tab-row">
+          <view
+            class="recipe-tab-chip"
+            :class="activeCookingRecipeTab == tag ? 'recipe-tab-chip-active' : ''"
+            v-for="(tag, i) in cookingRecipeTabs"
+            :key="i"
+            @click="activeCookingRecipeTab = tag"
+          >
+            <text class="recipe-tab-text" :class="activeCookingRecipeTab == tag ? 'recipe-tab-text-active' : ''">{{ tag }}</text>
+          </view>
+        </view>
+
+        <view class="selected-strip" v-if="selectedCookingRecipeIds.length > 0">
+          <text class="selected-strip-title">已选 {{ selectedCookingRecipeIds.length }} 个食谱</text>
+          <scroll-view class="selected-strip-scroll" scroll-x="true" :show-scrollbar="false">
+            <view class="selected-chip" v-for="(id, k) in selectedCookingRecipeIds" :key="k">
+              <text class="selected-chip-text">{{ getCookingRecipeTitle(id) }}</text>
+            </view>
+          </scroll-view>
+        </view>
+
+        <view class="cooking-empty" v-if="cookingLoading">
+          <text class="cooking-empty-text">正在加载食谱...</text>
+        </view>
+        <view class="cooking-empty" v-else-if="filteredCookingRecipes.length == 0">
+          <text class="cooking-empty-text">暂无可选食谱，请先创建或导入食谱任务</text>
+        </view>
+        <view class="recipe-grid" v-else>
+          <view class="recipe-card" :class="isCookingRecipeSelected(recipe.id) ? 'recipe-card-active' : ''" v-for="(recipe, index) in filteredCookingRecipes" :key="index" @click="toggleCookingRecipe(recipe.id)">
+            <image class="recipe-cover" mode="aspectFill" :src="getCookingRecipeCover(recipe)"></image>
+            <view class="recipe-check" :class="isCookingRecipeSelected(recipe.id) ? 'recipe-check-active' : ''">
+              <text class="recipe-check-text" v-if="isCookingRecipeSelected(recipe.id)">✓</text>
+            </view>
+            <text class="recipe-title">{{ recipe.title }}</text>
+            <text class="recipe-sub">{{ getCookingRecipeDuration(recipe) }}</text>
+          </view>
+        </view>
+
+        <view style="height: 20px;"></view>
+      </scroll-view>
+
+      <view class="cooking-footer">
+        <view class="cooking-confirm-btn" @click="submitCookingTask">
+          <text class="cooking-confirm-text">确认创建烹饪任务</text>
+        </view>
+      </view>
+    </view>
+  </view>
+</template>
+
+<script lang="uts">
+// #ifdef APP-ANDROID
+import UTSAndroid from 'io.dcloud.uts.UTSAndroid';
+import DatePickerDialog from 'android.app.DatePickerDialog';
+import TimePickerDialog from 'android.app.TimePickerDialog';
+import Calendar from 'java.util.Calendar';
+// #endif
+
+import { Task, TaskBiz } from '@/services/biz/TaskBiz.uts';
+import { GraphRelationType } from '@/utils/types/index.uts';
+
+export default {
+  emits: ['close', 'create'],
+  props: {
+    visible: { type: Boolean, default: false },
+    parentId: { type: String, default: '' },
+    scene: { type: String, default: '' }
+  },
+  data() {
+    return {
+      cookingDateStr: '',
+      cookingTimeStr: '',
+      cookingMealOptions: ['早餐', '午餐', '晚餐', '夜宵'],
+      selectedCookingMeal: '早餐',
+      cookingRecipeTabs: ['推荐', '家常', '健身', '快手菜', '素食'],
+      activeCookingRecipeTab: '推荐',
+      cookingRecipes: [] as Task[],
+      selectedCookingRecipeIds: [] as string[],
+      cookingLoading: false,
+    }
+  },
+  computed: {
+    cookingDateLabel(): string {
+      const raw = this.cookingDateStr.trim();
+      if (raw == '') return '选择日期';
+      const now = new Date();
+      const m = (now.getMonth() + 1).toString().padStart(2, '0');
+      const d = now.getDate().toString().padStart(2, '0');
+      const today = `${now.getFullYear()}-${m}-${d}`;
+      if (raw == today) return '今天';
+      const next = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+      const nm = (next.getMonth() + 1).toString().padStart(2, '0');
+      const nd = next.getDate().toString().padStart(2, '0');
+      const tomorrow = `${next.getFullYear()}-${nm}-${nd}`;
+      if (raw == tomorrow) return '明天';
+      return raw;
+    },
+    filteredCookingRecipes(): Task[] {
+      if (this.activeCookingRecipeTab == '推荐') return this.cookingRecipes;
+      const output = [] as Task[];
+      for (let i = 0; i < this.cookingRecipes.length; i++) {
+        const task = this.cookingRecipes[i];
+        if (this.matchCookingRecipeTab(task, this.activeCookingRecipeTab)) output.push(task);
+      }
+      if (output.length > 0) return output;
+      return this.cookingRecipes;
+    }
+  },
+  watch: {
+    visible(newVal: boolean) {
+      if (!newVal) return;
+      this.resetForm();
+      this.loadCookingRecipeCandidates();
+    },
+    cookingDateStr(_newVal: string) {
+      if (!this.visible) return;
+      this.loadBoundRecipesForCurrentSlot();
+    },
+    selectedCookingMeal(_newVal: string) {
+      if (!this.visible) return;
+      this.loadBoundRecipesForCurrentSlot();
+    }
+  },
+  methods: {
+    resetForm() {
+      const now = new Date(Date.now() + 30 * 60 * 1000);
+      const m = (now.getMonth() + 1).toString().padStart(2, '0');
+      const d = now.getDate().toString().padStart(2, '0');
+
+      this.cookingDateStr = `${now.getFullYear()}-${m}-${d}`;
+      this.selectedCookingMeal = '早餐';
+      this.cookingTimeStr = this.getCookingDefaultTimeByMeal(this.selectedCookingMeal);
+      this.activeCookingRecipeTab = '推荐';
+      this.selectedCookingRecipeIds = [] as string[];
+    },
+    getCookingDefaultTimeByMeal(meal: string): string {
+      if (meal == '早餐') return '08:00';
+      if (meal == '午餐') return '12:00';
+      if (meal == '晚餐') return '18:00';
+      if (meal == '夜宵') return '21:30';
+      return '12:00';
+    },
+    setCookingMeal(meal: string) {
+      this.selectedCookingMeal = meal;
+      this.cookingTimeStr = this.getCookingDefaultTimeByMeal(meal);
+    },
+    matchCookingRecipeTab(task: Task, tab: string): boolean {
+      if (tab == '推荐') return true;
+      const title = (task.title ?? '').toString().toLowerCase();
+      let tagsStr = '';
+      for (let i = 0; i < task.tags.length; i++) {
+        tagsStr += ' ' + (task.tags[i] ?? '').toString().toLowerCase();
+      }
+      const text = (title + tagsStr).trim();
+
+      if (tab == '家常') return text.indexOf('家常') >= 0 || text.indexOf('home') >= 0;
+      if (tab == '健身') return text.indexOf('健身') >= 0 || text.indexOf('低脂') >= 0 || text.indexOf('高蛋白') >= 0 || text.indexOf('fitness') >= 0;
+      if (tab == '快手菜') return text.indexOf('快手') >= 0 || text.indexOf('速') >= 0 || text.indexOf('15分钟') >= 0;
+      if (tab == '素食') return text.indexOf('素食') >= 0 || text.indexOf('vegetarian') >= 0;
+      return true;
+    },
+    isCookingRecipeTask(task: Task): boolean {
+      const tags = task.tags == null ? [] as string[] : task.tags;
+      for (let i = 0; i < tags.length; i++) {
+        const tag = tags[i] == null ? '' : tags[i].toString().trim().toLowerCase();
+        if (tag == 'scene:cooking_plan') return false;
+        if (tag == 'scene:recipe_import' || tag == 'source:web_recipe') return true;
+      }
+
+      const metadata = TaskBiz.parseMetadata(task.metadata);
+      const source = metadata['source'];
+      if (source != null) {
+        const sourceText = source.toString().trim();
+        if (sourceText == 'cooking_planner_modal') return false;
+        if (sourceText == 'web_recipe_paste') return true;
+      }
+
+      return false;
+    },
+    async loadCookingRecipeCandidates() {
+      if (this.cookingLoading) return;
+      this.cookingLoading = true;
+      try {
+        const list = await TaskBiz.listTasksByContext(GraphRelationType.ContextCooking);
+        const result = [] as Task[];
+        for (let i = 0; i < list.length; i++) {
+          const t = list[i];
+          const title = (t.title ?? '').toString().trim();
+          if (title == '') continue;
+          if (!this.isCookingRecipeTask(t)) continue;
+          result.push(t);
+        }
+        result.sort((a: Task, b: Task): number => {
+          return (b.updated_at ?? 0) - (a.updated_at ?? 0);
+        });
+        this.cookingRecipes = result;
+
+        const kept = [] as string[];
+        for (let i = 0; i < this.selectedCookingRecipeIds.length; i++) {
+          const id = this.selectedCookingRecipeIds[i];
+          for (let j = 0; j < this.cookingRecipes.length; j++) {
+            if (this.cookingRecipes[j].id == id) {
+              kept.push(id);
+              break;
+            }
+          }
+        }
+        this.selectedCookingRecipeIds = kept;
+        await this.loadBoundRecipesForCurrentSlot();
+      } catch (_e) {
+        this.cookingRecipes = [] as Task[];
+      } finally {
+        this.cookingLoading = false;
+      }
+    },
+    async loadBoundRecipesForCurrentSlot() {
+      const dateText = (this.cookingDateStr ?? '').toString().trim();
+      const mealText = (this.selectedCookingMeal ?? '').toString().trim();
+      if (dateText == '' || mealText == '') return;
+
+      try {
+        const ids = await TaskBiz.getMealPlanIdsForDate(dateText, mealText);
+        const kept = [] as string[];
+        for (let i = 0; i < ids.length; i++) {
+          const id = ids[i];
+          for (let j = 0; j < this.cookingRecipes.length; j++) {
+            if (this.cookingRecipes[j].id == id) {
+              kept.push(id);
+              break;
+            }
+          }
+        }
+        this.selectedCookingRecipeIds = kept;
+      } catch (_e) {}
+    },
+    openCookingDatePicker() {
+      // #ifdef APP-ANDROID
+      const activity = UTSAndroid.getUniActivity();
+      if (activity == null) return;
+      const cal = Calendar.getInstance();
+
+      const parts = this.cookingDateStr.split('-');
+      if (parts.length >= 3) {
+        cal.set(Calendar.YEAR, parseInt(parts[0]).toInt());
+        cal.set(Calendar.MONTH, (parseInt(parts[1]) - 1).toInt());
+        cal.set(Calendar.DAY_OF_MONTH, parseInt(parts[2]).toInt());
+      }
+
+      const dialog = new DatePickerDialog(
+        activity,
+        DatePickerDialog.OnDateSetListener((_view, year, month, dayOfMonth) => {
+          const mm = (month + 1).toString().padStart(2, '0');
+          const dd = dayOfMonth.toString().padStart(2, '0');
+          this.cookingDateStr = `${year}-${mm}-${dd}`;
+        }),
+        cal.get(Calendar.YEAR),
+        cal.get(Calendar.MONTH),
+        cal.get(Calendar.DAY_OF_MONTH)
+      );
+      dialog.show();
+      // #endif
+    },
+    openCookingTimePicker() {
+      // #ifdef APP-ANDROID
+      const activity = UTSAndroid.getUniActivity();
+      if (activity == null) return;
+      const cal = Calendar.getInstance();
+
+      const parts = this.cookingTimeStr.split(':');
+      if (parts.length >= 2) {
+        cal.set(Calendar.HOUR_OF_DAY, parseInt(parts[0]).toInt());
+        cal.set(Calendar.MINUTE, parseInt(parts[1]).toInt());
+      }
+
+      const dialog = new TimePickerDialog(
+        activity,
+        TimePickerDialog.OnTimeSetListener((_view, hourOfDay, minute) => {
+          const hh = hourOfDay.toString().padStart(2, '0');
+          const mm = minute.toString().padStart(2, '0');
+          this.cookingTimeStr = `${hh}:${mm}`;
+        }),
+        cal.get(Calendar.HOUR_OF_DAY),
+        cal.get(Calendar.MINUTE),
+        true
+      );
+      dialog.show();
+      // #endif
+    },
+    isCookingRecipeSelected(id: string): boolean {
+      return this.selectedCookingRecipeIds.indexOf(id) >= 0;
+    },
+    toggleCookingRecipe(id: string) {
+      const idx = this.selectedCookingRecipeIds.indexOf(id);
+      if (idx >= 0) {
+        this.selectedCookingRecipeIds.splice(idx, 1);
+        return;
+      }
+      this.selectedCookingRecipeIds.push(id);
+    },
+    getCookingRecipeById(id: string): Task | null {
+      for (let i = 0; i < this.cookingRecipes.length; i++) {
+        if (this.cookingRecipes[i].id == id) return this.cookingRecipes[i];
+      }
+      return null;
+    },
+    getCookingRecipeTitle(id: string): string {
+      const task = this.getCookingRecipeById(id);
+      if (task == null) return '未命名食谱';
+      const title = (task.title ?? '').toString().trim();
+      return title == '' ? '未命名食谱' : title;
+    },
+    getCookingRecipeDuration(task: Task): string {
+      const md = TaskBiz.parseMetadata(task.metadata);
+      let minsVal = md['cook_minutes'];
+      if (minsVal == null) minsVal = md['duration_min'];
+      if (minsVal != null) {
+        const mins = parseInt(minsVal.toString().trim());
+        if (!isNaN(mins) && mins > 0) return `约 ${mins} 分钟`;
+      }
+      const duration = md['duration'];
+      if (duration != null && duration.toString().trim() != '') return duration.toString();
+      return '约 20 分钟';
+    },
+    getCookingRecipeCover(task: Task): string {
+      const md = TaskBiz.parseMetadata(task.metadata);
+      let cover = md['cover'];
+      if (cover == null || cover.toString().trim() == '') cover = md['cover_url'];
+      if (cover == null || cover.toString().trim() == '') cover = md['image'];
+      if (cover == null || cover.toString().trim() == '') cover = md['thumb'];
+      if (cover != null && cover.toString().trim() != '') return cover.toString();
+      return '/static/logo.png';
+    },
+    parseDateTime(dateStr: string, timeStr: string, fallback: number = 0): number {
+      let ts = fallback;
+      try {
+        const dParts = dateStr.split('-');
+        const tParts = timeStr.split(':');
+        if (dParts.length >= 3 && tParts.length >= 2) {
+          const d = new Date();
+          d.setFullYear(parseInt(dParts[0]));
+          d.setMonth(parseInt(dParts[1]) - 1);
+          d.setDate(parseInt(dParts[2]));
+          d.setHours(parseInt(tParts[0]));
+          d.setMinutes(parseInt(tParts[1]));
+          d.setSeconds(0);
+          d.setMilliseconds(0);
+          ts = d.getTime();
+        }
+      } catch (_e) {}
+      return ts;
+    },
+    async submitCookingTask() {
+      if (this.selectedCookingRecipeIds.length == 0) {
+        uni.showToast({ title: '请至少选择一个食谱', icon: 'none' });
+        return;
+      }
+
+      const triggerAt = this.parseDateTime(this.cookingDateStr, this.cookingTimeStr, 0);
+      if (triggerAt <= Date.now()) {
+        uni.showToast({ title: '请选择未来时间', icon: 'none' });
+        return;
+      }
+
+      const recipeIds = [] as string[];
+      for (let i = 0; i < this.selectedCookingRecipeIds.length; i++) {
+        const id = this.selectedCookingRecipeIds[i];
+        const task = this.getCookingRecipeById(id);
+        if (task == null) continue;
+        recipeIds.push(task.id);
+      }
+
+      if (recipeIds.length == 0) {
+        uni.showToast({ title: '所选食谱已失效，请重新选择', icon: 'none' });
+        return;
+      }
+
+      const ok = await TaskBiz.saveMealPlan(this.cookingDateStr, this.selectedCookingMeal, this.cookingTimeStr, triggerAt, recipeIds);
+      if (ok) {
+        uni.showToast({ title: '已保存到饮食看板', icon: 'none' });
+        uni.$emit('task_changed', {});
+        this.close();
+      } else {
+        uni.showToast({ title: '保存失败', icon: 'none' });
+      }
+    },
+    close() {
+      this.$emit('close');
+    }
+  }
+}
+</script>
+
+<style>
+.modal-mask {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  justify-content: flex-end;
+  align-items: stretch;
+  background-color: rgba(18, 24, 32, 0.22);
+  display: flex;
+  flex-direction: column;
+  z-index: 9999;
+}
+
+.modal-content {
+  width: 100%;
+  border-radius: 34px 34px 0 0;
+  background-color: #ffffff;
+  box-shadow: 0 -8px 24px rgba(30, 48, 64, 0.12);
+  display: flex;
+  flex-direction: column;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.cooking-handle-wrap {
+  align-items: center;
+  padding-top: 12px;
+  padding-bottom: 6px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.cooking-handle {
+  width: 74px;
+  height: 8px;
+  border-radius: 6px;
+  background-color: #d7dce4;
+}
+
+.cooking-header {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  padding-left: 24px;
+  padding-right: 24px;
+  padding-top: 6px;
+  padding-bottom: 10px;
+  position: relative;
+}
+
+.cooking-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: #0e1b36;
+}
+
+.cooking-close {
+  position: absolute;
+  right: 24px;
+  top: 2px;
+  width: 44px;
+  height: 44px;
+  border-radius: 22px;
+  background-color: #e5e8ef;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cooking-close-text {
+  font-size: 20px;
+  color: #77808f;
+}
+
+.cooking-scroll {
+  padding-left: 24px;
+  padding-right: 24px;
+  max-height: 1000rpx;
+}
+
+.cooking-time-row {
+  display: flex;
+  flex-direction: row;
+  justify-content: space-between;
+  margin-top: 10px;
+}
+
+.cooking-picker {
+  width: 48.5%;
+  height: 58px;
+  border-radius: 18px;
+  background-color: #f4f6f8;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  padding-left: 14px;
+  padding-right: 12px;
+}
+
+.cooking-picker-icon {
+  font-size: 18px;
+  margin-right: 10px;
+}
+
+.cooking-picker-text {
+  flex: 1;
+  font-size: 19px;
+  color: #2a3650;
+  font-weight: 600;
+}
+
+.cooking-picker-arrow {
+  font-size: 24px;
+  color: #8a93a4;
+}
+
+.cooking-meal-row {
+  display: flex;
+  flex-direction: row;
+  margin-top: 18px;
+}
+
+.meal-chip {
+  flex: 1;
+  height: 50px;
+  border-radius: 18px;
+  background-color: #f4f6f8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 10px;
+}
+
+.meal-chip-active {
+  background-color: #0b6678;
+}
+
+.meal-chip-text {
+  font-size: 18px;
+  color: #243147;
+  font-weight: 500;
+}
+
+.meal-chip-text-active {
+  color: #ffffff;
+  font-weight: 700;
+}
+
+.cooking-time-hint {
+  font-size: 14px;
+  color: #9aa3b2;
+  margin-top: 10px;
+}
+
+.cooking-section-head {
+  display: flex;
+  flex-direction: row;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 22px;
+}
+
+.cooking-section-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: #0e1b36;
+}
+
+.cooking-section-link {
+  font-size: 16px;
+  font-weight: 600;
+  color: #0b6678;
+}
+
+.recipe-tab-row {
+  display: flex;
+  flex-direction: row;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+
+.recipe-tab-chip {
+  height: 38px;
+  padding-left: 16px;
+  padding-right: 16px;
+  border-radius: 19px;
+  background-color: #f4f6f8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 10px;
+  margin-bottom: 10px;
+}
+
+.recipe-tab-chip-active {
+  background-color: #e2ecff;
+}
+
+.recipe-tab-text {
+  font-size: 16px;
+  color: #364155;
+}
+
+.recipe-tab-text-active {
+  color: #1f4f8d;
+  font-weight: 600;
+}
+
+.selected-strip {
+  margin-top: 4px;
+  margin-bottom: 8px;
+}
+
+.selected-strip-title {
+  font-size: 15px;
+  color: #5f6a7c;
+  margin-bottom: 8px;
+}
+
+.selected-strip-scroll {
+  height: 34px;
+  white-space: nowrap;
+}
+
+.selected-chip {
+  display: inline-flex;
+  flex-direction: row;
+  height: 30px;
+  padding-left: 12px;
+  padding-right: 12px;
+  border-radius: 15px;
+  background-color: #d6e4f2;
+  margin-right: 8px;
+  align-items: center;
+  justify-content: center;
+}
+
+.selected-chip-text {
+  font-size: 14px;
+  color: #214b6b;
+}
+
+.cooking-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding-top: 36px;
+  padding-bottom: 36px;
+}
+
+.cooking-empty-text {
+  font-size: 16px;
+  color: #98a2b3;
+}
+
+.recipe-grid {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  margin-top: 10px;
+}
+
+.recipe-card {
+  width: 48.5%;
+  margin-bottom: 16px;
+  position: relative;
+  opacity: 0.8;
+  display: flex;
+  flex-direction: column;
+}
+
+.recipe-card-active {
+  opacity: 1;
+}
+
+.recipe-cover {
+  width: 100%;
+  height: 180px;
+  border-radius: 18px;
+  background-color: #e7ebf2;
+}
+
+.recipe-check {
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  width: 32px;
+  height: 32px;
+  border-radius: 16px;
+  border-width: 2px;
+  border-style: solid;
+  border-color: rgba(255, 255, 255, 0.9);
+  background-color: rgba(255, 255, 255, 0.2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.recipe-check-active {
+  background-color: #0b6678;
+  border-color: #0b6678;
+}
+
+.recipe-check-text {
+  color: #ffffff;
+  font-size: 18px;
+  font-weight: bold;
+}
+
+.recipe-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: #0e1b36;
+  margin-top: 8px;
+  lines: 1;
+  text-overflow: ellipsis;
+}
+
+.recipe-sub {
+  font-size: 14px;
+  color: #8f98a8;
+  margin-top: 3px;
+}
+
+.cooking-footer {
+  padding-top: 8px;
+  padding-left: 24px;
+  padding-right: 24px;
+  padding-bottom: 24px;
+}
+
+.cooking-confirm-btn {
+  height: 58px;
+  border-radius: 22px;
+  background-color: #0b6678;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.cooking-confirm-text {
+  font-size: 18px;
+  font-weight: 700;
+  color: #ffffff;
+}
+</style>

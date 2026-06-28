@@ -1,0 +1,1254 @@
+import { FinanceBiz, AccountNode, AssetAccountPayload } from '@/services/biz/FinanceBiz.uts'
+import { FinanceMarketService, MarketSearchItem } from '@/services/market/FinanceMarketService.uts'
+import { FinanceFieldSlmService, FinanceFieldSlmPrediction } from '@/services/sys/FinanceFieldSlmService.uts'
+import { FINANCE_HOME_PENDING_TRANSACTION_CHANGE_KEY } from '@/utils/constant.uts'
+
+type HoldingOcrLine = {
+  raw: string
+  text: string
+  x: number
+  y: number
+  w: number
+  h: number
+  index: number
+}
+
+type ParsedFundHolding = {
+  name: string
+  code: string
+  marketValue: number
+  latestNav: number
+  estimateNav: number
+  units: number
+  profitRate: number
+  dailyChange: number
+  holdingProfit: number
+  quoteTime: string
+  dataSource: string
+  missingCode: boolean
+}
+
+export type InvestmentOcrImportResult = {
+  matched: boolean
+  imported: number
+  updated: number
+  provider: string
+  message: string
+}
+
+export class InvestmentOcrImportService {
+  static async tryImportFromOcrText(text: string): Promise<InvestmentOcrImportResult> {
+    const empty = { matched: false, imported: 0, updated: 0, provider: '', message: '' } as InvestmentOcrImportResult
+    const sourceText = (text ?? '').toString()
+    if (sourceText.trim() == '') return empty
+
+    let lines = InvestmentOcrImportService.parseOcrLines(sourceText)
+    let slmResult = await FinanceFieldSlmService.classifyInvestmentText(sourceText, 'investment_ocr_import')
+    if (lines.length == 0 && slmResult.lines.length > 0) lines = InvestmentOcrImportService.toHoldingLines(slmResult.lines)
+    if (lines.length == 0) return empty
+
+    let holdings = [] as ParsedFundHolding[]
+    if (slmResult.predictions.length > 0 && InvestmentOcrImportService.looksLikeFundHoldingListBySlm(slmResult.predictions)) {
+      holdings = InvestmentOcrImportService.extractFundHoldingsBySlm(InvestmentOcrImportService.toHoldingLines(slmResult.lines), slmResult.predictions)
+    }
+    if (holdings.length == 0 && InvestmentOcrImportService.looksLikeFundHoldingList(lines)) {
+      holdings = InvestmentOcrImportService.extractFundHoldings(lines)
+    }
+
+    if (holdings.length == 0) {
+      console.log(`[FinanceRecord][Debug] investment_import_not_matched lines=${lines.length}, slmReady=${slmResult.ready ? 'true' : 'false'}`)
+      return empty
+    }
+
+    const accounts = await FinanceBiz.listAccountNodes(null)
+    const rawProvider = InvestmentOcrImportService.extractProvider(lines)
+    const provider = InvestmentOcrImportService.resolveImportProvider(accounts, rawProvider)
+    const bookId = InvestmentOcrImportService.resolveImportBookId(accounts, provider)
+    await InvestmentOcrImportService.resolveMissingCodes(holdings)
+    await InvestmentOcrImportService.enrichHoldingsWithQuotes(holdings)
+
+    let imported = 0
+    let updated = 0
+    let missingCode = 0
+    for (let i = 0; i < holdings.length; i++) {
+      const holding = holdings[i]
+      if (holding.code == '') missingCode += 1
+      const existing = InvestmentOcrImportService.findExistingHolding(accounts, provider, holding.name, holding.code)
+      const payload = InvestmentOcrImportService.buildHoldingPayload(holding, provider, existing != null && existing.book_id != '' ? existing.book_id : bookId, existing)
+      if (existing != null) {
+        const ok = await FinanceBiz.updateAssetAccount(existing.id, payload)
+        if (ok) updated += 1
+      } else {
+        const id = await FinanceBiz.createAssetAccount(payload)
+        if (id != null && id != '') {
+          imported += 1
+          const estimateNav = payload.estimate_nav ?? 0.0
+          const latestNav = payload.latest_nav ?? 0.0
+          const nav = estimateNav > 0.0 ? estimateNav : latestNav
+          await FinanceBiz.recordInvestmentHoldingSnapshot(
+            id,
+            payload.balance,
+            payload.units ?? 0.0,
+            nav,
+            payload.quote_time ?? '',
+            `OCR导入持仓：${holding.name}`
+          )
+        }
+      }
+    }
+
+    const okCount = imported + updated
+    if (okCount > 0) InvestmentOcrImportService.markFinanceChanged()
+    const message = okCount > 0
+      ? InvestmentOcrImportService.buildResultMessage(imported, updated, missingCode)
+      : '识别到基金/持仓页面，但写入资产账户失败'
+    console.log(`[FinanceRecord][Debug] investment_import_result provider=${provider}, holdings=${holdings.length}, imported=${imported}, updated=${updated}, missingCode=${missingCode}`)
+    return {
+      matched: true,
+      imported,
+      updated,
+      provider,
+      message
+    } as InvestmentOcrImportResult
+  }
+
+  private static buildResultMessage(imported: number, updated: number, missingCode: number): string {
+    const parts = [] as string[]
+    parts.push(`已录入 ${imported} 个，更新 ${updated} 个`)
+    if (missingCode > 0) parts.push(`${missingCode} 个缺代码`)
+    return parts.join('，')
+  }
+
+  private static looksLikeFundHoldingListBySlm(predictions: FinanceFieldSlmPrediction[]): boolean {
+    let assetNames = 0
+    let fields = 0
+    for (let i = 0; i < predictions.length; i++) {
+      const p = predictions[i]
+      if (FinanceFieldSlmService.hasLabel(p, ['asset_name'], 0.24)) assetNames += 1
+      if (FinanceFieldSlmService.hasLabel(p, ['asset_code', 'market_value', 'profit', 'profit_rate', 'holding', 'available', 'quantity', 'shares', 'net_value', 'price'], 0.22)) fields += 1
+    }
+    return assetNames > 0 && fields >= 2
+  }
+
+  private static toHoldingLines(lines: any[]): HoldingOcrLine[] {
+    const result = [] as HoldingOcrLine[]
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line == null) continue
+      result.push({
+        raw: line.raw == null ? '' : line.raw.toString(),
+        text: line.text == null ? '' : line.text.toString(),
+        x: InvestmentOcrImportService.safeNumericValue(line.x),
+        y: InvestmentOcrImportService.safeNumericValue(line.y),
+        w: InvestmentOcrImportService.safeNumericValue(line.w),
+        h: InvestmentOcrImportService.safeNumericValue(line.h),
+        index: i
+      } as HoldingOcrLine)
+    }
+    return result
+  }
+
+  private static safeNumericValue(value: any): number {
+    const num = parseFloat(value == null ? '' : value.toString())
+    return isNaN(num) ? 0.0 : num
+  }
+
+  private static extractFundHoldingsBySlm(lines: HoldingOcrLine[], predictions: FinanceFieldSlmPrediction[]): ParsedFundHolding[] {
+    const predictionByIndex = [] as Array<FinanceFieldSlmPrediction | null>
+    for (let i = 0; i < lines.length; i++) predictionByIndex.push(null)
+    for (let i = 0; i < predictions.length; i++) {
+      const p = predictions[i]
+      if (p.index >= 0 && p.index < predictionByIndex.length) predictionByIndex[p.index] = p
+    }
+
+    const starts = [] as HoldingOcrLine[]
+    for (let i = 0; i < lines.length; i++) {
+      const p = predictionByIndex[i]
+      if (!FinanceFieldSlmService.hasLabel(p, ['asset_name'], 0.24)) continue
+      const name = InvestmentOcrImportService.cleanFundName(lines[i].text)
+      if (name == '' || name.length < 2) continue
+      if (name == '基金' || name == '股票' || name == '债券') continue
+      starts.push(lines[i])
+    }
+
+    const result = [] as ParsedFundHolding[]
+    for (let i = 0; i < starts.length; i++) {
+      const start = starts[i]
+      const nextY = i < starts.length - 1 ? starts[i + 1].y : start.y + 190
+      const rowEndY = Math.min(nextY - 8, start.y + 175)
+      const holding = InvestmentOcrImportService.extractSlmHoldingRow(lines, predictionByIndex, start, rowEndY)
+      if (holding != null) result.push(holding)
+    }
+    return InvestmentOcrImportService.dedupeHoldings(result)
+  }
+
+  private static extractSlmHoldingRow(lines: HoldingOcrLine[], predictionByIndex: Array<FinanceFieldSlmPrediction | null>, start: HoldingOcrLine, rowEndY: number): ParsedFundHolding | null {
+    const name = InvestmentOcrImportService.cleanFundName(start.text)
+    if (name == '') return null
+    let code = ''
+    let marketValue = 0.0
+    let holdingProfit = 0.0
+    let profitRate = 0.0
+    let units = 0.0
+    let nav = 0.0
+    let bestMarketScore = -1.0
+    let bestProfitScore = -1.0
+    let bestRateScore = -1.0
+    let bestUnitsScore = -1.0
+    let bestNavScore = -1.0
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.y < start.y - 30 || line.y > rowEndY) continue
+      const p = i < predictionByIndex.length ? predictionByIndex[i] : null
+      if (p == null) continue
+
+      const codeScore = FinanceFieldSlmService.labelScore(p, ['asset_code'])
+      if (codeScore >= 0.20) {
+        const foundCode = InvestmentOcrImportService.extractBrokerCodeFromText(line.text)
+        if (foundCode != '') code = foundCode
+        const mixedUnits = InvestmentOcrImportService.parseBrokerUnitsFromMixedCodeText(line.text)
+        if (mixedUnits > 0.0 && codeScore > bestUnitsScore) {
+          bestUnitsScore = codeScore
+          units = mixedUnits
+        }
+      }
+
+      const unitScore = FinanceFieldSlmService.labelScore(p, ['holding', 'available', 'quantity', 'shares'])
+      if (unitScore >= 0.20) {
+        const mixedUnits = InvestmentOcrImportService.parseBrokerUnitsFromMixedCodeText(line.text)
+        const value = mixedUnits > 0.0 ? mixedUnits : InvestmentOcrImportService.parseNumber(line.text)
+        if (!isNaN(value) && value > 0.0 && unitScore > bestUnitsScore) {
+          bestUnitsScore = unitScore
+          units = value
+        }
+        const foundCode = InvestmentOcrImportService.extractBrokerCodeFromText(line.text)
+        if (foundCode != '' && code == '') code = foundCode
+      }
+
+      const marketScore = FinanceFieldSlmService.labelScore(p, ['market_value'])
+      if (marketScore >= 0.20) {
+        const value = InvestmentOcrImportService.parseNumber(line.text)
+        if (!isNaN(value) && value >= 0.0 && marketScore > bestMarketScore) {
+          bestMarketScore = marketScore
+          marketValue = value
+        }
+      }
+
+      const profitScore = FinanceFieldSlmService.labelScore(p, ['profit'])
+      if (profitScore >= 0.20 && line.text.indexOf('%') < 0) {
+        const value = InvestmentOcrImportService.parseNumber(line.text)
+        if (!isNaN(value) && profitScore > bestProfitScore) {
+          bestProfitScore = profitScore
+          holdingProfit = value
+        }
+      }
+
+      const rateScore = FinanceFieldSlmService.labelScore(p, ['profit_rate'])
+      if (rateScore >= 0.20) {
+        const value = InvestmentOcrImportService.parseNumber(line.text.replace(/%/g, ''))
+        if (!isNaN(value) && rateScore > bestRateScore) {
+          bestRateScore = rateScore
+          profitRate = value
+        }
+      }
+
+      const navScore = FinanceFieldSlmService.labelScore(p, ['net_value', 'price'])
+      if (navScore >= 0.20) {
+        const value = InvestmentOcrImportService.parseNumber(line.text)
+        if (!isNaN(value) && value > 0.0 && navScore > bestNavScore) {
+          bestNavScore = navScore
+          nav = value
+        }
+      }
+    }
+
+    const latest = nav > 0.0 ? nav : (marketValue > 0.0 && units > 0.0 ? InvestmentOcrImportService.roundMoney(marketValue / units) : 0.0)
+    if (code == '' && marketValue == 0.0 && holdingProfit == 0.0 && profitRate == 0.0 && units == 0.0 && latest == 0.0) return null
+    return {
+      name: name,
+      code: code,
+      marketValue: marketValue,
+      latestNav: latest,
+      estimateNav: latest,
+      units: units,
+      profitRate: profitRate,
+      dailyChange: 0.0,
+      holdingProfit: holdingProfit,
+      quoteTime: '',
+      dataSource: '',
+      missingCode: code == ''
+    } as ParsedFundHolding
+  }
+
+  private static safeJson(value: any): string {
+    try {
+      return JSON.stringify(value)
+    } catch (_e) {
+      try {
+        return value == null ? 'null' : value.toString()
+      } catch (_e2) {
+        return '[unserializable]'
+      }
+    }
+  }
+
+  private static async resolveMissingCodes(holdings: ParsedFundHolding[]): Promise<void> {
+    for (let i = 0; i < holdings.length; i++) {
+      const holding = holdings[i]
+      if (holding.code.trim() != '') {
+        holding.missingCode = false
+        continue
+      }
+      const matched = await InvestmentOcrImportService.resolveFundByName(holding.name)
+      if (matched != null && matched.code != '') {
+        holding.code = matched.code
+        if (matched.name != '') holding.name = matched.name
+        holding.missingCode = false
+      }
+    }
+  }
+
+  private static async resolveFundByName(name: string): Promise<MarketSearchItem | null> {
+    try {
+      const fuzzy = await FinanceMarketService.searchFundByNameFuzzy(name, 16)
+      const fuzzyMatched = InvestmentOcrImportService.selectBestMarketMatch(name, fuzzy)
+      if (fuzzyMatched != null && fuzzyMatched.code != '') return fuzzyMatched
+    } catch (e) {
+      console.warn(`[InvestmentOcrImport] fuzzy resolve failed name=${name}`, e)
+    }
+
+    const keywords = InvestmentOcrImportService.buildFundSearchKeywords(name)
+    for (let i = 0; i < keywords.length; i++) {
+      const keyword = keywords[i]
+      if (keyword == '') continue
+      try {
+        const list = await FinanceMarketService.search(keyword, 10)
+        const matched = InvestmentOcrImportService.selectBestMarketMatch(name, list)
+        if (matched != null && matched.code != '') return matched
+      } catch (e) {
+        console.warn(`[InvestmentOcrImport] resolve code failed name=${name}, keyword=${keyword}`, e)
+      }
+    }
+    return null
+  }
+
+  private static async enrichHoldingsWithQuotes(holdings: ParsedFundHolding[]): Promise<void> {
+    for (let i = 0; i < holdings.length; i++) {
+      const holding = holdings[i]
+      if (holding.code == '') continue
+      try {
+        const quote = await FinanceMarketService.fetchQuote(holding.code)
+        if (quote == null) continue
+        if (quote.name != '') holding.name = quote.name
+        if (quote.nav > 0) holding.latestNav = quote.nav
+        if (quote.estimate_nav > 0) holding.estimateNav = quote.estimate_nav
+        const price = quote.estimate_nav > 0 ? quote.estimate_nav : quote.nav
+        if (price > 0 && holding.marketValue > 0) {
+          holding.units = InvestmentOcrImportService.roundUnits(holding.marketValue / price)
+        }
+        holding.quoteTime = quote.estimate_time != '' ? quote.estimate_time : quote.nav_date
+        holding.dataSource = quote.source
+      } catch (e) {
+        console.warn(`[InvestmentOcrImport] enrich quote failed code=${holding.code}`, e)
+      }
+    }
+  }
+
+  private static buildFundSearchKeywords(name: string): string[] {
+    const result = [] as string[]
+    const raw = InvestmentOcrImportService.normalizeFundSearchText(name)
+    InvestmentOcrImportService.pushUnique(result, raw)
+    InvestmentOcrImportService.pushUnique(result, raw.replace(/（QDII）/g, '').replace(/\(QDII\)/g, ''))
+    InvestmentOcrImportService.pushUnique(result, raw.replace(/（[^）]+）/g, '').replace(/\([^)]*\)/g, ''))
+    InvestmentOcrImportService.pushUnique(result, raw.replace(/[ABC]$/i, ''))
+    InvestmentOcrImportService.pushUnique(result, raw.replace(/（QDII）/g, '').replace(/\(QDII\)/g, '').replace(/[ABC]$/i, ''))
+    return result
+  }
+
+  private static selectBestMarketMatch(name: string, list: MarketSearchItem[]): MarketSearchItem | null {
+    const target = InvestmentOcrImportService.normalizeFundMatchText(name)
+    const targetCore = InvestmentOcrImportService.normalizeFundCoreText(name)
+    let best: MarketSearchItem | null = null
+    let bestScore = 0
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i]
+      const itemName = InvestmentOcrImportService.normalizeFundMatchText(item.name)
+      const itemCore = InvestmentOcrImportService.normalizeFundCoreText(item.name)
+      const itemCode = InvestmentOcrImportService.normalizeFundMatchText(item.code)
+      if (itemName == '' && itemCode == '') continue
+      let score = 0
+      if (itemName == target) score += 1200
+      if (targetCore != '' && itemCore == targetCore) score += 1100
+      if (target.length >= 4 && itemName.indexOf(target) >= 0) score += 780
+      if (targetCore.length >= 4 && itemCore.indexOf(targetCore) >= 0) score += 760
+      if (itemName.length >= 4 && target.indexOf(itemName) >= 0) score += 560
+      if (itemCore.length >= 4 && targetCore.indexOf(itemCore) >= 0) score += 520
+      const ratio = Math.max(
+        InvestmentOcrImportService.orderedCommonRatio(targetCore, itemCore),
+        InvestmentOcrImportService.orderedCommonRatio(itemCore, targetCore)
+      )
+      score += Math.round(ratio * 520.0)
+      const targetShare = InvestmentOcrImportService.extractFundShareClass(name)
+      const itemShare = InvestmentOcrImportService.extractFundShareClass(item.name)
+      if (targetShare != '') score += itemShare == targetShare ? 80 : -120
+      if (target.indexOf('qdii') >= 0) score += itemName.indexOf('qdii') >= 0 ? 60 : -60
+      if (InvestmentOcrImportService.normalizeFundMatchText(item.type).indexOf('基金') >= 0) score += 40
+      if (item.code.length == 6) score += 20
+      score -= Math.abs(itemCore.length - targetCore.length) * 2
+      if (score > bestScore) {
+        bestScore = score
+        best = item
+      }
+    }
+    return bestScore >= 480 ? best : null
+  }
+
+  private static normalizeFundSearchText(text: string): string {
+    return (text ?? '').toString().replace(/\s+/g, '').replace(/>+/g, '').trim()
+  }
+
+  private static normalizeFundMatchText(text: string): string {
+    return InvestmentOcrImportService.normalizeFundSearchText(text)
+      .toLowerCase()
+      .replace(/[()（）\-_*·]/g, '')
+  }
+
+  private static normalizeFundCoreText(text: string): string {
+    let value = InvestmentOcrImportService.normalizeFundMatchText(text)
+    value = value.replace(/人民币/g, '')
+    value = value.replace(/qdii/g, '')
+    value = value.replace(/lof/g, '')
+    value = value.replace(/基金/g, '')
+    value = value.replace(/混合型/g, '混合')
+    value = value.replace(/股票型/g, '股票')
+    value = value.replace(/债券型/g, '债券')
+    value = value.replace(/指数型/g, '指数')
+    value = value.replace(/[abc]$/g, '')
+    return value
+  }
+
+  private static extractFundShareClass(text: string): string {
+    const value = InvestmentOcrImportService.normalizeFundMatchText(text)
+    if (value.endsWith('a')) return 'a'
+    if (value.endsWith('b')) return 'b'
+    if (value.endsWith('c')) return 'c'
+    return ''
+  }
+
+  private static orderedCommonRatio(a: string, b: string): number {
+    if (a == '' || b == '') return 0.0
+    let pos = 0
+    let hit = 0
+    for (let i = 0; i < a.length; i++) {
+      const ch = a.charAt(i)
+      const next = b.indexOf(ch, pos)
+      if (next >= 0) {
+        hit += 1
+        pos = next + 1
+      }
+    }
+    return hit / Math.max(a.length, b.length)
+  }
+
+  private static roundUnits(value: number): number {
+    if (isNaN(value) || value <= 0.0) return 0.0
+    return Math.round(value * 10000.0) / 10000.0
+  }
+
+  private static roundMoney(value: number): number {
+    if (isNaN(value)) return 0.0
+    return Math.round(value * 100.0) / 100.0
+  }
+
+  private static pushUnique(list: string[], value: string): void {
+    const v = (value ?? '').toString().trim()
+    if (v == '' || list.indexOf(v) >= 0) return
+    list.push(v)
+  }
+
+  private static resolveImportProvider(accounts: AccountNode[], rawProvider: string): string {
+    const fallback = (rawProvider ?? '').toString().trim() == '' ? '默认账户' : rawProvider.trim()
+    const cashProviders = InvestmentOcrImportService.collectInvestmentProviders(accounts, true)
+    const allProviders = InvestmentOcrImportService.collectInvestmentProviders(accounts, false)
+    const exactCash = InvestmentOcrImportService.findProviderMatch(cashProviders, fallback, true)
+    if (exactCash != '') return exactCash
+    const exactAny = InvestmentOcrImportService.findProviderMatch(allProviders, fallback, true)
+    if (exactAny != '') return exactAny
+    const fuzzyCash = InvestmentOcrImportService.findProviderMatch(cashProviders, fallback, false)
+    if (fuzzyCash != '') return fuzzyCash
+    const fuzzyAny = InvestmentOcrImportService.findProviderMatch(allProviders, fallback, false)
+    if (fuzzyAny != '') return fuzzyAny
+    return fallback
+  }
+
+  private static collectInvestmentProviders(accounts: AccountNode[], cashOnly: boolean): string[] {
+    const result = [] as string[]
+    for (let i = 0; i < accounts.length; i++) {
+      const acc = accounts[i]
+      if (acc.category != 'investment') continue
+      if (cashOnly && acc.sub_type != '账户现金') continue
+      const provider = (acc.provider ?? '').toString().trim()
+      if (provider == '') continue
+      InvestmentOcrImportService.pushUnique(result, provider)
+    }
+    return result
+  }
+
+  private static resolveImportBookId(accounts: AccountNode[], provider: string): string {
+    for (let i = 0; i < accounts.length; i++) {
+      const acc = accounts[i]
+      if (acc.category != 'investment') continue
+      if ((acc.provider ?? '').toString() != provider) continue
+      if (acc.book_id != '') return acc.book_id
+    }
+    return FinanceBiz.DEFAULT_BOOK_ID
+  }
+
+  private static findProviderMatch(providers: string[], target: string, exactOnly: boolean): string {
+    const normalizedTarget = InvestmentOcrImportService.normalizeProviderKey(target)
+    for (let i = 0; i < providers.length; i++) {
+      if (InvestmentOcrImportService.normalizeProviderKey(providers[i]) == normalizedTarget) return providers[i]
+    }
+    if (exactOnly) return ''
+    for (let i = 0; i < providers.length; i++) {
+      if (InvestmentOcrImportService.isProviderAliasMatch(providers[i], target)) return providers[i]
+    }
+    return ''
+  }
+
+  private static isProviderAliasMatch(provider: string, target: string): boolean {
+    const p = InvestmentOcrImportService.normalizeProviderKey(provider)
+    const t = InvestmentOcrImportService.normalizeProviderKey(target)
+    if (p == '' || t == '') return false
+    if (p.indexOf(t) >= 0 || t.indexOf(p) >= 0) return true
+    if ((p.indexOf('支付宝') >= 0 || p.indexOf('蚂蚁') >= 0) && (t.indexOf('支付宝') >= 0 || t.indexOf('蚂蚁') >= 0)) return true
+    if ((p.indexOf('天天基金') >= 0 || p.indexOf('东方财富') >= 0) && (t.indexOf('天天基金') >= 0 || t.indexOf('东方财富') >= 0)) return true
+    if ((p.indexOf('同花顺') >= 0 || p.indexOf('证券') >= 0) && (t.indexOf('同花顺') >= 0 || t.indexOf('证券') >= 0)) return true
+    return false
+  }
+
+  private static normalizeProviderKey(text: string): string {
+    return (text ?? '').toString().toLowerCase().replace(/\s+/g, '').replace(/[()（）\-_*·]/g, '')
+  }
+
+  private static buildHoldingPayload(holding: ParsedFundHolding, provider: string, bookId: string, existing: AccountNode | null = null): AssetAccountPayload {
+    const hasExisting = existing != null
+    const ocrMarketValue = holding.marketValue > 0.0 ? holding.marketValue : InvestmentOcrImportService.estimateMarketValueFromProfit(holding)
+    const nextBalance = ocrMarketValue > 0.0 ? ocrMarketValue : (hasExisting ? existing!.balance : 0.0)
+    const latestNav = holding.latestNav > 0.0 ? holding.latestNav : (hasExisting ? existing!.latest_nav : 0.0)
+    const estimateNav = holding.estimateNav > 0.0 ? holding.estimateNav : (holding.latestNav > 0.0 ? holding.latestNav : (hasExisting ? existing!.estimate_nav : 0.0))
+    const price = estimateNav > 0.0 ? estimateNav : latestNav
+    const inferredUnits = holding.units > 0.0 ? holding.units : (ocrMarketValue > 0.0 && price > 0.0 ? InvestmentOcrImportService.roundUnits(ocrMarketValue / price) : 0.0)
+    const nextUnits = inferredUnits > 0.0 ? inferredUnits : (hasExisting ? existing!.units : 0.0)
+    const code = holding.code != '' ? holding.code : (hasExisting ? existing!.code : '')
+    const subType = hasExisting && existing!.sub_type != '' ? existing!.sub_type : InvestmentOcrImportService.inferHoldingType(holding.name)
+    const profitAmount = holding.dailyChange != 0.0 ? holding.dailyChange : holding.holdingProfit
+    return {
+      name: holding.name,
+      category: 'investment',
+      balance: nextBalance,
+      book_id: hasExisting && existing!.book_id != '' ? existing!.book_id : bookId,
+      provider: provider != '' ? provider : (hasExisting ? existing!.provider : ''),
+      include_in_total: hasExisting ? existing!.include_in_total : true,
+      code: code,
+      sub_type: subType,
+      profit_rate: holding.profitRate,
+      profit_amount: profitAmount,
+      market_value: ocrMarketValue > 0.0 ? ocrMarketValue : (hasExisting ? existing!.market_value : 0.0),
+      units: nextUnits,
+      latest_nav: latestNav,
+      estimate_nav: estimateNav,
+      quote_time: holding.quoteTime != '' ? holding.quoteTime : (hasExisting ? existing!.quote_time : ''),
+      data_source: InvestmentOcrImportService.buildImportSource(holding)
+    } as AssetAccountPayload
+  }
+
+  private static buildImportSource(holding: ParsedFundHolding): string {
+    const parts = ['ocr_fund_holding_list'] as string[]
+    if (holding.marketValue > 0.0) parts.push(`amount=${holding.marketValue.toString()}`)
+    if (holding.dailyChange != 0.0) parts.push(`change=${holding.dailyChange.toString()}`)
+    if (holding.holdingProfit != 0.0) parts.push(`holding_profit=${holding.holdingProfit.toString()}`)
+    if (holding.units > 0.0) parts.push(`units=${holding.units.toString()}`)
+    if (holding.dataSource != '') parts.push(`quote=${holding.dataSource}`)
+    if (holding.missingCode) parts.push('missing_code')
+    return parts.join('|')
+  }
+
+  private static estimateMarketValueFromProfit(holding: ParsedFundHolding): number {
+    if (holding.marketValue > 0.0) return holding.marketValue
+    if (holding.holdingProfit == 0.0 || holding.profitRate == 0.0) return 0.0
+    const rate = holding.profitRate / 100.0
+    if (rate == 0.0) return 0.0
+    const cost = holding.holdingProfit / rate
+    const value = cost + holding.holdingProfit
+    if (isNaN(value) || value <= 0.0) return 0.0
+    return Math.round(value * 100.0) / 100.0
+  }
+
+  private static findExistingHolding(accounts: AccountNode[], provider: string, name: string, code: string): AccountNode | null {
+    const n = InvestmentOcrImportService.normalizeKey(name)
+    const c = InvestmentOcrImportService.normalizeKey(code)
+    const fundName = InvestmentOcrImportService.normalizeFundCoreText(name)
+    for (let i = 0; i < accounts.length; i++) {
+      const acc = accounts[i]
+      if (acc.category != 'investment' || acc.sub_type == '账户现金') continue
+      if ((acc.provider ?? '').toString() != provider) continue
+      if (c != '' && InvestmentOcrImportService.normalizeKey(acc.code) == c) return acc
+      if (InvestmentOcrImportService.normalizeKey(acc.name) == n) return acc
+      if (c == '' && InvestmentOcrImportService.isLikelySameFundName(fundName, InvestmentOcrImportService.normalizeFundCoreText(acc.name))) return acc
+    }
+    return null
+  }
+
+  private static isLikelySameFundName(a: string, b: string): boolean {
+    if (a == '' || b == '') return false
+    if (a == b) return true
+    if (a.length >= 5 && b.indexOf(a) >= 0) return true
+    if (b.length >= 5 && a.indexOf(b) >= 0) return true
+    const ratio = Math.max(
+      InvestmentOcrImportService.orderedCommonRatio(a, b),
+      InvestmentOcrImportService.orderedCommonRatio(b, a)
+    )
+    return ratio >= 0.86
+  }
+
+  private static looksLikeFundHoldingList(lines: HoldingOcrLine[]): boolean {
+    const text = lines.map((l: HoldingOcrLine): string => l.text).join('\n')
+    if (InvestmentOcrImportService.looksLikeAlipayHoldingList(lines)) {
+      return InvestmentOcrImportService.extractAlipayFundHoldings(lines).length > 0
+    }
+    if (InvestmentOcrImportService.looksLikeBrokerHoldingList(lines)) {
+      return InvestmentOcrImportService.extractBrokerFundHoldings(lines).length > 0
+    }
+    if (!InvestmentOcrImportService.containsAny(text, ['自选股', '持仓股', '最新', '涨幅', '涨跌'])) return false
+    if (!InvestmentOcrImportService.containsAny(text, ['ETF', '基金', '场内'])) return false
+    return InvestmentOcrImportService.extractMarketFundHoldings(lines).length > 0
+  }
+
+  private static extractFundHoldings(lines: HoldingOcrLine[]): ParsedFundHolding[] {
+    if (InvestmentOcrImportService.looksLikeAlipayHoldingList(lines)) {
+      return InvestmentOcrImportService.extractAlipayFundHoldings(lines)
+    }
+    if (InvestmentOcrImportService.looksLikeBrokerHoldingList(lines)) {
+      return InvestmentOcrImportService.extractBrokerFundHoldings(lines)
+    }
+    return InvestmentOcrImportService.extractMarketFundHoldings(lines)
+  }
+
+  private static extractMarketFundHoldings(lines: HoldingOcrLine[]): ParsedFundHolding[] {
+    const headerY = InvestmentOcrImportService.findHeaderLineY(lines)
+    const footerY = InvestmentOcrImportService.findFooterLineY(lines)
+    const latestX = InvestmentOcrImportService.findHeaderX(lines, '最新', 430)
+    const rateX = InvestmentOcrImportService.findHeaderX(lines, '涨幅', 650)
+    const changeX = InvestmentOcrImportService.findHeaderX(lines, '涨跌', 940)
+    const result = [] as ParsedFundHolding[]
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.y <= headerY) continue
+      if (footerY > 0 && line.y >= footerY - 120) continue
+      if (line.x > 390) continue
+      const name = InvestmentOcrImportService.cleanFundName(line.text)
+      if (name == '') continue
+
+      const code = InvestmentOcrImportService.findCodeNear(lines, line)
+      const latest = InvestmentOcrImportService.findNumberNearColumn(lines, line.y, latestX, false, false)
+      const rate = InvestmentOcrImportService.findNumberNearColumn(lines, line.y, rateX, true, true)
+      const change = InvestmentOcrImportService.findNumberNearColumn(lines, line.y, changeX, false, true)
+      if (code == '' && latest == 0.0 && rate == 0.0 && change == 0.0) continue
+      result.push({
+        name: name,
+        code: code,
+        marketValue: 0.0,
+        latestNav: latest,
+        estimateNav: latest,
+        units: 0.0,
+        profitRate: rate,
+        dailyChange: change,
+        holdingProfit: 0.0,
+        quoteTime: '',
+        dataSource: '',
+        missingCode: code == ''
+      } as ParsedFundHolding)
+    }
+
+    return InvestmentOcrImportService.dedupeHoldings(result)
+  }
+
+  private static looksLikeBrokerHoldingList(lines: HoldingOcrLine[]): boolean {
+    const text = lines.map((l: HoldingOcrLine): string => l.text).join('\n')
+    const hasTableHeader = InvestmentOcrImportService.containsAny(text, ['证券代码', '持仓/可用', '持仓可用', '证券名称', '名称/代码', '持仓市值', '持有市值'])
+      && InvestmentOcrImportService.containsAny(text, ['市值', '盈亏', '收益', '持仓'])
+    const hasBrokerContext = InvestmentOcrImportService.containsAny(text, ['买入', '卖出', '撤单', '查询', '持仓管理', '总资产', '总市值', '证券', '同花顺'])
+    const hasFundContext = InvestmentOcrImportService.containsAny(text, ['基金', 'ETF', 'LOF', 'QDII', '指数', '标普', '纳指', '债'])
+    return hasTableHeader && hasBrokerContext && hasFundContext
+  }
+
+  private static extractBrokerFundHoldings(lines: HoldingOcrLine[]): ParsedFundHolding[] {
+    const headerY = InvestmentOcrImportService.findBrokerHeaderLineY(lines)
+    const footerY = InvestmentOcrImportService.findBrokerFooterLineY(lines, headerY)
+    const marketValueX = InvestmentOcrImportService.findHeaderXNearY(lines, ['市值', '持仓市值', '持有市值'], headerY, 40)
+    const profitX = InvestmentOcrImportService.findHeaderXNearY(lines, ['盈亏', '收益', '持有收益'], headerY, 400)
+    const unitsX = InvestmentOcrImportService.findHeaderXNearY(lines, ['持仓/可用', '持仓可用', '持仓', '份额'], headerY, 610)
+    const codeX = InvestmentOcrImportService.findHeaderXNearY(lines, ['证券代码', '代码'], headerY, 900)
+    const starts = [] as HoldingOcrLine[]
+    let lastY = -999999.0
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.y <= headerY + 32) continue
+      if (footerY > 0 && line.y >= footerY - 20) continue
+      if (line.x > 430) continue
+      const name = InvestmentOcrImportService.cleanBrokerHoldingName(line.text)
+      if (name == '') continue
+      if (line.y - lastY < 88) continue
+      if (!InvestmentOcrImportService.hasBrokerRowMetric(lines, line.y, profitX, unitsX, codeX)) continue
+      starts.push(line)
+      lastY = line.y
+    }
+
+    const result = [] as ParsedFundHolding[]
+    for (let i = 0; i < starts.length; i++) {
+      const start = starts[i]
+      const nextY = i < starts.length - 1 ? starts[i + 1].y : (footerY > 0 ? footerY : start.y + 180)
+      const rowEndY = Math.min(nextY - 8, start.y + 155)
+      const name = InvestmentOcrImportService.cleanBrokerHoldingName(start.text)
+      if (name == '') continue
+      const code = InvestmentOcrImportService.findBrokerCodeInRow(lines, start.y, rowEndY, codeX)
+      const marketValue = InvestmentOcrImportService.findBrokerNumberInBand(lines, start.y, rowEndY, marketValueX, 170, false, false)
+      const holdingProfit = InvestmentOcrImportService.findBrokerNumberInBand(lines, start.y, rowEndY, profitX, 150, false, true)
+      const profitRate = InvestmentOcrImportService.findBrokerNumberInBand(lines, start.y, rowEndY, profitX, 150, true, true)
+      const units = InvestmentOcrImportService.findBrokerUnitsInRow(lines, start.y, rowEndY, unitsX)
+      const latest = marketValue > 0.0 && units > 0.0 ? InvestmentOcrImportService.roundMoney(marketValue / units) : 0.0
+      if (code == '' && marketValue == 0.0 && holdingProfit == 0.0 && profitRate == 0.0 && units == 0.0) continue
+      result.push({
+        name: name,
+        code: code,
+        marketValue: marketValue,
+        latestNav: latest,
+        estimateNav: latest,
+        units: units,
+        profitRate: profitRate,
+        dailyChange: 0.0,
+        holdingProfit: holdingProfit,
+        quoteTime: '',
+        dataSource: '',
+        missingCode: code == ''
+      } as ParsedFundHolding)
+    }
+    return InvestmentOcrImportService.dedupeHoldings(result)
+  }
+
+  private static findBrokerHeaderLineY(lines: HoldingOcrLine[]): number {
+    let y = 0
+    for (let i = 0; i < lines.length; i++) {
+      const text = lines[i].text
+      if (!InvestmentOcrImportService.containsAny(text, ['证券代码', '持仓/可用', '持仓可用', '证券名称', '名称/代码', '市值', '盈亏', '收益'])) continue
+      if (lines[i].y > y) y = lines[i].y
+    }
+    return y <= 0 ? 900 : y
+  }
+
+  private static findBrokerFooterLineY(lines: HoldingOcrLine[], headerY: number): number {
+    let y = 0
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.y <= headerY) continue
+      if (!InvestmentOcrImportService.containsAny(line.text, ['查看已清仓', '持仓管理', '首页', '行情', '自选', '交易', '资讯', '理财'])) continue
+      if (y == 0 || line.y < y) y = line.y
+    }
+    return y
+  }
+
+  private static findHeaderXNearY(lines: HoldingOcrLine[], keywords: string[], headerY: number, fallback: number): number {
+    let bestX = fallback
+    let bestScore = 999999.0
+    for (let i = 0; i < lines.length; i++) {
+      if (!InvestmentOcrImportService.containsAny(lines[i].text, keywords)) continue
+      const score = Math.abs(lines[i].y - headerY)
+      if (score < bestScore) {
+        bestScore = score
+        bestX = InvestmentOcrImportService.estimateHeaderKeywordX(lines[i], keywords)
+      }
+    }
+    return bestX
+  }
+
+  private static estimateHeaderKeywordX(line: HoldingOcrLine, keywords: string[]): number {
+    const text = line.text
+    if (text == '' || line.w <= 0) return line.x
+    for (let i = 0; i < keywords.length; i++) {
+      const keyword = keywords[i]
+      const index = text.indexOf(keyword)
+      if (index < 0) continue
+      const ratio = Math.max(0.0, Math.min(1.0, (index + keyword.length / 2.0) / text.length))
+      return line.x + line.w * ratio
+    }
+    return line.x
+  }
+
+  private static cleanBrokerHoldingName(text: string): string {
+    const value = InvestmentOcrImportService.cleanFundName(text)
+    if (value == '') return ''
+    if (value == '基金' || value == '股票' || value == '债券' || value == '人民币账户A股' || value == '人民币账户 A股') return ''
+    if (InvestmentOcrImportService.containsAny(value, ['总资产', '总盈亏', '总市值', '可用', '可取', '转账', '逆回购', '买入', '卖出', '撤单', '查询', '查看已清仓', '持仓管理'])) return ''
+    return value
+  }
+
+  private static hasBrokerRowMetric(lines: HoldingOcrLine[], rowY: number, profitX: number, unitsX: number, codeX: number): boolean {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.y < rowY - 20 || line.y > rowY + 150) continue
+      if (line.text.indexOf('%') >= 0) return true
+      if (InvestmentOcrImportService.extractBrokerCodeFromText(line.text) != '' && Math.abs(line.x - codeX) <= 260) return true
+      if (InvestmentOcrImportService.parseBrokerUnitsFromMixedCodeText(line.text) > 0.0 && Math.abs(line.x - unitsX) <= 260) return true
+      if (!InvestmentOcrImportService.isBrokerNumericMetricText(line.text)) continue
+      const value = InvestmentOcrImportService.parseNumber(line.text)
+      if (isNaN(value)) continue
+      if (Math.abs(line.x - profitX) <= 170 || Math.abs(line.x - unitsX) <= 170) return true
+    }
+    return false
+  }
+
+  private static findBrokerCodeInRow(lines: HoldingOcrLine[], startY: number, endY: number, codeX: number): string {
+    let best = ''
+    let bestScore = 999999.0
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.y < startY - 24 || line.y > endY) continue
+      const code = InvestmentOcrImportService.extractBrokerCodeFromText(line.text)
+      if (code == '') continue
+      if (Math.abs(line.x - codeX) > 360) continue
+      const score = Math.abs(line.x - codeX) + Math.abs(line.y - startY) * 0.25
+      if (score < bestScore) {
+        bestScore = score
+        best = code
+      }
+    }
+    return best
+  }
+
+  private static extractBrokerCodeFromText(text: string): string {
+    const value = (text ?? '').toString().trim()
+    if (value == '') return ''
+    const separated = /[^0-9]([0-9]{6})[^0-9]/.exec(' ' + value + ' ')
+    if (separated != null && separated.length >= 2) return separated[1]
+    const compact = value.replace(/[^0-9]/g, '')
+    if (/^[0-9]{7,12}$/.test(compact)) return compact.substring(compact.length - 6)
+    return ''
+  }
+
+  private static findBrokerNumberInBand(lines: HoldingOcrLine[], startY: number, endY: number, columnX: number, toleranceX: number, requirePercent: boolean, allowSigned: boolean): number {
+    let best = 0.0
+    let bestScore = -999999.0
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.y < startY - 26 || line.y > endY) continue
+      if (Math.abs(line.x - columnX) > toleranceX) continue
+      if (requirePercent && line.text.indexOf('%') < 0) continue
+      if (!requirePercent && line.text.indexOf('%') >= 0) continue
+      if (/^[0-9]{5,8}$/.test(line.text.trim())) continue
+      if (!InvestmentOcrImportService.isBrokerNumericMetricText(line.text)) continue
+      const value = InvestmentOcrImportService.parseNumber(line.text.replace(/%/g, ''))
+      if (isNaN(value)) continue
+      if (!allowSigned && value < 0) continue
+      const score = 1000.0 - Math.abs(line.x - columnX) - Math.abs(line.y - startY) * 0.2
+      if (score > bestScore) {
+        bestScore = score
+        best = value
+      }
+    }
+    return best
+  }
+
+  private static findBrokerUnitsInRow(lines: HoldingOcrLine[], startY: number, endY: number, unitsX: number): number {
+    let best = 0.0
+    let bestScore = -999999.0
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.y < startY - 26 || line.y > endY) continue
+      const mixedUnits = InvestmentOcrImportService.parseBrokerUnitsFromMixedCodeText(line.text)
+      if (mixedUnits > 0.0 && Math.abs(line.x - unitsX) <= 260) {
+        const mixedScore = 1000.0 - Math.abs(line.x - unitsX) - Math.abs(line.y - startY) * 0.5
+        if (mixedScore > bestScore) {
+          bestScore = mixedScore
+          best = mixedUnits
+        }
+        continue
+      }
+      if (Math.abs(line.x - unitsX) > 180) continue
+      if (line.text.indexOf('%') >= 0) continue
+      if (/^[0-9]{5,8}$/.test(line.text.trim())) continue
+      if (!InvestmentOcrImportService.isBrokerNumericMetricText(line.text)) continue
+      const value = InvestmentOcrImportService.parseNumber(line.text)
+      if (isNaN(value) || value <= 0.0) continue
+      const score = 1000.0 - Math.abs(line.x - unitsX) - Math.abs(line.y - startY) * 0.5
+      if (score > bestScore) {
+        bestScore = score
+        best = value
+      }
+    }
+    return best
+  }
+
+  private static parseBrokerUnitsFromMixedCodeText(text: string): number {
+    const value = (text ?? '').toString().trim().replace(/,/g, '').replace(/，/g, '').replace(/[¥￥]/g, '')
+    if (value == '') return 0.0
+    const m = /^([0-9]+(?:\.[0-9]+)?)\s+[0-9]{5,8}$/.exec(value)
+    let rawUnits = ''
+    if (m != null && m.length >= 2) {
+      rawUnits = m[1]
+    } else {
+      const compact = value.replace(/[^0-9]/g, '')
+      if (/^[0-9]{7,12}$/.test(compact)) rawUnits = compact.substring(0, compact.length - 6)
+    }
+    if (rawUnits == '') return 0.0
+    const units = parseFloat(rawUnits)
+    if (isNaN(units) || units <= 0.0) return 0.0
+    return units
+  }
+
+  private static isBrokerNumericMetricText(text: string): boolean {
+    let value = (text ?? '').toString().trim()
+    if (value == '') return false
+    value = value.replace(/\s+/g, '').replace(/,/g, '').replace(/，/g, '').replace(/[¥￥]/g, '')
+    if (value == '') return false
+    if (/[\u4e00-\u9fa5A-Za-z]/.test(value)) return false
+    return /^[+\-]?[0-9]+(?:\.\.?[0-9]+)?%?$/.test(value)
+  }
+
+  private static looksLikeAlipayHoldingList(lines: HoldingOcrLine[]): boolean {
+    const text = lines.map((l: HoldingOcrLine): string => l.text).join('\n')
+    if (text.indexOf('我的持有') < 0 || text.indexOf('金额/昨日收益') < 0 || text.indexOf('持有收益/率') < 0) return false
+    if (!InvestmentOcrImportService.containsAny(text, ['基金', '财富号', 'QDII', '混合', '债', '股票', '指数'])) return false
+    return true
+  }
+
+  private static extractAlipayFundHoldings(lines: HoldingOcrLine[]): ParsedFundHolding[] {
+    const headerY = InvestmentOcrImportService.findAlipayHeaderLineY(lines)
+    const footerY = InvestmentOcrImportService.findFooterLineY(lines)
+    const starts = [] as HoldingOcrLine[]
+    let lastStartY = -999999.0
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.y <= headerY) continue
+      if (footerY > 0 && line.y >= footerY - 120) continue
+      if (line.x > 520) continue
+      const part = InvestmentOcrImportService.cleanAlipayFundNamePart(line.text)
+      if (part == '') continue
+      if (!InvestmentOcrImportService.hasAlipayRowMetric(lines, line.y)) continue
+      if (line.y - lastStartY < 120) continue
+      starts.push(line)
+      lastStartY = line.y
+    }
+
+    const result = [] as ParsedFundHolding[]
+    for (let i = 0; i < starts.length; i++) {
+      const start = starts[i]
+      const nextY = i < starts.length - 1 ? starts[i + 1].y : (footerY > 0 ? footerY : start.y + 180)
+      const name = InvestmentOcrImportService.collectAlipayFundName(lines, start.y, Math.min(start.y + 105, nextY - 8))
+      if (name == '') continue
+      const marketValue = InvestmentOcrImportService.findAlipayNumberInBand(lines, start.y, 450, 790, -45, 38, false, false)
+      const yesterdayProfit = InvestmentOcrImportService.findAlipayNumberInBand(lines, start.y, 560, 790, 35, 105, false, true)
+      const holdingProfit = InvestmentOcrImportService.findAlipayNumberInBand(lines, start.y, 850, 1095, -45, 38, false, true)
+      const profitRate = InvestmentOcrImportService.findAlipayNumberInBand(lines, start.y, 850, 1095, 35, 105, true, true)
+      if (marketValue == 0.0 && yesterdayProfit == 0.0 && holdingProfit == 0.0 && profitRate == 0.0) continue
+      result.push({
+        name: name,
+        code: '',
+        marketValue: marketValue,
+        latestNav: 0.0,
+        estimateNav: 0.0,
+        units: 0.0,
+        profitRate: profitRate,
+        dailyChange: yesterdayProfit,
+        holdingProfit: holdingProfit,
+        quoteTime: '',
+        dataSource: '',
+        missingCode: true
+      } as ParsedFundHolding)
+    }
+    return InvestmentOcrImportService.dedupeHoldings(result)
+  }
+
+  private static findAlipayHeaderLineY(lines: HoldingOcrLine[]): number {
+    let y = 0
+    for (let i = 0; i < lines.length; i++) {
+      if (InvestmentOcrImportService.containsAny(lines[i].text, ['名称', '金额/昨日收益', '持有收益/率'])) {
+        if (lines[i].y > y) y = lines[i].y
+      }
+    }
+    return y <= 0 ? 740 : y
+  }
+
+  private static hasAlipayRowMetric(lines: HoldingOcrLine[], rowY: number): boolean {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      const dy = line.y - rowY
+      if (dy < -45 || dy > 45) continue
+      if (line.x < 450) continue
+      if (line.text.indexOf('%') >= 0) return true
+      const value = InvestmentOcrImportService.parseNumber(line.text)
+      if (!isNaN(value)) return true
+    }
+    return false
+  }
+
+  private static collectAlipayFundName(lines: HoldingOcrLine[], startY: number, endY: number): string {
+    const parts = [] as string[]
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.x > 520) continue
+      if (line.y < startY - 8 || line.y > endY) continue
+      const part = InvestmentOcrImportService.cleanAlipayFundNamePart(line.text)
+      if (part == '') continue
+      parts.push(part)
+    }
+    return InvestmentOcrImportService.normalizeAlipayFundName(parts.join(''))
+  }
+
+  private static cleanAlipayFundNamePart(text: string): string {
+    let value = (text ?? '').toString().trim()
+    if (value == '') return ''
+    value = value.replace(/>+/g, '').trim()
+    if (value == '') return ''
+    if (InvestmentOcrImportService.isAlipayControlText(value)) return ''
+    if (/^[+\-]?[0-9,.]+(?:\.\.?[0-9]+)?%*$/.test(value)) return ''
+    if (!/[\u4e00-\u9fa5A-Za-z]/.test(value)) return ''
+    if (value.length < 2 || value.length > 42) return ''
+    return value
+  }
+
+  private static normalizeAlipayFundName(text: string): string {
+    let value = (text ?? '').toString().replace(/\s+/g, '').replace(/>+/g, '').trim()
+    if (value.length > 48) value = value.substring(0, 48)
+    return value
+  }
+
+  private static isAlipayControlText(text: string): boolean {
+    const value = (text ?? '').toString().trim()
+    if (value == '基金' || value == '全部' || value == '偏股' || value == '偏债' || value == '指数' || value == '黄金') return true
+    if (value == '名称' || value == '金额/昨日收益' || value == '持有收益/率' || value == '金额排序') return true
+    if (value == '基金市场' || value == '机会' || value == '自选' || value == '持有' || value == '定投') return true
+    if (InvestmentOcrImportService.containsAny(value, ['我的持有', '财富号', '答题有礼', '市场解读', '闲钱', '远离股市', '不投股票', '金选'])) return true
+    return false
+  }
+
+  private static findAlipayNumberInBand(lines: HoldingOcrLine[], rowY: number, minX: number, maxX: number, minDy: number, maxDy: number, requirePercent: boolean, allowSigned: boolean): number {
+    let best = 0.0
+    let bestScore = -999999
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.x < minX || line.x > maxX) continue
+      const dy = line.y - rowY
+      if (dy < minDy || dy > maxDy) continue
+      if (requirePercent && line.text.indexOf('%') < 0) continue
+      if (!requirePercent && line.text.indexOf('%') >= 0) continue
+      const value = InvestmentOcrImportService.parseNumber(line.text.replace(/%/g, ''))
+      if (isNaN(value)) continue
+      if (!allowSigned && value < 0) continue
+      const score = 1000 - Math.abs(dy) - Math.abs(line.x - ((minX + maxX) / 2.0)) * 0.1
+      if (score > bestScore) {
+        bestScore = score
+        best = value
+      }
+    }
+    return best
+  }
+
+  private static cleanFundName(text: string): string {
+    let value = (text ?? '').toString().trim()
+    if (value == '') return ''
+    if (InvestmentOcrImportService.isHeaderOrControl(value)) return ''
+    if (value.indexOf('场内') >= 0) return ''
+    if (/^[+\-]?[0-9]+(?:\.[0-9]+)?%?$/.test(value)) return ''
+    if (/[0-9]{5,8}/.test(value)) return ''
+    if (!/[\u4e00-\u9fa5A-Za-z]/.test(value)) return ''
+    if (value.length < 2 || value.length > 32) return ''
+    return value
+  }
+
+  private static findCodeNear(lines: HoldingOcrLine[], anchor: HoldingOcrLine): string {
+    let best = ''
+    let bestDist = 999999
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.x > 420) continue
+      if (line.y <= anchor.y || line.y > anchor.y + 105) continue
+      const m = /([0-9]{5,8})/.exec(line.text)
+      if (m == null || m.length < 2) continue
+      const dist = Math.abs(line.y - anchor.y)
+      if (dist < bestDist) {
+        bestDist = dist
+        best = m[1]
+      }
+    }
+    return best
+  }
+
+  private static findNumberNearColumn(lines: HoldingOcrLine[], rowY: number, columnX: number, requirePercent: boolean, allowSigned: boolean): number {
+    let best = 0.0
+    let bestScore = -999999
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (Math.abs(line.y - rowY) > 42) continue
+      if (Math.abs(line.x - columnX) > 95) continue
+      if (requirePercent && line.text.indexOf('%') < 0) continue
+      if (!requirePercent && line.text.indexOf('%') >= 0) continue
+      const value = InvestmentOcrImportService.parseNumber(line.text.replace('%', ''))
+      if (isNaN(value)) continue
+      if (!allowSigned && value < 0) continue
+      const score = 1000 - Math.abs(line.x - columnX) - Math.abs(line.y - rowY) * 0.8
+      if (score > bestScore) {
+        bestScore = score
+        best = value
+      }
+    }
+    return best
+  }
+
+  private static isHeaderOrControl(text: string): boolean {
+    return InvestmentOcrImportService.containsAny(text, [
+      '同花', '上证指数', '自选股', '持仓股', '持仓汇总', '最新', '涨幅', '涨跌',
+      '首页', '行情', '自选', '交易', '资讯', '理财', '月期持'
+    ])
+  }
+
+  private static extractProvider(lines: HoldingOcrLine[]): string {
+    const allText = lines.map((line: HoldingOcrLine): string => line.text).join('\n')
+    if (InvestmentOcrImportService.looksLikeAlipayHoldingList(lines)) return '支付宝理财'
+    if (InvestmentOcrImportService.containsAny(allText, ['支付宝', '蚂蚁财富'])) return '支付宝理财'
+    if (InvestmentOcrImportService.containsAny(allText, ['天天基金'])) return '天天基金'
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]
+      if (line.y > 260) break
+      if (line.text.indexOf('同花') >= 0) return '同花顺持仓'
+      if (line.text.indexOf('证券') >= 0 || line.text.indexOf('基金') >= 0) return line.text
+    }
+    return '同花顺持仓'
+  }
+
+  private static findHeaderLineY(lines: HoldingOcrLine[]): number {
+    let y = 0
+    for (let i = 0; i < lines.length; i++) {
+      if (InvestmentOcrImportService.containsAny(lines[i].text, ['最新', '持仓汇总', '涨幅', '涨跌'])) {
+        if (lines[i].y > y) y = lines[i].y
+      }
+    }
+    return y <= 0 ? 600 : y
+  }
+
+  private static findFooterLineY(lines: HoldingOcrLine[]): number {
+    let y = 0
+    for (let i = 0; i < lines.length; i++) {
+      if (!InvestmentOcrImportService.isFooterNavLine(lines[i].text)) continue
+      if (y == 0 || lines[i].y < y) y = lines[i].y
+    }
+    return y
+  }
+
+  private static isFooterNavLine(text: string): boolean {
+    const value = (text ?? '').toString().trim()
+    return value == '首页' || value == '行情' || value == '自选' || value == '交易' || value == '资讯' || value == '理财' || value == '基金市场' || value == '机会' || value == '持有'
+  }
+
+  private static findHeaderX(lines: HoldingOcrLine[], keyword: string, fallback: number): number {
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].text.indexOf(keyword) >= 0) return lines[i].x
+    }
+    return fallback
+  }
+
+  private static dedupeHoldings(list: ParsedFundHolding[]): ParsedFundHolding[] {
+    const result = [] as ParsedFundHolding[]
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i]
+      const key = item.code != '' ? item.code : InvestmentOcrImportService.normalizeKey(item.name)
+      let exists = false
+      for (let j = 0; j < result.length; j++) {
+        const otherKey = result[j].code != '' ? result[j].code : InvestmentOcrImportService.normalizeKey(result[j].name)
+        if (otherKey == key) {
+          exists = true
+          break
+        }
+      }
+      if (!exists) result.push(item)
+    }
+    return result
+  }
+
+  private static inferHoldingType(name: string): string {
+    const upper = name.toUpperCase()
+    if (upper.indexOf('ETF') >= 0) return 'ETF'
+    return '基金'
+  }
+
+  private static parseOcrLines(text: string): HoldingOcrLine[] {
+    const rawLines = (text ?? '').toString().replace(/\r\n/g, '\n').split('\n')
+    const result = [] as HoldingOcrLine[]
+    const reg = /^\[\[ocr:([0-9.\-]+),([0-9.\-]+),([0-9.\-]+),([0-9.\-]+)\]\](.*)$/
+    for (let i = 0; i < rawLines.length; i++) {
+      const raw = rawLines[i].trim()
+      const m = reg.exec(raw)
+      if (m == null || m.length < 6) continue
+      const value = m[5].trim()
+      if (value == '') continue
+      result.push({
+        raw: raw,
+        text: value,
+        x: parseFloat(m[1]),
+        y: parseFloat(m[2]),
+        w: parseFloat(m[3]),
+        h: parseFloat(m[4]),
+        index: i
+      } as HoldingOcrLine)
+    }
+    result.sort((a: HoldingOcrLine, b: HoldingOcrLine): number => {
+      const dy = a.y - b.y
+      if (Math.abs(dy) > 8) return dy
+      return a.x - b.x
+    })
+    return result
+  }
+
+  private static parseNumber(text: string): number {
+    const source = (text ?? '').toString().trim()
+    const compact = source.replace(/,/g, '').replace(/，/g, '').replace(/\.\./g, '.').replace(/[^0-9.\-+]/g, '')
+    const signedCompact = compact.startsWith('+') || compact.startsWith('-')
+    const raw = compact.replace(/^\+/, '')
+    if (raw == '' || raw == '-' || raw == '+' || raw == '.') return NaN
+    if (signedCompact && raw.indexOf('.') < 0) {
+      const negative = raw.startsWith('-')
+      const digits = raw.replace(/[^0-9]/g, '')
+      if (digits.length >= 3 && digits.length <= 5) {
+        let fixed = ''
+        if (digits.startsWith('0')) {
+          fixed = `0.${digits.substring(digits.length - 2)}`
+        } else {
+          fixed = `${digits.substring(0, digits.length - 2)}.${digits.substring(digits.length - 2)}`
+        }
+        const fixedNumber = parseFloat(fixed)
+        if (!isNaN(fixedNumber)) return negative ? -fixedNumber : fixedNumber
+      }
+    }
+    return parseFloat(raw)
+  }
+
+  private static normalizeKey(text: string): string {
+    return (text ?? '').toString().toLowerCase().replace(/\s+/g, '').replace(/[()（）\-_*·]/g, '')
+  }
+
+  private static containsAny(text: string, keywords: string[]): boolean {
+    for (let i = 0; i < keywords.length; i++) {
+      if (text.indexOf(keywords[i]) >= 0) return true
+    }
+    return false
+  }
+
+  private static markFinanceChanged(): void {
+    try {
+      uni.setStorageSync(FINANCE_HOME_PENDING_TRANSACTION_CHANGE_KEY, Date.now().toString())
+    } catch (_e) {}
+  }
+}

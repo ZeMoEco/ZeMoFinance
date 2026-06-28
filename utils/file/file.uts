@@ -1,0 +1,1133 @@
+import {
+  RUNTIME_ASSETS_DIR,
+  RUNTIME_BILL_IMAGES_DIR,
+  RUNTIME_DB_EXPORT_DIR,
+  RUNTIME_FULL_EXPORT_DIR,
+  RUNTIME_MUSIC_DIR,
+  RUNTIME_NOTE_DOCS_DIR,
+  RUNTIME_NOTE_IMAGES_DIR,
+  RUNTIME_NOTE_VIDEOS_DIR,
+  RUNTIME_VIDEOS_DIR
+} from '../constant.uts'
+
+// #ifdef APP-ANDROID
+import File from 'java.io.File'
+import FileInputStream from 'java.io.FileInputStream'
+import FileOutputStream from 'java.io.FileOutputStream'
+import UTSAndroid from 'io.dcloud.uts.UTSAndroid'
+import { UTSJSONObject } from 'io.dcloud.uts'
+// #endif
+
+// #ifdef APP-HARMONY
+import fs from '@ohos.file.fs'
+import { fileShare } from '@kit.CoreFileKit'
+// #endif
+
+export type FileCopyOptions = {
+  overwrite?: boolean
+}
+
+export type DirCopyOptions = {
+  overwrite?: boolean
+  /** if set, these file/dir names will be skipped at any level */
+  skipNames?: string[]
+}
+
+type FsmStatOptions = {
+  path: string
+  success: (res: FsmStatResult) => void
+  fail: (_e: any) => void
+}
+
+type FsmStatResult = {
+  stats: any
+}
+
+type FsmMkdirOptions = {
+  dirPath: string
+  recursive: boolean
+  success: () => void
+  fail: (_e: any) => void
+}
+
+type FsmCopyFileOptions = {
+  srcPath: string
+  destPath: string
+  success: () => void
+  fail: (_e: any) => void
+}
+
+type FsmWriteFileOptions = {
+  filePath: string
+  data: any
+  encoding?: string
+  success: () => void
+  fail: (_e: any) => void
+}
+
+type FsmReadFileOptions = {
+	filePath: string
+	encoding?: string
+	success: (res: FsmReadFileResult) => void
+	fail: (_e: any) => void
+}
+
+type FsmReadFileResult = {
+	data: any
+}
+
+type FsmUnlinkOptions = {
+  filePath: string
+  success: () => void
+  fail: (_e: any) => void
+}
+
+type FsmRmdirOptions = {
+  dirPath: string
+  recursive?: boolean
+  success: () => void
+  fail: (_e: any) => void
+}
+
+type FsmReadDirOptions = {
+  dirPath: string
+  success: (res: FsmReadDirResult) => void
+  fail: (_e: any) => void
+}
+
+type FsmReadDirResult = {
+  files: string[]
+}
+
+export class FileUtil {
+
+  static async ensureRuntimeDirs(): Promise<void> {
+    await FileUtil.ensureDir(RUNTIME_ASSETS_DIR)
+    await FileUtil.ensureDir(RUNTIME_NOTE_IMAGES_DIR)
+    await FileUtil.ensureDir(RUNTIME_BILL_IMAGES_DIR)
+    await FileUtil.ensureDir(RUNTIME_VIDEOS_DIR)
+    await FileUtil.ensureDir(RUNTIME_NOTE_VIDEOS_DIR)
+    await FileUtil.ensureDir(RUNTIME_MUSIC_DIR)
+    await FileUtil.ensureDir(RUNTIME_NOTE_DOCS_DIR)
+    await FileUtil.ensureDir(RUNTIME_DB_EXPORT_DIR)
+    await FileUtil.ensureDir(RUNTIME_FULL_EXPORT_DIR)
+  }
+
+  static writeTextFile(filePath: string, content: string, encoding: string = 'utf8'): Promise<boolean> {
+    return new Promise(resolve => {
+      try {
+        // #ifdef APP-HARMONY
+        if (FileUtil.isUriTarget(filePath)) {
+          let file: any | null = null
+          try {
+            file = FileUtil.openHarmonyFileForWrite(filePath, false)
+            if (file == null) {
+              resolve(false)
+              return
+            }
+            FileUtil.truncateHarmonyOpenFile(file, filePath)
+            fs.writeSync(file.fd, content, { encoding: FileUtil.normalizeHarmonyEncoding(encoding) })
+            try { fs.fsyncSync(file.fd) } catch (_e1) {}
+            resolve(true)
+          } catch (_e0) {
+            resolve(false)
+          } finally {
+            FileUtil.closeHarmonyFile(file)
+          }
+          return
+        }
+        // #endif
+
+        FileUtil.ensureDir(filePath.substring(0, filePath.lastIndexOf('/'))).then(() => {
+          uni.getFileSystemManager().writeFile({
+            filePath,
+            data: content,
+            encoding,
+            success: () => resolve(true),
+            fail: (_e: any) => resolve(false)
+          })
+        })
+      } catch (_e2) {
+        resolve(false)
+      }
+    })
+  }
+
+  static readTextFile(filePath: string, encoding: string = 'utf8'): Promise<string | null> {
+    return new Promise(resolve => {
+      try {
+        // #ifdef APP-HARMONY
+        if (FileUtil.isUriTarget(filePath)) {
+          try {
+            const content = fs.readTextSync(filePath, { encoding: FileUtil.normalizeHarmonyEncoding(encoding) })
+            resolve(content)
+          } catch (_e0) {
+            resolve(null)
+          }
+          return
+        }
+        // #endif
+
+        uni.getFileSystemManager().readFile({
+          filePath,
+          encoding,
+          success: (res: any) => {
+            let dataStr = ''
+            // #ifdef APP-ANDROID
+            try {
+              const obj = res as UTSJSONObject
+              const v = obj.get('data')
+              if (v != null) dataStr = v.toString()
+            } catch (_e0) { }
+            // #endif
+            // #ifndef APP-ANDROID
+            try {
+              if (res != null && res.data != null) dataStr = res.data.toString()
+            } catch (_e0) {}
+            // #endif
+
+            // detect replacement character meaning non-utf8
+            if (encoding === 'utf8' && dataStr.indexOf(String.fromCharCode(65533)) !== -1) {
+                uni.getFileSystemManager().readFile({
+                    filePath,
+                    encoding: 'gbk',
+                    success: (res2: any) => {
+                        let dataStr2 = ''
+                        // #ifdef APP-ANDROID
+                        try {
+                            const obj2 = res2 as UTSJSONObject
+                            const v2 = obj2.get('data')
+                            if (v2 != null) dataStr2 = v2.toString()
+                        } catch (_e0) { }
+                        // #endif
+                        // #ifndef APP-ANDROID
+                        try {
+                            if (res2 != null && res2.data != null) dataStr2 = res2.data.toString()
+                        } catch (_e0) {}
+                        // #endif
+                        resolve(dataStr2)
+                    },
+                    fail: () => resolve(dataStr)
+                });
+                return;
+            }
+            resolve(dataStr)
+          },
+          fail: (_e: any) => resolve(null)
+        })
+      } catch (_e2) {
+        resolve(null)
+      }
+    })
+  }
+  static exists(path: string): Promise<boolean> {
+    return new Promise(resolve => {
+      const normalizedPath = FileUtil.normalizePath(path)
+      // #ifdef APP-HARMONY
+      if (FileUtil.isUriTarget(normalizedPath)) {
+        let file: any | null = null
+        try {
+          if (fs.accessSync(normalizedPath)) {
+            resolve(true)
+            return
+          }
+        } catch (_e0) {
+          try {
+            file = FileUtil.openHarmonyFileForRead(normalizedPath)
+            resolve(true)
+          } catch (_e1) {
+            resolve(false)
+          } finally {
+            FileUtil.closeHarmonyFile(file)
+          }
+        }
+        return
+      }
+      if (FileUtil.isHarmonyPhysicalPath(normalizedPath)) {
+        try {
+          resolve(fs.accessSync(normalizedPath))
+        } catch (_e1) {
+          resolve(false)
+        }
+        return
+      }
+      // #endif
+
+      // #ifdef APP-ANDROID
+      try {
+        const abs = FileUtil.toAndroidAbsPath(normalizedPath)
+        if (abs != '') {
+          const f = new File(abs)
+          if (f.exists()) {
+            resolve(true)
+            return
+          }
+        }
+      } catch (_e0) {}
+      // #endif
+
+      uni.getFileSystemManager().stat({
+        path: normalizedPath,
+        success: () => resolve(true),
+        fail: (_e: any) => resolve(false)
+      })
+    })
+  }
+
+  static ensureDir(dirPath: string): Promise<void> {
+    return new Promise(resolve => {
+      const normalizedDirPath = FileUtil.normalizePath(dirPath)
+      // #ifdef APP-HARMONY
+      if (FileUtil.isUriTarget(normalizedDirPath)) {
+        resolve()
+        return
+      }
+      // #endif
+
+      // #ifdef APP-ANDROID
+      try {
+        const abs = FileUtil.toAndroidAbsPath(normalizedDirPath)
+        if (abs != '') {
+          const dir = new File(abs)
+          if (dir.exists() && dir.isDirectory()) {
+            resolve()
+            return
+          }
+          if (dir.mkdirs() || (dir.exists() && dir.isDirectory())) {
+            resolve()
+            return
+          }
+        }
+      } catch (_e0) {}
+      // #endif
+
+      uni.getFileSystemManager().mkdir({
+        dirPath: normalizedDirPath,
+        recursive: true,
+        success: () => resolve(),
+        fail: (e: any) => {
+             // Suppress "File already exists" (1301005) as it is not a real error here
+             let isExistsError = false
+             try {
+                 const jsonStr = JSON.stringify(e);
+                 if (jsonStr.includes("1301005") || jsonStr.includes("File already exists")) {
+                     isExistsError = true;
+                 }
+             } catch(_e) {}
+
+             if (!isExistsError) {
+                 // #ifdef APP-ANDROID
+                 try {
+                    const obj = e as UTSJSONObject;
+                    const errCode = obj.get('errCode');
+                    if (errCode != null && (errCode.toString() == '1301005')) isExistsError = true;
+                 } catch(_e2) {}
+                 // #endif
+             }
+             
+             if (!isExistsError) {
+               console.log(`[FileUtil] ensureDir failed for ${normalizedDirPath}:`, e)
+             }
+             resolve()
+        }
+      })
+    })
+  }
+
+  static async copyFile(srcPath: string, destPath: string, options: FileCopyOptions = {}): Promise<void> {
+    const normalizedSrcPath = FileUtil.normalizePath(srcPath)
+    const normalizedDestPath = FileUtil.normalizePath(destPath)
+    const overwrite = options.overwrite ?? false
+    if (!overwrite) {
+      const exists = await FileUtil.exists(normalizedDestPath)
+      if (exists) return
+    }
+
+    await FileUtil.ensureDir(normalizedDestPath.substring(0, normalizedDestPath.lastIndexOf('/')))
+
+    let nativeCopied = false
+    // #ifdef APP-ANDROID
+    try {
+      const absSrc = FileUtil.toAndroidAbsPath(normalizedSrcPath)
+      const absDest = FileUtil.toAndroidAbsPath(normalizedDestPath)
+        if (absSrc != "" && absDest != "") {
+             const fSrc = new File(absSrc)
+             if (fSrc.exists()) {
+                 const fDest = new File(absDest)
+                 const ins = new FileInputStream(fSrc)
+                 const ous = new FileOutputStream(fDest)
+                 const inChannel = ins.getChannel()
+                 const outChannel = ous.getChannel()
+                 const size = inChannel.size()
+                 inChannel.transferTo(0, size, outChannel)
+                 ins.close()
+                 ous.close()
+                 nativeCopied = true
+                 console.log(`[FileUtil] Native copy success: ${absSrc} -> ${absDest}`)
+             } else {
+                 console.log(`[FileUtil] Native copy src not found: ${absSrc}`)
+             }
+        }
+    } catch(e) {
+        console.error("[FileUtil] Native copyFile failed:", e)
+    }
+    // #endif
+
+    if (!nativeCopied) {
+        await new Promise((resolve) => {
+          uni.getFileSystemManager().copyFile({
+            srcPath: normalizedSrcPath,
+            destPath: normalizedDestPath,
+            success: () => resolve(null),
+            fail: (_e: any) => resolve(null)
+          })
+        })
+    }
+
+    return
+  }
+
+  static copyBinaryFileDirect(srcPath: string, destPath: string): boolean {
+    const normalizedSrcPath = FileUtil.normalizePath(srcPath)
+    const normalizedDestPath = FileUtil.normalizePath(destPath)
+
+    // #ifdef APP-HARMONY
+    const srcCandidates = FileUtil.buildHarmonyPathCandidates(normalizedSrcPath)
+    const destCandidates = FileUtil.buildHarmonyPathCandidates(normalizedDestPath)
+    for (let i = 0; i < srcCandidates.length; i++) {
+      for (let j = 0; j < destCandidates.length; j++) {
+        try {
+          fs.copyFileSync(srcCandidates[i], destCandidates[j])
+          return true
+        } catch (_e0) {}
+      }
+    }
+    return false
+    // #endif
+
+    return false
+  }
+
+  static removeFile(path: string): Promise<void> {
+    return new Promise(resolve => {
+      const normalizedPath = FileUtil.normalizePath(path)
+      // #ifdef APP-HARMONY
+      if (FileUtil.isUriTarget(normalizedPath)) {
+        try {
+          if (fs.accessSync(normalizedPath)) fs.unlinkSync(normalizedPath)
+        } catch (_e0) {}
+        resolve()
+        return
+      }
+      // #endif
+
+      uni.getFileSystemManager().unlink({
+        filePath: normalizedPath,
+        success: () => resolve(),
+        fail: (_e: any) => resolve()
+      })
+    })
+  }
+
+  static removeDir(dirPath: string): Promise<void> {
+    return new Promise(resolve => {
+      try {
+        uni.getFileSystemManager().rmdir({
+          dirPath,
+          recursive: true,
+          success: () => resolve(),
+          fail: (_e: any) => resolve(),
+        })
+      } catch (_e) {
+        resolve()
+      }
+    })
+  }
+
+  static createDirExclusive(dirPath: string): Promise<boolean> {
+    return new Promise(resolve => {
+      try {
+        // #ifdef APP-HARMONY
+        if (FileUtil.isUriTarget(dirPath)) {
+          resolve(false)
+          return
+        }
+        // #endif
+
+        uni.getFileSystemManager().mkdir({
+          dirPath,
+          recursive: false,
+          success: () => resolve(true),
+          fail: (_e: any) => resolve(false),
+        })
+      } catch (_e) {
+        resolve(false)
+      }
+    })
+  }
+
+  static async getFileSize(filePath: string): Promise<number> {
+    const stats = await FileUtil.stat(filePath)
+    if (stats == null) return 0
+
+    try {
+      const sizeAny = (stats as any).size
+      if (sizeAny != null) return parseInt(sizeAny.toString())
+    } catch (_e0) {}
+
+    // #ifdef APP-ANDROID
+    try {
+      const obj = stats as UTSJSONObject
+      const v = obj.get('size')
+      if (v != null) return parseInt(v.toString())
+    } catch (_e1) {}
+    // #endif
+
+    return 0
+  }
+
+  static writeBinaryFile(filePath: string, data: ArrayBuffer): Promise<boolean> {
+    return new Promise(resolve => {
+      try {
+        // #ifdef APP-HARMONY
+        if (FileUtil.isUriTarget(filePath)) {
+          let file: any | null = null
+          try {
+            file = FileUtil.openHarmonyFileForWrite(filePath, false)
+            if (file == null) {
+              resolve(false)
+              return
+            }
+            FileUtil.truncateHarmonyOpenFile(file, filePath)
+            fs.writeSync(file.fd, data)
+            try { fs.fsyncSync(file.fd) } catch (_e1) {}
+            resolve(true)
+          } catch (_e0) {
+            resolve(false)
+          } finally {
+            FileUtil.closeHarmonyFile(file)
+          }
+          return
+        }
+        if (FileUtil.isHarmonyPhysicalPath(filePath)) {
+          let file: any | null = null
+          try {
+            file = FileUtil.openHarmonyFileForWrite(filePath, false)
+            if (file == null) {
+              resolve(false)
+              return
+            }
+            FileUtil.truncateHarmonyOpenFile(file, filePath)
+            fs.writeSync(file.fd, data)
+            try { fs.fsyncSync(file.fd) } catch (_e1) {}
+            resolve(true)
+          } catch (_e2) {
+            resolve(false)
+          } finally {
+            FileUtil.closeHarmonyFile(file)
+          }
+          return
+        }
+        // #endif
+
+        FileUtil.ensureDir(filePath.substring(0, filePath.lastIndexOf('/'))).then(() => {
+          // #ifdef APP-ANDROID
+          try {
+            const abs = FileUtil.toAndroidAbsPath(filePath)
+            if (abs != '') {
+              const target = new File(abs)
+              const parent = target.getParentFile()
+              if (parent != null && !parent.exists()) parent.mkdirs()
+              const out = new FileOutputStream(target)
+              const bytes = new Uint8Array(data)
+              for (let i = 0; i < bytes.length; i++) {
+                out.write(bytes[i])
+              }
+              out.flush()
+              out.close()
+              resolve(true)
+              return
+            }
+          } catch (_e0) {}
+          // #endif
+
+          uni.getFileSystemManager().writeFile({
+            filePath,
+            data,
+            success: () => resolve(true),
+            fail: (_e: any) => resolve(false),
+          })
+        })
+      } catch (_e2) {
+        resolve(false)
+      }
+    })
+  }
+
+  static async appendBinaryFile(filePath: string, data: ArrayBuffer): Promise<boolean> {
+    // #ifdef APP-HARMONY
+    if (FileUtil.isUriTarget(filePath)) {
+      let file: any | null = null
+      try {
+        file = FileUtil.openHarmonyFileForWrite(filePath, true)
+        if (file == null) return false
+        fs.writeSync(file.fd, data)
+        return true
+      } catch (_e0) {
+        return false
+      } finally {
+        FileUtil.closeHarmonyFile(file)
+      }
+    }
+    // #endif
+
+    // #ifdef APP-ANDROID
+    try {
+      await FileUtil.ensureDir(filePath.substring(0, filePath.lastIndexOf('/')))
+      const abs = FileUtil.toAndroidAbsPath(filePath)
+      if (abs != '') {
+        const target = new File(abs)
+        const parent = target.getParentFile()
+        if (parent != null && !parent.exists()) parent.mkdirs()
+        const out = new FileOutputStream(target, true)
+        const bytes = new Uint8Array(data)
+        for (let i = 0; i < bytes.length; i++) {
+          out.write(bytes[i])
+        }
+        out.flush()
+        out.close()
+        return true
+      }
+    } catch (_e0) {}
+    // #endif
+
+    const existing = await FileUtil.readBinaryFile(filePath)
+    const current = existing == null ? new Uint8Array(0) : new Uint8Array(existing)
+    const next = new Uint8Array(data)
+    const merged = new Uint8Array(current.length + next.length)
+    for (let i = 0; i < current.length; i++) merged[i] = current[i]
+    for (let i = 0; i < next.length; i++) merged[current.length + i] = next[i]
+    return await FileUtil.writeBinaryFile(filePath, merged.buffer)
+  }
+
+  static readBinaryFile(filePath: string): Promise<ArrayBuffer | null> {
+    return new Promise(resolve => {
+      try {
+        // #ifdef APP-HARMONY
+        if (FileUtil.isUriTarget(filePath)) {
+          let file: any | null = null
+          try {
+            file = FileUtil.openHarmonyFileForRead(filePath)
+            if (file == null) {
+              resolve(null)
+              return
+            }
+            const stat = fs.statSync(file.fd)
+            const size = parseInt(stat.size.toString())
+            const out = new ArrayBuffer(size)
+            if (size > 0) fs.readSync(file.fd, out)
+            resolve(out)
+          } catch (_e0) {
+            resolve(null)
+          } finally {
+            FileUtil.closeHarmonyFile(file)
+          }
+          return
+        }
+        if (FileUtil.isHarmonyPhysicalPath(filePath)) {
+          let file: any | null = null
+          try {
+            file = FileUtil.openHarmonyFileForRead(filePath)
+            if (file == null) {
+              resolve(null)
+              return
+            }
+            const stat = fs.statSync(file.fd)
+            const size = parseInt(stat.size.toString())
+            const out = new ArrayBuffer(size)
+            if (size > 0) fs.readSync(file.fd, out)
+            resolve(out)
+          } catch (_e1) {
+            resolve(null)
+          } finally {
+            FileUtil.closeHarmonyFile(file)
+          }
+          return
+        }
+        // #endif
+
+        // #ifdef APP-ANDROID
+        try {
+          const abs = FileUtil.toAndroidAbsPath(filePath)
+          if (abs != '') {
+            const source = new File(abs)
+            if (!source.exists()) {
+              resolve(null)
+              return
+            }
+            const size = parseInt(source.length().toString())
+            const out = new Uint8Array(size)
+            const input = new FileInputStream(source)
+            let index = 0
+            while (index < size) {
+              const value = input.read()
+              if (value < 0) break
+              out[index] = value
+              index += 1
+            }
+            input.close()
+            resolve(out.buffer)
+            return
+          }
+        } catch (_e0) {}
+        // #endif
+
+        uni.getFileSystemManager().readFile({
+          filePath,
+          success: (res: any) => {
+            try {
+              const dataAny = res != null ? (res as any).data : null
+              if (dataAny != null) {
+                try {
+                  const maybeBuffer = dataAny as ArrayBuffer
+                  const check = new Uint8Array(maybeBuffer)
+                  resolve(check.buffer)
+                  return
+                } catch (_e1) {}
+
+                try {
+                  const maybeBytes = dataAny as Uint8Array
+                  if (maybeBytes.buffer != null) {
+                    resolve(maybeBytes.buffer)
+                    return
+                  }
+                } catch (_e2) {}
+              }
+            } catch (_e3) {}
+            resolve(null)
+          },
+          fail: (_e: any) => resolve(null),
+        })
+      } catch (_e4) {
+        resolve(null)
+      }
+    })
+  }
+
+  static readDir(dirPath: string): Promise<string[]> {
+    return new Promise(resolve => {
+      const normalizedDirPath = FileUtil.normalizePath(dirPath)
+      // #ifdef APP-ANDROID
+      try {
+          const abs = FileUtil.toAndroidAbsPath(normalizedDirPath)
+          const f = new File(abs)
+          if (f.exists() && f.isDirectory()) {
+              const list = f.list()
+              if (list != null) {
+                  const res: string[] = []
+                  // Native Java Array uses .size property and requires Int index
+                  // Cast to any to access .size if type inference fails, or just use .size if known
+                  // But safer to just iteration with for-loop using Int
+                   
+                   // Use java reflection to iterate native array safely
+                   const len = java.lang.reflect.Array.getLength(list)
+                   for(let i: Int = 0; i < len; i++) {
+                       const item = java.lang.reflect.Array.get(list, i)
+                       if (item != null) res.push(item.toString())
+                   }
+                  resolve(res)
+                  return
+              }
+          }
+      } catch(e) {}
+      // #endif
+
+      uni.getFileSystemManager().readdir({
+        dirPath: normalizedDirPath,
+        success: (res: any) => {
+      const out: string[] = []
+      // #ifdef APP-ANDROID
+      try {
+        const obj = res as UTSJSONObject
+        const v = obj.get('files')
+        if (v != null) {
+          const arr = v as UTSArray<any>
+          for (let i = 0; i < arr.length; i++) {
+            const it = arr[i]
+            out.push(it != null ? it.toString() : '')
+          }
+        }
+      } catch (_e0) {
+        // ignore
+      }
+      // #endif
+      // #ifndef APP-ANDROID
+      try {
+        if (res != null && res.files != null) {
+          const arr = res.files as Array<any>
+          for (let i = 0; i < arr.length; i++) {
+            const it = arr[i]
+            out.push(it != null ? it.toString() : '')
+          }
+        }
+      } catch (_e0) {}
+      // #endif
+      resolve(out)
+        },
+        fail: (_e: any) => resolve([])
+      })
+    })
+  }
+
+  static stat(path: string): Promise<any | null> {
+    return new Promise(resolve => {
+      const normalizedPath = FileUtil.normalizePath(path)
+      // #ifdef APP-HARMONY
+      if (FileUtil.isUriTarget(normalizedPath)) {
+        let file: any | null = null
+        try {
+          file = FileUtil.openHarmonyFileForRead(normalizedPath)
+          if (file == null) {
+            resolve(null)
+            return
+          }
+          resolve(fs.statSync(file.fd))
+        } catch (_e0) {
+          resolve(null)
+        } finally {
+          FileUtil.closeHarmonyFile(file)
+        }
+        return
+      }
+      if (FileUtil.isHarmonyPhysicalPath(normalizedPath)) {
+        let file: any | null = null
+        try {
+          file = FileUtil.openHarmonyFileForRead(normalizedPath)
+          if (file == null) {
+            resolve(null)
+            return
+          }
+          resolve(fs.statSync(file.fd))
+        } catch (_e1) {
+          resolve(null)
+        } finally {
+          FileUtil.closeHarmonyFile(file)
+        }
+        return
+      }
+      // #endif
+
+      // #ifdef APP-ANDROID
+      try {
+         const abs = FileUtil.toAndroidAbsPath(normalizedPath)
+           if (abs != '') {
+               const f = new java.io.File(abs)
+               if (f.exists()) {
+                   // Return a mock stats object to satisfy size checks
+                   const mockStats = new UTSJSONObject()
+                   mockStats.set("size", f.length())
+                   mockStats.set("lastModified", f.lastModified())
+                   mockStats.set("mtimeMs", f.lastModified())
+                   resolve(mockStats)
+                   return
+               }
+           }
+      } catch(e) {}
+      // #endif
+
+      uni.getFileSystemManager().stat({
+        path: normalizedPath,
+        success: (res: any) => {
+      let statsObj: any | null = null
+      // #ifdef APP-ANDROID
+      try {
+        const obj = res as UTSJSONObject
+        const v = obj.get('stats')
+        if (v != null) statsObj = v
+      } catch (_e0) {
+        statsObj = null
+      }
+      // #endif
+      // #ifndef APP-ANDROID
+      try {
+        if (res != null && res.stats != null) statsObj = res.stats
+      } catch (_e0) { statsObj = null }
+      // #endif
+      resolve(statsObj)
+        },
+        fail: (_e: any) => resolve(null)
+      })
+    })
+  }
+
+  static isDir(path: string): Promise<boolean> {
+     return new Promise(resolve => {
+       const normalizedPath = FileUtil.normalizePath(path)
+         // #ifdef APP-ANDROID
+         try {
+             // Try Native logic first for robustness on Android
+         const abs = FileUtil.toAndroidAbsPath(normalizedPath)
+             if (abs != '') {
+                 const f = new java.io.File(abs)
+                 if (f.exists()) {
+                     resolve(f.isDirectory())
+                     return
+                 }
+             }
+         } catch(_e) {}
+         // #endif
+         
+         // Fallback to Uni API
+         uni.getFileSystemManager().readdir({
+          dirPath: normalizedPath,
+            success: (_res: any) => resolve(true),
+            fail: (_e: any) => resolve(false)
+         })
+     })
+  }
+
+  static async copyDir(srcDir: string, destDir: string, options: DirCopyOptions = {}): Promise<void> {
+    const overwrite = options.overwrite ?? false
+    const skipNames = options.skipNames ?? []
+
+    console.log(`[FileUtil] copyDir: ${srcDir} -> ${destDir}`)
+    const srcExists = await FileUtil.isDir(srcDir) // Re-use isDir check to confirm source exists
+    if (!srcExists) {
+        console.log(`[FileUtil] Source dir does not exist or is not a dir: ${srcDir}`)
+        return
+    }
+
+    await FileUtil.ensureDir(destDir)
+    const items = await FileUtil.readDir(srcDir)
+    console.log(`[FileUtil] Items in ${srcDir}: ${items.length}`)
+    
+    for (let i = 0; i < items.length; i++) {
+      const name = items[i]
+      let skip = false
+      for (let j = 0; j < skipNames.length; j++) {
+        if (skipNames[j] == name) {
+          skip = true
+          break
+        }
+      }
+      if (skip) continue
+      const src = `${srcDir}/${name}`
+      const dest = `${destDir}/${name}`
+
+      const dir = await FileUtil.isDir(src)
+      if (dir) {
+        await FileUtil.copyDir(src, dest, options)
+      } else {
+        await FileUtil.copyFile(src, dest, { overwrite })
+      }
+    }
+  }
+
+  static async listDirRecursive(dirPath: string): Promise<string[]> {
+      const res: string[] = []
+      try {
+        const normalizedDirPath = FileUtil.normalizePath(dirPath)
+        const items = await FileUtil.readDir(normalizedDirPath)
+          for(let i=0; i<items.length; i++){
+              const name = items[i]
+          const full = normalizedDirPath.endsWith('/') ? (normalizedDirPath + name) : (normalizedDirPath + '/' + name)
+              res.push(full)
+              const isD = await FileUtil.isDir(full)
+              if(isD) {
+                  const sub = await FileUtil.listDirRecursive(full)
+                  res.push(...sub)
+              }
+          }
+      } catch(e) {}
+      return res
+  }
+
+  // Remove duplicate isDir implementation here.
+  // The first implementation using readdir is cross-platform but relies on behavior.
+  // The second one was Native Java.
+  // Let's replace the FIRST implementation with the Native one (more robust), and delete the second one entirely.
+
+  static normalizePath(path: string): string {
+    let p = (path ?? '').toString().trim().replace(/\\/g, '/')
+    p = p.replace('unifile://usr//', 'unifile://usr/')
+    p = p.replace('unifile://cache//', 'unifile://cache/')
+    while (p.indexOf('unifile://usr//') == 0) p = 'unifile://usr/' + p.substring('unifile://usr//'.length)
+    while (p.indexOf('unifile://cache//') == 0) p = 'unifile://cache/' + p.substring('unifile://cache//'.length)
+    return p
+  }
+
+  // Helper for android path resolution (internal use)
+  private static toAndroidAbsPath(p: string): string {
+    const normalizedPath = FileUtil.normalizePath(p)
+    // #ifdef APP-ANDROID
+    return UTSAndroid.convert2AbsFullPath(normalizedPath)
+    // #endif
+    // #ifndef APP-ANDROID
+    return normalizedPath
+    // #endif
+  }
+
+  private static isUriTarget(path: string): boolean {
+    const p = FileUtil.normalizePath(path)
+    if (p.indexOf('unifile://usr/') == 0 || p.indexOf('unifile://cache/') == 0) return false
+    return p.indexOf('://') > 0
+  }
+
+  private static isHarmonyPhysicalPath(path: string): boolean {
+    const p = FileUtil.normalizePath(path)
+    if (p.indexOf('://') > 0) return false
+    return p.indexOf('/') == 0
+  }
+
+  static async activatePersistedUriPermission(path: string): Promise<boolean> {
+    const normalizedPath = FileUtil.normalizePath(path)
+    if (!FileUtil.isUriTarget(normalizedPath)) return true
+
+    // #ifdef APP-HARMONY
+    try {
+      if (!canIUse('SystemCapability.FileManagement.AppFileService.FolderAuthorization')) return false
+      const policyInfo: fileShare.PolicyInfo = {
+        uri: normalizedPath,
+        operationMode: fileShare.OperationMode.READ_MODE | fileShare.OperationMode.WRITE_MODE,
+      }
+      const policies: Array<fileShare.PolicyInfo> = [policyInfo]
+      await fileShare.activatePermission(policies)
+      return true
+    } catch (_e0) {
+      return false
+    }
+    // #endif
+
+    // #ifndef APP-HARMONY
+    return true
+    // #endif
+  }
+
+  // #ifdef APP-HARMONY
+  private static normalizeHarmonyEncoding(encoding: string): string {
+    return encoding == 'utf8' ? 'utf-8' : encoding
+  }
+
+  private static pushUniqueHarmonyPath(list: string[], value: string): void {
+    const text = (value ?? '').toString().trim()
+    if (text == '') return
+    for (let i = 0; i < list.length; i++) {
+      if (list[i] == text) return
+    }
+    list.push(text)
+  }
+
+  private static buildHarmonyPathCandidates(filePath: string): string[] {
+    const result = [] as string[]
+    const normalized = FileUtil.normalizePath(filePath)
+    FileUtil.pushUniqueHarmonyPath(result, normalized)
+
+    let decoded = normalized
+    try {
+      decoded = decodeURIComponent(normalized)
+      FileUtil.pushUniqueHarmonyPath(result, decoded)
+    } catch (_e0) {}
+
+    const values = [normalized, decoded] as string[]
+    for (let i = 0; i < values.length; i++) {
+      const text = values[i]
+      const marker = '://'
+      const schemeIdx = text.indexOf(marker)
+      if (schemeIdx < 0) continue
+      const rest = text.substring(schemeIdx + marker.length)
+      const slashIdx = rest.indexOf('/')
+      if (slashIdx >= 0 && slashIdx < rest.length - 1) {
+        const physical = rest.substring(slashIdx)
+        if (physical.indexOf('/') == 0) FileUtil.pushUniqueHarmonyPath(result, physical)
+      }
+    }
+
+    return result
+  }
+
+  private static openHarmonyFileForRead(filePath: string): any | null {
+    const candidates = FileUtil.buildHarmonyPathCandidates(filePath)
+    for (let i = 0; i < candidates.length; i++) {
+      try {
+        return fs.openSync(candidates[i], fs.OpenMode.READ_ONLY)
+      } catch (_e0) {}
+    }
+    return null
+  }
+
+  private static openHarmonyFileForWrite(filePath: string, append: boolean): any | null {
+    const uriTarget = FileUtil.isUriTarget(filePath)
+    if (uriTarget) {
+      if (append) {
+        let appendFile = FileUtil.tryOpenHarmonyFileForWriteMode(filePath, fs.OpenMode.READ_WRITE | fs.OpenMode.APPEND)
+        if (appendFile != null) return appendFile
+        appendFile = FileUtil.tryOpenHarmonyFileForWriteMode(filePath, fs.OpenMode.WRITE_ONLY | fs.OpenMode.APPEND)
+        if (appendFile != null) return appendFile
+        return FileUtil.tryOpenHarmonyFileForWriteMode(filePath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.APPEND)
+      }
+
+      let file = FileUtil.tryOpenHarmonyFileForWriteMode(filePath, fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC)
+      if (file != null) return file
+      file = FileUtil.tryOpenHarmonyFileForWriteMode(filePath, fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC)
+      if (file != null) return file
+      file = FileUtil.tryOpenHarmonyFileForWriteMode(filePath, fs.OpenMode.READ_WRITE)
+      if (file != null) return file
+      file = FileUtil.tryOpenHarmonyFileForWriteMode(filePath, fs.OpenMode.WRITE_ONLY)
+      if (file != null) return file
+      return FileUtil.tryOpenHarmonyFileForWriteMode(filePath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC)
+    }
+
+    try {
+      const stat = fs.statSync(filePath)
+      if (stat.isDirectory()) return null
+    } catch (_e0) {
+      if (append) {
+        return fs.openSync(filePath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.APPEND)
+      }
+      return fs.openSync(filePath, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC)
+    }
+
+    if (append) {
+      return fs.openSync(filePath, fs.OpenMode.READ_WRITE | fs.OpenMode.APPEND)
+    }
+    return fs.openSync(filePath, fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC)
+  }
+
+  private static tryOpenHarmonyFileForWriteMode(filePath: string, mode: number): any | null {
+    const candidates = FileUtil.buildHarmonyPathCandidates(filePath)
+    for (let i = 0; i < candidates.length; i++) {
+      try {
+        return fs.openSync(candidates[i], mode)
+      } catch (_e0) {}
+    }
+    return null
+  }
+
+  private static truncateHarmonyOpenFile(file: any | null, filePath: string): void {
+    if (file == null) return
+    try {
+      const fsAny = fs as any
+      if (fsAny.truncateSync != null) {
+        try {
+          fsAny.truncateSync(file.fd, 0)
+          return
+        } catch (_e0) {}
+        const candidates = FileUtil.buildHarmonyPathCandidates(filePath)
+        for (let i = 0; i < candidates.length; i++) {
+          try {
+            fsAny.truncateSync(candidates[i], 0)
+            return
+          } catch (_e1) {}
+        }
+      }
+    } catch (_e2) {}
+  }
+
+  private static closeHarmonyFile(file: any | null): void {
+    if (file == null) return
+    try {
+      fs.closeSync(file)
+    } catch (_e0) {}
+  }
+  // #endif
+}

@@ -1,0 +1,193 @@
+<template>
+	<view class="app-selector-mask" @click="close">
+		<view class="app-selector-content" @click.stop>
+			<view class="selector-header">
+				<text class="selector-title">Select App to Record</text>
+				<view class="search-box">
+					<text class="search-icon">🔍</text>
+					<input class="search-input" placeholder="Search apps..." v-model="searchText" />
+				</view>
+			</view>
+			
+			<scroll-view class="app-list" scroll-y="true">
+				<view class="app-item" v-for="(app, index) in filteredApps" :key="index" @click="selectApp(app)">
+					<!-- Placeholder Icon -->
+					<view class="app-icon-placeholder">
+						<text class="app-icon-text">{{ app.appName.slice(0,1) }}</text>
+					</view>
+					<view class="app-info">
+						<text class="app-name">{{ app.appName }}</text>
+						<text class="app-pkg">{{ app.packageName }}</text>
+					</view>
+					<text class="app-arrow">➤</text>
+				</view>
+			</scroll-view>
+            
+            <view class="close-btn" @click="close">
+                <text class="close-btn-text">Cancel</text>
+            </view>
+		</view>
+	</view>
+</template>
+
+<script lang="uts">
+    import { ZemoRpa } from '@/uni_modules/zemo-rpa';
+    
+    type AppData = {
+        appName: string
+        packageName: string
+    }
+
+	export default {
+		name: "RpaAppSelector",
+        emits: ['confirm', 'close'],
+        data() {
+            return {
+                searchText: "",
+                allApps: [] as AppData[]
+            }
+        },
+        mounted() {
+            this.loadApps();
+        },
+        computed: {
+            filteredApps(): AppData[] {
+                if (this.searchText == "") return this.allApps;
+                const lower = this.searchText.toLowerCase();
+                return this.allApps.filter((app: AppData) => {
+                    return app.appName.toLowerCase().includes(lower) || 
+                           app.packageName.toLowerCase().includes(lower);
+                });
+            }
+        },
+        methods: {
+            close() {
+                this.$emit('close');
+            },
+            loadApps() {
+                const apps = ZemoRpa.getInstalledApps();
+                 const res: AppData[] = [];
+                 apps.forEach(item => {
+                      // getInstalledApps returns Map<string, any> items, not UTSJSONObject
+                      const obj = item as Map<string, any>;
+                      const appName = (obj.get('appName') ?? "Unknown") as string;
+                      const packageName = (obj.get('packageName') ?? "") as string;
+                      res.push({ appName: appName, packageName: packageName } as AppData);
+                 });
+                 this.allApps = res;
+            },
+            selectApp(app: AppData) {
+                this.$emit('confirm', app);
+            }
+        }
+	}
+</script>
+
+<style scoped>
+	.app-selector-mask {
+		position: fixed;
+		top: 0;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		background-color: rgba(0,0,0,0.5);
+		justify-content: center;
+		align-items: center;
+		z-index: 9999;
+        display: flex;
+	}
+	.app-selector-content {
+		width: 320px;
+		height: 500px;
+		background-color: #ffffff;
+		border-radius: 16px;
+		display: flex;
+		flex-direction: column;
+		overflow: hidden;
+        padding: 16px;
+	}
+    .selector-header {
+        margin-bottom: 12px;
+    }
+    .selector-title {
+        font-size: 18px;
+        font-weight: bold;
+        color: #333;
+        margin-bottom: 12px;
+        text-align: center;
+    }
+    .search-box {
+        background-color: #f5f5f5;
+        border-radius: 8px;
+        flex-direction: row;
+        align-items: center;
+        padding: 8px 12px;
+        display: flex;
+    }
+    .search-icon {
+        margin-right: 8px;
+        font-size: 14px;
+    }
+    .search-input {
+        flex: 1;
+        font-size: 14px;
+        background-color: transparent;
+    }
+    .app-list {
+        flex: 1;
+        background-color: #fafafa;
+        border-radius: 8px;
+        padding: 4px;
+    }
+    .app-item {
+        flex-direction: row;
+        align-items: center;
+        padding: 10px;
+        border-bottom-width: 1px;
+        border-bottom-color: #eee;
+        background-color: #fff;
+        margin-bottom: 4px;
+        border-radius: 6px;
+    }
+    .app-icon-placeholder {
+        width: 40px;
+        height: 40px;
+        border-radius: 8px;
+        background-color: #007aff;
+        justify-content: center;
+        align-items: center;
+        margin-right: 12px;
+    }
+    .app-icon-text {
+        color: white;
+        font-size: 18px;
+        font-weight: bold;
+    }
+    .app-info {
+        flex: 1;
+    }
+    .app-name {
+        font-size: 15px;
+        color: #333;
+        font-weight: 500;
+    }
+    .app-pkg {
+        font-size: 12px;
+        color: #999;
+        margin-top: 2px;
+    }
+    .app-arrow {
+        color: #ccc;
+    }
+    .close-btn {
+        margin-top: 12px;
+        align-items: center;
+        padding: 10px;
+        background-color: #f0f0f0;
+        border-radius: 8px;
+    }
+    .close-btn-text {
+        color: #666;
+        font-size: 14px;
+    }
+</style>

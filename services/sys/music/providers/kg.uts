@@ -1,0 +1,105 @@
+import { MusicSong } from "../types.uts";
+//import UTSAndroid from "io.dcloud.uts.UTSAndroid";
+
+export const fetchKGSearch = (keyword: string): Promise<MusicSong[]> => {
+    return new Promise((resolve, reject) => {
+        const url = "https://api.timelessq.com/music/kugou/search";
+        console.log("Searching KG music from:", url, "keyword:", keyword);
+        uni.request({
+            url: url,
+            method: "GET",
+            data: {
+                keyword: keyword,
+                page: 1,
+                limit: 100
+            },
+            dataType: "text",
+            timeout: 15000,
+            success: (res) => {
+                let data: UTSJSONObject | null = null;
+                if (res.data != null) {
+                    try {
+                        const raw = res.data as string;
+                        const parsed = JSON.parse(raw);
+                        data = parsed as UTSJSONObject;
+                    } catch(e) { console.error(e); }
+                }
+
+                const songs: MusicSong[] = [];
+                if (data != null) {
+                    // Kugou structure: data.lists
+                    let lists: any[] | null = null;
+                    
+                    const d = data['data'] as UTSJSONObject | null;
+                    if (d != null) {
+                        const l = d['lists'];
+                        if (Array.isArray(l)) lists = l as any[];
+                    }
+
+                    if (lists != null) {
+                        lists.forEach((item: any) => {
+                            const itemObj = item as UTSJSONObject;
+                            
+                            songs.push({
+                                mid: itemObj['FileHash']?.toString() ?? "",
+                                name: itemObj['SongName']?.toString() ?? "",
+                                singer: itemObj['SingerName']?.toString() ?? "",
+                                album: itemObj['AlbumName']?.toString() ?? "",
+                                interval: parseInt(itemObj['Duration']?.toString() ?? "0"),
+                                cover: "/static/music-placeholder.png", 
+                                src: "",
+                                source: "kg"
+                            } as MusicSong);
+                        });
+                    }
+                }
+                console.log(`Found ${songs.length} KG songs for keyword ${keyword}`);
+                resolve(songs);
+            },
+            fail: (err) => {
+                console.error("KG Search failed:", err);
+                reject(err);
+            }
+        });
+    });
+}
+
+export const fetchKGSongUrl = (mid: string): Promise<string> => {
+    return new Promise((resolve, reject) => {
+        const url = `https://api.timelessq.com/music/kugou/songUrl?hash=${mid}`;
+        uni.request({
+            url: url,
+            method: "GET",
+            dataType: "text",
+            success: (res) => {
+                let data: UTSJSONObject | null = null;
+                if (res.data != null) {
+                    try {
+                        const raw = res.data as string;
+                        const parsed = JSON.parse(raw);
+                        data = parsed as UTSJSONObject;
+                    } catch(e) { console.error(e); }
+                }
+                
+                if (data != null) {
+                    const d = data['data'] as UTSJSONObject | null;
+                    if (d != null) {
+                        const u = d['url']?.toString() ?? "";
+                        if (u != "") {
+                            resolve(u);
+                            return;
+                        }
+                        // Sometimes play_url
+                        const u2 = d['play_url']?.toString() ?? "";
+                        if (u2 != "") {
+                            resolve(u2);
+                            return;
+                        }
+                    }
+                }
+                resolve("");
+            },
+            fail: (err) => reject(err)
+        });
+    });
+}

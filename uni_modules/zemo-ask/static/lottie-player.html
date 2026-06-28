@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <style>
+    html,
+    body,
+    #pet {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: transparent;
+    }
+
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #pet {
+      transform-origin: center center;
+    }
+
+    #fallback {
+      display: none;
+      width: 72%;
+      height: 72%;
+      border-radius: 50%;
+      background: radial-gradient(circle at 38% 32%, #f8fcff 0, #8bd3ff 28%, #4b80ff 72%, #2254c7 100%);
+      box-shadow: 0 10px 22px rgba(34, 84, 199, 0.28);
+      animation: breathe 1.8s ease-in-out infinite;
+    }
+
+    @keyframes breathe {
+      0%, 100% { transform: translateY(0) scale(1); }
+      50% { transform: translateY(-4px) scale(1.04); }
+    }
+  </style>
+</head>
+<body>
+  <div id="pet"></div>
+  <div id="fallback"></div>
+  <script>
+    function showFallback() {
+      document.getElementById('pet').style.display = 'none';
+      document.getElementById('fallback').style.display = 'block';
+    }
+
+    function startLottie() {
+      if (!window.lottie) {
+        showFallback();
+        return;
+      }
+      window.lottie.loadAnimation({
+        container: document.getElementById('pet'),
+        renderer: 'svg',
+        loop: true,
+        autoplay: true,
+        path: 'lottie.json',
+        rendererSettings: {
+          preserveAspectRatio: 'xMidYMid meet',
+          progressiveLoad: true
+        }
+      });
+    }
+  </script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/lottie-web/5.12.2/lottie.min.js" onload="startLottie()" onerror="showFallback()"></script>
+</body>
+</html>

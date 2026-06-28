@@ -1,0 +1,854 @@
+﻿<template>
+	<view class="map-container" :class="mode === 'full' ? 'layer-fixed' : 'layer-embed'">
+
+		<!-- Glass Background -->
+		<view class="glass-background" v-if="mode === 'embed'"></view>
+
+		<view v-if="mode === 'full'" class="mask" :style="{ opacity: maskOpacity }" @click="closeMap"></view>
+
+		<view class="drawer" :class="{ 'drawer-embed': mode === 'embed' }" :style="drawerStyle">
+
+			<!-- Header (Full Mode) -->
+			<view v-if="mode === 'full'" class="drawer-header glass-header">
+				<view class="handle-bar"></view>
+				<text class="header-title">任务星系</text>
+				<!-- Close Button -->
+				<view class="close-btn" @click.stop="closeMap" style="right: 15px;"><text class="close-icon"></text>
+				</view>
+
+				<!-- Action Buttons (Full Mode) -->
+				<view class="header-actions">
+					<view class="icon-btn" @click.stop="emitAction('create')"><text class="icon-text"></text></view>
+					<view class="icon-btn" @click.stop="emitAction('delete')"><text class="icon-text">🗑️</text></view>
+				</view>
+			</view>
+
+			<view class="canvas-area" :style="{ backgroundColor: mode === 'embed' ? 'transparent' : '#F5F7FA' }"
+				@click="onCanvasClick" @touchstart="onMapTouchStart" @touchmove="onMapTouchMove"
+				@touchend="onMapTouchEnd">
+
+				<!-- Action Buttons (Embed Mode) -->
+				<view v-if="mode === 'embed'" class="embed-actions">
+					<view class="mini-btn" @click.stop="emitAction('create')"><text class="mini-btn-text"></text>
+					</view>
+					<view class="mini-btn" @click.stop="emitAction('delete')"><text class="mini-btn-text">🗑️</text>
+					</view>
+				</view>
+
+				<!-- Lines -->
+				<view v-for="(line, index) in renderLines" :key="'line_'+index" class="link-line"
+					:style="getLineStyle(line)"></view>
+
+				<!-- Nodes -->
+				<view v-for="(node, index) in nodes" :key="'node_'+node.id" class="node-group"
+					:style="getNodeStyle(node)">
+
+					<!-- Info Bubble -->
+					<view v-if="activeNodeId === node.id && isBubbleVisible" class="info-bubble-glass" @touchstart.stop
+						@click.stop="onBubbleContentClick(node)">
+						<view class="bubble-content-col">
+							<text class="bubble-info-text">开始: {{ getDeadlineText(node.startAt) }}</text>
+							<text class="bubble-info-text" :style="{ color: getHeatColor(node.endAt) }">截止:
+								{{ getDeadlineText(node.endAt) }}</text>
+							<view class="bubble-link-row">
+								<text class="bubble-detail-link">查看详情 </text>
+							</view>
+						</view>
+						<view class="bubble-close-row" @click.stop="hideBubble">
+							<text class="bubble-close-icon">收起</text>
+						</view>
+					</view>
+
+					<!-- Node Circle -->
+					<view class="node-circle" @touchstart.stop="onNodeTouchStart($event as TouchEvent, node)"
+						@touchmove.stop="onNodeTouchMove($event as TouchEvent, node)"
+						@touchend.stop="onNodeTouchEnd($event as TouchEvent, node)"
+						:style="getNodeCircleStyle(node)">
+						<text class="node-icon" :style="{ fontSize: (getNodeSize(node)/2.2)+'px' }">
+							{{ node.hasChildren && !node.isExpanded ? '+' : node.title.substring(0, 1) }}
+						</text>
+					</view>
+
+					<!-- Title -->
+					<view class="glass-title-wrapper" :style="getTitleWrapperStyle()">
+						<view class="glass-title-label" @touchstart.stop @click.stop="onLabelClick(node)">
+							<text class="glass-title-text">{{ node.title }}</text>
+						</view>
+					</view>
+				</view>
+
+				<view v-if="mode === 'embed'" class="fullscreen-hint" @click.stop="$emit('open')">
+					<text class="hint-icon"></text>
+				</view>
+			</view>
+
+		</view>
+	</view>
+</template>
+<script lang="uts">
+	import { TaskBiz, Task, TreeNode, TaskLog } from '@/services/biz/TaskBiz.uts';
+
+	// 修复：移除未使用的 Android 原生依赖，防止编译告警
+	// import JSONObject from "org.json.JSONObject";
+
+	export type JumpPayload = { logId : number; taskId : number; }
+
+	// 定义节点类型，确保物理引擎计算时类型准确
+	type PNode = {
+		id : string; parentId : string; title : string; status : string;
+		x : number; y : number; vx : number; vy : number; color : string;
+		level : number; hasChildren : boolean;
+		isExpanded : boolean;
+		isRoot : boolean; isDragging : boolean; isPinned : boolean;
+		expandedTime : number; isMinimized : boolean; isLoadingLogs : boolean;
+		startAt : number; endAt : number;
+	}
+
+	type PLink = { source : string; target : string; length : number; }
+	type RenderLine = { left : number; top : number; width : number; angle : number; }
+
+	export default {
+		emits: ['close', 'open', 'jump', 'update:currentActiveId', 'action'],
+		props: {
+			rootTask: { type: Object, required: false },
+			subtasks: { type: Array, required: true },
+			mode: { type: String, default: 'full' },
+			focusTaskId: { type: String, default: '' },
+			currentActiveId: { type: String, default: '' }
+		},
+		data() {
+			return {
+				screenWidth: 375.0, screenHeight: 800.0, sheetHeight: 600.0,
+				translateX: 0.0, translateY: 0.0, scale: 1.0,
+				isMapDragging: false, lastMapX: 0.0, lastMapY: 0.0,
+				initialPinchDist: 0.0, initialScale: 1.0,
+				dragNodeId: '', lastNodeX: 0.0, lastNodeY: 0.0,
+				nodes: [] as PNode[], links: [] as PLink[], renderLines: [] as RenderLine[],
+				dataMap: new Map<string, TreeNode>(),
+				timer: -1,
+				colors: ['#7B8CDE', '#86C166', '#F5A623', '#E06C75', '#56CCF2', '#BB99FF'],
+				logsCache: new Map<string, TaskLog[]>(),
+				activeNodeId: '',
+				isBubbleVisible: false,
+				
+				// 交互优化变量
+				dragStartNodeX: 0.0,
+				dragStartNodeY: 0.0,
+				isNodeMoving: false,
+			}
+		},
+		computed: {
+			maskOpacity() : number { return 0.5; },
+			drawerStyle() : string {
+				if (this.mode === 'embed') return 'height: 100%; width: 100%; border-radius: 12px;';
+				return `height: ${this.sheetHeight}px; border-radius: 20px 20px 0 0; background-color: #F5F7FA;`;
+			}
+		},
+		watch: {
+			currentActiveId: {
+				handler(newVal : string) {
+					if (newVal != this.activeNodeId) {
+						this.activeNodeId = newVal;
+						if (newVal != '') {
+							const node = this.nodes.find(n => n.id == newVal);
+							if (node != null) this.fetchNodeLogs(node);
+						}
+					}
+				},
+				immediate: true
+			},
+			rootTask: {
+				handler(newVal : Task | null, oldVal : Task | null) {
+					if (newVal != null) {
+						if (oldVal == null || newVal.id != oldVal.id) setTimeout(() => { this.resetDataAndGraph(); }, 100);
+						else if (this.focusTaskId != '') this.handleFocusChange(this.focusTaskId);
+					}
+				}, immediate: true
+			},
+			subtasks: {
+				handler(newVal : Array<any>) {
+					this.resetDataAndGraph();
+				}
+			},
+			focusTaskId(newVal : string) {
+				if (newVal != '') setTimeout(() => { this.handleFocusChange(newVal); }, 200);
+			}
+		},
+		mounted() {
+			const sys = uni.getSystemInfoSync();
+
+			// 修复：直接赋值，避免 undefined is not callable
+			// UTS 中 sys.windowWidth 已经是 number
+			this.screenWidth = sys.windowWidth;
+			this.screenHeight = sys.windowHeight;
+
+			// 确保 resetViewport 已定义
+			this.resetViewport();
+
+			// 安全检查
+			if (this.nodes.length == 0 && this.rootTask != null) {
+				this.resetDataAndGraph();
+			}
+		},
+		destroyed() { this.stopSim(); },
+		methods: {
+			emitAction(type : string) {
+				const nodeId = this.activeNodeId != '' ? this.activeNodeId : (this.rootTask != null ? (this.rootTask as Task).id : '');
+				this.$emit('action', { type: type, nodeId: nodeId });
+			},
+
+			getDeadlineText(ts : number) : string {
+				if (ts <= 0) return "未设置";
+				const d = new Date(ts);
+				const m = (d.getMonth() + 1).toString().padStart(2, '0');
+				const day = d.getDate().toString().padStart(2, '0');
+				const h = d.getHours().toString().padStart(2, '0');
+				const min = d.getMinutes().toString().padStart(2, '0');
+				return `${m}-${day} ${h}:${min}`;
+			},
+
+			onCanvasClick() { },
+			closeMap() { this.$emit('close'); },
+
+			updateActiveNode(id : string, showBubble : boolean) {
+				this.activeNodeId = id;
+				if (showBubble) this.isBubbleVisible = true;
+				this.$emit('update:currentActiveId', id);
+				if (id != '') {
+					const node = this.nodes.find(n => n.id == id);
+					if (node != null) this.fetchNodeLogs(node);
+				}
+			},
+
+			// onAvatarClick(node : PNode) {
+			// 	if (node.isDragging) return;
+			// 	if (node.hasChildren) {
+			// 		if (node.isExpanded) this.collapseNode(node);
+			// 		else this.expandNode(node, true);
+			// 	}
+			// 	this.updateActiveNode(node.id, true);
+			// },
+			// 修复 1：优化点击响应
+			    onAvatarClick(node : PNode) {
+			        if (node.isDragging) return;
+			        
+		        // 无论是否是叶子节点，先激活它（显示高亮和详情气泡）
+			        this.updateActiveNode(node.id, true);
+			
+		        // 如果有子节点，则切换展开状态
+			        if (node.hasChildren) {
+			            if (node.isExpanded) {
+			                this.collapseNode(node);
+			            } else {
+		                // 强制展开，即使是深层节点
+			                this.expandNode(node, true);
+			            }
+			        } else {
+		            // 关键：检查是否真的是叶子节点，还是数据尚未加载
+		            // 尝试在 dataMap 里查找是否还有子节点
+			            const realData = this.dataMap.get(node.id);
+			            if (realData != null && realData!.children.length > 0) {
+		                // 修正状态并强制展开
+			                node.hasChildren = true;
+			                this.expandNode(node, true);
+			            }
+			        }
+			    },
+			onLabelClick(node : PNode) {
+				if (node.isDragging) return;
+				this.updateActiveNode(node.id, true);
+			},
+
+			closeAll() {
+				this.isBubbleVisible = false;
+				this.updateActiveNode('', false);
+			},
+
+			hideBubble() { this.isBubbleVisible = false; },
+
+			onBubbleContentClick(node : PNode) {
+				const payload = { taskId: node.id, logId: 0 };
+				this.$emit('jump', payload);
+			},
+
+			resetDataAndGraph() { this.stopSim(); this.processData(); this.initGraph(); },
+
+			processData() {
+				this.dataMap.clear();
+				const root = this.rootTask as Task | null;
+				if (root == null) return;
+				const rootNode = {
+					id: root.id, title: root.title, status: root.status,
+					priority: 0, difficulty: 0, data: root,
+					children: this.subtasks as TreeNode[],
+					end_at: root.end_at,
+					start_at: root.start_at
+				} as TreeNode;
+				this.dataMap.set(rootNode.id, rootNode);
+				this.traverseTree(this.subtasks as TreeNode[]);
+			},
+			traverseTree(list : TreeNode[]) {
+				list.forEach(node => { this.dataMap.set(node.id, node); if (node.children.length > 0) this.traverseTree(node.children); });
+			},
+			initGraph() {
+				const root = this.rootTask as Task | null;
+				if (root == null) return;
+				const nodesToExpand = new Set<string>();
+				if (this.focusTaskId != null && this.focusTaskId != '' && this.focusTaskId != root.id) this.findPathToNode(this.subtasks as TreeNode[], this.focusTaskId, nodesToExpand);
+
+				this.nodes = []; this.links = [];
+				const rootNode = {
+					id: root.id, parentId: '-1', title: root.title, status: root.status,
+					x: 0, y: 0, vx: 0, vy: 0, color: '#333', level: 0,
+					hasChildren: (this.subtasks.length > 0), isExpanded: true,
+					isRoot: true, isDragging: false, isPinned: true, expandedTime: Date.now(),
+					isMinimized: false, isLoadingLogs: false,
+					endAt: root.end_at, startAt: root.start_at
+				} as PNode;
+				this.nodes.push(rootNode);
+				this.expandNode(rootNode, false, nodesToExpand);
+
+				if (this.activeNodeId != '') {
+					setTimeout(() => {
+						const node = this.nodes.find(n => n.id == this.activeNodeId);
+						if (node != null) this.fetchNodeLogs(node);
+					}, 100);
+				}
+
+				setTimeout(() => { this.centerOnNode(this.focusTaskId); }, 50);
+				this.startSim();
+			},
+			resetViewport() {
+				if (this.mode === 'embed') { this.translateX = this.screenWidth / 2; this.translateY = 140; this.scale = 0.75; }
+				else { this.translateX = this.screenWidth / 2; this.translateY = 300; this.scale = 0.9; }
+			},
+			async fetchNodeLogs(node : PNode) {
+				if (this.logsCache.has(node.id)) return;
+				node.isLoadingLogs = true;
+				try {
+					const allLogs = await TaskBiz.getTaskLogs(node.id);
+					// 关键修复：显式标注 (l: TaskLog) 类型，避免 "Cannot infer type"
+					const validLogs = allLogs.filter((l : TaskLog) : boolean => {
+						return l.content != null && l.content != "";
+					}).reverse();
+					// const validLogs = allLogs.filter(l => l.content != null && l.content != "").reverse();
+					this.logsCache.set(node.id, validLogs);
+				} catch (e) { } finally { node.isLoadingLogs = false; }
+			},
+			onMapTouchStart(e : TouchEvent) {
+				if (e.touches.length == 1) { this.isMapDragging = true; this.lastMapX = e.touches[0].clientX; this.lastMapY = e.touches[0].clientY; }
+				else if (e.touches.length == 2) { this.isMapDragging = false; this.initialPinchDist = this.calcDistance(e.touches[0], e.touches[1]); this.initialScale = this.scale; }
+			},
+			onMapTouchMove(e : TouchEvent) {
+				if (e.touches.length == 1 && this.isMapDragging) {
+					const dx = e.touches[0].clientX - this.lastMapX; const dy = e.touches[0].clientY - this.lastMapY;
+					this.translateX += dx; this.translateY += dy; this.lastMapX = e.touches[0].clientX; this.lastMapY = e.touches[0].clientY;
+					this.updateRender();
+				} else if (e.touches.length == 2) {
+					const dist = this.calcDistance(e.touches[0], e.touches[1]);
+					if (this.initialPinchDist > 0) {
+						let s = this.initialScale * (dist / this.initialPinchDist);
+						if (s < 0.3) s = 0.3; if (s > 2.0) s = 2.0;
+						this.scale = s; this.updateRender();
+					}
+				}
+			},
+			onMapTouchEnd() { this.isMapDragging = false; },
+			onNodeTouchStart(e : TouchEvent, node : PNode) {
+				node.isPinned = true;
+				this.dragNodeId = node.id;
+				this.lastNodeX = e.touches[0].clientX;
+				this.lastNodeY = e.touches[0].clientY;
+				
+				// 记录点击/拖拽起始位置
+				this.dragStartNodeX = e.touches[0].clientX;
+				this.dragStartNodeY = e.touches[0].clientY;
+				this.isNodeMoving = false;
+				
+				this.startSim();
+			},
+			onNodeTouchMove(e : TouchEvent, node : PNode) {
+				if (this.dragNodeId !== node.id) return;
+				
+				const screenX = e.touches[0].clientX;
+				const screenY = e.touches[0].clientY;
+
+				// 只有移动超过阈值才视为拖拽
+				if (!this.isNodeMoving) {
+					const dx = Math.abs(screenX - this.dragStartNodeX);
+					const dy = Math.abs(screenY - this.dragStartNodeY);
+					if (dx > 5 || dy > 5) {
+						this.isNodeMoving = true;
+						node.isDragging = true;
+					}
+				}
+
+				if (this.isNodeMoving) {
+					const dx = screenX - this.lastNodeX;
+					const dy = screenY - this.lastNodeY;
+					node.x += dx / this.scale;
+					node.y += dy / this.scale;
+					this.updateRender();
+				}
+				
+				this.lastNodeX = screenX;
+				this.lastNodeY = screenY;
+			},
+			onNodeTouchEnd(e : TouchEvent, node : PNode) {
+				// 如果没有发生移动，则认为是点击
+				if (!this.isNodeMoving) {
+					this.onAvatarClick(node);
+				}
+				
+				node.isDragging = false;
+				node.isPinned = node.isExpanded || node.isRoot;
+				this.dragNodeId = '';
+				this.isNodeMoving = false;
+			},
+			expandNode(parent : PNode, checkLimit : boolean, forceExpandSet : Set<string> | null = null) {
+				if (checkLimit) {
+					const expandedNodes = this.nodes.filter(n => n.isExpanded && !n.isRoot);
+					if (expandedNodes.length >= 3) { expandedNodes.sort((a, b) => a.expandedTime - b.expandedTime); this.collapseNode(expandedNodes[0]); }
+				}
+				parent.isExpanded = true; parent.isPinned = true; parent.expandedTime = Date.now(); parent.isMinimized = false;
+				const realData = this.dataMap.get(parent.id);
+				if (realData == null || realData!.children.length == 0) return;
+				let addedCount = 0;
+				realData!.children.forEach((child, i) => {
+					if (this.nodes.find(ex => ex.id == child.id) != null) return;
+					let angle = 0.0;
+					if (this.mode === 'embed' && parent.isRoot) angle = (Math.PI * 0.2) + (i / realData!.children.length) * (Math.PI * 0.6);
+					else angle = (i / realData!.children.length) * 6.28 + (Math.random() - 0.5);
+					const dist = 60 + Math.random() * 20;
+					const shouldAutoExpand = (forceExpandSet != null && forceExpandSet!.has(child.id));
+						// 关键：确保 hasChildren 属性在创建时正确设置
+					            const hasKids = child.children.length > 0;
+					const newNode = {
+						id: child.id, parentId: parent.id, title: child.title, status: child.status,
+						x: parent.x + Math.cos(angle) * dist, y: parent.y + Math.sin(angle) * dist,
+						vx: 0, vy: 0, color: this.colors[(parent.level + i) % this.colors.length],
+						level: parent.level + 1,  hasChildren: hasKids, // 确保这里传递正确
+						isExpanded: shouldAutoExpand, isRoot: false, isDragging: false, isPinned: false,
+						expandedTime: 0, isMinimized: false, isLoadingLogs: false,
+						endAt: child.end_at ?? 0, startAt: child.start_at ?? 0
+					} as PNode;
+					this.nodes.push(newNode); this.links.push({ source: parent.id, target: child.id, length: 110 }); addedCount++;
+					if (shouldAutoExpand) this.expandNode(newNode, false, forceExpandSet);
+				});
+				if (addedCount > 0) this.startSim();
+			},
+			collapseNode(parent : PNode) {
+				if (parent.isRoot) return;
+				parent.isExpanded = false; parent.isPinned = false;
+				const toRemove = new Set<string>();
+				this.collectDescendants(parent.id, toRemove);
+				this.nodes = this.nodes.filter(n => !toRemove.has(n.id));
+				this.links = this.links.filter(l => !toRemove.has(l.target) && !toRemove.has(l.source));
+				this.startSim();
+			},
+			collectDescendants(pid : string, set : Set<string>) {
+				const children = this.nodes.filter(n => n.parentId == pid);
+				children.forEach(child => { set.add(child.id); this.collectDescendants(child.id, set); });
+			},
+			startSim() {
+				if (this.timer != -1) return;
+				this.timer = setInterval(() => {
+					const k_repel = 5000; const k_spring = 0.04; let totalV = 0.0;
+					this.nodes.forEach(n => {
+						if (n.isDragging || n.isPinned) { n.vx = 0; n.vy = 0; return; }
+						let fx = 0.0; let fy = 0.0;
+						this.nodes.forEach(other => {
+							if (n.id !== other.id) {
+								const dx = n.x - other.x; const dy = n.y - other.y; const dSq = dx * dx + dy * dy;
+								if (dSq > 1 && dSq < 100000) { const f = k_repel / dSq; const dist = Math.sqrt(dSq); fx += (dx / dist) * f; fy += (dy / dist) * f; }
+							}
+						});
+						this.links.forEach(l => {
+							if (l.target == n.id || l.source == n.id) {
+								const otherId = (l.target == n.id) ? l.source : l.target;
+								const other = this.nodes.find(x => x.id == otherId);
+								if (other != null) {
+									const dx = n.x - other!.x; const dy = n.y - other!.y; const dist = Math.sqrt(dx * dx + dy * dy);
+									const f = (dist - l.length) * k_spring; fx -= (dx / dist) * f; fy -= (dy / dist) * f;
+								}
+							}
+						});
+						n.vx = (n.vx + fx) * 0.8; n.vy = (n.vy + fy) * 0.8; n.x += n.vx; n.y += n.vy; totalV += Math.abs(n.vx) + Math.abs(n.vy);
+					});
+					this.updateRender();
+					if (totalV < 0.2 && this.nodes.length > 0 && this.dragNodeId == '') this.stopSim();
+				}, 16);
+			},
+			stopSim() { if (this.timer != -1) clearInterval(this.timer); this.timer = -1; },
+			updateRender() {
+				const lines = [] as RenderLine[];
+				this.links.forEach(l => {
+					const s = this.nodes.find(n => n.id == l.source); const t = this.nodes.find(n => n.id == l.target);
+					if (s != null && t != null) {
+						const x1 = s!.x * this.scale + this.translateX; const y1 = s!.y * this.scale + this.translateY;
+						const x2 = t!.x * this.scale + this.translateX; const y2 = t!.y * this.scale + this.translateY;
+						const dx = x2 - x1; const dy = y2 - y1; const len = Math.sqrt(dx * dx + dy * dy);
+						const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+						lines.push({ left: x1, top: y1, width: len, angle: angle } as RenderLine);
+					}
+				});
+				this.renderLines = lines;
+			},
+			calcDistance(t1 : Touch, t2 : Touch) : number { const x = t1.clientX - t2.clientX; const y = t1.clientY - t2.clientY; return Math.sqrt(x * x + y * y); },
+
+			handleFocusChange(targetId : string) {
+				const nodesToExpand = new Set<string>(); this.findPathToNode(this.subtasks as TreeNode[], targetId, nodesToExpand);
+				const rootNode = this.nodes.find(n => n.isRoot);
+				if (rootNode != null) this.ensurePathExpanded(rootNode.id, nodesToExpand);
+				setTimeout(() => {
+					this.centerOnNode(targetId);
+					this.updateRender();
+					this.startSim();
+				}, 100);
+			},
+
+			ensurePathExpanded(nodeId : string, pathSet : Set<string>) {
+				const node = this.nodes.find(n => n.id == nodeId); if (node == null) return;
+				if (pathSet.has(nodeId) || node.isRoot) {
+					if (!node.isExpanded) this.expandNode(node, false, pathSet);
+					else { const children = this.nodes.filter(n => n.parentId == nodeId); children.forEach(child => { if (pathSet.has(child.id)) this.ensurePathExpanded(child.id, pathSet); }); }
+				}
+			},
+			findPathToNode(tree : TreeNode[], targetId : string, result : Set<string>) : boolean {
+				for (const node of tree) {
+					if (node.id == targetId) return true;
+					if (node.children.length > 0) { if (this.findPathToNode(node.children, targetId, result)) { result.add(node.id); return true; } }
+				}
+				return false;
+			},
+
+			centerOnNode(targetId : string) {
+				if (targetId == '') return;
+				const targetNode = this.nodes.find(n => n.id == targetId);
+				if (targetNode != null) {
+					const centerY = (this.mode === 'embed') ? 140 : (this.screenHeight / 2); const centerX = this.screenWidth / 2;
+					this.translateX = centerX - (targetNode.x * this.scale); this.translateY = centerY - (targetNode.y * this.scale);
+					this.updateRender();
+				}
+			},
+
+			getHeatColor(endAt : number) : string {
+				if (endAt <= 0) return '#409EFF';
+				const now = Date.now();
+				const diff = endAt - now;
+				const day = 24 * 60 * 60 * 1000;
+
+				if (diff < 0) return '#F56C6C';
+				if (diff < 1 * day) return '#E6A23C';
+				if (diff < 3 * day) return '#FFD700';
+				return '#67C23A';
+			},
+
+			getNodeCircleStyle(node : PNode) : string {
+				let size = 30; if (node.isRoot) size = 42; if (node.id == this.focusTaskId) size += 4;
+				const radius = size / 2;
+				let color = this.getHeatColor(node.endAt);
+
+				// 默认样式
+				let borderColor = '#FFFFFF';
+				let borderWidth = '2px';
+				let boxShadow = '0 2px 6px rgba(0,0,0,0.2)';
+				let transform = '';
+				let zIndex = '1002';
+
+				// 选中状态样式
+				if (node.id == this.activeNodeId) {
+					borderColor = '#FFD700'; // 金色边框
+					borderWidth = '3px';
+					// 双层光晕：内层金色，外层淡金
+					boxShadow = '0 0 0 4px rgba(255, 215, 0, 0.4), 0 0 4px rgba(255, 215, 0, 0.6)';
+					transform = 'scale(1.15)';
+					zIndex = '2000';
+				} else if (node.id == this.focusTaskId) {
+					borderColor = '#303133';
+					borderWidth = '3px';
+				}
+
+				return `position:absolute; left:-${radius}px; top:-${radius}px; width:${size}px; height:${size}px; border-radius:${radius}px; background-color:${color}; border-width:${borderWidth}; border-color:${borderColor}; border-style:solid; box-shadow:${boxShadow}; transform:${transform}; z-index:${zIndex}; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);`;
+			},
+
+			getTitleWrapperStyle() : string {
+				return `position:absolute; top:25px; left:-60px; width:120px; height:30px; display:flex; justify-content:center; align-items:center; z-index:1003; overflow:visible;`;
+			},
+
+			getNodeStyle(n : PNode) : string {
+				const left = n.x * this.scale + this.translateX;
+				const top = n.y * this.scale + this.translateY;
+				const zIndex = n.isDragging ? 99999 : ((n.isRoot || n.isExpanded || n.id == this.activeNodeId) ? 900 : 100);
+				return `left:${left}px; top:${top}px; width:0px; height:0px; z-index:${zIndex}; overflow:visible;`;
+			},
+
+			getLineStyle(l : RenderLine) : string { return `left: ${l.left}px; top: ${l.top}px; width: ${l.width}px; transform: rotate(${l.angle}deg);`; },
+			getNodeSize(n : PNode) : number { let baseSize = (this.mode === 'embed') ? (n.isRoot ? 30 : 20) : (n.isRoot ? 44 : 34); if (n.id == this.focusTaskId) baseSize += 6; return baseSize; }
+		}
+	}
+</script>
+
+<style scoped>
+	.glass-background {
+		position: absolute;
+		top: 0;
+		left: 0;
+		width: 100%;
+		height: 100%;
+		z-index: 0;
+		background-color: rgba(255, 255, 255, 0.45);
+		border: 1px solid rgba(255, 255, 255, 0.6);
+		border-radius: 12px;
+	}
+
+	.layer-embed {
+		width: 100%;
+		height: 240px;
+		margin-top: 10px;
+	}
+
+	.drawer-embed {
+		height: 100%;
+		width: 100%;
+		border-radius: 12px;
+		background-color: transparent !important;
+	}
+
+	.canvas-area {
+		flex: 1;
+		position: relative;
+		overflow: hidden;
+		height: 100%;
+		background-color: transparent !important;
+	}
+
+	.map-container {
+		position: relative;
+		width: 100%;
+		height: 100%;
+		overflow: hidden;
+	}
+
+	.layer-fixed {
+		position: fixed;
+		top: 0;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		z-index: 1000;
+	}
+
+	.mask {
+		position: absolute;
+		top: 0;
+		left: 0;
+		width: 100%;
+		height: 100%;
+		background-color: #000;
+		z-index: 1001;
+	}
+
+	.drawer {
+		position: absolute;
+		bottom: 0;
+		left: 0;
+		width: 100%;
+		background-color: #F5F7FA;
+		z-index: 1002;
+		display: flex;
+		flex-direction: column;
+	}
+
+	.glass-header {
+		height: 54px;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+		background-color: rgba(255, 255, 255, 0.85);
+		border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+		border-radius: 20px 20px 0 0;
+		position: absolute;
+		top: 0;
+		left: 0;
+		width: 100%;
+		z-index: 6000;
+		box-shadow: 0 4px 10px rgba(0, 0, 0, 0.05);
+	}
+
+	.handle-bar {
+		width: 40px;
+		height: 5px;
+		background-color: #ddd;
+		border-radius: 3px;
+		position: absolute;
+		top: 8px;
+	}
+
+	.header-title {
+		font-size: 16px;
+		font-weight: bold;
+		color: #333;
+	}
+
+	.close-btn {
+		position: absolute;
+		right: 15px;
+		padding: 5px;
+	}
+
+	.close-icon {
+		font-size: 18px;
+		color: #999;
+	}
+
+	/* New Action Buttons Styles */
+	.header-actions {
+		position: absolute;
+		right: 50px;
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.icon-btn {
+		padding: 6px;
+		margin-left: 4px;
+	}
+
+	.icon-text {
+		font-size: 18px;
+	}
+
+	.embed-actions {
+		position: absolute;
+		top: 10px;
+		right: 10px;
+		z-index: 5000;
+		flex-direction: row;
+	}
+
+	.mini-btn {
+		width: 28px;
+		height: 28px;
+		background-color: rgba(255, 255, 255, 0.8);
+		border-radius: 14px;
+		align-items: center;
+		justify-content: center;
+		margin-left: 6px;
+		box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+	}
+
+	.mini-btn-text {
+		font-size: 14px;
+	}
+
+	.link-line {
+		position: absolute;
+		height: 2px;
+		background-color: #dcdfe6;
+		transform-origin: 0 50%;
+	}
+
+	.node-group {
+		position: absolute;
+		width: 0;
+		height: 0;
+		z-index: 100;
+	}
+
+	/* Updated Bubble Styles */
+	.info-bubble-glass {
+		position: absolute;
+		bottom: 25px;
+		left: -70px;
+		width: 140px;
+		background-color: rgba(255, 255, 255, 0.95);
+		border-radius: 12px;
+		border-bottom-left-radius: 4px;
+		padding: 8px 10px;
+		box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+		border: 1px solid rgba(255, 255, 255, 0.6);
+		z-index: 2000;
+	}
+
+	.bubble-content-col {
+		flex-direction: column;
+	}
+
+	.bubble-info-text {
+		font-size: 10px;
+		color: #333;
+		margin-bottom: 2px;
+	}
+
+	.bubble-link-row {
+		align-items: flex-end;
+		margin-top: 4px;
+	}
+
+	.bubble-detail-link {
+		font-size: 10px;
+		color: #007aff;
+		font-weight: bold;
+	}
+
+	.bubble-close-row {
+		margin-top: 6px;
+		border-top: 1px solid rgba(0, 0, 0, 0.05);
+		padding-top: 4px;
+		align-items: center;
+	}
+
+	.bubble-close-icon {
+		font-size: 9px;
+		color: #999;
+	}
+
+	.node-circle {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		z-index: 1002;
+	
+	}
+
+	.node-icon {
+		color: #fff;
+		font-weight: bold;
+		text-align: center;
+	}
+
+	.glass-title-label {
+		padding: 6px 12px;
+		border-radius: 16px;
+		background-color: rgba(255, 255, 255, 0.75);
+		border: 1px solid rgba(255, 255, 255, 0.6);
+		box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+	}
+
+	.glass-title-text {
+		font-size: 11px;
+		color: #333;
+		font-weight: bold;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.fullscreen-hint {
+		position: absolute;
+		right: 10px;
+		bottom: 10px;
+		width: 32px;
+		height: 32px;
+		background-color: rgba(255, 255, 255, 0.9);
+		border-radius: 16px;
+		align-items: center;
+		justify-content: center;
+		box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+	}
+
+	.hint-icon {
+		font-size: 20px;
+		color: #666;
+	}
+</style>

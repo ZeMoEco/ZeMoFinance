@@ -1,0 +1,407 @@
+// uni_modules/zemo-rpa/utssdk/app-android/services/GlobalInputListener.uts
+//
+// UTS bridge: imports the native Kotlin AccessibilityService and registers
+// event handlers. The native .kt class lives in src/GlobalInputListener.kt
+// and is compiled into the main APK (uts.sdk.modules.zemoRpa).
+//
+import AccessibilityNodeInfo from 'android.view.accessibility.AccessibilityNodeInfo';
+import AccessibilityEvent from 'android.view.accessibility.AccessibilityEvent';
+import Rect from 'android.graphics.Rect';
+import System from 'java.lang.System';
+import NativeService from 'uts.sdk.modules.zemoRpa.GlobalInputListener';
+import NativeListener from 'uts.sdk.modules.zemoRpa.AccessibilityEventListener';
+import { RPARecorder } from '../../services/RPARecorder.uts';
+import { RPAActionType, RPARect, RPANodeDetail } from '../../utils/RPAStep.uts';
+import { SmartExecutor } from '../../services/SmartExecutor.uts';
+import { RPAExecutorImpl } from './RPAExecutorImpl.uts';
+
+/** 当前前台应用包名 */
+let currentForegroundPkg: string = "";
+/** 当前前台 Activity 名称 */
+let currentForegroundActivity: string = "";
+
+// 滑动状态
+let scrollAccumulated: Int = 0;
+let lastScrollEventTime: Long = 0;
+
+/**
+ * 获取当前前台应用信息
+ */
+export function getCurrentForegroundInfo(): Map<string, string> {
+	const info = new Map<string, string>();
+	info.set("packageName", currentForegroundPkg);
+	info.set("activityName", currentForegroundActivity);
+	return info;
+}
+
+/**
+ * Static Accessor to dispatchTap (Pass Through)
+ */
+export function nativeDispatchTap(x: Float, y: Float): Boolean {
+	return NativeService.dispatchTap(x, y);
+}
+
+/**
+ * 获取原生 Service 实例
+ */
+export function getNativeServiceInstance(): NativeService | null {
+	return NativeService.instance;
+}
+
+/**
+ * 从 AccessibilityNodeInfo 提取完整的节点详情
+ */
+function extractNodeDetail(node: AccessibilityNodeInfo): RPANodeDetail {
+	const rect = new Rect();
+	node.getBoundsInScreen(rect);
+	
+	let treePath = node.getClassName()?.toString() ?? "";
+	let depth = 0;
+	let parentClassName = "";
+	let indexInParent = 0;
+	
+	let parent = node.getParent();
+	if (parent != null) {
+		parentClassName = parent.getClassName()?.toString() ?? "";
+		const childCount = parent.getChildCount();
+		for (let i: Int = 0; i < childCount; i++) {
+			const child = parent.getChild(i);
+			if (child != null) {
+				if (child == node) {
+					indexInParent = i;
+				}
+				child.recycle();
+			}
+		}
+		
+		let p = parent;
+		let pathSegments: string[] = [treePath];
+		let d = 0;
+		while (p != null && d < 3) {
+			pathSegments.splice(0, 0, p.getClassName()?.toString() ?? "?");
+			d++;
+			const pp = p.getParent();
+			p.recycle();
+			p = pp;
+		}
+		treePath = pathSegments.join("/");
+		depth = d + 1;
+	}
+
+	const detail: RPANodeDetail = {
+		resourceId: node.getViewIdResourceName() ?? "",
+		text: node.getText()?.toString() ?? "",
+		contentDescription: node.getContentDescription()?.toString() ?? "",
+		className: node.getClassName()?.toString() ?? "",
+		clickable: node.isClickable(),
+		longClickable: node.isLongClickable(),
+		checkable: node.isCheckable(),
+		checked: node.isChecked(),
+		editable: node.isEditable(),
+		scrollable: node.isScrollable(),
+		focusable: node.isFocusable(),
+		selected: node.isSelected(),
+		enabled: node.isEnabled(),
+		depth: depth,
+		indexInParent: indexInParent,
+		parentClassName: parentClassName,
+		treePath: treePath,
+		bounds: {
+			left: rect.left,
+			top: rect.top,
+			right: rect.right,
+			bottom: rect.bottom
+		} as RPARect
+	};
+	return detail;
+}
+
+function handleViewClicked(source: AccessibilityNodeInfo) {
+	const rect = new Rect();
+	source.getBoundsInScreen(rect);
+	
+	const x = rect.centerX();
+	const y = rect.centerY();
+
+	const viewId = source.getViewIdResourceName() ?? "";
+	const text = source.getText()?.toString() ?? "";
+	const contentDesc = source.getContentDescription()?.toString() ?? "";
+	const className = source.getClassName()?.toString() ?? "";
+	const buttonLabel = text != "" ? text : (contentDesc != "" ? contentDesc : className);
+	const clickedInfo = "BTN:" + buttonLabel + "|CLASS:" + className;
+
+	const rpaRect = {
+		left: rect.left,
+		top: rect.top,
+		right: rect.right,
+		bottom: rect.bottom
+	} as RPARect;
+
+	const nodeDetail = extractNodeDetail(source);
+
+	RPARecorder.processAction(
+		RPAActionType.CLICK,
+		x.toFloat(),
+		y.toFloat(),
+		viewId,
+		clickedInfo,
+		rpaRect,
+		nodeDetail,
+		currentForegroundPkg,
+		currentForegroundActivity
+	);
+	console.log("[GlobalInputListener] CLICK", viewId, clickedInfo, x, y);
+	source.recycle();
+}
+
+function handleViewLongClicked(source: AccessibilityNodeInfo) {
+	const rect = new Rect();
+	source.getBoundsInScreen(rect);
+	
+	const x = rect.centerX();
+	const y = rect.centerY();
+
+	const viewId = source.getViewIdResourceName() ?? "";
+	const text = source.getText()?.toString() ?? "";
+	const contentDesc = source.getContentDescription()?.toString() ?? "";
+	const className = source.getClassName()?.toString() ?? "";
+	const buttonLabel = text != "" ? text : (contentDesc != "" ? contentDesc : className);
+	const clickedInfo = "BTN:" + buttonLabel + "|CLASS:" + className;
+
+	const rpaRect = {
+		left: rect.left,
+		top: rect.top,
+		right: rect.right,
+		bottom: rect.bottom
+	} as RPARect;
+
+	const nodeDetail = extractNodeDetail(source);
+
+	RPARecorder.processAction(
+		RPAActionType.LONG_PRESS,
+		x.toFloat(),
+		y.toFloat(),
+		viewId,
+		clickedInfo,
+		rpaRect,
+		nodeDetail,
+		currentForegroundPkg,
+		currentForegroundActivity
+	);
+	console.log("[GlobalInputListener] LONG_PRESS", viewId, clickedInfo, x, y);
+	source.recycle();
+}
+
+function handleViewScrolled(source: AccessibilityNodeInfo, eventType: Int) {
+	const now = System.currentTimeMillis();
+	const viewId = source.getViewIdResourceName() ?? "";
+	const className = source.getClassName()?.toString() ?? "";
+
+	if (className.contains("RecyclerView") || className.contains("ViewPager")) {
+		// OK
+	} else if (className.contains("ScrollView") || className.contains("ListView")) {
+		// OK
+	} else {
+		source.recycle();
+		return;
+	}
+
+	if (now - lastScrollEventTime < 300) {
+		scrollAccumulated += 1;
+		source.recycle();
+		return;
+	}
+
+	if (scrollAccumulated < 2) {
+		lastScrollEventTime = now;
+		source.recycle();
+		return;
+	}
+
+	const rect = new Rect();
+	source.getBoundsInScreen(rect);
+
+	const rpaRect = {
+		left: rect.left,
+		top: rect.top,
+		right: rect.right,
+		bottom: rect.bottom
+	} as RPARect;
+
+	const nodeDetail = extractNodeDetail(source);
+
+	RPARecorder.processAction(
+		RPAActionType.SWIPE,
+		rect.centerX().toFloat(),
+		rect.centerY().toFloat(),
+		viewId,
+		"SCROLL|" + className + "|delta:" + scrollAccumulated,
+		rpaRect,
+		nodeDetail,
+		currentForegroundPkg,
+		currentForegroundActivity
+	);
+	console.log("[GlobalInputListener] SWIPE (verified)", viewId, "delta:", scrollAccumulated);
+
+	scrollAccumulated = 0;
+	lastScrollEventTime = now;
+	source.recycle();
+}
+
+function handleTextChanged(source: AccessibilityNodeInfo, pkg: string, cls: string) {
+	const text = source.getText()?.toString() ?? "";
+
+	const rect = new Rect();
+	source.getBoundsInScreen(rect);
+
+	const rpaRect = {
+		left: rect.left,
+		top: rect.top,
+		right: rect.right,
+		bottom: rect.bottom
+	} as RPARect;
+
+	const nodeDetail = extractNodeDetail(source);
+
+	RPARecorder.processAction(
+		RPAActionType.INPUT,
+		rect.centerX().toFloat(),
+		rect.centerY().toFloat(),
+		source.getViewIdResourceName() ?? "",
+		text,
+		rpaRect,
+		nodeDetail,
+		currentForegroundPkg,
+		currentForegroundActivity
+	);
+	console.log("[GlobalInputListener] INPUT", source.getViewIdResourceName() ?? "", text);
+	source.recycle();
+}
+
+function handleWindowContentChanged(source: AccessibilityNodeInfo, pkg: string) {
+	if (!RPARecorder.isRecording) {
+		source.recycle();
+		return;
+	}
+
+	if (!RPARecorder.isRawClickPending) {
+		source.recycle();
+		return;
+	}
+
+	if (pkg != "" && source.getClassName()?.toString()?.contains("FloatingRecorder") == true) {
+		source.recycle();
+		return;
+	}
+
+	const clickable = source.isClickable();
+	const focusable = source.isFocusable();
+	
+	const rawText = source.getText()?.toString() ?? "";
+	const rawDesc = source.getContentDescription()?.toString() ?? "";
+	const rawLabel = rawText != "" ? rawText : rawDesc;
+	const isInteractiveText = rawLabel.includes("跳过") || rawLabel.includes("Skip") || rawLabel.includes("关闭") || rawLabel == "X" || rawLabel.includes("完成");
+
+	if (!clickable && !focusable && !isInteractiveText) {
+		source.recycle();
+		return;
+	}
+
+	const rect = new Rect();
+	source.getBoundsInScreen(rect);
+	if (rect.width() <= 0 || rect.height() <= 0) {
+		source.recycle();
+		return;
+	}
+
+	const viewId = source.getViewIdResourceName() ?? "";
+	const text = source.getText()?.toString() ?? "";
+	const contentDesc = source.getContentDescription()?.toString() ?? "";
+	const className = source.getClassName()?.toString() ?? "";
+	const buttonLabel = text != "" ? text : (contentDesc != "" ? contentDesc : className);
+	const clickedInfo = "BTN:" + buttonLabel + "|CLASS:" + className + "|EVENT:WINDOW_CHANGED";
+
+	const rpaRect = {
+		left: rect.left,
+		top: rect.top,
+		right: rect.right,
+		bottom: rect.bottom
+	} as RPARect;
+
+	const nodeDetail = extractNodeDetail(source);
+
+	RPARecorder.processAction(
+		RPAActionType.CLICK,
+		rect.centerX().toFloat(),
+		rect.centerY().toFloat(),
+		viewId,
+		clickedInfo,
+		rpaRect,
+		nodeDetail,
+		currentForegroundPkg,
+		currentForegroundActivity
+	);
+	console.log("[GlobalInputListener] WINDOW_CONTENT_CHANGED", viewId, clickedInfo);
+	source.recycle();
+}
+
+// ======= Register UTS listener with the native Kotlin service =======
+
+class GILEventListener implements NativeListener {
+	
+	override onServiceConnected(): void {
+		console.log("[GlobalInputListener-UTS] onServiceConnected");
+		const svc = NativeService.instance;
+		if (svc != null) {
+			SmartExecutor.setAndroidService(svc);
+			RPAExecutorImpl.setService(svc);
+		}
+	}
+	
+	override onAccessibilityEvent(eventType: Int, packageName: string, className: string, source: AccessibilityNodeInfo | null): void {
+		// Track foreground app
+		if (eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+			if (packageName != "" && className != "") {
+				currentForegroundPkg = packageName;
+				currentForegroundActivity = className;
+				RPARecorder.updateCurrentActivity(className);
+				console.log("[GlobalInputListener] Window changed: ", packageName, className);
+			}
+		}
+
+		if (!RPARecorder.isRecording) return;
+		if (source == null) return;
+
+		console.log("[GlobalInputListener] eventType=", eventType);
+
+		if (eventType == AccessibilityEvent.TYPE_VIEW_CLICKED) {
+			handleViewClicked(source);
+		} else if (eventType == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) {
+			handleViewLongClicked(source);
+		} else if (eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) {
+			handleViewScrolled(source, eventType);
+		} else if (eventType == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED) {
+			handleTextChanged(source, packageName, className);
+		} else if (eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+			handleWindowContentChanged(source, packageName);
+		} else {
+			source.recycle();
+		}
+	}
+	
+	override onInterrupt(): void {
+		console.log("[GlobalInputListener-UTS] onInterrupt");
+	}
+}
+
+// Auto-register on module load
+NativeService.registerEventListener(new GILEventListener());
+
+export function initGlobalInputListener() {
+	console.log("[GlobalInputListener-UTS] initGlobalInputListener called");
+	const svc = NativeService.instance;
+	if (svc != null) {
+		SmartExecutor.setAndroidService(svc);
+		RPAExecutorImpl.setService(svc);
+	}
+}

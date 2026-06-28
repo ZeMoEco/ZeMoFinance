@@ -1,0 +1,322 @@
+import { requestText } from '@/utils/common/tools.uts';
+
+export type MarketSearchItem = {
+  code: string;
+  name: string;
+  type: string;
+  pinyin: string;
+  source: string;
+};
+
+export type MarketQuote = {
+  code: string;
+  name: string;
+  nav: number;
+  estimate_nav: number;
+  estimate_rate: number;
+  nav_date: string;
+  estimate_time: string;
+  source: string;
+};
+
+type ScoredMarketSearchItem = {
+  item: MarketSearchItem;
+  score: number;
+};
+
+export class FinanceMarketService {
+  private static readonly FUND_LIST_URL: string = 'https://fund.eastmoney.com/js/fundcode_search.js';
+  private static readonly FUND_QUOTE_BASE: string = 'https://fundgz.1234567.com.cn/js/';
+  private static readonly STOCK_QUOTE_BASE: string = 'https://push2.eastmoney.com/api/qt/stock/get';
+  private static readonly CACHE_KEY: string = 'finance_market_fund_list_cache';
+  private static readonly CACHE_TIME_KEY: string = 'finance_market_fund_list_cache_time';
+  private static readonly CACHE_TTL: number = 24 * 60 * 60 * 1000;
+
+  private static safeNumber(raw: string): number {
+    const n = parseFloat((raw ?? '').toString());
+    return isNaN(n) ? 0.0 : n;
+  }
+
+  private static normalizeKeyword(keyword: string): string {
+    return (keyword ?? '').toString().trim().toLowerCase();
+  }
+
+  private static normalizeFundMatchText(text: string): string {
+    return (text ?? '').toString()
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, '')
+      .replace(/（/g, '(')
+      .replace(/）/g, ')')
+      .replace(/[()\-_*·.]/g, '')
+      .replace(/人民币/g, '');
+  }
+
+  private static normalizeFundCoreText(text: string): string {
+    let value = FinanceMarketService.normalizeFundMatchText(text);
+    value = value.replace(/qdii/g, '');
+    value = value.replace(/lof/g, '');
+    value = value.replace(/基金/g, '');
+    value = value.replace(/混合型/g, '混合');
+    value = value.replace(/股票型/g, '股票');
+    value = value.replace(/债券型/g, '债券');
+    value = value.replace(/指数型/g, '指数');
+    value = value.replace(/[abc]$/g, '');
+    return value;
+  }
+
+  private static extractFundShareClass(text: string): string {
+    const value = FinanceMarketService.normalizeFundMatchText(text);
+    if (value.endsWith('a')) return 'a';
+    if (value.endsWith('b')) return 'b';
+    if (value.endsWith('c')) return 'c';
+    return '';
+  }
+
+  private static orderedCommonRatio(a: string, b: string): number {
+    if (a == '' || b == '') return 0.0;
+    let pos = 0;
+    let hit = 0;
+    for (let i = 0; i < a.length; i++) {
+      const ch = a.charAt(i);
+      const next = b.indexOf(ch, pos);
+      if (next >= 0) {
+        hit += 1;
+        pos = next + 1;
+      }
+    }
+    return hit / Math.max(a.length, b.length);
+  }
+
+  private static fundNameScore(keyword: string, item: MarketSearchItem): number {
+    const target = FinanceMarketService.normalizeFundMatchText(keyword);
+    const targetCore = FinanceMarketService.normalizeFundCoreText(keyword);
+    const name = FinanceMarketService.normalizeFundMatchText(item.name);
+    const core = FinanceMarketService.normalizeFundCoreText(item.name);
+    const code = FinanceMarketService.normalizeFundMatchText(item.code);
+    if (target == '' || (name == '' && code == '')) return 0;
+    if (code != '' && code == target) return 10000;
+
+    let score = 0;
+    if (name == target) score += 2200;
+    if (targetCore != '' && core == targetCore) score += 2000;
+    if (target.length >= 4 && name.indexOf(target) >= 0) score += 1500;
+    if (targetCore.length >= 4 && core.indexOf(targetCore) >= 0) score += 1400;
+    if (name.length >= 4 && target.indexOf(name) >= 0) score += 1000;
+    if (core.length >= 4 && targetCore.indexOf(core) >= 0) score += 900;
+
+    const ratio = Math.max(
+      FinanceMarketService.orderedCommonRatio(targetCore, core),
+      FinanceMarketService.orderedCommonRatio(core, targetCore)
+    );
+    score += Math.round(ratio * 900.0);
+
+    const targetShare = FinanceMarketService.extractFundShareClass(keyword);
+    const itemShare = FinanceMarketService.extractFundShareClass(item.name);
+    if (targetShare != '') {
+      score += itemShare == targetShare ? 120 : -160;
+    }
+    const targetHasQdii = target.indexOf('qdii') >= 0;
+    const itemHasQdii = name.indexOf('qdii') >= 0;
+    if (targetHasQdii) score += itemHasQdii ? 80 : -80;
+    if (FinanceMarketService.normalizeFundMatchText(item.type).indexOf('基金') >= 0) score += 30;
+    score -= Math.abs(core.length - targetCore.length) * 3;
+    return score;
+  }
+
+  private static isSixDigitCode(raw: string): boolean {
+    const c = (raw ?? '').toString().trim();
+    return /^[0-9]{6}$/.test(c);
+  }
+
+  private static inferSecId(code: string): string {
+    const c = (code ?? '').toString().trim();
+    if (c.startsWith('6') || c.startsWith('5') || c.startsWith('9')) return `1.${c}`;
+    return `0.${c}`;
+  }
+
+  private static formatNowLabel(): string {
+    const d = new Date();
+    const m = (d.getMonth() + 1).toString().padStart(2, '0');
+    const day = d.getDate().toString().padStart(2, '0');
+    const h = d.getHours().toString().padStart(2, '0');
+    const min = d.getMinutes().toString().padStart(2, '0');
+    return `${m}-${day} ${h}:${min}`;
+  }
+
+  private static parseFundList(text: string): MarketSearchItem[] {
+    const start = text.indexOf('[');
+    const end = text.lastIndexOf(']');
+    if (start < 0 || end <= start) return [] as MarketSearchItem[];
+    const json = text.substring(start, end + 1);
+    const parsed = JSON.parse(json) as any[];
+    const result = [] as MarketSearchItem[];
+    for (let i = 0; i < parsed.length; i++) {
+      const row = parsed[i] as any[];
+      if (row == null || row.length < 3) continue;
+      result.push({
+        code: row[0]?.toString() ?? '',
+        pinyin: row[1]?.toString() ?? '',
+        name: row[2]?.toString() ?? '',
+        type: row.length > 3 ? (row[3]?.toString() ?? '基金') : '基金',
+        source: 'eastmoney'
+      } as MarketSearchItem);
+    }
+    return result;
+  }
+
+  private static parseJsonpObject(text: string): UTSJSONObject | null {
+    const raw = (text ?? '').toString();
+    const start = raw.indexOf('(');
+    const end = raw.lastIndexOf(')');
+    if (start < 0 || end <= start + 1) return null;
+    const json = raw.substring(start + 1, end).trim();
+    if (json == '' || json == 'null' || json == 'undefined') return null;
+    try {
+      const parsed = JSON.parse(json) as any;
+      if (parsed == null) return null;
+      return new UTSJSONObject(parsed);
+    } catch (_e) {
+      return null;
+    }
+  }
+
+  private static async loadFundList(forceRefresh: boolean = false): Promise<MarketSearchItem[]> {
+    const now = Date.now();
+    if (!forceRefresh) {
+      const cacheTimeRaw = uni.getStorageSync(FinanceMarketService.CACHE_TIME_KEY);
+      const cacheRaw = uni.getStorageSync(FinanceMarketService.CACHE_KEY);
+      const cacheTime = cacheTimeRaw == null ? 0 : parseInt(cacheTimeRaw.toString());
+      if (cacheRaw != null && cacheRaw.toString() != '' && now - cacheTime < FinanceMarketService.CACHE_TTL) {
+        try {
+          return JSON.parse(cacheRaw.toString()) as MarketSearchItem[];
+        } catch (_e) {}
+      }
+    }
+
+    const text = await requestText(`${FinanceMarketService.FUND_LIST_URL}?rt=${now}`);
+    const list = FinanceMarketService.parseFundList(text);
+    if (list.length > 0) {
+      uni.setStorageSync(FinanceMarketService.CACHE_KEY, JSON.stringify(list));
+      uni.setStorageSync(FinanceMarketService.CACHE_TIME_KEY, now.toString());
+    }
+    return list;
+  }
+
+  static async search(keyword: string, limit: number = 12): Promise<MarketSearchItem[]> {
+    const kw = FinanceMarketService.normalizeKeyword(keyword);
+    if (kw == '') return [] as MarketSearchItem[];
+    const safeLimit = limit <= 0 ? 12 : limit;
+    const looseKw = FinanceMarketService.normalizeFundMatchText(kw);
+    const funds = await FinanceMarketService.loadFundList(false);
+    const result = [] as MarketSearchItem[];
+    for (let i = 0; i < funds.length; i++) {
+      const item = funds[i];
+      const code = item.code.toLowerCase();
+      const name = item.name.toLowerCase();
+      const py = item.pinyin.toLowerCase();
+      const looseName = FinanceMarketService.normalizeFundMatchText(item.name);
+      if (code.indexOf(kw) >= 0 || name.indexOf(kw) >= 0 || py.indexOf(kw) >= 0 || (looseKw != '' && looseName.indexOf(looseKw) >= 0)) {
+        result.push(item);
+        if (result.length >= safeLimit) break;
+      }
+    }
+    if (FinanceMarketService.isSixDigitCode(kw)) {
+      let exists = false;
+      for (let j = 0; j < result.length; j++) {
+        if (result[j].code == kw) {
+          exists = true;
+          break;
+        }
+      }
+      if (!exists && result.length < safeLimit) {
+        result.push({
+          code: kw,
+          name: kw,
+          type: '股票/场内ETF',
+          pinyin: '',
+          source: 'eastmoney-push2'
+        } as MarketSearchItem);
+      }
+    }
+    return result;
+  }
+
+  static async searchFundByNameFuzzy(keyword: string, limit: number = 12): Promise<MarketSearchItem[]> {
+    const kw = (keyword ?? '').toString().trim();
+    if (kw == '') return [] as MarketSearchItem[];
+    const safeLimit = limit <= 0 ? 12 : limit;
+    const funds = await FinanceMarketService.loadFundList(false);
+    const scored = [] as ScoredMarketSearchItem[];
+    for (let i = 0; i < funds.length; i++) {
+      const item = funds[i];
+      const score = FinanceMarketService.fundNameScore(kw, item);
+      if (score >= 520) {
+        scored.push({ item: item, score: score } as ScoredMarketSearchItem);
+      }
+    }
+    scored.sort((a: ScoredMarketSearchItem, b: ScoredMarketSearchItem): number => b.score - a.score);
+    const result = [] as MarketSearchItem[];
+    const total = Math.min(scored.length, safeLimit);
+    for (let i = 0; i < total; i++) {
+      result.push(scored[i].item);
+    }
+    return result;
+  }
+
+  static async fetchFundQuote(code: string): Promise<MarketQuote | null> {
+    const c = (code ?? '').toString().trim();
+    if (c == '') return null;
+    const text = await requestText(`${FinanceMarketService.FUND_QUOTE_BASE}${c}.js?rt=${Date.now()}`);
+    const obj = FinanceMarketService.parseJsonpObject(text);
+    if (obj == null) return null;
+    return {
+      code: obj.get('fundcode')?.toString() ?? c,
+      name: obj.get('name')?.toString() ?? '',
+      nav: FinanceMarketService.safeNumber(obj.get('dwjz')?.toString() ?? ''),
+      estimate_nav: FinanceMarketService.safeNumber(obj.get('gsz')?.toString() ?? ''),
+      estimate_rate: FinanceMarketService.safeNumber(obj.get('gszzl')?.toString() ?? ''),
+      nav_date: obj.get('jzrq')?.toString() ?? '',
+      estimate_time: obj.get('gztime')?.toString() ?? '',
+      source: 'eastmoney'
+    } as MarketQuote;
+  }
+
+  static async fetchStockQuote(code: string): Promise<MarketQuote | null> {
+    const c = (code ?? '').toString().trim();
+    if (!FinanceMarketService.isSixDigitCode(c)) return null;
+    const secid = FinanceMarketService.inferSecId(c);
+    const url = `${FinanceMarketService.STOCK_QUOTE_BASE}?secid=${secid}&fields=f43,f57,f58,f60,f170`;
+    const text = await requestText(url);
+    const root = new UTSJSONObject(JSON.parse(text) as any);
+    const dataRaw = root.get('data');
+    const data = dataRaw == null ? null : new UTSJSONObject(dataRaw as any);
+    if (data == null) return null;
+    const priceRaw = FinanceMarketService.safeNumber(data.get('f43')?.toString() ?? '');
+    const closeRaw = FinanceMarketService.safeNumber(data.get('f60')?.toString() ?? '');
+    const rateRaw = FinanceMarketService.safeNumber(data.get('f170')?.toString() ?? '');
+    const price = priceRaw > 0 ? priceRaw / 100.0 : 0.0;
+    const close = closeRaw > 0 ? closeRaw / 100.0 : 0.0;
+    return {
+      code: data.get('f57')?.toString() ?? c,
+      name: data.get('f58')?.toString() ?? c,
+      nav: close,
+      estimate_nav: price,
+      estimate_rate: rateRaw / 100.0,
+      nav_date: '',
+      estimate_time: FinanceMarketService.formatNowLabel(),
+      source: 'eastmoney-push2'
+    } as MarketQuote;
+  }
+
+  static async fetchQuote(code: string): Promise<MarketQuote | null> {
+    try {
+      const fund = await FinanceMarketService.fetchFundQuote(code);
+      if (fund != null && (fund.estimate_nav > 0 || fund.nav > 0)) return fund;
+    } catch (_e) {}
+    try {
+      return await FinanceMarketService.fetchStockQuote(code);
+    } catch (_e2) {}
+    return null;
+  }
+}

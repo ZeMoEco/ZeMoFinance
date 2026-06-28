@@ -1,0 +1,131 @@
+import { ScreenUnderstandingService, ScreenUnderstandingResult } from '@/services/sys/ScreenUnderstandingService.uts'
+import { ChatTodoExtractionService, ChatTodoCreateResult } from '@/services/sys/ChatTodoExtractionService.uts'
+import { DeskPetBillCaptureService } from '@/services/sys/DeskPetBillCaptureService.uts'
+import { InvestmentOcrImportService, InvestmentOcrImportResult } from '@/services/sys/InvestmentOcrImportService.uts'
+import { TimelineBiz } from '@/services/biz/TimelineBiz.uts'
+import { FullModalScreenActionService } from '@/services/sys/FullModalScreenActionService.uts'
+
+export type ScreenActionExecutionResult = {
+	ok: boolean
+	kind: string
+	message: string
+	screen: ScreenUnderstandingResult
+	taskResult: ChatTodoCreateResult | null
+	investmentResult: InvestmentOcrImportResult | null
+	transactionId: string
+}
+
+export class ScreenActionExecutorService {
+	static async executeCurrentScreen(skipLiveCapture: boolean = false): Promise<ScreenActionExecutionResult> {
+		console.log(`[ScreenAction][Debug] execute_current skipLiveCapture=${skipLiveCapture ? 'true' : 'false'}`)
+		const fullModal = await FullModalScreenActionService.executeCurrentScreen(skipLiveCapture)
+		const fullModalScreen = fullModal.screen
+		if (fullModal.handled && fullModalScreen != null) {
+			console.log(`[ScreenAction][Debug] full_modal_handled kind=${fullModal.kind}, ok=${fullModal.ok ? 'true' : 'false'}, message=${fullModal.message}`)
+			return ScreenActionExecutorService.result(fullModal.ok, fullModal.kind, fullModal.message, fullModalScreen, fullModal.taskResult, fullModal.investmentResult, fullModal.transactionId)
+		}
+		console.log(`[ScreenAction][Debug] full_modal_fallback reason=${fullModal.fallbackReason}`)
+		const screen = await ScreenUnderstandingService.analyzeCurrentScreen(skipLiveCapture)
+		return await ScreenActionExecutorService.executeAnalysis(screen)
+	}
+
+	static async executeText(text: string, source: string = 'manual'): Promise<ScreenActionExecutionResult> {
+		console.log(`[ScreenAction][Debug] execute_text source=${source}, length=${(text ?? '').toString().length}`)
+		const fullModal = await FullModalScreenActionService.executeText(text, source)
+		const fullModalScreen = fullModal.screen
+		if (fullModal.handled && fullModalScreen != null) {
+			console.log(`[ScreenAction][Debug] full_modal_text_handled kind=${fullModal.kind}, ok=${fullModal.ok ? 'true' : 'false'}, message=${fullModal.message}`)
+			return ScreenActionExecutorService.result(fullModal.ok, fullModal.kind, fullModal.message, fullModalScreen, fullModal.taskResult, fullModal.investmentResult, fullModal.transactionId)
+		}
+		console.log(`[ScreenAction][Debug] full_modal_text_fallback reason=${fullModal.fallbackReason}`)
+		const screen = await ScreenUnderstandingService.analyzeText(text, source)
+		return await ScreenActionExecutorService.executeAnalysis(screen)
+	}
+
+	static async executeAnalysis(screen: ScreenUnderstandingResult): Promise<ScreenActionExecutionResult> {
+		console.log(`[ScreenAction][Debug] execute_analysis ok=${screen.ok ? 'true' : 'false'}, kind=${screen.kind}, source=${screen.source}, summary=${screen.summary}`)
+		if (!screen.ok) return ScreenActionExecutorService.result(false, screen.kind, screen.message, screen)
+
+		const billPrefill = screen.billPrefill
+		if (screen.kind == 'bill' && billPrefill != null) {
+			console.log(`[ScreenAction][Debug] branch=bill amount=${billPrefill.amount}, mode=${billPrefill.activeMode}, accountId=${billPrefill.accountId}, note=${billPrefill.note}`)
+			const id = await DeskPetBillCaptureService.createTransactionFromPrefill(billPrefill, 'screen_understanding_execute')
+			if (id != null && id != '') {
+				console.log(`[ScreenAction][Debug] bill_created transactionId=${id}`)
+				return ScreenActionExecutorService.result(true, 'bill', `已记账：${screen.summary}`, screen, null, null, id)
+			}
+			if (billPrefill.amount == '') {
+				console.warn('[ScreenAction][Debug] bill_open_manual reason=image_or_text_missing_amount')
+				DeskPetBillCaptureService.openRecordSheet(billPrefill)
+				return ScreenActionExecutorService.result(false, 'bill', '已识别到账单页面，但缺少金额，已打开记账确认页', screen)
+			}
+			console.warn('[ScreenAction][Debug] bill_create_failed reason=insufficient_fields_or_create_failed')
+			return ScreenActionExecutorService.result(false, 'bill', '账单字段不足，未能自动记账，可打开确认页手动补充', screen)
+		}
+
+		if (screen.kind == 'investment') {
+			console.log(`[ScreenAction][Debug] branch=investment textLength=${screen.ocrText.length}`)
+			const investment = await InvestmentOcrImportService.tryImportFromOcrText(screen.ocrText)
+			if (investment.matched) {
+				const ok = investment.imported + investment.updated > 0
+				console.log(`[ScreenAction][Debug] investment_result ok=${ok ? 'true' : 'false'}, imported=${investment.imported}, updated=${investment.updated}, provider=${investment.provider}, message=${investment.message}`)
+				return ScreenActionExecutorService.result(ok, 'investment', investment.message, screen, null, investment)
+			}
+			console.warn('[ScreenAction][Debug] investment_not_matched')
+			return ScreenActionExecutorService.result(false, 'investment', '未识别到可导入的基金/持仓明细', screen)
+		}
+
+		if (screen.kind == 'chat' || ChatTodoExtractionService.looksLikeChatText(screen.ocrText) || ChatTodoExtractionService.extractCandidates(screen.ocrText).length > 0) {
+			console.log(`[ScreenAction][Debug] branch=chat textLength=${screen.ocrText.length}`)
+			const tasks = await ChatTodoExtractionService.createTasksFromText(screen.ocrText)
+			console.log(`[ScreenAction][Debug] chat_result ok=${tasks.ok ? 'true' : 'false'}, created=${tasks.created}, candidates=${tasks.candidates.length}, message=${tasks.message}`)
+			return ScreenActionExecutorService.result(tasks.ok, 'chat', tasks.message, screen, tasks)
+		}
+
+		if (screen.kind == 'activity') {
+			console.log(`[ScreenAction][Debug] branch=activity title=${screen.title}, source=${screen.source}`)
+			const category = screen.actions.length > 0 ? screen.actions[0].query : ''
+			const content = ScreenActionExecutorService.buildActivityContent(screen, category)
+			const metadata = JSON.stringify({
+				source: 'screen_understanding',
+				screen_source: screen.source,
+				category,
+				summary: screen.summary
+			})
+			const ok = await TimelineBiz.addTimelineEntry(content, null, 'screen_activity', metadata)
+			return ScreenActionExecutorService.result(ok, 'activity', ok ? `已记录：${screen.title}` : '活动记录失败', screen)
+		}
+
+		console.log(`[ScreenAction][Debug] no_action kind=${screen.kind}`)
+		return ScreenActionExecutorService.result(false, screen.kind, '当前页面没有可执行动作', screen)
+	}
+
+	private static buildActivityContent(screen: ScreenUnderstandingResult, category: string): string {
+		const lines = [] as string[]
+		lines.push(`屏幕活动：${screen.title}`)
+		if (category != '') lines.push(`分类：${category}`)
+		if (screen.summary != '') lines.push(screen.summary)
+		if (screen.content != '') lines.push(screen.content)
+		return lines.join('\n')
+	}
+
+	private static result(
+		ok: boolean,
+		kind: string,
+		message: string,
+		screen: ScreenUnderstandingResult,
+		taskResult: ChatTodoCreateResult | null = null,
+		investmentResult: InvestmentOcrImportResult | null = null,
+		transactionId: string = ''
+	): ScreenActionExecutionResult {
+		return {
+			ok,
+			kind,
+			message,
+			screen,
+			taskResult,
+			investmentResult,
+			transactionId
+		} as ScreenActionExecutionResult
+	}
+}

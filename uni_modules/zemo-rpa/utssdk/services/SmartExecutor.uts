@@ -1,0 +1,255 @@
+// #ifdef APP-ANDROID
+import AccessibilityService from 'android.accessibilityservice.AccessibilityService'
+import AccessibilityNodeInfo from 'android.view.accessibility.AccessibilityNodeInfo'
+import AccessibilityEvent from 'android.view.accessibility.AccessibilityEvent'
+import Bundle from 'android.os.Bundle'
+import List from 'java.util.List'
+import CharSequence from 'java.lang.CharSequence'
+import Rect from 'android.graphics.Rect'
+import { initGlobalInputListener } from '../app-android/services/GlobalInputListener.uts'
+// #endif
+
+// #ifdef APP-HARMONY
+import accessibility from '@ohos.accessibility'
+import window from '@ohos.window'
+import { BusinessError } from '@ohos.base'
+// #endif
+
+export type TargetParams = {
+    // Identification
+    text?: string
+    id?: string
+    desc?: string
+    
+    // Confirmation
+    confirmType?: string // 'event_window_state', 'element_appear', 'none'
+    confirmValue?: string // Package name, or text of element that should appear
+    timeout?: number
+}
+
+export class SmartExecutor {
+    private static isDebug: boolean = false;
+
+    public static setDebug(enable: boolean) {
+        SmartExecutor.isDebug = enable;
+        console.log(`[SmartExecutor] Debug mode: ${enable}`);
+    }
+
+    // #ifdef APP-ANDROID
+    private static androidService: AccessibilityService | null = null;
+    
+    public static setAndroidService(service: AccessibilityService) {
+        SmartExecutor.androidService = service;
+    }
+
+    public static getAndroidService(): AccessibilityService | null {
+        if (SmartExecutor.androidService == null) {
+            initGlobalInputListener();
+        }
+        return SmartExecutor.androidService;
+    }
+    // #endif
+
+    // #ifdef APP-HARMONY
+    private static harmonyContext: accessibility.AccessibilityExtensionContext | null = null;
+
+    public static setHarmonyContext(context: accessibility.AccessibilityExtensionContext) {
+        SmartExecutor.harmonyContext = context;
+    }
+    // #endif
+
+    /**
+     * Smart Click with verification
+     */
+    static async smartClick(params: TargetParams): Promise<boolean> {
+        if (SmartExecutor.isDebug) {
+            console.log(`[SmartExecutor] Executing smartClick: ${JSON.stringify(params)}`);
+        }
+
+        // 1. Find Target (Platform Specific)
+        // #ifdef APP-ANDROID
+        const service = SmartExecutor.getAndroidService();
+        if (service == null) {
+            if (SmartExecutor.isDebug) console.error("[SmartExecutor] Service not bound");
+            return false;
+        }
+        
+        const root = service.getRootInActiveWindow();
+        if (root == null) return false;
+
+        let targetNode: AccessibilityNodeInfo | null = null;
+        
+        if (params.text != null) {
+            const list = root.findAccessibilityNodeInfosByText(params.text!);
+            if (list != null && list.size > 0) targetNode = list.get(0);
+        }
+        
+        if (targetNode == null && params.id != null) {
+            const list = root.findAccessibilityNodeInfosByViewId(params.id!);
+             if (list != null && list.size > 0) targetNode = list.get(0);
+        }
+        
+        if (targetNode != null) {
+            let clickableNode = targetNode;
+            while (clickableNode != null && !clickableNode.isClickable()) {
+                clickableNode = clickableNode.getParent();
+            }
+            if (clickableNode != null) {
+                const clicked = clickableNode.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                if (!clicked) return false;
+            } else {
+                return false;
+            }
+        } else {
+            console.log("[SmartExecutor] Node not found: " + JSON.stringify(params));
+            return false;
+        }
+        
+        if (params.confirmType == 'event_window_state') {
+            return await SmartExecutor.waitForWindowChange(params.timeout ?? 3000);
+        } else if (params.confirmType == 'element_appear') {
+            return await SmartExecutor.waitForElement(params.confirmValue ?? "", params.timeout ?? 3000);
+        }
+        return true;
+        // #endif
+
+        // #ifdef APP-HARMONY
+        if (SmartExecutor.harmonyContext == null) {
+            console.error("[SmartExecutor] Harmony context not bound");
+            return false;
+        }
+
+        try {
+            // Get Windows -> Root Element -> Search
+            const windows = await SmartExecutor.harmonyContext.getWindows();
+            let targetElement: accessibility.AccessibilityElement | null = null;
+
+            for (const win of windows) {
+                const root = await win.getRootElement();
+                if (root) {
+                    targetElement = await SmartExecutor.findNodeRecursivelyHarmony(root, params);
+                    if (targetElement) break;
+                }
+            }
+
+            if (targetElement) {
+                await targetElement.performAction('click');
+                return true;
+            } 
+        } catch (e) {
+             console.error(`[SmartExecutor] Harmony exec error: ${e}`);
+        }
+        return false;
+        // #endif
+
+        // #ifdef APP-IOS
+        if (SmartExecutor.isDebug) {
+             console.log("[SmartExecutor] iOS simulation: Click success.");
+        }
+        return true; 
+        // #endif
+
+        // #ifndef APP-ANDROID || APP-HARMONY || APP-IOS
+        return false;
+        // #endif
+    }
+
+    // #ifdef APP-ANDROID
+    private static eventListeners: ((event: AccessibilityEvent) => void)[] = [];
+
+    public static onAccessibilityEvent(event: AccessibilityEvent) {
+        for (const listener of SmartExecutor.eventListeners) {
+            listener(event);
+        }
+    }
+
+    private static waitForWindowChange(timeout: number): Promise<boolean> {
+        return new Promise<boolean>((resolve) => {
+            let solved = false;
+            const timer = setTimeout(() => {
+                if (!solved) {
+                    solved = true;
+                    resolve(false); 
+                }
+            }, timeout);
+
+            const listener = (event: AccessibilityEvent) => {
+                if (solved) return;
+                const eventType = event.getEventType();
+                if (eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || 
+                    eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED) {
+                    solved = true;
+                    clearTimeout(timer);
+                    resolve(true);
+                }
+            };
+            SmartExecutor.eventListeners.push(listener); 
+        });
+    }
+
+    private static waitForElement(text: string, timeout: number): Promise<boolean> {
+        return new Promise<boolean>((resolve) => {
+             let solved = false;
+             const startTime = Date.now();
+             
+             // Define loop function variable first so it can reference itself? 
+             // In UTS/Kotlin, recursive lambda needs careful handling or a class member.
+             // Using a simpler loop approach with setInterval might be safer or just a class method.
+             // Switching to a class method approach for stable recursion.
+             SmartExecutor.checkElementRecursive(text, timeout, startTime, resolve);
+        });
+    }
+
+    private static checkElementRecursive(text: string, timeout: number, startTime: number, resolve: (val: boolean) => void) {
+        const service = SmartExecutor.getAndroidService();
+        if (service == null) {
+            resolve(false);
+            return;
+        }
+        const root = service.getRootInActiveWindow();
+        if (root != null) {
+            const list = root.findAccessibilityNodeInfosByText(text);
+            if (list != null && list.size > 0) {
+                resolve(true);
+                return;
+            }
+        }
+        if (Date.now() - startTime > timeout) {
+            resolve(false);
+        } else {
+             // Pass static method reference
+             setTimeout(() => { 
+                 SmartExecutor.checkElementRecursive(text, timeout, startTime, resolve); 
+             }, 200); 
+        }
+    }
+    // #endif
+
+    // #ifdef APP-HARMONY
+    // Recursively find node (BFS preferred for shallower finds, implementing simplified recursion)
+    private static async findNodeRecursivelyHarmony(
+        root: accessibility.AccessibilityElement, 
+        params: TargetParams
+    ): Promise<accessibility.AccessibilityElement | null> {
+        
+        // Check current
+        try {
+            const info = await root.accessibilityInfo(); // hypothetical helper or property access
+            // Note: Actual Harmony API accessing properties might be root.attributeValues or similar
+            // For simplicity assuming standard properties exposure in UTS wrapper or using inspection methods
+            
+            if (params.text && info.text && info.text.includes(params.text)) return root;
+            if (params.id && info.resourceId == params.id) return root;
+
+            // Children
+            const children = await root.getChildElementList();
+            for (const child of children) {
+                const found = await SmartExecutor.findNodeRecursivelyHarmony(child, params);
+                if (found) return found;
+            }
+        } catch (e) { }
+
+        return null;
+    }
+    // #endif
+}

@@ -1,0 +1,98 @@
+// common/DBInit.uts
+import { DB } from "@/utils/DB/DB.uts";
+import { getCurrentDbName } from '@/utils/app/AppRuntime.uts'
+
+/**
+ * 数据库初始化与迁移管理类
+ * 职责：定义表结构、执行建表、处理版本升级 (Migrations)、预制默认数据。
+ */
+export class DBInit {
+    public static debug: boolean = false;
+    private static running: Promise<boolean> | null = null;
+
+    public static async ensurePrimaryUserId(): Promise<number> {
+        try {
+            const existingId = await DBInit.findPrimaryUserId();
+            if (existingId > 0) return existingId;
+
+            const inserted = await DB.insert('users', DBInit.buildDefaultUserRow(Date.now()));
+            if (!inserted) return 0;
+
+            return await DBInit.findPrimaryUserId();
+        } catch (e) {
+            console.error(`[DBInit] ensurePrimaryUserId error: ${e}`);
+            return 0;
+        }
+    }
+
+    /**
+     * 执行数据库初始化流程
+     */
+    public static async run(context: any | null = null): Promise<boolean> {
+        if (DBInit.running != null) {
+            return await DBInit.running;
+        }
+
+        DBInit.running = DBInit.runInternal(context);
+        try {
+            return await DBInit.running;
+        } finally {
+            DBInit.running = null;
+        }
+    }
+
+    private static async runInternal(context: any | null = null): Promise<boolean> {
+        if (DB.isReady) {
+            return await DBInit.initDefaultUser();
+        }
+
+        // 1. 初始化连接
+        // 在恢复备份后，连接可能被关闭，这里会重新打开
+        const isInit = await DB.init(context, getCurrentDbName());
+        if (!isInit) {
+            console.error("[DBInit] Critical Error: Database init failed");
+            return false;
+        }
+
+        if (DBInit.debug) console.log("[DBInit] DB connected. Ensuring schema...");
+
+        const ok = await DB.ensureSchema();
+        if (!ok) {
+            console.error("[DBInit] Schema ensure failed");
+            return false;
+        }
+
+        // 2. 初始化默认数据
+        return await DBInit.initDefaultUser();
+    }
+
+    private static async initDefaultUser(): Promise<boolean> {
+        try {
+            const userId = await DBInit.ensurePrimaryUserId();
+            if (userId > 0) return true;
+            if (DBInit.debug) console.log("[DBInit] Creating default user 'me' failed.");
+            return false;
+        } catch (e) {
+            console.error(`[DBInit] User init error: ${e}`);
+            return false;
+        }
+    }
+
+    private static async findPrimaryUserId(): Promise<number> {
+        const rows = await DB.query("SELECT id FROM users ORDER BY id ASC LIMIT 1");
+        if (rows.length == 0) return 0;
+        const id = parseInt(rows[0].get("id")?.toString() ?? "0");
+        return !isNaN(id) && id > 0 ? id : 0;
+    }
+
+    private static buildDefaultUserRow(now: number): Map<string, any | null> {
+        const row = new Map<string, any | null>();
+        row.set('username', 'me');
+        row.set('xp', 0);
+        row.set('level', 1);
+        row.set('coins', 0);
+        row.set('created_at', now);
+        row.set('updated_at', now);
+        return row;
+    }
+}

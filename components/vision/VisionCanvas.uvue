@@ -1,0 +1,3705 @@
+﻿<template>
+
+	<view class="vision-canvas-container">
+		<view class="grid-background" :style="{ backgroundPosition: backgroundPos, backgroundSize: backgroundSize }"></view>
+		<!-- Top Bar: Moved below Live Panel -->
+		<canvas id="connections-canvas" class="connections-canvas" :style="canvasStyle"></canvas>
+		<view class="canvas-area" @touchstart="onCanvasTouchStart" @touchmove="onCanvasTouchMove" @touchend="onCanvasTouchEnd" @click="onCanvasClick">
+			<!-- Flattened Layout for Android Performance & Visibility -->
+			<view v-for="node in (viewportNodes as VisionNode[])" :key="node.id" class="node-wrapper"
+				:class="{
+					'selected': selectedNodeId == node.id,
+					'is-group': node.type == 'group',
+					'is-dragging': draggingNodeIndex != -1 && nodes[draggingNodeIndex].id == node.id
+				}"
+				:style="{
+					left: (offsetX + (draggingNodeIndex != -1 && nodes[draggingNodeIndex].id == node.id ? tempNodeX : node.x) * scale) + 'px',
+					top: (offsetY + (draggingNodeIndex != -1 && nodes[draggingNodeIndex].id == node.id ? tempNodeY : node.y) * scale) + 'px',
+					width: node.width + 'px',
+					height: node.height + 'px',
+					transform: `scale(${scale})`,
+					transformOrigin: '0 0'
+				}"
+				@click.stop="onNodeClick(node)">
+				<EntityCard v-if="node.type == 'entity'"
+					:node="node"
+					:isSelected="selectedNodeId == node.id"
+					@click="onNodeClick(node)"
+					@context-menu="onNodeContextMenu"
+					@connect-start="onConnectStart(node.id)"
+					style="width: 100%; height: 100%; box-sizing: border-box;"
+				/>
+				<KineticChip v-if="node.type == 'kinetic'" :node="node" />
+				<VisionGroup v-if="node.type == 'group'" :node="node" />
+			</view>
+		</view>
+		<!-- Bottom Input Panel - Flush to bottom -->
+		<view class="bottom-input-panel" v-if="showLiveLog">
+			<!-- Input wrapper for consistent width and left alignment -->
+			<view class="input-panel-wrapper" :style="inputBarWidthStyle">
+				<!-- Log Bubble - Same left alignment as input -->
+				<view class="log-bubble-container" v-if="selectedNodeId != null && panelLogs.length > 0">
+					<view class="log-bubble">
+						<!-- Resize Handle -->
+						<view class="log-resize-handle"
+							@touchstart="onPanelResizeStart"
+							@touchmove="onPanelResizeMove"
+							@touchend="onPanelResizeEnd">
+							<view class="log-resize-bar"></view>
+						</view>
+						<scroll-view class="log-scroll" direction="vertical" :style="{ height: livePanelHeight + 'px' }">
+							<template v-for="(node, idx) in (panelLogs as VisionLogNode[])" :key="node.log.id">
+								<!-- Root log -->
+								<view class="log-item root-log-item" @click.stop="startSupplement(node.log)">
+									<view class="log-inline-content">
+										<view class="log-badge" :class="node.log.type == 'note' ? 'badge-user' : 'badge-sys'">
+											<text class="log-badge-text">{{ node.log.type == 'note' ? '进展' : '记录' }}</text>
+										</view>
+										<text class="log-author">我：</text>
+										<text class="log-text">{{ node.log.content }}</text>
+										<text class="log-reply-hint" v-if="node.children.length > 0" @click.stop="toggleNode(node)">
+											{{ node.expanded ? '收起' : '展开 ' + node.children.length + ' 条补充' }}
+										</text>
+										<text class="log-reply-hint" v-else>回复</text>
+									</view>
+								</view>
+								<!-- Child logs (supplements) -->
+								<template v-if="node.expanded">
+								<view v-for="(child, cIdx) in (node.children as VisionLogNode[])" :key="child.log.id" class="log-item child-log-item" @click.stop="startSupplement(child.log)">
+									<view class="log-inline-content">
+										<text class="log-author desc-color">补充：</text>
+										<text class="log-text">{{ child.log.content }}</text>
+										<text class="log-reply-hint">回复</text>
+									</view>
+								</view>
+								</template>
+							</template>
+						</scroll-view>
+					</view>
+				</view>
+				<!-- Input Bar -->
+				<view class="input-bar-wrapper">
+				<TaskInputBar
+					:isReplying="replyingLogId != ''"
+                    :replyContext="replyingLogContent"
+					@send="onSendProgress"
+					@cancel="cancelReply"
+					islandMode="default"
+					:placeholder="replyingLogId != '' ? '补充进展...' : (selectedNodeId != null ? '说点什么...' : '输入内容自动创建笔记...')"
+				/>
+				</view>
+			</view>
+		</view>
+		<!-- Top Left: Minimap (Independent positioned) -->
+		<view class="minimap-area" @touchstart.stop="onMinimapTouchStart" :style="{ top: (safeAreaTop + 60) + 'px' }">
+			<view class="minimap-card">
+				<view class="minimap-card-header" @click.stop="toggleMinimapState">
+					<text class="minimap-card-title">🗺️ {{ minimapCollapsed ? '' : 'Map' }}</text>
+					<text class="minimap-card-toggle">{{ minimapCollapsed ? '+' : '-' }}</text>
+				</view>
+				<view class="minimap-card-body" v-if="!minimapCollapsed">
+					<view class="minimap-canvas" :style="minimapCanvasStyle"
+						@touchstart="onMinimapCanvasTouchStart"
+						@touchmove="onMinimapCanvasTouchMove"
+						@touchend="onMinimapCanvasTouchEnd">
+						<!-- Render nodes directly as colored dots -->
+						<view v-for="node in minimapNodes" :key="node.id"
+							class="minimap-dot"
+							:style="getMinimapNodeStyle(node)">
+						</view>
+						<!-- Viewport indicator -->
+						<view class="minimap-viewport" :style="minimapViewportStyle"></view>
+					</view>
+					<!-- Horizontal Slider for X movement -->
+					<slider class="minimap-slider-x" :value="minimapSliderX" :min="0" :max="100"
+						@changing="onMinimapSliderXChange" @change="onMinimapSliderXChange"
+						activeColor="#ffffff" backgroundColor="#999999" :block-size="12" block-color="#ffffff" />
+					<!-- Vertical Slider for Y movement -->
+					<view class="minimap-slider-y-wrapper">
+						<slider class="minimap-slider-y" :value="minimapSliderY" :min="0" :max="100"
+							@changing="onMinimapSliderYChange" @change="onMinimapSliderYChange"
+							activeColor="#ffffff" backgroundColor="#999999" :block-size="12" block-color="#ffffff" />
+					</view>
+				</view>
+			</view>
+		</view>
+		<!-- Top Middle: Tags/Tabs (Independent positioned) -->
+		<view class="tabs-area" :style="{ top: (safeAreaTop + 64) + 'px' }">
+			<scroll-view class="sub-tabs-scroll" direction="horizontal" :show-scrollbar="false">
+				<view class="sub-tab-item" :class="{ 'active': activeTag == 'all' }" @click="activeTag = 'all'">
+					<text class="sub-tab-text" :style="{ color: activeTag == 'all' ? '#000' : '#333' }">All</text>
+				</view>
+				<view v-for="tag in displayedTags" :key="tag" class="sub-tab-item" :style="{ backgroundColor: activeTag == tag ? '#fff' : 'rgba(255,255,255,0.2)' }" @click="activeTag = tag">
+					<text class="sub-tab-text" :style="{ fontWeight: activeTag == tag ? 'bold' : 'normal' }">{{ tag }}</text>
+					<view class="sub-tab-close" @click.stop="removeTag(tag)">
+						<text class="sub-tab-close-text">×</text>
+					</view>
+				</view>
+			</scroll-view>
+		</view>
+		<!-- Top Right: Group Switcher (Independent positioned) -->
+		<view class="group-area">
+			<view class="group-switcher-btn" @click.stop="toggleGroupDropdown">
+				<text class="group-switcher-icon">🧭</text>
+				<text class="group-switcher-text">{{ currentGroupName }}</text>
+				<text class="group-switcher-arrow">▾</text>
+			</view>
+			<!-- Dropdown Menu -->
+			<view class="group-dropdown" v-if="showGroupDropdown" @click.stop="onDropdownClick">
+				<view class="group-dropdown-item" @click.stop="exitGroupView" v-if="activeGroupId != null">
+					<text class="group-dropdown-text">🚪 Exit Group (Show All)</text>
+				</view>
+				<view class="group-dropdown-separator" v-if="activeGroupId != null"></view>
+				<view class="group-dropdown-item" @click.stop="initCreateGroup">
+					<text class="group-dropdown-text">+ New Group</text>
+				</view>
+				<view class="group-dropdown-separator"></view>
+				<view class="group-dropdown-header"><text class="group-dropdown-header-text">All Groups</text></view>
+				<scroll-view class="group-dropdown-scroll" scroll-y="true">
+					<view v-for="group in allGroups" :key="group.id" class="group-dropdown-item" @click.stop="focusOnGroup(group)">
+						<text class="group-dropdown-text">{{ group.label }}</text>
+						<view @click.stop="deleteGroup(group)" style="padding: 2px 6px;">
+							<text style="font-size: 14px;">🗑️</text>
+						</view>
+					</view>
+					<view v-if="allGroups.length == 0" class="group-dropdown-item">
+						<text class="group-dropdown-sub">No groups found</text>
+					</view>
+				</scroll-view>
+			</view>
+		</view>
+		<!-- Link Picker Modal -->
+		<view class="picker-overlay" v-if="showLinkPicker" @click="closeLinkPicker">
+			<view class="picker-modal" @click.stop="onModalClick">
+				<view class="picker-header">
+					<text class="picker-title">关联真实数据</text>
+					<view class="picker-tabs">
+						<text class="picker-tab" :class="{ active: pickerTab == 'task' }" @click="pickerTab = 'task'">任务</text>
+						<text class="picker-tab" :class="{ active: pickerTab == 'note' }" @click="pickerTab = 'note'">笔记</text>
+					</view>
+				</view>
+				<scroll-view class="picker-list" scroll-y="true">
+					<view v-for="(item, idx) in currentPickerList" :key="idx" class="picker-item" @click="confirmLink(item)">
+						<text class="picker-item-icon">{{ pickerTab == 'task' ? '✅' : '📝' }}</text>
+						<view class="picker-item-info">
+							<text class="picker-item-title">{{ item['title'] }}</text>
+							<text class="picker-item-sub">{{ item['id'] }}</text>
+						</view>
+					</view>
+					<view v-if="currentPickerList.length == 0" class="picker-empty">
+						<text>暂无数据</text>
+					</view>
+				</scroll-view>
+			</view>
+		</view>
+		<view class="floating-toolbar" :class="{'toolbar-collapsed': isToolbarHidden}">
+			<!-- Toggle Toolbar -->
+			<view class="tool-btn toggle-btn" @click="toggleToolbar">
+				<text class="tool-icon">{{ isToolbarHidden ? '👁️' : '✅' }}</text>
+			</view>
+			<template v-if="!isToolbarHidden">
+			<!-- Input Panel Toggle -->
+			<view class="tool-btn" :class="{ 'active': showLiveLog }" @click="toggleInputPanel">
+				<text class="tool-icon">{{ showLiveLog ? '⏸️' : '📋' }}</text>
+			</view>
+			<view class="tool-btn" @click="createEntityAtCenter">
+				<text class="tool-icon">+</text>
+			</view>
+			<view class="tool-btn" @click="resetView">
+				<text class="tool-icon">🧭</text>
+			</view>
+			<view class="tool-btn" @click="autoLayout">
+				<text class="tool-icon">🧩</text>
+			</view>
+			<view class="tool-btn" @click="openBindingModal">
+				<text class="tool-icon">🔗</text>
+				<text class="tool-label">Bind</text>
+			</view>
+			<view class="tool-separator" v-if="selectedNodeId != null"></view>
+			<view class="tool-btn" v-if="isShowJumpButton" @click="jumpToSelectedTask">
+				<text class="tool-icon">鈫楋笍</text>
+				<text class="tool-label">Open</text>
+			</view>
+			<view class="tool-btn" :class="{ 'active': isLinkingMode }" v-if="selectedNodeId != null" @click="toggleLinkMode">
+				<text class="tool-icon">🔗</text>
+				<text class="tool-label">Link</text>
+			</view>
+			<!-- Task/Note Switch Button -->
+			<view class="tool-btn tool-switch" v-if="selectedNodeId != null && !isLinkingMode" @click="switchSelectedType">
+				<text class="tool-icon">{{ selectedNodeType == 'task' ? '✅' : '📝' }}</text>
+				<text class="tool-label">{{ selectedNodeType == 'task' ? 'To Note' : 'To Task' }}</text>
+			</view>
+			<!-- Remove from canvas (not delete from database) -->
+			<view class="tool-btn" v-if="selectedNodeId != null" @click="removeFromCanvas(selectedNodeId!)">
+				<text class="tool-icon">🗑️</text>
+				<text class="tool-label">移除</text>
+			</view>
+			</template>
+		</view>
+		<!-- Binding Modal -->
+		<GenericModal
+			v-model="showBindingModal"
+			title="Bind Content"
+			confirmText="Add to Group"
+			@confirm="confirmBinding"
+		>
+			<view class="binding-container">
+				<view class="binding-search-bar">
+					<input class="binding-input" v-model="bindingKeyword" placeholder="Search tasks or notes..." @confirm="searchBindingCandidates" />
+					<view class="binding-search-btn" @click="searchBindingCandidates">
+						<text class="binding-btn-text">Search</text>
+					</view>
+				</view>
+				<view class="binding-options" style="flex-direction: row; align-items: center; padding: 10px; border-bottom: 1px solid #eee;" @click="includeAssociated = !includeAssociated">
+					<view class="checkbox" style="margin-right: 8px;">
+						<view class="checkbox-inner" v-if="includeAssociated"></view>
+					</view>
+					<text style="font-size: 14px; color: #333;">携带关联笔记/任务</text>
+				</view>
+				<scroll-view class="binding-list" scroll-y="true">
+					<view v-if="bindingCandidates.length == 0" class="empty-state">
+						<text class="empty-text">No candidates found.</text>
+					</view>
+					<view v-for="item in bindingCandidates" :key="item['uniqueId']" class="binding-item"
+						:class="{ 'selected': selectedCandidateIds.includes(item['uniqueId'] as string) }"
+						@click="toggleCandidate(item['uniqueId'] as string)">
+						<view class="checkbox">
+							<view class="checkbox-inner" v-if="selectedCandidateIds.includes(item['uniqueId'] as string)"></view>
+						</view>
+						<view class="binding-content">
+							<text class="binding-title">{{ item['title'] }}</text>
+							<text class="binding-sub">{{ item['type'] }}</text>
+						</view>
+					</view>
+				</scroll-view>
+			</view>
+		</GenericModal>
+		<!-- Create Group Modal -->
+		<GenericModal
+			v-model="showCreateGroupModal"
+			title="Create New Group"
+			confirmText="Create"
+			@confirm="confirmCreateGroup"
+		>
+			<view style="padding: 10px 0;">
+				<input
+					style="background-color: #f5f5f5; padding: 10px; border-radius: 8px; font-size: 14px; width: 100%; box-sizing: border-box;"
+					placeholder="Enter group name..."
+					v-model="newGroupName"
+				/>
+			</view>
+		</GenericModal>
+		<!-- Unified Confirmation Modal -->
+		<GenericModal
+			v-model="showConfirmModal"
+			:title="confirmModalTitle"
+			confirmText="Confirm"
+			cancelText="Cancel"
+			@confirm="onConfirmAction"
+		>
+			<view style="padding: 20px;">
+				<text style="font-size: 16px; color: #333;">{{ confirmModalContent }}</text>
+			</view>
+		</GenericModal>
+	</view>
+</template>
+<script lang="uts">
+	import { VisionStore } from '@/services/sys/vision/VisionStore.uts';
+	import { VisionNode, EntityNode, KineticNode, GroupNode, MinimapUpdateEvent } from './VisionTypes.uts';
+	import EntityCard from './EntityCard.uvue';
+	import KineticChip from './KineticChip.uvue';
+    import VisionGroup from './VisionGroup.uvue';
+	import VisionMinimap from './VisionMinimap.uvue';
+	import TaskInputBar, { SendPayload } from '@/components/sys/task-input-bar.uvue';
+	import GenericModal from '@/components/sys/GenericModal.uvue';
+	import { CanvasBiz } from '@/services/biz/CanvasBiz.uts';
+	import { TaskBiz, TaskItem, CreateTaskPayload } from '@/services/biz/TaskBiz.uts';
+	import { NoteBiz, NoteItem } from "@/services/biz/NoteBiz.uts";
+	import { UserBiz } from '@/services/biz/UserBiz.uts';
+	type VisionLogNode = {
+		log: any;
+		children: VisionLogNode[];
+		expanded: boolean;
+	};
+	export default {
+		components: { EntityCard, KineticChip, VisionGroup, VisionMinimap, TaskInputBar, GenericModal },
+		data() {
+			return {
+				// Live Panel State
+				minimapCollapsed: false,
+				showGroupDropdown: false,
+				livePanelHeight: 120,
+				isResizingPanel: false,
+				panelStartY: 0,
+				panelStartH: 0,
+				panelLogs: [] as VisionLogNode[],
+				expandedIds: [] as string[],
+				expandedLoadedKey: '',
+				showLiveLog: false,
+				inputCollapsed: false,
+				isToolbarHidden: false,
+				replyingLogId: '',
+				replyingLogContent: "",
+				nodes: [] as VisionNode[],
+				connections: [] as Array<UTSJSONObject>,
+				offsetX: 0,
+				offsetY: 0,
+				// Optimized Canvas Rendering State
+				canvasDrawOffsetX: 0,
+				canvasDrawOffsetY: 0,
+				canvasDrawScale: 1, // Track scale at last draw
+				lastTouchX: 0,
+				lastTouchY: 0,
+				isDraggingCanvas: false,
+				selectedNodeId: null as string | null,
+				isConnecting: false,
+				connectingSourceId: null as string | null,
+				tempTouchX: 0,
+				tempTouchY: 0,
+				draggingNodeIndex: -1,
+				nodeTouchOffsetX: 0,
+				nodeTouchOffsetY: 0,
+				canvasCtx: null as CanvasRenderingContext2D | null,
+				canvasRect: null as NodeInfo | null, // Stores canvas position
+				// Picker State
+				showLinkPicker: false,
+				safeAreaTop: 0,
+				pickerTab: 'task', // 'task' | 'note'
+				pickerTasks: [] as TaskItem[],
+				pickerNotes: [] as NoteItem[],
+				// Sheet Drag State
+				headerStartY: 0,
+				headerCurrentY: 0,
+				// Zoom State
+				scale: 1,
+				lastPinchDist: 0,
+				// Minimap drag state
+				minimapDragging: false,
+				minimapLastX: 0,
+				minimapLastY: 0,
+				// Link State
+				isLinkingMode: false,
+				linkingSourceId: null as string | null,
+				// Manual Long Press State
+				longPressTimer: -1,
+				interactionMode: 'idle', // idle, panning, waiting, dragging, pinching
+				dragStartTimer: -1,
+				touchStartX: 0,
+				touchStartY: 0,
+				lastNodeClickTime: 0,
+				wasPanning: false,
+				pixelRatio: 1,
+				canvasWidth: 0,
+				canvasHeight: 0,
+				tempNodeX: 0,
+				tempNodeY: 0,
+				dragStartNodeX: 0,
+				dragStartNodeY: 0,
+				// Filtering
+				activeTag: 'all',
+				allTags: [] as string[],
+				// Group Mode
+				viewMode: 'tags', // 'tags' | 'groups'
+				activeGroupId: null as string | null,
+				pendingGroupId: null as string | null, // For restoring last active group after load
+				savedGroups: [] as GroupNode[],
+				// Unified Confirmation Modal
+				showConfirmModal: false,
+				confirmModalTitle: '',
+				confirmModalContent: '',
+				confirmModalAction: '', // 'deleteGroup' | 'deleteNode' | 'removeNode'
+				confirmModalTargetId: null as string | null, // Stores ID for action
+				deletedAutoGroups: [] as string[],
+				// Group View States - stores view position per group
+				groupViewStates: new Map<string, UTSJSONObject>(),
+				// Create Group Modal
+				showCreateGroupModal: false,
+				newGroupName: '',
+				// Binding Modal
+				showBindingModal: false,
+				bindingKeyword: '',
+				bindingCandidates: [] as UTSJSONObject[],
+				selectedCandidateIds: [] as string[],
+				includeAssociated: true
+			}
+		},
+		emits: ['close'],
+		watch: {
+			selectedNodeId(val: string | null) {
+				if (val != null) {
+					// Load logs for selected node
+					this.loadNodeLogs(val);
+				}
+			},
+			activeTag(newVal: string) {
+				// Apply layout aggregation when filtering
+				this.applyLayout(newVal);
+				// Re-draw canvas when tag filtering changes
+				// Wait for DOM to update (nodes to disappear/reappear)
+				this.$nextTick(() => {
+					this.drawAll();
+				});
+			}
+		},
+		computed: {
+			currentLogIdNum(): number {
+				if (this.selectedNodeId == null) return 0;
+				if (this.selectedNodeId!.startsWith('task_') || this.selectedNodeId!.startsWith('note_')) {
+					const idNum = parseInt(this.selectedNodeId!.replace('task_', '').replace('note_', ''));
+					return isNaN(idNum) ? 0 : idNum;
+				}
+				return 0;
+			},
+			activeGroupNode(): GroupNode | null {
+				if (this.activeGroupId == null) return null;
+				const n = this.findNodeById(this.activeGroupId!);
+				if (n != null && n.type == 'group') {
+					return n as GroupNode;
+				}
+				return null;
+			},
+			currentGroupName(): string {
+				const g = this.activeGroupNode;
+				return g != null ? g.label : 'Groups';
+			},
+			displayedTags(): string[] {
+				// Collect tags from currently VISIBLE nodes
+				// This satisfies: "Sub tabs should only show correspondent group's"
+				const tags = new Set<string>();
+				// We need to base this on nodes that WOULD be visible if 'all' was selected
+				// To avoid circular dependency with visibleNodes (which filters by activeTag),
+				// we calculate "Scope Nodes" first.
+				const scopeNodes = this.nodes.filter((node: VisionNode): boolean => {
+					// 1. Filter by Group Scope
+					if (this.activeGroupId != null) {
+						if (node.type == 'group') return false; // Don't count groups' tags
+						// Check if node is spatially inside the active group
+						const group = this.activeGroupNode;
+						if (group != null) {
+							// Simple AABB check (Center point or full containment?)
+							// Let's use Center Point for leniency
+							const cx = node.x + node.width / 2;
+							const cy = node.y + node.height / 2;
+							if (cx < group.x || cx > group.x + group.width ||
+								cy < group.y || cy > group.y + group.height) {
+								return false;
+							}
+						}
+					}
+					if (node instanceof EntityNode) {
+						return true;
+					}
+					return false;
+				});
+				scopeNodes.forEach((node: VisionNode) => {
+					if (node instanceof EntityNode) {
+						const d = node.data as UTSJSONObject;
+						const startTags = d.getArray<string>('tags');
+						if (startTags != null) {
+							startTags.forEach((t) => { tags.add(t); });
+						}
+					}
+				});
+				// Sort
+				const res = [] as string[];
+				tags.forEach((t) => { res.push(t); });
+				res.sort();
+				return res;
+			},
+			allGroups(): GroupNode[] {
+				return this.nodes.filter((n: VisionNode): boolean => n.type == 'group').map((n: VisionNode): GroupNode => n as GroupNode);
+			},
+			visibleNodes(): VisionNode[] {
+				// Base scope: All nodes
+				let scope: VisionNode[] = this.nodes;
+				// When in group view, only show nodes bound to the group (no group frame)
+				if (this.activeGroupId != null) {
+					const group = this.activeGroupNode;
+					scope = this.nodes.filter((node: VisionNode): boolean => {
+						// Hide ALL group frames in group view
+						if (node.type == 'group') return false;
+						// Only show nodes that are bound to this group
+						if (group != null) {
+							return group.children.includes(node.id);
+						}
+						// No group found, hide all
+						return false;
+					});
+				}
+				if (this.activeTag == 'all') return scope;
+				return scope.filter((node: VisionNode): boolean => {
+					// Hide groups strictly when filtering to avoid clutter and broken group frames
+					if (node.type == 'group') return false;
+					if (node instanceof EntityNode) {
+						const d = node.data as UTSJSONObject;
+						// Check tags in data
+						const tags = d.getArray<string>('tags'); // We need to ensure we populate this
+						if (tags != null && tags.includes(this.activeTag)) {
+							return true;
+						}
+					}
+					return false;
+				});
+			},
+			viewportNodes(): VisionNode[] {
+				const nodes = this.visibleNodes as VisionNode[];
+				if (this.canvasWidth == 0 || this.canvasHeight == 0) return nodes;
+				//const buffer = 5000; // Load extra around edges
+				const s = this.scale;
+				// Viewport in World Coordinates
+                // Screen (0,0) corresponds to World (-offsetX / s, -offsetY / s)
+				const minX = -this.offsetX / s //- buffer;
+				const minY = -this.offsetY / s //- buffer;
+				const maxX = (this.canvasWidth - this.offsetX) / s //+ buffer;
+				const maxY = (this.canvasHeight - this.offsetY) / s //+ buffer;
+				return nodes.filter((n: VisionNode): boolean => {
+					// Simple AABB Intersection
+					const right = n.x + n.width;
+					const bottom = n.y + n.height;
+					if (right < minX) return false;
+					if (n.x > maxX) return false;
+					if (bottom < minY) return false;
+					if (n.y > maxY) return false;
+					return true;
+				});
+			},
+			backgroundPos() : string {
+				return `${this.offsetX}px ${this.offsetY}px`;
+			},
+            backgroundSize(): string {
+                return `${30 * this.scale}px ${30 * this.scale}px`;
+            },
+			transformLayerStyle(): string {
+				// FIX: Use top/left for positioning to avoid Android clipChildren issues with translate
+				const s = this.scale;
+				const x = this.offsetX;
+				const y = this.offsetY;
+				// Force 1px size to avoid layout pass overhead, but rely on overflow: visible
+				return `position: absolute; left: ${x}px; top: ${y}px; width: 1px; height: 1px; transform: scale(${s}); transform-origin: 0 0; overflow: visible;`;
+			},
+			worldTransform(): string {
+				// We apply scale to a wrapper or handle manually.
+				// Manual handling gives better control for infinite canvas + culling
+				return '';
+			},
+			canvasStyle(): string {
+				// Optimization: Use CSS Transform to move the already-drawn canvas during Panning & Zooming
+				// This matches the sync of card movement and avoids expensive redraws on every frame
+				// Calculate Relative Scale
+				// If scale is roughly same (within epsilon), force 1 to avoid glitches
+				let s = 1.0;
+				if (this.canvasDrawScale > 0) {
+					s = this.scale / this.canvasDrawScale;
+				}
+				// Calculate Relative Translation
+				// P_target = P_drawn * s + T -> T = P_target - P_drawn * s
+				// We actually want: CanvasViewTransform(P_drawn) = P_target
+				// Using formula: T = currentOffset - (drawOffset * s)
+				const dx = this.offsetX - (this.canvasDrawOffsetX * s);
+				const dy = this.offsetY - (this.canvasDrawOffsetY * s);
+				return `width: 100%; height: 100%; transform: translate(${dx}px, ${dy}px) scale(${s}); transform-origin: 0 0;`;
+			},
+			selectedVisionNode(): VisionNode | null {
+				if (this.selectedNodeId == null) return null;
+				let res: VisionNode | null = null;
+				for (let i = 0; i < this.nodes.length; i++) {
+					if (this.nodes[i].id == this.selectedNodeId) {
+						res = this.nodes[i];
+						break;
+					}
+				}
+				return res;
+			},
+			isShowJumpButton(): boolean {
+				const node = this.selectedVisionNode;
+				if (node instanceof EntityNode) {
+					return node.subtype == 'task' || node.subtype == 'note';
+				}
+				return false;
+			},
+			selectedNodeType(): string {
+				const node = this.selectedVisionNode;
+				if (node instanceof EntityNode) {
+					return node.subtype;
+				}
+				return 'simple';
+			},
+			currentPickerList(): Array<UTSJSONObject> {
+				if (this.pickerTab == 'task') {
+					return this.pickerTasks.map((t): UTSJSONObject => {
+						const res = { id: t.node.id, title: t.node.content } as UTSJSONObject;
+						return res;
+					});
+				} else {
+					return this.pickerNotes.map((n): UTSJSONObject => {
+						const res = { id: n.node.id, title: n.node.content } as UTSJSONObject;
+						return res;
+					});
+				}
+			},
+			// Minimap computed properties
+			minimapNodes(): VisionNode[] {
+				// Return visible nodes for current view (group or all)
+				return this.visibleNodes;
+			},
+			minimapBounds(): UTSJSONObject {
+				// Calculate the bounding box based on NODES ONLY (not viewport)
+				// Viewport can be shown extending beyond if needed
+				const nodes = this.minimapNodes;
+				if (nodes.length == 0) {
+					// No nodes - use a default area around origin
+					return { minX: -100, minY: -100, maxX: 400, maxY: 400, width: 500, height: 500 } as UTSJSONObject;
+				}
+				let minX = Number.MAX_VALUE;
+				let minY = Number.MAX_VALUE;
+				let maxX = Number.MIN_VALUE;
+				let maxY = Number.MIN_VALUE;
+				// Calculate bounds from nodes only
+				for (const node of nodes) {
+					if (node.x < minX) minX = node.x;
+					if (node.y < minY) minY = node.y;
+					if (node.x + node.width > maxX) maxX = node.x + node.width;
+					if (node.y + node.height > maxY) maxY = node.y + node.height;
+				}
+				// Add padding
+				const padding = 30;
+				minX -= padding;
+				minY -= padding;
+				maxX += padding;
+				maxY += padding;
+				return {
+					minX: minX,
+					minY: minY,
+					maxX: maxX,
+					maxY: maxY,
+					width: maxX - minX,
+					height: maxY - minY
+				} as UTSJSONObject;
+			},
+			// Responsive width for input panel (90% of screen, max 400px)
+			inputBarWidthStyle(): string {
+				const screenW = this.canvasWidth > 0 ? this.canvasWidth : 375;
+				const w = Math.min(screenW * 0.92, 400);
+				return `width: ${w}px;`;
+			},
+			// Minimap metrics for reuse - always fit ALL content
+			minimapMetrics(): UTSJSONObject {
+				const bounds = this.minimapBounds;
+				const contentW = (bounds['width'] as number) > 0 ? (bounds['width'] as number) : 300;
+				const contentH = (bounds['height'] as number) > 0 ? (bounds['height'] as number) : 300;
+				const minX = bounds['minX'] as number;
+				const minY = bounds['minY'] as number;
+				// Adaptive minimap size based on content aspect ratio
+				const aspectRatio = contentW / contentH;
+				const maxW = 160.0;
+				const maxH = 120.0;
+				let mapW: number;
+				let mapH: number;
+				if (aspectRatio > 1) {
+					// Content is wider than tall
+					mapW = maxW;
+					mapH = Math.max(60, mapW / aspectRatio);
+				} else {
+					// Content is taller than wide (like your screenshot)
+					mapH = maxH;
+					mapW = Math.max(50, mapH * aspectRatio);
+				}
+				// Calculate scale to fit ALL content into minimap
+				const scaleX = mapW / contentW;
+				const scaleY = mapH / contentH;
+				const mapScale = Math.min(scaleX, scaleY);
+				// Actual scaled content size
+				const scaledW = contentW * mapScale;
+				const scaledH = contentH * mapScale;
+				// Center content in minimap
+				const offsetX = (mapW - scaledW) / 2;
+				const offsetY = (mapH - scaledH) / 2;
+				return {
+					mapW: mapW,
+					mapH: mapH,
+					contentW: contentW,
+					contentH: contentH,
+					minX: minX,
+					minY: minY,
+					mapScale: mapScale,
+					scaledW: scaledW,
+					scaledH: scaledH,
+					offsetX: offsetX,
+					offsetY: offsetY
+				} as UTSJSONObject;
+			},
+			minimapCanvasStyle(): string {
+				// Adaptive size based on content
+				const m = this.minimapMetrics;
+				const w = m['mapW'] as number;
+				const h = m['mapH'] as number;
+				return `width: ${w}px; height: ${h}px;`;
+			},
+			minimapContentStyle(): string {
+				const m = this.minimapMetrics;
+				const ox = m['offsetX'] as number;
+				const oy = m['offsetY'] as number;
+				const w = m['scaledW'] as number;
+				const h = m['scaledH'] as number;
+				return `left: ${ox}px; top: ${oy}px; width: ${w}px; height: ${h}px;`;
+			},
+			minimapViewportStyle(): string {
+				const m = this.minimapMetrics;
+				const mapScale = m['mapScale'] as number;
+				const minX = m['minX'] as number;
+				const minY = m['minY'] as number;
+				const offsetX = m['offsetX'] as number;
+				const offsetY = m['offsetY'] as number;
+				// Viewport left edge (screen x=0) corresponds to worldX where:
+				// 0 = World * Scale + OffsetX -> World = -OffsetX / Scale
+				const vpLeft = -this.offsetX / this.scale;
+				const vpTop = -this.offsetY / this.scale;
+				const vpW = this.canvasWidth / this.scale;
+				const vpH = this.canvasHeight / this.scale;
+				// Convert to minimap coordinates (with centering offset)
+				const x = (vpLeft - minX) * mapScale + offsetX;
+				const y = (vpTop - minY) * mapScale + offsetY;
+				let w = vpW * mapScale;
+				let h = vpH * mapScale;
+				// Ensure minimum visible size
+				const minSize = 8;
+				if (w < minSize) w = minSize;
+				if (h < minSize) h = minSize;
+				return `left: ${x}px; top: ${y}px; width: ${w}px; height: ${h}px;`;
+			},
+			// Minimap slider values (0-100)
+			minimapSliderX(): number {
+				const bounds = this.minimapBounds;
+				if (bounds == null || bounds['minX'] == null || bounds['maxX'] == null) return 50;
+				const minX = bounds['minX'] as number;
+				const maxX = bounds['maxX'] as number;
+				const contentW = maxX - minX;
+				if (contentW <= 0) return 50;
+				// Viewport world left = -OffsetX / Scale
+				const vpLeft = -this.offsetX / this.scale;
+				const vpW = this.canvasWidth / this.scale;
+				const vpCenter = vpLeft + vpW / 2;
+				// Map to 0-100
+				let percent = (vpCenter - minX) / contentW * 100;
+				if (isNaN(percent) || percent == Infinity || percent == -Infinity) percent = 50;
+				return Math.floor(Math.max(0, Math.min(100, percent)));
+			},
+			minimapSliderY(): number {
+				const bounds = this.minimapBounds;
+				if (bounds == null || bounds['minY'] == null || bounds['maxY'] == null) return 50;
+				const minY = bounds['minY'] as number;
+				const maxY = bounds['maxY'] as number;
+				const contentH = maxY - minY;
+				if (contentH <= 0) return 50;
+				const vpTop = -this.offsetY / this.scale;
+				const vpH = this.canvasHeight / this.scale;
+				const vpCenter = vpTop + vpH / 2;
+				let percent = (vpCenter - minY) / contentH * 100;
+				if (isNaN(percent) || percent == Infinity || percent == -Infinity) percent = 50;
+				return Math.floor(Math.max(0, Math.min(100, percent)));
+			}
+		},
+		mounted() {
+			const hiddenVal = uni.getStorageSync('vision_toolbar_hidden');
+			if (hiddenVal != null && hiddenVal !== '') {
+				this.isToolbarHidden = hiddenVal as boolean;
+			}
+			const sys = uni.getSystemInfoSync();
+			if (sys.safeAreaInsets != null) {
+				const top = sys.safeAreaInsets!.top;
+				if (top != null) this.safeAreaTop = parseInt(top.toString());
+			}
+            this.restoreViewState();
+			this.$nextTick(() => {
+				// 1. Get Container Dimensions First to ensure accurate 1:1 pixel mapping
+				uni.createSelectorQuery().in(this).select('.vision-canvas-container').boundingClientRect((rect) => {
+					if (rect != null) {
+						// Store rect for offset usage
+						const info = rect as NodeInfo;
+						// Get dimensions - fallback to system info if query fails
+						const sys = uni.getSystemInfoSync();
+						// Use Pixel Ratio for high fidelity
+						const dpr = sys.pixelRatio;
+						this.pixelRatio = dpr;
+						const w = (info.width ?? sys.windowWidth);
+						const h = (info.height ?? sys.windowHeight);
+						this.canvasWidth = w;
+						this.canvasHeight = h;
+						// 2. Setup Canvas
+						const canvas = uni.getElementById('connections-canvas') as UniCanvasElement;
+						if (canvas != null) {
+							// Set Buffer Size = Logical Size * DPR
+							canvas.width = w * dpr;
+							canvas.height = h * dpr;
+							this.canvasCtx = canvas.getContext('2d');
+							if (this.canvasCtx != null) {
+								console.log(`Canvas initialized: Logical=${w}x${h}, Buffer=${canvas.width}x${canvas.height}, DPR=${dpr}`);
+								// Scale context once so we can draw in logical coordinates
+								this.canvasCtx!.scale(dpr, dpr);
+								this.drawAll();
+							}
+						}
+						// 3. Update Canvas Rect
+						this.canvasRect = info;
+					}
+				}).exec();
+			});
+			this.loadRealData();
+		},
+		unmounted() {
+			this.saveViewState();
+		},
+		methods: {
+			toggleToolbar() {
+				this.isToolbarHidden = !this.isToolbarHidden;
+				uni.setStorageSync('vision_toolbar_hidden', this.isToolbarHidden);
+			},
+			toggleGroupMode() {
+				if (this.viewMode == 'tags') {
+					this.viewMode = 'groups';
+					this.activeTag = 'groups';
+					// TODO: Load saved groups
+				} else {
+					this.viewMode = 'tags';
+					this.activeTag = 'all';
+				}
+			},
+			openBindingModal() {
+				this.showBindingModal = true;
+				this.bindingKeyword = '';
+				this.bindingCandidates = [];
+				this.selectedCandidateIds = [];
+				this.includeAssociated = true;
+				this.searchBindingCandidates();
+			},
+			async searchBindingCandidates() {
+                                const kw = this.bindingKeyword.trim().toLowerCase();
+                                const candidates = [] as UTSJSONObject[];
+				const allTasks = TaskBiz.getTaskList();
+				allTasks.forEach((entity: TaskItem) => {
+					const title = entity.node.content;
+					if (kw == "" || title.toLowerCase().includes(kw)) {
+						candidates.push({
+							uniqueId: `task_${entity.node.id}`,
+							id: entity.node.id,
+							type: 'task',
+							title: title,
+							status: entity.status,
+							raw: entity
+						} as UTSJSONObject);
+					}
+				});
+				const allNotes = await NoteBiz.getAllNotesAsync();
+				allNotes.forEach((entity: NoteItem) => {
+					const title = entity.node.content;
+					if (kw == "" || title.toLowerCase().includes(kw)) {
+						candidates.push({
+							uniqueId: `note_${entity.node.id}`,
+							id: entity.node.id,
+							type: 'note',
+							title: title,
+							status: 'note',
+							raw: entity
+						} as UTSJSONObject);
+					}
+				});
+                                this.bindingCandidates = candidates;
+                        },
+			toggleCandidate(uid: string) {
+				const idx = this.selectedCandidateIds.indexOf(uid);
+				if (idx >= 0) {
+					this.selectedCandidateIds.splice(idx, 1);
+				} else {
+					this.selectedCandidateIds.push(uid);
+				}
+			},
+			async confirmBinding() {
+				if (this.selectedCandidateIds.length == 0) return;
+				// Map to store data for all items (including subtasks)
+				const itemsData = new Map<string, UTSJSONObject>();
+				// 1. Populate from selected candidates
+				this.bindingCandidates.forEach(c => {
+					const uid = c.getString('uniqueId') ?? '';
+					if (this.selectedCandidateIds.includes(uid)) {
+						itemsData.set(uid, c);
+					}
+				});
+				// Expand selected candidates to include subtasks
+				const expandedIds = [] as string[];
+				// Use a copy to iterate safely
+				const selectedIds = [] as string[];
+				this.selectedCandidateIds.forEach((id: string) => {
+				    selectedIds.push(id);
+				});
+				for (let i = 0; i < selectedIds.length; i++) {
+                                        const uid = selectedIds[i];
+                                        if (!expandedIds.includes(uid)) {
+                                                expandedIds.push(uid);
+                                        }
+										// 携带关联支持：只携带子任务及子笔记（不含父级或平级链接）
+                                        if (this.includeAssociated) {
+                                                let entityId = '';
+						if (uid.startsWith('task_')) {
+							entityId = uid.replace('task_', '');
+						} else if (uid.startsWith('note_')) {
+							entityId = uid.replace('note_', '');
+						}
+						if (entityId != '') {
+														const detail = TaskBiz.getTaskDetail(entityId);
+														if (detail != null) {
+															detail.subTasks.forEach((child: TaskItem) => {
+																const childType = 'task';
+																const subUid = `${childType}_${child.node.id}`;
+																if (!expandedIds.includes(subUid)) {
+																		expandedIds.push(subUid);
+																		if (!selectedIds.includes(subUid)) {
+																				selectedIds.push(subUid);
+																		}
+																		if (!itemsData.has(subUid)) {
+																				itemsData.set(subUid, {
+																						uniqueId: subUid,
+																						id: child.node.id,
+																						type: childType,
+																						title: child.node.content,
+																						status: child.status,
+																						raw: child
+																				} as UTSJSONObject);
+																		}
+																}
+															});
+														}
+                                                }
+                                        }
+                                }
+				// If we have an active group, add to it
+				if (this.activeGroupId != null) {
+					const group = this.activeGroupNode;
+					if (group != null) {
+						// Add selected items to group's children
+						const centerX = (this.canvasWidth / 2 - this.offsetX) / this.scale;
+						const centerY = (this.canvasHeight / 2 - this.offsetY) / this.scale;
+						expandedIds.forEach((uid: string) => {
+							// uid format: 'task_123' or 'note_456'
+							if (!group.children.includes(uid)) {
+								group.children.push(uid);
+							}
+							// Ensure node exists on canvas
+							let node = this.findNodeById(uid);
+							if (node == null) {
+								const itemData = itemsData.get(uid);
+								if (itemData != null) {
+									// Create new node instance
+									const nData = {
+										id: itemData.getNumber('id'),
+										title: itemData.getString('title'),
+										status: itemData.getNumber('status'),
+										content: '',
+										tags: [] as string[]
+									} as UTSJSONObject;
+									node = new EntityNode(
+										uid,
+										group.x + 20, // Initial pos
+										group.y + 40,
+										itemData.getString('type') ?? 'task',
+										nData,
+										{} as UTSJSONObject
+									);
+									this.nodes.push(node);
+								}
+							}
+							// Position the node inside the group
+							if (node != null) {
+								// Place at screen center with slight randomized scatter to prevent stacking
+								node.x = centerX - node.width / 2 + (Math.random() * 40 - 20);
+								node.y = centerY - node.height / 2 + (Math.random() * 40 - 20);
+								// Save position to database
+								this.saveNodePosition(node);
+							}
+						});
+						// Expand group if needed to fit children
+						const rows = Math.ceil(group.children.length / 2);
+						const neededH = 60 + rows * 170;
+						if (group.height < neededH) {
+							group.height = neededH;
+						}
+						if (group.width < 500 && group.children.length > 1) {
+							group.width = 500;
+						}
+						this.saveGroups();
+						this.drawAll();
+						// Force update to ensure new children appear in group view due to reactivity limits on nested arrays
+						this.nodes = this.nodes.slice();
+						console.log("Added to group:", group.label, group.children);
+					}
+				} else {
+					// Create a new group with selected items
+					const cx = (-this.offsetX + this.canvasWidth/2) / this.scale;
+					const cy = (-this.offsetY + this.canvasHeight/2) / this.scale;
+					const newGroup = new GroupNode(
+						`group_${Date.now()}`,
+						cx,
+						cy,
+						"New Group",
+						500,
+						400,
+						{ borderColor: '#4A90D9', color: '#4A90D9' } as UTSJSONObject
+					);
+					newGroup.children = [] as string[];
+					// Add items and position them
+					expandedIds.forEach((uid: string, idx: number) => {
+						newGroup.children.push(uid);
+						// Ensure node exists
+						let node = this.findNodeById(uid);
+						if (node == null) {
+							const itemData = itemsData.get(uid);
+							if (itemData != null) {
+								const nData = {
+									id: itemData.getNumber('id'),
+									title: itemData.getString('title'),
+									status: itemData.getNumber('status'),
+									content: '',
+									tags: [] as string[]
+								} as UTSJSONObject;
+								node = new EntityNode(
+									uid,
+									newGroup.x + 20,
+									newGroup.y + 40,
+									itemData.getString('type') ?? 'task',
+									nData,
+									{} as UTSJSONObject
+								);
+								this.nodes.push(node);
+							}
+						}
+						if (node != null) {
+							const col = idx % 2;
+							const row = Math.floor(idx / 2);
+							node.x = newGroup.x + 20 + col * 240;
+							node.y = newGroup.y + 40 + row * 170;
+							// Save position to database
+							this.saveNodePosition(node);
+						}
+					});
+					this.nodes.push(newGroup);
+					this.saveGroups();
+					this.viewMode = 'groups';
+					console.log("Created Group with:", expandedIds);
+				}
+				// Close modal and reset
+				this.showBindingModal = false;
+				this.selectedCandidateIds = [] as string[];
+			},
+			// onSendProgress merged with async version below
+			removeTag(tag: string) {
+				const idx = this.allTags.indexOf(tag);
+				if (idx > -1) {
+					this.allTags.splice(idx, 1);
+					if (this.activeTag == tag) {
+						this.activeTag = 'all';
+					}
+				}
+			},
+			async loadNodeLogs(nodeId: string) {
+				this.panelLogs = [] as VisionLogNode[];
+				let idNum = '';
+				if (nodeId.startsWith('task_') || nodeId.startsWith('note_')) {
+					idNum = nodeId.replace('task_', '').replace('note_', '');
+				}
+				if (idNum != '') {
+					try {
+						// Retrieve logs (进展记录)
+						const logs = await TaskBiz.getNodeLogs(idNum);
+						const normalizedLogs = [] as UTSJSONObject[];
+						for (let i = 0; i < logs.length; i++) {
+							const row = logs[i] as UTSJSONObject;
+							const logId = row.getString('id') ?? '';
+							const content = row.getString('content') ?? row.getString('message') ?? '';
+							const parentLogId = row.getString('parent_log_id');
+							normalizedLogs.push({
+								id: logId,
+								content: content,
+								parent_log_id: parentLogId
+							} as UTSJSONObject);
+						}
+						this.ensureExpandedLoaded(idNum);
+						this.buildLogTree(normalizedLogs.reverse());
+					} catch(e) {
+						console.log("Error loading logs", e);
+					}
+				}
+			},
+			getExpandedStorageKey(taskId: string): string {
+				return taskId != '' ? ('zemo_task_log_expand_' + taskId) : 'zemo_task_log_expand_global';
+			},
+			getExpandedUserKey(taskId: string): string {
+				return taskId != '' ? ('task_log_expand_' + taskId) : 'task_log_expand_global';
+			},
+			ensureExpandedLoaded(taskId: string) {
+				const key = this.getExpandedStorageKey(taskId);
+				const keyChanged = (key != this.expandedLoadedKey);
+				if (keyChanged) {
+					this.expandedLoadedKey = key;
+					this.expandedIds = this.loadExpandedFromLocal(key);
+					this.loadExpandedFromUserKV(taskId);
+				}
+			},
+			loadExpandedFromLocal(key: string): string[] {
+				const ids: string[] = [];
+				try {
+					const rawAny = uni.getStorageSync(key);
+					if (rawAny == null) return ids;
+					const raw = rawAny.toString().trim();
+					if (raw == '') return ids;
+					const parts = raw.split(',');
+					for (let i = 0; i < parts.length; i++) {
+						const p = parts[i].trim();
+						if (p == '') continue;
+						ids.push(p);
+					}
+				} catch (_e) {}
+				return ids;
+			},
+			async loadExpandedFromUserKV(taskId: string) {
+				const userKey = this.getExpandedUserKey(taskId);
+				try {
+					const raw = await UserBiz.getString(userKey);
+					if (raw == null) return;
+					const ids = UserBiz.parseIdCsv(raw);
+					this.expandedIds = ids;
+					this.persistExpandedState(taskId);
+					this.restoreExpandedState(this.panelLogs);
+				} catch (_e) {}
+			},
+			persistExpandedState(taskId: string) {
+				const key = this.getExpandedStorageKey(taskId);
+				try {
+					const csv = UserBiz.toIdCsv(this.expandedIds);
+					uni.setStorageSync(key, csv);
+				} catch (_e) {}
+				const userKey = this.getExpandedUserKey(taskId);
+				const userCsv = UserBiz.toIdCsv(this.expandedIds);
+				UserBiz.setString(userKey, userCsv);
+			},
+			restoreExpandedState(nodes: VisionLogNode[]): VisionLogNode[] {
+				const stack: VisionLogNode[] = [];
+				for (let i = 0; i < nodes.length; i++) stack.push(nodes[i]);
+				while (stack.length > 0) {
+					const n = stack.pop() as VisionLogNode;
+					const id = n.log.id;
+					if (id != null) {
+						try {
+							const idStr = id.toString();
+							n.expanded = (this.expandedIds.indexOf(idStr) >= 0);
+						} catch (_e) {}
+					}
+					if (n.children != null && n.children.length > 0) {
+						for (let j = 0; j < n.children.length; j++) stack.push(n.children[j]);
+					}
+				}
+				return nodes;
+			},
+			toggleNode(node : VisionLogNode) {
+				node.expanded = !node.expanded;
+				const id = node.log.id;
+				if (id != null) {
+					try {
+						let idNum = '';
+						if (this.selectedNodeId!.startsWith('task_') || this.selectedNodeId!.startsWith('note_')) {
+							idNum = this.selectedNodeId!.replace('task_', '').replace('note_', '');
+						}
+						const idStr = id.toString();
+						const idx = this.expandedIds.indexOf(idStr);
+						if (node.expanded) {
+							if (idx < 0) this.expandedIds.push(idStr);
+						} else {
+							if (idx >= 0) this.expandedIds.splice(idx, 1);
+						}
+						this.persistExpandedState(idNum);
+					} catch (_e2) {}
+				}
+			},
+			buildLogTree(allLogs: UTSJSONObject[]) {
+				const nodeMap = new Map<string, VisionLogNode>();
+				const standardRoots: VisionLogNode[] = [];
+				const allLogMap = new Map<string, UTSJSONObject>();
+				allLogs.forEach((log: UTSJSONObject) => {
+					const logId = log.getString('id') ?? '';
+					if (logId == '') return;
+					allLogMap.set(logId, log);
+					nodeMap.set(logId, { log: log, children: [] as VisionLogNode[], expanded: true } as VisionLogNode);
+				});
+				allLogs.forEach((log: UTSJSONObject) => {
+					const logId = log.getString('id') ?? '';
+					if (logId == '') return;
+					const node = nodeMap.get(logId);
+					if (node == null) return;
+					const parentId = log.getString('parent_log_id');
+					if (parentId == null || parentId == '') {
+						standardRoots.push(node);
+					} else {
+						let rootId = parentId;
+						let currentId = rootId;
+						let safety = 0;
+						while (safety < 50) {
+							const p = allLogMap.get(currentId);
+							if (p == null) break;
+							const pParentId = p.getString('parent_log_id');
+							if (pParentId == null || pParentId == '') {
+								rootId = p.getString('id') ?? currentId;
+								break;
+							}
+							currentId = pParentId;
+							safety++;
+						}
+						const rootNode = nodeMap.get(rootId);
+						if (rootNode != null) {
+							rootNode.children.push(node);
+						} else {
+							standardRoots.push(node);
+						}
+					}
+				});
+				this.panelLogs = this.restoreExpandedState(standardRoots);
+			},
+			// Create a new note from content, title is first 3 chars
+			async createNoteFromContent(content: string) {
+				// Calculate position - place in current viewport center
+				const sys = uni.getSystemInfoSync();
+				const viewCenterX = ((sys.screenWidth / 2) - this.offsetX) / this.scale;
+				const viewCenterY = ((sys.screenHeight / 2) - this.offsetY) / this.scale;
+				// Always prioritize user's current view focus (Optimization)
+				let centerX = viewCenterX - 100;
+				let centerY = viewCenterY - 50;
+				const title = content.substring(0, Math.min(3, content.length));
+				const emptyStyle = { backgroundColor: 'yellow' } as UTSJSONObject;
+				// Create note using unified TaskBiz with entity_type='note'
+				const taskItem = await TaskBiz.createTaskItem({
+					title: title,
+					description: content,
+					parent_id: null,
+					start_at: Date.now(),
+					repeat_rule: null,
+					tags: [] as string[]
+				 } as CreateTaskPayload);
+				const newId = taskItem?.node?.id;
+				if (newId != null && newId != '') {
+					const newNode = new EntityNode(
+						"task_" + newId,
+						centerX, centerY, "task",
+						{ "id": newId, "title": title, "content": content, "tags": [] as string[] } as UTSJSONObject,
+						emptyStyle
+					);
+					this.nodes.push(newNode);
+					this.selectedNodeId = newNode.id;
+					// If inside a group, add the new node to the group's children array
+					if (this.activeGroupId != null && this.activeGroupNode != null) {
+						const group = this.activeGroupNode as GroupNode;
+						if (group.children.indexOf(newNode.id) == -1) {
+							group.children.push(newNode.id);
+							// IMPORTANT: Save groups immediately so the binding persists across reloads
+							this.saveGroups();
+						}
+					}
+					// Force minimap update
+					this.nodes = this.nodes.slice();
+					this.drawAll();
+					uni.showToast({ title: '已创建笔记', icon: 'success' });
+				}
+			},
+			// Switch between task and note for selected node
+			// Uses unified entity model - just update entity_type field
+			async switchSelectedType() {
+                                if (this.selectedNodeId == null) return;
+                                const node = typeof this.selectedNodeId == 'string' ? this.findNodeById(this.selectedNodeId!) : null;
+                                if (node == null || !(node instanceof EntityNode)) return;
+                                const d = node.data as UTSJSONObject;
+                                let cid = d.getString('id');
+                                if (cid == null && d.getNumber('id') != null) { cid = d.getNumber('id')?.toString(); }
+                                if (cid != null && cid != '') {
+                                    uni.navigateTo({ url: `/pages/tasks/task-detail?id=${cid}&autoOpenNote=true` });
+                                }},
+			cancelReply() {
+				this.replyingLogId = '';
+				this.replyingLogContent = "";
+			},
+			startSupplement(log: any) {
+				this.replyingLogId = log.id;
+				this.replyingLogContent = log.content ?? log.message ?? "[图片/文件]";
+			},
+			async onSendProgress(payload: SendPayload) {
+				if (this.selectedNodeId == null) return;
+				const content = payload.node.content;
+				if (content.trim() == '') return;
+				// Handle Note Content Update (Local + DB)
+				if (this.selectedNodeId!.startsWith('note_') || this.selectedNodeId!.startsWith('task_')) {
+					const node = this.findNodeById(this.selectedNodeId!);
+					if (node != null && node instanceof EntityNode) {
+						const d = node.data as UTSJSONObject;
+						const nid = d.getString('id');
+						if (nid != null && nid != '') {
+							const parentId : string | null = this.replyingLogId != '' ? this.replyingLogId : null;
+							TaskBiz.addTaskLog(
+								nid, 'UPDATE',
+								content,
+								payload.images.concat(payload.files), // Media paths
+								parentId
+							);
+							this.cancelReply();
+							// refresh
+							this.loadNodeLogs(this.selectedNodeId!);
+						}
+						return;
+					}
+				}
+				// Save to Backend
+				let idNum = '';
+				if (this.selectedNodeId!.startsWith('task_')) {
+					idNum = this.selectedNodeId!.replace('task_', '');
+				}
+				if (idNum != '') {
+					const parentId : string | null = this.replyingLogId != '' ? this.replyingLogId : null;
+					TaskBiz.addNodeLog(idNum, 'UPDATE', content, payload.images.concat(payload.files), parentId);
+					this.cancelReply();
+					this.loadNodeLogs(this.selectedNodeId!);
+				}
+			},
+			onPanelResizeStart(e: TouchEvent) {
+				if (e.touches.length > 0) {
+					this.isResizingPanel = true;
+					this.panelStartY = e.touches[0].clientY;
+					this.panelStartH = this.livePanelHeight;
+				}
+			},
+			onPanelResizeMove(e: TouchEvent) {
+				if (this.isResizingPanel && e.touches.length > 0) {
+					const cy = e.touches[0].clientY;
+					const diff = this.panelStartY - cy; // Drag up -> height increase
+					let newH = this.panelStartH + diff;
+					if (newH < 80) newH = 80;
+					if (newH > 400) newH = 400;
+					this.livePanelHeight = newH;
+				}
+			},
+			onPanelResizeEnd(e: TouchEvent) {
+				this.isResizingPanel = false;
+			},
+			async saveViewState() {
+				const state = {
+					offsetX: this.offsetX,
+					offsetY: this.offsetY,
+					scale: this.scale,
+					activeGroupId: this.activeGroupId
+				};
+				await VisionStore.set('vision_limit_view_state', JSON.stringify(state));
+			},
+			async saveGroupViewStates() {
+				// Convert Map to array of [key, value] pairs for storage
+				const states: UTSJSONObject[] = [];
+				this.groupViewStates.forEach((value: UTSJSONObject, key: string) => {
+					states.push({
+						groupId: key,
+						offsetX: value.getNumber('offsetX') ?? 0,
+						offsetY: value.getNumber('offsetY') ?? 0,
+						scale: value.getNumber('scale') ?? 1
+					} as UTSJSONObject);
+				});
+				await VisionStore.set('vision_group_view_states', JSON.stringify(states));
+			},
+			async loadGroupViewStates() {
+				try {
+					const val = await VisionStore.get('vision_group_view_states');
+					if (val != null && val !== '') {
+						const states = JSON.parse(val as string) as Array<UTSJSONObject>;
+						if (states != null) {
+							states.forEach((s: UTSJSONObject) => {
+								const groupId = s.getString('groupId');
+								if (groupId != null) {
+									this.groupViewStates.set(groupId, {
+										offsetX: s.getNumber('offsetX') ?? 0,
+										offsetY: s.getNumber('offsetY') ?? 0,
+										scale: s.getNumber('scale') ?? 1
+									} as UTSJSONObject);
+								}
+							});
+						}
+					}
+				} catch(e) {
+					console.log("Failed to load group view states", e);
+				}
+			},
+			async saveConnections() {
+				// Only save manual connections (not auto-generated task ones)
+				// Currently we don't distinguish perfectly, but we can assume
+				// any connection NOT between task_X and task_Y parent/child is manual?
+				// Or simpler: Just save ALL connections that are not strictly task parent-child?
+				// Or easier: Just save all connections and deduplicate on load?
+				// Let's filter for connections that involve Groups or Notes mainly
+				// or just save all, but we need to avoid duping the Task ones which are re-generated.
+				// Better approach: Tag connections as 'manual' when creating them.
+				// Since we haven't done that, let's just save everything for now
+				// BUT in loadRealData, we must ensure we don't double add.
+				// Actually, we should filter Manual ones.
+				// For now, let's just save everything in 'vision_saved_connections'
+				// But on load, we already re-generate Task ones.
+				// So we only want to save connections that users created manually.
+				// Since we don't have a 'type' field on connections yet, let's assume
+				// connections between 'group_' nodes are manual.
+				const manualConns = this.connections.filter(c => {
+					const s = c.getString('sourceId');
+					const t = c.getString('targetId');
+					return (s != null && s.startsWith('group_')) || (t != null && t.startsWith('group_'));
+				});
+				await VisionStore.set('vision_saved_connections', JSON.stringify(manualConns));
+			},
+			async saveGroups() {
+				// Only save custom groups that start with 'group_'
+				const groupsToSave = this.nodes.filter((n: VisionNode): boolean => {
+					return n.type == 'group' && n.id.startsWith('group_');
+				}).map((n: VisionNode): UTSJSONObject => {
+					const g = n as GroupNode;
+					return {
+						id: g.id,
+						x: g.x,
+						y: g.y,
+						label: g.label,
+						width: g.width,
+						height: g.height,
+						style: g.style,
+						children: g.children
+					} as UTSJSONObject;
+				});
+				await VisionStore.set('vision_saved_groups', JSON.stringify(groupsToSave));
+			},
+			async loadSavedGroups() {
+				try {
+					const val = await VisionStore.get('vision_saved_groups');
+					if (val != null && val !== '') {
+						const list = JSON.parse(val as string) as Array<UTSJSONObject>;
+						if (list != null) {
+							list.forEach((obj: UTSJSONObject) => {
+								const id = obj.getString('id') ?? `group_${Date.now()}`;
+								// Check if already exists to avoid dupes if called multiple times
+								const exists = this.nodes.find((n: VisionNode): boolean => n.id == id);
+								if (exists == null) {
+									const g = new GroupNode(
+										id,
+										obj.getNumber('x') ?? 0,
+										obj.getNumber('y') ?? 0,
+										obj.getString('label') ?? 'Group',
+										obj.getNumber('width') ?? 300,
+										obj.getNumber('height') ?? 200,
+										obj.get('style') as UTSJSONObject
+									);
+									// Restore children (bound items)
+									const childrenArr = obj.getArray('children');
+									if (childrenArr != null) {
+										g.children = childrenArr.map((c): string => c as string);
+									}
+									this.nodes.push(g);
+								}
+							});
+						}
+					}
+				} catch(e) {
+					console.log("Failed to load saved groups", e);
+				}
+			},
+			async restoreViewState() {
+				try {
+					const val = await VisionStore.get('vision_limit_view_state');
+					if (val != null && val !== '') {
+						const state = JSON.parse(val as string) as UTSJSONObject;
+						if (state != null) {
+							this.offsetX = state.getNumber('offsetX') ?? 0;
+							this.offsetY = state.getNumber('offsetY') ?? 0;
+							this.scale = state.getNumber('scale') ?? 1;
+							// Restore last active group
+							const savedGroupId = state.getString('activeGroupId');
+							if (savedGroupId != null && savedGroupId != '') {
+								this.pendingGroupId = savedGroupId;
+							}
+						}
+					}
+				} catch(e) {
+					console.log("Failed to restore view state", e);
+				}
+			},
+			applyLayout(tag: string) {
+				if (tag == 'all') {
+					// Restore positions
+					this.nodes.forEach(node => {
+						node.x = node.ox;
+						node.y = node.oy;
+					});
+				} else {
+					// Grid Layout for Filtered Items
+					let x = 100;
+					let y = 100;
+					const colWidth = 250;
+					const maxX = 1000;
+					this.nodes.forEach(node => {
+						// Check if node matches filter
+						let match = false;
+						if (node instanceof EntityNode) {
+							const d = node.data as UTSJSONObject;
+							const tags = d.getArray<string>('tags');
+							if (tags != null && tags.includes(tag)) {
+								match = true;
+							}
+						}
+						if (match) {
+							node.x = x;
+							node.y = y;
+							x += colWidth;
+							if (x > maxX) {
+								x = 100;
+								y += 180; // height assumption
+							}
+						}
+					});
+				}
+			},
+			onHeaderTouchStart(e: TouchEvent) {
+				if(e.touches.length > 0) {
+					this.headerStartY = e.touches[0].screenY;
+				}
+			},
+			onHeaderTouchMove(e: TouchEvent) {
+				// Optional: visually move the sheet down?
+				// For now, simpler logic handled in End
+			},
+			onHeaderTouchEnd(e: TouchEvent) {
+				if(e.changedTouches.length > 0) {
+					const endY = e.changedTouches[0].screenY;
+					const diff = endY - this.headerStartY;
+					// If dragged down by 100px, close
+					if(diff > 100) {
+						this.saveViewState();
+						this.$emit('close');
+					}
+				}
+			},
+			toggleMinimapState() {
+				this.minimapCollapsed = !this.minimapCollapsed;
+			},
+			toggleInputPanel() {
+				this.showLiveLog = !this.showLiveLog;
+			},
+			getMinimapNodeStyle(node: VisionNode): string {
+				// Map node position to minimap coordinates
+				const m = this.minimapMetrics;
+				const mapScale = m['mapScale'] as number;
+				const minX = m['minX'] as number;
+				const minY = m['minY'] as number;
+				const offsetX = m['offsetX'] as number;
+				const offsetY = m['offsetY'] as number;
+				// Node position relative to content, then add offset for centering
+				const x = (node.x - minX) * mapScale + offsetX;
+				const y = (node.y - minY) * mapScale + offsetY;
+				const w = Math.max(4, node.width * mapScale);
+				const h = Math.max(4, node.height * mapScale);
+				// Color based on type
+				let color = '#4A90D9'; // Default blue for tasks
+				if (node.type == 'group') {
+					color = 'rgba(100, 200, 100, 0.5)';
+				} else if (node instanceof EntityNode) {
+					const en = node as EntityNode;
+					if (en.subtype == 'note') {
+						color = '#F5A623'; // Orange for notes
+					} else if (en.subtype == 'task') {
+						// Get status from data object
+						const taskData = en.data as UTSJSONObject | null;
+						const taskStatus = taskData?.getString('status') ?? '';
+						if (taskStatus == 'DONE') {
+							color = '#7ED321'; // Green for completed
+						} else if (taskStatus == 'IN_PROGRESS') {
+							color = '#4A90D9'; // Blue for in progress
+						}
+					}
+				}
+				return `left: ${x}px; top: ${y}px; width: ${w}px; height: ${h}px; background-color: ${color};`;
+			},
+			onMinimapTouchStart(e: TouchEvent) {
+				// Only block single-finger touches for minimap interaction
+				// Allow two-finger (pinch) touches to propagate for zoom
+				if (e.touches.length == 1) {
+					e.stopPropagation();
+				}
+				// When 2+ fingers, let the event pass through to canvas for pinch-to-zoom
+			},
+			onMinimapCanvasTouchStart(e: TouchEvent) {
+				if (e.touches.length == 1) {
+					e.stopPropagation();
+					e.preventDefault();
+					this.minimapDragging = true;
+					this.minimapLastX = e.touches[0].screenX;
+					this.minimapLastY = e.touches[0].screenY;
+					// Also jump to tap position immediately
+					this.handleMinimapTap(e.touches[0].pageX, e.touches[0].pageY);
+				}
+			},
+			onMinimapCanvasTouchMove(e: TouchEvent) {
+				if (!this.minimapDragging || e.touches.length != 1) return;
+				e.stopPropagation();
+				e.preventDefault();
+				const currentX = e.touches[0].screenX;
+				const currentY = e.touches[0].screenY;
+				const dx = currentX - this.minimapLastX;
+				const dy = currentY - this.minimapLastY;
+				this.minimapLastX = currentX;
+				this.minimapLastY = currentY;
+				// Convert minimap delta to world delta
+				const m = this.minimapMetrics;
+				const mapScale = m['mapScale'] as number;
+				if (mapScale > 0) {
+					const worldDx = dx / mapScale;
+					const worldDy = dy / mapScale;
+					// offsetX/offsetY are in SCREEN coordinates (Pixels)
+					// Moving viewport right means shifting content left
+					// Delta(Screen) = Delta(World) * Scale
+					this.offsetX = this.offsetX - (worldDx * this.scale);
+					this.offsetY = this.offsetY - (worldDy * this.scale);
+					this.drawAll();
+				}
+			},
+			onMinimapCanvasTouchEnd(e: TouchEvent) {
+				this.minimapDragging = false;
+			},
+			// Minimap slider handlers
+			onMinimapSliderXChange(e: UniSliderChangeEvent) {
+				const val = e.detail.value;
+				const bounds = this.minimapBounds;
+				const minX = bounds['minX'] as number;
+				const maxX = bounds['maxX'] as number;
+				const contentW = maxX - minX;
+				if (contentW <= 0) return;
+				// Map slider value (0-100) to world X center
+				const worldCenterX = minX + (val / 100) * contentW;
+				// OffsetX = ScreenCenter - WorldX * Scale
+				this.offsetX = (this.canvasWidth / 2) - worldCenterX * this.scale;
+				this.drawAll();
+			},
+			onMinimapSliderYChange(e: UniSliderChangeEvent) {
+				const val = e.detail.value;
+				const bounds = this.minimapBounds;
+				const minY = bounds['minY'] as number;
+				const maxY = bounds['maxY'] as number;
+				const contentH = maxY - minY;
+				if (contentH <= 0) return;
+				const worldCenterY = minY + (val / 100) * contentH;
+				this.offsetY = (this.canvasHeight / 2) - worldCenterY * this.scale;
+				this.drawAll();
+			},
+			handleMinimapTap(pageX: number, pageY: number) {
+				// Get minimap canvas position (need to query)
+				uni.createSelectorQuery().in(this).select('.minimap-canvas').boundingClientRect((rect) => {
+					if (rect == null) return;
+					const info = rect as NodeInfo;
+					const canvasLeft = info.left ?? 0;
+					const canvasTop = info.top ?? 0;
+					// Tap position relative to minimap canvas
+					const tapX = pageX - canvasLeft;
+					const tapY = pageY - canvasTop;
+					const m = this.minimapMetrics;
+					const mapScale = m['mapScale'] as number;
+					const minX = m['minX'] as number;
+					const minY = m['minY'] as number;
+					const ox = m['offsetX'] as number;
+					const oy = m['offsetY'] as number;
+					// Convert tap to content-relative position
+					const contentTapX = tapX - ox;
+					const contentTapY = tapY - oy;
+					// Convert to world coordinates
+					const worldX = contentTapX / mapScale + minX;
+					const worldY = contentTapY / mapScale + minY;
+					// Center viewport on this world position
+					// ScreenCenter = WorldX * Scale + OffsetX
+					// OffsetX = ScreenCenter - WorldX * Scale
+					this.offsetX = (this.canvasWidth / 2) - worldX * this.scale;
+					this.offsetY = (this.canvasHeight / 2) - worldY * this.scale;
+					this.drawAll();
+				}).exec();
+			},
+			onMinimapUpdate(event: MinimapUpdateEvent) {
+				const dx = event.dx;
+				const dy = event.dy;
+				if (dx != null && dy != null) {
+					let newOffsetX = this.offsetX - dx;
+					let newOffsetY = this.offsetY - dy;
+					// Apply limits if provided (viewport can only go until edge cards are at center)
+					const minOffsetX = event.minOffsetX;
+					const maxOffsetX = event.maxOffsetX;
+					const minOffsetY = event.minOffsetY;
+					const maxOffsetY = event.maxOffsetY;
+					if (minOffsetX != null && maxOffsetX != null) {
+						if (newOffsetX < minOffsetX) newOffsetX = minOffsetX;
+						if (newOffsetX > maxOffsetX) newOffsetX = maxOffsetX;
+					}
+					if (minOffsetY != null && maxOffsetY != null) {
+						if (newOffsetY < minOffsetY) newOffsetY = minOffsetY;
+						if (newOffsetY > maxOffsetY) newOffsetY = maxOffsetY;
+					}
+					this.offsetX = newOffsetX;
+					this.offsetY = newOffsetY;
+					this.drawAll();
+				}
+			},
+		// loadRealData: replace demo data with actual content
+		async loadRealData() {
+			this.nodes = [] as VisionNode[];
+			this.connections = [] as Array<UTSJSONObject>;
+			// Load Persistent Blacklist for Auto Groups
+			try {
+				const delVal = await VisionStore.get('vision_deleted_auto_groups');
+				if (delVal != null && delVal !== '') {
+					this.deletedAutoGroups = JSON.parse(delVal as string) as string[];
+				}
+			} catch(e) {}
+			// Demo Group (Free Group)
+			const groupStyle = { borderColor: '#FFA500', color: '#FFA500' } as UTSJSONObject;
+			const demoGroup = new GroupNode(
+				"group_demo",
+				50, 50,
+				"老司机新建卡片",
+				600, 400,
+				groupStyle
+			);
+			// Initialize Tags
+			const collectedTags = new Set<string>();
+			// ========================================
+			// Unified Entity Loading (tasks table only)
+			// entity_type field distinguishes task vs note
+			// ========================================
+			const allEntities = TaskBiz.getTaskList();
+			let x = 100;
+			let y = 100;
+			const colWidth = 250;
+			const maxX = 1000;
+			// Map to track created nodes for connections
+			const taskNodeMap = new Map<string, string>();
+			const nodeObjMap = new Map<string, VisionNode>();
+			const parentToChildMap = new Map<string, string[]>();
+			// Add all entities (unified tasks and notes from single table)
+			allEntities.forEach(entity => {
+				// Determine visual type from entity_type field (fallback to 'task' if null)
+                const type = entity.entity_type ?? 'task';
+				const isNote = type == 'note';
+				const style = isNote
+					? { backgroundColor: 'yellow' } as UTSJSONObject
+					: { backgroundColor: 'green' } as UTSJSONObject;
+                // Ensure ID reflects the type we determined, to match what we created
+                const nodeId = `${type}_${entity.node.id}`;
+				// Collect Tags
+				if (entity.tags.length > 0) {
+					entity.tags.forEach((tag: string) => { collectedTags.add(tag); });
+				}
+				// Estimate Dimensions
+				const content = entity.description ?? '';
+				let h = 110; // Base height
+				if (content.length > 20) h = 130;
+				if (content.length > 50) h = 160;
+				// Restore position from Metadata
+				let posX = x;
+				let posY = y;
+				let hasPosition = false;
+				if (entity.metadata != null) {
+					try {
+						const meta = JSON.parse(entity.metadata!) as UTSJSONObject;
+						if (meta['vision_x'] != null && meta['vision_y'] != null) {
+							posX = meta.getNumber('vision_x') ?? x;
+							posY = meta.getNumber('vision_y') ?? y;
+							if (isNaN(posX)) posX = x;
+							if (isNaN(posY)) posY = y;
+							hasPosition = true;
+						}
+					} catch(e) {}
+				}
+				// Auto-increment Position ONLY if not restored
+				if (!hasPosition) {
+					x += colWidth;
+					if (x > maxX) { x = 100; y += 180; }
+				}
+				const nodeData = { title: entity.node.content, content: content, id: entity.node.id, tags: entity.tags } as UTSJSONObject;
+				const node = new EntityNode(
+					nodeId, posX, posY, type, // Use determined type
+					nodeData,
+					style,
+					220, h
+				);
+				this.nodes.push(node);
+				taskNodeMap.set(entity.node.id, nodeId);
+				nodeObjMap.set(nodeId, node);
+				// Track Parent-Child for Grouping (works for both tasks and notes)
+				if (entity.parent_id != null && entity.parent_id != '') {
+					if (!parentToChildMap.has(entity.parent_id!)) {
+						parentToChildMap.set(entity.parent_id!, []);
+					}
+					parentToChildMap.get(entity.parent_id!)!.push(nodeId);
+				}
+				x += colWidth;
+				if (x > maxX) { x = 100; y += 180; }
+			});
+			// Update Tags - Correctly convert Set to Array<String>
+			const tagsArr = [] as string[];
+			collectedTags.forEach((s) => { tagsArr.push(s); });
+			this.allTags = tagsArr;
+			// Create Connections for Subtasks
+			console.log("Start creating connections for", allEntities.length, "entities");
+			// Load Saved Manual Connections
+			const savedConns = await VisionStore.get('vision_saved_connections');
+			if (savedConns != null && savedConns != '') {
+				try {
+					const list = JSON.parse(savedConns as string) as Array<UTSJSONObject>;
+					if (list != null) {
+						list.forEach(c => {
+							this.connections.push(c);
+						});
+					}
+				} catch(e) {}
+			}
+			allEntities.forEach(entity => {
+				// Loose check for parent_id
+				const pid = entity.parent_id;
+				if (pid != null && pid != '') {
+					if (taskNodeMap.has(pid) && taskNodeMap.has(entity.node.id)) {
+						const sourceId = taskNodeMap.get(pid);
+						const targetId = taskNodeMap.get(entity.node.id);
+						this.connections.push({
+							sourceId: sourceId,
+							targetId: targetId
+						} as UTSJSONObject);
+					} else {
+						// console.log("Missing definition for parent or self in map");
+					}
+				}
+			});
+			// NEW: Load Entity Links (Many-to-Many via NoteService - currently deprecated in unified TaskBiz)
+			// const dbLinks = await [] /* Deprecated getLinks */;
+			// dbLinks.forEach(link => {
+			// 	const srcIdNum = link.get('source_id');
+			// 	const tgtIdNum = link.get('target_id');
+			//
+			// 	if (srcIdNum != null && tgtIdNum != null) {
+			// 		const sid = srcIdNum.toString();
+			// 		const tid = tgtIdNum.toString();
+			//
+			// 		if (taskNodeMap.has(sid as string) && taskNodeMap.has(tid as string)) {
+			// 			this.connections.push({
+			// 				sourceId: taskNodeMap.get(sid as string),
+			// 				targetId: taskNodeMap.get(tid as string)
+			// 			} as UTSJSONObject);
+			// 		}
+			// 	}
+			// });
+			// AUTOMATIC GROUPING LOGIC (More than 3 children)
+			parentToChildMap.forEach((childIds, parentId) => {
+				if (childIds.length > 3) {
+					console.log(`Grouping parent ${parentId} with ${childIds.length} children`);
+					let minX = 100000;
+					let minY = 100000;
+					let maxX = -100000;
+					let maxY = -100000;
+					// Include Parent in Group Calculation to ensure frame covers everything
+					if (taskNodeMap.has(parentId)) {
+						const pidStr = taskNodeMap.get(parentId)!;
+						const pNode = nodeObjMap.get(pidStr);
+						if (pNode != null) {
+							if (pNode.x < minX) minX = pNode.x;
+							if (pNode.y < minY) minY = pNode.y;
+							if (pNode.x + pNode.width > maxX) maxX = pNode.x + pNode.width;
+							if (pNode.y + pNode.height > maxY) maxY = pNode.y + pNode.height;
+						}
+					}
+					childIds.forEach(cid => {
+						const n = nodeObjMap.get(cid);
+						if (n != null) {
+							// For child, using stored position is fine
+							if (n.x < minX) minX = n.x;
+							if (n.y < minY) minY = n.y;
+							if (n.x + n.width > maxX) maxX = n.x + n.width;
+							if (n.y + n.height > maxY) maxY = n.y + n.height;
+						}
+					});
+					// Add padding
+					const pad = 30;
+					const groupWidth = (maxX - minX) + (pad * 2);
+					const groupHeight = (maxY - minY) + (pad * 2);
+					if (groupWidth > 0 && groupHeight > 0) {
+						const groupId = `auto_group_${parentId}`;
+						// CHECK BLACKLIST
+						if (!this.deletedAutoGroups.includes(groupId)) {
+							const groupNode = new GroupNode(
+								groupId,
+								minX - pad,
+								minY - pad,
+								`Group for Task ${parentId}`,
+								groupWidth,
+								groupHeight,
+								{ borderColor: '#ccc', color: '#999', backgroundColor: 'rgba(0,0,0,0.02)' } as UTSJSONObject
+							);
+							// Add to BEGINNING of array so it is rendered behind (z-index)
+							// and checked LAST in hit testing (so children are hit first)
+							this.nodes.unshift(groupNode);
+						}
+					}
+				}
+			});
+			// this.nodes.push(demoGroup); // Removed Hardcoded Demo Group
+			// Load Saved Groups
+			await this.loadSavedGroups();
+			// Load saved group view states
+			await this.loadGroupViewStates();
+			// Initialize Original Positions for View Switching
+			this.nodes.forEach(n => {
+				n.ox = n.x;
+				n.oy = n.y;
+			});
+			// Restore last active group if saved
+			if (this.pendingGroupId != null) {
+				const groupNode = this.findNodeById(this.pendingGroupId!);
+				if (groupNode != null && groupNode.type == 'group') {
+					// Use focusOnGroup but skip the auto-layout since positions are saved
+					this.activeGroupId = groupnode.id;
+					// Restore saved view state for this group
+					const savedState = this.groupViewStates.get(groupnode.id);
+					if (savedState != null) {
+						this.offsetX = savedState.getNumber('offsetX') ?? this.offsetX;
+						this.offsetY = savedState.getNumber('offsetY') ?? this.offsetY;
+						this.scale = savedState.getNumber('scale') ?? this.scale;
+					}
+				}
+				this.pendingGroupId = null;
+			}
+			// Initial Draw
+			// Need a slight delay to ensure canvas is ready if called immediately,
+			// but mounted calls this so it's fine.
+			setTimeout(() => {
+				this.drawAll();
+			}, 100);
+		},
+		async createEntityAtCenter() {
+			const sys = uni.getSystemInfoSync();
+			// Fix: Correct coordinate calculation by including scale factor
+			let centerX = ((sys.screenWidth / 2) - this.offsetX) / this.scale - 100;
+			let centerY = ((sys.screenHeight / 2) - this.offsetY) / this.scale - 30;
+			// Priority Check: Are we targeting a group?
+			// 1. If a Group is SELECTED (clicked), add to it.
+			// 2. If we are INSIDE a Group View (activeGroupId), add to it.
+			let targetGroup: GroupNode | null = null;
+			if (this.selectedNodeId != null) {
+				const sNode = this.findNodeById(this.selectedNodeId!);
+				if (sNode != null && sNode.type == 'group') {
+					targetGroup = sNode as GroupNode;
+				}
+			}
+			if (targetGroup == null && this.activeGroupId != null) {
+				targetGroup = this.activeGroupNode;
+			}
+			if (targetGroup != null) {
+				// Use screen center even for groups to ensure visibility
+				// centerX = targetGroup.x + (targetGroup.width / 2) - 100;
+				// centerY = targetGroup.y + (targetGroup.height / 2) - 40;
+			}
+			const emptyStyle = { backgroundColor: 'white' } as UTSJSONObject;
+			// Create note using unified TaskBiz with entity_type='note'
+			const title = "新想法";
+				const taskItem = await TaskBiz.createTaskItem({
+				title: title,
+				description: "",
+				parent_id: null,
+				start_at: Date.now(),
+				repeat_rule: null,
+				tags: [] as string[]
+			} as CreateTaskPayload);
+			const newId = taskItem?.node?.id;
+			if (newId != null && newId != '') {
+				const newNode = new EntityNode(
+					"task_" + newId, // Use consistent ID format for notes
+					centerX, centerY, "task",
+					{ "id": newId, "title": title, "content": "", "tags": [] as string[] } as UTSJSONObject,
+					emptyStyle
+				);
+				this.nodes.push(newNode);
+				// Auto select the new node
+				this.selectedNodeId = newNode.id;
+				if (targetGroup != null) {
+					// Add to group children if using explicit grouping
+					if (!targetGroup.children.includes(newNode.id)) {
+						targetGroup.children.push(newNode.id);
+						this.saveGroups();
+					}
+				}
+				// Force minimap update
+				this.nodes = this.nodes.slice();
+				this.drawAll();
+			}
+		},
+		onNodeContextMenu(nodeId: string) {
+			// Deprecated action sheet, now using Floating Island
+			// this.onNodeClick should have set selectedNodeId
+		},
+		toggleTask(nodeId: string) {
+			const node = this.findNodeById(nodeId);
+			if (node == null || !(node instanceof EntityNode)) return;
+			node.subtype = 'task';
+			this.setNodeColor(node, 'green');
+		},
+		toggleNote(nodeId: string) {
+			const node = this.findNodeById(nodeId);
+			if (node == null || !(node instanceof EntityNode)) return;
+			node.subtype = 'note';
+			this.setNodeColor(node, 'yellow');
+		},
+		cycleNodeType(nodeId: string) {
+			const node = this.findNodeById(nodeId);
+			if (node == null || !(node instanceof EntityNode)) return;
+			const types = ['simple', 'task', 'note'];
+			const currentType = node.subtype;
+			let nextIndex = (types.indexOf(currentType) + 1) % 3;
+			// If unknown, start at task
+			if (nextIndex < 0) nextIndex = 0;
+			const newType = types[nextIndex];
+			node.subtype = newType;
+			// Auto color update
+			if (newType == 'task') this.setNodeColor(node, 'green');
+			else if (newType == 'note') this.setNodeColor(node, 'yellow');
+			else this.setNodeColor(node, 'white');
+			// Force reactivity hack: replace node in array if needed,
+			// but since EntityCard reads properties directly, this should be fine.
+			// Let's force update the style object ref just in case
+			const oldStyle = node.style as UTSJSONObject;
+			const newStyle = {} as UTSJSONObject;
+			newStyle['backgroundColor'] = oldStyle['backgroundColor'];
+			node.style = newStyle;
+			console.log("Cycled node type to", newType);
+		},
+		async openLinkPicker(nodeId: string) {
+			this.showLinkPicker = true;
+			// Preload data
+			await this.loadPickerData();
+		},
+		closeLinkPicker() {
+			this.showLinkPicker = false;
+		},
+		onModalClick() {
+			// Prevent click propagation
+		},
+		async loadPickerData() {
+			this.pickerTasks = TaskBiz.getTaskList();
+			this.pickerNotes = await NoteBiz.getAllNotesAsync();
+		},
+		confirmLink(item: UTSJSONObject) {
+			if (this.selectedNodeId == null) return;
+			const node = this.findNodeById(this.selectedNodeId!);
+			if (node == null || !(node instanceof EntityNode)) return;
+			const isTask = this.pickerTab == 'task';
+			node.subtype = isTask ? 'task' : 'note';
+			this.setNodeColor(node, isTask ? 'green' : 'yellow');
+			// Update Data
+			const data = node.data as UTSJSONObject;
+			data['title'] = item['title'];
+			data['linkedId'] = item['id']; // Store real ID
+			// Optionally store content preview
+			data['content'] = this.pickerTab == 'task' ? 'Real Task' : 'Real Note';
+			// Force refresh
+			node.data = data;
+			// Save to metadata
+			this.saveNodeFullMetadata(node);
+			this.closeLinkPicker();
+			console.log('Linked node to', item['title']);
+		},
+		onConnectStart(nodeId: string) {
+			this.isConnecting = true;
+			this.connectingSourceId = nodeId;
+			console.log('Connect start:', nodeId);
+		},
+		setNodeColor(node: EntityNode, color: string) {
+			console.log('Setting color for', node.id, color);
+			if (node.style == null) node.style = {};
+			const s = node.style as UTSJSONObject;
+			s['backgroundColor'] = color;
+			// Force reactivity if needed, though objects should differ
+			// this.drawAll(); // Not needed for Vue reactivity usually, but good for Canvas
+		},
+		// Remove node from canvas (does NOT delete from database)
+		// Prompt user for remove or delete action
+		removeFromCanvas(id: string) {
+			uni.showActionSheet({
+				itemList: ["仅从当前分组/视图中移除", "完全彻底删除此项数据"],
+				success: (res) => {
+					if (res.tapIndex == 0) {
+						this.confirmModalTargetId = id;
+						this.confirmModalAction = "removeNode";
+						this.confirmModalTitle = "确认移除";
+						this.confirmModalContent = "确定要将此卡片从当前分组/视图中移除吗？（数据仍可在全部视图或其他地方找回）";
+						this.showConfirmModal = true;
+					} else if (res.tapIndex == 1) {
+						this.deleteNode(id);
+					}
+				}
+			});
+		},
+		deleteNode(id: string) {
+			this.confirmModalTargetId = id;
+			this.confirmModalAction = 'deleteNode';
+			this.confirmModalTitle = '确认彻底删除';
+			this.confirmModalContent = '确定要彻底删除此项数据吗？此操作无法撤销。';
+			this.showConfirmModal = true;
+		},
+		deleteGroup(group: VisionNode) {
+			const g = group as GroupNode;
+			this.confirmModalTargetId = g.id;
+			this.confirmModalAction = 'deleteGroup';
+			this.confirmModalTitle = 'Delete Group';
+			this.confirmModalContent = `Are you sure you want to delete group "${g.label}"? Cards inside will be preserved.`;
+			this.showConfirmModal = true;
+			this.showGroupDropdown = false;
+		},
+		async onConfirmAction() {
+			if (this.confirmModalTargetId == null) return;
+			const id = this.confirmModalTargetId!;
+			if (this.confirmModalAction == 'removeNode') {
+				// Remove Logic
+				const node = this.findNodeById(id);
+				if (node != null) {
+					// If in a group view, just remove from group's children
+					if (this.activeGroupId != null) {
+						const group = this.activeGroupNode;
+						if (group != null) {
+							const idx = group.children.indexOf(id);
+							if (idx >= 0) {
+								group.children.splice(idx, 1);
+								this.saveGroups();
+								uni.showToast({ title: 'Removed from group', icon: 'success' });
+							}
+						}
+					} else {
+						// In all view, remove from all groups
+						this.nodes.forEach(n => {
+							if (n.type == 'group' && n instanceof GroupNode) {
+								const gn = n as GroupNode;
+								const idx = gn.children.indexOf(id);
+								if (idx >= 0) {
+									gn.children.splice(idx, 1);
+								}
+							}
+						});
+						this.saveGroups();
+						uni.showToast({ title: 'Removed from canvas', icon: 'success' });
+					}
+					// Remove connections involving this node
+					this.connections = this.connections.filter((c: UTSJSONObject): boolean => {
+						return c.getString('sourceId') != id && c.getString('targetId') != id;
+					});
+					// Clear selection if this node was selected
+					if (this.selectedNodeId == id) {
+						this.selectedNodeId = null;
+					}
+					this.drawAll();
+				}
+			}
+			else if (this.confirmModalAction == 'deleteNode') {
+				// Delete Logic
+				const index = this.nodes.findIndex((n: VisionNode): boolean => n.id == id);
+				if (index != -1) {
+					const node = this.nodes[index];
+					// Delete from database
+					if (node instanceof EntityNode) {
+						const d = node.data as UTSJSONObject;
+const dbId = d.getString('id');
+                                                if (dbId != null && dbId != '') {
+							TaskBiz.deleteTask(dbId).then((success: boolean) => {
+								if (success) uni.showToast({ title: 'Deleted', icon: 'success' });
+							});
+						}
+					}
+					this.nodes.splice(index, 1);
+					// Remove connections
+					this.connections = this.connections.filter((c: UTSJSONObject): boolean => {
+						return c.getString('sourceId') != id && c.getString('targetId') != id;
+					});
+					if (this.selectedNodeId == id) this.selectedNodeId = null;
+					this.drawAll();
+				}
+			}
+			else if (this.confirmModalAction == 'deleteGroup') {
+				// Delete Group Logic
+				// Handle Auto Group Persistence Blacklist
+				if (id.startsWith('auto_group_')) {
+					this.deletedAutoGroups.push(id);
+					await VisionStore.set('vision_deleted_auto_groups', JSON.stringify(this.deletedAutoGroups));
+				}
+				const index = this.nodes.findIndex((n: VisionNode): boolean => n.id == id);
+				if (index != -1) {
+					this.nodes.splice(index, 1);
+					this.saveGroups();
+					this.drawAll();
+				}
+			}
+			this.showConfirmModal = false;
+			this.confirmModalTargetId = null;
+			this.confirmModalAction = '';
+			// Force minimap update
+			this.nodes = this.nodes.slice();
+		},
+		findNodeById(id: string): VisionNode | null {
+			return this.nodes.find((n: VisionNode): boolean => n.id == id) ?? null;
+		},
+			drawAll() {
+				const ctx = this.canvasCtx;
+				if (ctx == null) return;
+				// Sync Draw Offset & Scale for future optimized translations
+				this.canvasDrawOffsetX = this.offsetX;
+				this.canvasDrawOffsetY = this.offsetY;
+				this.canvasDrawScale = this.scale;
+				// Standard Clear
+				const w = this.canvasWidth;
+				const h = this.canvasHeight;
+				ctx.clearRect(0, 0, w, h);
+				// Loop through all connections
+				const conns = this.connections;
+				for(let i=0; i<conns.length; i++) {
+					const conn = conns[i];
+					const sId = conn.getString('sourceId');
+					const tId = conn.getString('targetId');
+					// Draw line if both nodes exist and are VISIBLE
+					if (sId != null && tId != null) {
+						const source = this.findNodeById(sId);
+						const target = this.findNodeById(tId);
+						if (source != null && target != null) {
+							// Visibility Check
+							if (this.isNodeVisible(source) && this.isNodeVisible(target)) {
+								this.drawBezierLine(ctx, source, target, '#999999');
+							}
+						}
+					}
+				}
+				if (this.isConnecting && this.connectingSourceId != null) {
+					const source = this.findNodeById(this.connectingSourceId!);
+					if (source != null) {
+						this.drawTempLine(ctx, source, this.tempTouchX, this.tempTouchY);
+					}
+				}
+				ctx.draw();
+			},
+			initCreateGroup() {
+				this.showGroupDropdown = false;
+				this.newGroupName = '';
+				this.showCreateGroupModal = true;
+			},
+			confirmCreateGroup() {
+				this.showCreateGroupModal = false;
+				const name = this.newGroupName.trim() == '' ? 'New Group' : this.newGroupName.trim();
+				// Calculate center position
+				const cx = (this.canvasWidth / 2 - this.offsetX) / this.scale;
+				const cy = (this.canvasHeight / 2 - this.offsetY) / this.scale;
+				// Create empty group - tasks will be added via binding
+				const groupId = `group_${Date.now()}`;
+				const newGroup = new GroupNode(
+					groupId,
+					cx - 150,
+					cy - 100,
+					name,
+					300,
+					200,
+					{ borderColor: '#4A90D9', color: '#4A90D9', backgroundColor: 'rgba(74,144,217,0.05)', boundItems: [] as string[] } as UTSJSONObject
+				);
+				newGroup.children = [] as string[];
+				this.nodes.push(newGroup);
+				this.saveGroups();
+				// Clear canvas before switching view to avoid line residue
+				const ctx = this.canvasCtx;
+				if (ctx != null) {
+					ctx.clearRect(0, 0, this.canvasWidth, this.canvasHeight);
+					ctx.draw();
+				}
+				// Switch view to focus on this new group
+				this.focusOnGroup(newGroup);
+				this.drawAll();
+			},
+			/* Deprecated direct creation
+			createGroup() { ... }
+			*/
+			// deleteGroup moved to earlier section
+			toggleGroupDropdown() {
+				this.showGroupDropdown = !this.showGroupDropdown;
+			},
+			// Empty handler to stop event propagation on dropdown
+			onDropdownClick() {
+				// Do nothing, just stop propagation
+			},
+			focusOnGroup(group: VisionNode) {
+				this.showGroupDropdown = false;
+				// Save current view state for previous group (or default)
+				const prevGroupId = this.activeGroupId ?? 'default';
+				this.groupViewStates.set(prevGroupId, {
+					offsetX: this.offsetX,
+					offsetY: this.offsetY,
+					scale: this.scale
+				} as UTSJSONObject);
+				this.saveGroupViewStates(); // Persist immediately
+				this.activeGroupId = group.id; // Set Context
+				// Calculate content bounds WITHOUT auto-layout
+				// Only layout nodes that don't have saved positions
+				const g = group as GroupNode;
+				let contentMinX = group.x;
+				let contentMinY = group.y;
+				let contentMaxX = group.x + group.width;
+				let contentMaxY = group.y + group.height;
+				if (g.children != null && g.children.length > 0) {
+					// First pass: count nodes without positions for potential layout
+					let nodesNeedingLayout: VisionNode[] = [];
+					g.children.forEach((childId: string) => {
+						const node = this.findNodeById(childId);
+						if (node != null) {
+							// Check if node is at default/uninitialized position (0,0 or very close to origin)
+							const isAtOrigin = node.x < 10 && node.y < 10;
+							if (isAtOrigin) {
+								nodesNeedingLayout.push(node);
+							} else {
+								// Node has valid position, just track bounds
+								if (node.x < contentMinX) contentMinX = node.x;
+								if (node.y < contentMinY) contentMinY = node.y;
+								if (node.x + node.width > contentMaxX) contentMaxX = node.x + node.width;
+								if (node.y + node.height > contentMaxY) contentMaxY = node.y + node.height;
+							}
+						}
+					});
+					// Only layout nodes that need it
+					if (nodesNeedingLayout.length > 0) {
+						const colWidth = 240;
+						const rowHeight = 160;
+						const cols = 2;
+						const startX = g.x + 20;
+						const startY = g.y + 50;
+						nodesNeedingLayout.forEach((node: VisionNode, idx: number) => {
+							const col = idx % cols;
+							const row = Math.floor(idx / cols);
+							node.x = startX + col * colWidth;
+							node.y = startY + row * rowHeight;
+							// Track bounds
+							if (node.x < contentMinX) contentMinX = node.x;
+							if (node.y < contentMinY) contentMinY = node.y;
+							if (node.x + node.width > contentMaxX) contentMaxX = node.x + node.width;
+							if (node.y + node.height > contentMaxY) contentMaxY = node.y + node.height;
+							// Save the new position
+							this.saveNodePosition(node);
+						});
+					}
+					// Resize group to fit all children if needed
+					const padding = 40;
+					const neededW = contentMaxX - g.x + padding;
+					const neededH = contentMaxY - g.y + padding;
+					if (g.width < neededW) g.width = neededW;
+					if (g.height < neededH) g.height = neededH;
+					this.saveGroups();
+				}
+				// Restore saved view state for this group if available
+				const savedState = this.groupViewStates.get(group.id);
+				if (savedState != null) {
+					// Restore saved position
+					this.scale = savedState.getNumber('scale') ?? 1;
+					this.offsetX = savedState.getNumber('offsetX') ?? 0;
+					this.offsetY = savedState.getNumber('offsetY') ?? 0;
+				} else {
+					// Fallback: Center content
+					if (this.canvasWidth > 0 && this.canvasHeight > 0) {
+						const contentCX = (contentMinX + contentMaxX) / 2;
+						const contentCY = (contentMinY + contentMaxY) / 2;
+						// Reset scale to 1 for clarity
+						this.scale = 1;
+						// offsetX/offsetY are in SCREEN Space offsets?
+						// Drawing logic: x_screen = x_world * scale + offsetX
+						// To center contentCX at screen center: ScreenW / 2 = contentCX * scale + offsetX
+						// offsetX = ScreenW/2 - contentCX * scale
+						this.offsetX = (this.canvasWidth / 2) - contentCX * this.scale;
+						this.offsetY = (this.canvasHeight / 2) - contentCY * this.scale;
+					}
+				}
+				// Persist group view states to storage
+				this.saveGroupViewStates();
+				this.saveViewState();
+				// Clear canvas before redraw to avoid line residue
+				const ctx = this.canvasCtx;
+				if (ctx != null) {
+					ctx.clearRect(0, 0, this.canvasWidth, this.canvasHeight);
+				}
+				this.drawAll();
+			},
+			exitGroupView() {
+				// Save current group view state
+				if (this.activeGroupId != null) {
+					this.groupViewStates.set(this.activeGroupId!, {
+						offsetX: this.offsetX,
+						offsetY: this.offsetY,
+						scale: this.scale
+					} as UTSJSONObject);
+				}
+				this.activeGroupId = null;
+				this.showGroupDropdown = false;
+				// Restore default view state
+				const defaultState = this.groupViewStates.get('default');
+				if (defaultState != null) {
+					this.offsetX = defaultState.getNumber('offsetX') ?? 0;
+					this.offsetY = defaultState.getNumber('offsetY') ?? 0;
+					this.scale = defaultState.getNumber('scale') ?? 1;
+				}
+				// Persist group view states to storage
+				this.saveGroupViewStates();
+				// Clear canvas before redraw to avoid line residue
+				const ctx = this.canvasCtx;
+				if (ctx != null) {
+					ctx.clearRect(0, 0, this.canvasWidth, this.canvasHeight);
+				}
+				this.drawAll();
+			},
+			isNodeVisible(node: VisionNode): boolean {
+				// 1. Group View Check - only show nodes bound to the group (no group frame)
+				if (this.activeGroupId != null) {
+					// Hide ALL group frames in group view
+					if (node.type == 'group') return false;
+					// Only show nodes that are bound to this group
+					const group = this.activeGroupNode;
+					if (group != null) {
+						return group.children.includes(node.id);
+					}
+					// No group found, hide node
+					return false;
+				}
+				if (this.activeTag == 'all') return true;
+				if (node.type == 'group') return true; // Show groups in main view
+				if (node.type == 'kinetic') return true;
+				if (node instanceof EntityNode) {
+					const d = node.data as UTSJSONObject;
+					const tags = d.getArray<string>('tags');
+					if (tags != null && tags.includes(this.activeTag)) {
+						return true;
+					}
+				}
+				return false;
+			},
+			drawBezierLine(ctx : CanvasRenderingContext2D, source : VisionNode, target : VisionNode, color : string) {
+				const s = this.scale;
+                // 1. Calculate Bounding Boxes in Screen Space (Explicit Typed Variables)
+                const sRectX : number = source.x * s + this.offsetX;
+                const sRectY : number = source.y * s + this.offsetY;
+                const sRectW : number = source.width * s;
+                const sRectH : number = source.height * s;
+                const sRectCX : number = (source.x + source.width/2) * s + this.offsetX;
+                const sRectCY : number = (source.y + source.height/2) * s + this.offsetY;
+                const tRectX : number = target.x * s + this.offsetX;
+                const tRectY : number = target.y * s + this.offsetY;
+                const tRectW : number = target.width * s;
+                const tRectH : number = target.height * s;
+                const tRectCX : number = (target.x + target.width/2) * s + this.offsetX;
+                const tRectCY : number = (target.y + target.height/2) * s + this.offsetY;
+                // 2. Determine Directions
+                // Angle from Source Center to Target Center
+                const dx : number = tRectCX - sRectCX;
+                const dy : number = tRectCY - sRectCY;
+                const angle : number = Math.atan2(dy, dx); // -PI to PI
+                // Quantize angle to 4 directions (Right, Bottom, Left, Top)
+                let sourceSide = 'right';
+                let targetSide = 'left';
+                // Logic: Choose closest sides based on relative position
+                const deg = angle * 180 / Math.PI;
+                if (deg >= -45 && deg < 45) { sourceSide = 'right'; targetSide = 'left'; }
+                else if (deg >= 45 && deg < 135) { sourceSide = 'bottom'; targetSide = 'top'; }
+                else if (deg >= -135 && deg < -45) { sourceSide = 'top'; targetSide = 'bottom'; }
+                else { sourceSide = 'left'; targetSide = 'right'; }
+                // 3. Calculate Start and End Points
+                let p1x : number = 0;
+                let p1y : number = 0;
+                let p2x : number = 0;
+                let p2y : number = 0;
+                // Source Point
+                if (sourceSide == 'right') { p1x = sRectX + sRectW; p1y = sRectCY; }
+                else if (sourceSide == 'left') { p1x = sRectX; p1y = sRectCY; }
+                else if (sourceSide == 'bottom') { p1x = sRectCX; p1y = sRectY + sRectH; }
+                else if (sourceSide == 'top') { p1x = sRectCX; p1y = sRectY; }
+                // Target Point
+                if (targetSide == 'right') { p2x = tRectX + tRectW; p2y = tRectCY; }
+                else if (targetSide == 'left') { p2x = tRectX; p2y = tRectCY; }
+                else if (targetSide == 'bottom') { p2x = tRectCX; p2y = tRectY + tRectH; }
+                else if (targetSide == 'top') { p2x = tRectCX; p2y = tRectY; }
+                // 4. Calculate Control Points
+                // Obsidian Logic: Control points extend OUT from the side
+                const dist = Math.sqrt(Math.pow(p2x - p1x, 2) + Math.pow(p2y - p1y, 2));
+                const minCurve : number = 50 * s;
+                const maxCurve : number = 200 * s;
+                const rawCurvature : number = dist * 0.5;
+                let curvature : number = rawCurvature;
+                if (curvature < minCurve) curvature = minCurve;
+                if (curvature > maxCurve) curvature = maxCurve;
+                let cp1x = p1x;
+                let cp1y = p1y;
+                let cp2x = p2x;
+                let cp2y = p2y;
+                if (sourceSide == 'right') cp1x += curvature;
+                else if (sourceSide == 'left') cp1x -= curvature;
+                else if (sourceSide == 'bottom') cp1y += curvature;
+                else if (sourceSide == 'top') cp1y -= curvature;
+                if (targetSide == 'right') cp2x += curvature;
+                else if (targetSide == 'left') cp2x -= curvature;
+                else if (targetSide == 'bottom') cp2y += curvature;
+                else if (targetSide == 'top') cp2y -= curvature;
+                // 5. Draw Curve
+                ctx.beginPath();
+				ctx.moveTo(p1x, p1y);
+				ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2x, p2y);
+				ctx.strokeStyle = color;
+				ctx.lineWidth = 2 * s;
+				ctx.stroke();
+                // 6. Draw Arrow at p2 (Target)
+                let arrowAngle = 0;
+                if (targetSide == 'left') arrowAngle = 0;
+                else if (targetSide == 'right') arrowAngle = Math.PI;
+                else if (targetSide == 'top') arrowAngle = Math.PI/2;
+                else if (targetSide == 'bottom') arrowAngle = -Math.PI/2;
+                const arrowLen = 10 * s;
+                ctx.beginPath();
+				// Stick the arrow tip exactly on the edge
+                ctx.moveTo(p2x, p2y);
+                ctx.lineTo(p2x - arrowLen * Math.cos(arrowAngle - Math.PI/6), p2y - arrowLen * Math.sin(arrowAngle - Math.PI/6));
+                ctx.moveTo(p2x, p2y);
+                ctx.lineTo(p2x - arrowLen * Math.cos(arrowAngle + Math.PI/6), p2y - arrowLen * Math.sin(arrowAngle + Math.PI/6));
+                ctx.stroke();
+            },
+			drawTempLine(ctx : CanvasRenderingContext2D, source : VisionNode, tx : number, ty : number) {
+				const s = this.scale;
+				const sourceW = source.width * s;
+				const sourceH = source.height * 0.5 * s;
+				// Adjust touch coordinates for canvas offset
+				let adjTx = tx;
+				let adjTy = ty;
+				if (this.canvasRect != null) {
+					adjTx -= (this.canvasRect!.left ?? 0);
+					adjTy -= (this.canvasRect!.top ?? 0);
+				}
+				const startX = source.x * s + this.offsetX + sourceW;
+				const startY = source.y * s + this.offsetY + sourceH;
+				this.renderBezier(ctx, startX, startY, adjTx, adjTy, '#aaaaaa', s);
+			},
+			renderBezier(ctx : CanvasRenderingContext2D, x1 : number, y1 : number, x2 : number, y2 : number, color : string, s: number) {
+				const cp1x = x1 + (x2 - x1) / 2;
+				ctx.beginPath();
+				ctx.moveTo(x1, y1);
+				ctx.bezierCurveTo(cp1x, y1, cp1x, y2, x2, y2);
+				ctx.strokeStyle = color;
+				ctx.lineWidth = 2 * s;
+				ctx.stroke();
+			},
+			// Optimized Unified Touch Handling
+			onCanvasTouchStart(e : UniTouchEvent) {
+				this.wasPanning = false;
+				if (this.isConnecting) return;
+				// Ensure CanvasRect is fresh to prevent jumps if offset is stale
+				// (e.g. if toolbar appeared or layout shifted without re-mount)
+				// We do a best-effort update or assume mounted was roughly correct.
+				// Given performance, we'll try to use the stored one but rely more on
+				// delta calculation consistency.
+				// Optimization: If we really want to be safe, we could queryExec,
+				// but that's async and too late for this continuous event.
+				// Trusting mounted logic + system offset.
+				if (e.touches.length == 2) {
+					// Pinch Start
+					this.interactionMode = 'pinching';
+					const x1 = e.touches[0].clientX;
+					const y1 = e.touches[0].clientY;
+					const x2 = e.touches[1].clientX;
+					const y2 = e.touches[1].clientY;
+					this.lastPinchDist = Math.sqrt((x2-x1)*(x2-x1) + (y2-y1)*(y2-y1));
+					return;
+				}
+				// 1 Finger
+				const touch = e.touches[0];
+				// Optional: update rect if moved/scrolled (though less likely in full screen)
+				if (this.canvasRect == null) {
+					uni.createSelectorQuery().in(this).select('.canvas-area').boundingClientRect((rect) => {
+						if (rect != null) this.canvasRect = rect as NodeInfo;
+					}).exec();
+				}
+				this.lastTouchX = touch.clientX;
+				this.lastTouchY = touch.clientY;
+				this.touchStartX = touch.clientX;
+				this.touchStartY = touch.clientY;
+				// Check Hit
+				const hitNode = this.findNodeAt(touch.clientX, touch.clientY);
+				if (hitNode != null) {
+					// Hit a node -> Wait for potential drag
+					this.interactionMode = 'waiting';
+					this.draggingNodeIndex = this.nodes.indexOf(hitNode);
+					this.dragStartNodeX = hitNode.x;
+					this.dragStartNodeY = hitNode.y;
+					// Init temp pos immediately to prevent jumping to previous node's pos
+					this.tempNodeX = hitNode.x;
+					this.tempNodeY = hitNode.y;
+					// Start Timer
+					clearTimeout(this.dragStartTimer);
+					this.dragStartTimer = setTimeout(() => {
+						if (this.interactionMode == 'waiting') {
+							this.interactionMode = 'dragging';
+							// Force select on start drag
+							this.selectedNodeId = hitnode.id;
+							// Init temp pos for reactive dragging
+							this.tempNodeX = hitNode.x;
+							this.tempNodeY = hitNode.y;
+						}
+					}, 300); // 300ms hold
+				} else {
+					// Hit Background -> Pan immediately
+					this.interactionMode = 'panning';
+					// Clear selection on background touch start ?
+					// No, usually click clears, but maybe user wants to pan without losing selection.
+				}
+			},
+			onCanvasTouchMove(e : UniTouchEvent) {
+				if (this.isConnecting) {
+					this.tempTouchX = e.touches[0].clientX;
+					this.tempTouchY = e.touches[0].clientY;
+					this.drawAll();
+					return;
+				}
+				if (e.touches.length == 2) {
+					// Pinch Move logic - zoom around center point
+					const x1 = e.touches[0].clientX;
+					const y1 = e.touches[0].clientY;
+					const x2 = e.touches[1].clientX;
+					const y2 = e.touches[1].clientY;
+					const dist = Math.sqrt((x2-x1)*(x2-x1) + (y2-y1)*(y2-y1));
+					// Pinch center point (screen coordinates)
+					const centerX = (x1 + x2) / 2;
+					const centerY = (y1 + y2) / 2;
+					if (this.lastPinchDist > 0) {
+						const ratio = dist / this.lastPinchDist;
+						const oldScale = this.scale;
+						let newScale = oldScale * ratio;
+						if (newScale < 0.2) newScale = 0.2;
+						if (newScale > 3.0) newScale = 3.0;
+                        // Calculate world point under pinch
+                        // World = (Screen - Offset) / Scale
+						const worldCenterX = (centerX - this.offsetX) / oldScale;
+						const worldCenterY = (centerY - this.offsetY) / oldScale;
+						this.scale = newScale;
+                        // Calculate new offset
+                        // Offset = Screen - World * Scale
+						this.offsetX = centerX - (worldCenterX * newScale);
+						this.offsetY = centerY - (worldCenterY * newScale);
+					}
+					this.lastPinchDist = dist;
+					// Optimization: Do NOT redraw lines during pinch. Let CSS transform scale the bitmap.
+					// this.drawAll();
+					return;
+				}
+				const touch = e.touches[0];
+				const x = touch.clientX;
+				const y = touch.clientY;
+				const dx = x - this.lastTouchX;
+				const dy = y - this.lastTouchY;
+				// WAITING: Check jitter
+				if (this.interactionMode == 'waiting') {
+					const moveDist = Math.sqrt(Math.pow(x - this.touchStartX, 2) + Math.pow(y - this.touchStartY, 2));
+					if (moveDist > 10) {
+						// Moved before timer fired -> Cancel drag, switch to Pan
+						clearTimeout(this.dragStartTimer);
+						this.interactionMode = 'panning';
+						this.draggingNodeIndex = -1;
+						// Catch up missed delta to prevent lag/jitter
+						this.offsetX += (this.lastTouchX - this.touchStartX);
+						this.offsetY += (this.lastTouchY - this.touchStartY);
+					}
+				}
+				if (this.interactionMode == 'panning') {
+					this.wasPanning = true;
+					this.offsetX += dx;
+					this.offsetY += dy;
+					// Optimization: DO NOT redraw canvas on every move step.
+					// Let CSS translate handle visual sync with nodes.
+				}
+				else if (this.interactionMode == 'dragging' && this.draggingNodeIndex != -1) {
+					// Mark as panning/dragging so click doesn't fire
+					this.wasPanning = true;
+					// Delta Move Logic (Avoids jump/offset calculation errors)
+					const dx = x - this.touchStartX;
+					const dy = y - this.touchStartY;
+					const newNodeX = this.dragStartNodeX + (dx / this.scale);
+					const newNodeY = this.dragStartNodeY + (dy / this.scale);
+					// Update Temp Reactive Vars to force Template Update
+					this.tempNodeX = newNodeX;
+					this.tempNodeY = newNodeY;
+					const draggedNode = this.nodes[this.draggingNodeIndex];
+					// Calculate delta for children
+					const deltaX = newNodeX - draggedNode.x;
+					const deltaY = newNodeY - draggedNode.y;
+					// Also update underlying data for DrawAll
+					draggedNode.x = newNodeX;
+					draggedNode.y = newNodeY;
+					if (draggedNode.type == 'group') {
+						const groupNode = draggedNode as GroupNode;
+						for (let i = 0; i < groupNode.children.length; i++) {
+							const childId = groupNode.children[i];
+							const childNode = this.findNodeById(childId);
+							if (childNode != null) {
+								childNode.x += deltaX;
+								childNode.y += deltaY;
+							}
+						}
+					}
+					this.drawAll();
+				}
+				this.lastTouchX = x;
+				this.lastTouchY = y;
+			},
+			async onCanvasTouchEnd(e : UniTouchEvent) {
+				clearTimeout(this.dragStartTimer);
+				// Handle "Tap" on Node (if we were waiting but didn't drag)
+				if (this.interactionMode == 'waiting' && this.draggingNodeIndex != -1) {
+					// Treat as click/selection
+					const node = this.nodes[this.draggingNodeIndex];
+					this.onNodeClick(node);
+				}
+				if (this.isConnecting) {
+					// Use previously stored temp touch, but ensure we check adjusted coordinates for hit detection
+					// findNodeAt already applies canvasRect adjustment to screen inputs
+					const targetNode = this.findNodeAt(this.tempTouchX, this.tempTouchY);
+					if (targetNode != null && targetnode.id != this.connectingSourceId) {
+						this.connections.push({
+							"sourceId": this.connectingSourceId,
+							"targetId": targetnode.id
+						} as UTSJSONObject);
+						// PERSIST CONNECTION
+						await this.persistConnection(this.connectingSourceId!, targetnode.id);
+					}
+				}
+				if (this.interactionMode == 'dragging' && this.draggingNodeIndex != -1) {
+					const draggedNode = this.nodes[this.draggingNodeIndex];
+					this.saveNodePosition(draggedNode);
+					if (draggedNode.type == 'group') {
+						const groupNode = draggedNode as GroupNode;
+						for (let i = 0; i < groupNode.children.length; i++) {
+							const childNode = this.findNodeById(groupNode.children[i]);
+							if (childNode != null) {
+								this.saveNodePosition(childNode);
+							}
+						}
+					}
+					void CanvasBiz.flushPendingNodePositionsAsync();
+					// Force update minimap if node position changed significantly
+					this.nodes = this.nodes.slice();
+				}
+				// Optimization: Save view state on interaction end to prevent loss on unexpected exit
+				if (this.interactionMode == 'panning' || this.interactionMode == 'pinching') {
+					this.saveViewState();
+					// Also update group state in map if active (for switching consistency)
+					if (this.activeGroupId != null) {
+						this.groupViewStates.set(this.activeGroupId!, {
+							offsetX: this.offsetX,
+							offsetY: this.offsetY,
+							scale: this.scale
+						} as UTSJSONObject);
+						this.saveGroupViewStates();
+					} else {
+						// Save 'default' (world) state
+						this.groupViewStates.set('default', {
+							offsetX: this.offsetX,
+							offsetY: this.offsetY,
+							scale: this.scale
+						} as UTSJSONObject);
+						this.saveGroupViewStates();
+					}
+				}
+				this.isConnecting = false;
+				this.connectingSourceId = null;
+				this.interactionMode = 'idle';
+				this.draggingNodeIndex = -1;
+				this.lastPinchDist = 0;
+				// Panning end: Full redraw and reset canvas offset
+				this.drawAll();
+			},
+			async persistConnection(sourceNodeId: string, targetNodeId: string) {
+				console.log("Persisting connection", sourceNodeId, "->", targetNodeId);
+				// Parse "task_123" -> 123
+const getTaskId = (s: string): string | null => {
+                                        if (s.startsWith('task_')) {
+                                                const parts = s.split('_');
+                                                if (parts.length > 1) {
+                                                        // Return string id
+return parts[1];
+						}
+					}
+					return null;
+				};
+				const sourceTid = getTaskId(sourceNodeId);
+				const targetTid = getTaskId(targetNodeId);
+				if (sourceTid != null && targetTid != null) {
+					// Task -> Task 走真实子任务绑定通道
+					const success = await TaskBiz.bindSubtask(sourceTid, targetTid);
+					if (success) {
+						uni.showToast({ title: '已设为子任务', icon: 'success' });
+					} else {
+						uni.showToast({ title: '子任务绑定失败', icon: 'none' });
+						// Rollback visual connection?
+						// ideally we should remove from this.connections
+					}
+				} else {
+					console.log("Not both tasks, skipping persistence for now");
+				}
+			},
+			saveNodePosition(node: VisionNode) {
+				// Prevent layout reset when switching views
+				node.ox = node.x;
+				node.oy = node.y;
+				if (node instanceof EntityNode) {
+					// Unified handling for all entities (tasks and notes are in the same table now)
+					console.log('Saving entity position:', node.id, node.subtype, node.x, node.y);
+					const d = node.data as UTSJSONObject;
+                                        const entityId = d.getString('id');
+                                        if (entityId != null && entityId != '') {
+						const success = CanvasBiz.updateNodePosition(entityId, node.x, node.y);
+						console.log('Position saved:', success, entityId, node.x, node.y);
+					}
+				}
+			},
+			// Save full node metadata (subtype, linkedId, position)
+			// Unified for all entities since they're all in the tasks table
+			async saveNodeFullMetadata(node: VisionNode) {
+				if (!(node instanceof EntityNode)) return;
+				const d = node.data as UTSJSONObject;
+                                const linkedId = d.getString('linkedId');
+                                const entityId = d.getString('id');
+                                if (entityId != null && entityId != '') {
+                                        const t = TaskBiz.getTaskDetail(entityId)?.node;
+					let meta = {} as UTSJSONObject;
+					if (t?.metadata != null) {
+						try { meta = JSON.parse(t?.metadata!) as UTSJSONObject; } catch(e) {}
+					}
+					meta['vision_x'] = node.x;
+					meta['vision_y'] = node.y;
+					meta['vision_subtype'] = node.subtype;
+					if (linkedId != null) meta['vision_linkedId'] = linkedId;
+					const payload = { metadata: JSON.stringify(meta) } as UpdateTaskPayload;
+					CanvasBiz.updateNodePosition(entityId, payload, 0, 0) /* TODO: specific update */;
+				}
+			},
+			onCanvasClick() {
+				// Check for recent node click to prevent race condition deselection
+				if (Date.now() - this.lastNodeClickTime < 300) return;
+				// Keep selection if we just panned/dragged
+				if (this.wasPanning) {
+					this.wasPanning = false;
+					return;
+				}
+				// Only clear selection if not linking
+				if (!this.isLinkingMode) {
+					this.selectedNodeId = null;
+					this.isLinkingMode = false;
+				}
+			},
+			onNodeClick(node : VisionNode) {
+				// If panned significantly, ignore click
+				if (this.wasPanning) return;
+				console.log('Node clicked:', node.id);
+				this.lastNodeClickTime = Date.now();
+				if (this.isLinkingMode && this.linkingSourceId != null) {
+					if (node.id != this.linkingSourceId) {
+						// Create visual connection
+						const newConn = {
+							"sourceId": this.linkingSourceId,
+							"targetId": node.id
+						} as UTSJSONObject;
+						this.connections.push(newConn);
+						this.saveConnections();
+						// Persist the relationship in database
+						this.persistLinkRelation(this.linkingSourceId!, node.id);
+						this.drawAll();
+						uni.showToast({ title: 'Linked', icon: 'none' });
+						// Reset link mode
+						this.isLinkingMode = false;
+						this.linkingSourceId = null;
+					}
+					return;
+				}
+				// Check for connecting mode (from context menu / EntityCard emit)
+				if (this.isConnecting && this.connectingSourceId != null) {
+					if (node.id != this.connectingSourceId) {
+						const newConn = {
+							"sourceId": this.connectingSourceId,
+							"targetId": node.id
+						} as UTSJSONObject;
+						this.connections.push(newConn);
+						this.saveConnections(); // Save Manual Connection
+						this.isConnecting = false;
+						this.connectingSourceId = null;
+						this.drawAll();
+						uni.showToast({ title: 'Connected', icon: 'none' });
+					}
+					return;
+				}
+				this.selectedNodeId = node.id;
+			},
+			jumpToSelectedTask() {
+				const node = this.selectedVisionNode;
+				if (node instanceof EntityNode) {
+					const d = node.data as UTSJSONObject;
+					const tid = d.getNumber('id') ?? d.getString('id');
+					if (tid != null) {
+						if (node.subtype == 'task') {
+							uni.navigateTo({
+								url: `/pages/tasks/task-detail?id=${tid}`
+							});
+						} else if (node.subtype == 'note') {
+							uni.navigateTo({
+								url: `/pages/notes/note-edit?noteId=${tid}`
+							});
+						}
+					}
+				}
+			},
+			toggleLinkMode() {
+				if (this.selectedNodeId == null) return;
+				this.isLinkingMode = !this.isLinkingMode;
+				if (this.isLinkingMode) {
+					this.linkingSourceId = this.selectedNodeId;
+					uni.showToast({ title: 'Select another card to link', icon: 'none' });
+				} else {
+					this.linkingSourceId = null;
+				}
+			},
+			// Persist link relationship in database
+			// With unified entity model, all entities are in tasks table
+			// Linking is done via parent_id (hierarchy)
+			async persistLinkRelation(sourceId: string, targetId: string) {
+				const sourceNode = this.findNodeById(sourceId);
+				const targetNode = this.findNodeById(targetId);
+				if (sourceNode == null || targetNode == null) return;
+				if (!(sourceNode instanceof EntityNode) || !(targetNode instanceof EntityNode)) return;
+				const sourceData = sourceNode.data as UTSJSONObject;
+				const targetData = targetNode.data as UTSJSONObject;
+const sourceDbId = sourceData.getString('id');
+                                const targetDbId = targetData.getString('id');
+                                if (sourceDbId == null || targetDbId == null || sourceDbId == '' || targetDbId == '') return;
+				const sourceType = sourceNode.subtype; // 'task' or 'note'
+				const targetType = targetNode.subtype;
+				// In unified entity model, all links use parent_id
+				// Source becomes parent of target (target.parent_id = source.id)
+				if (sourceType == 'task' && targetType == 'task') {
+					// Task -> Task: make target a subtask of source
+					const success = await TaskBiz.bindSubtask(sourceDbId, targetDbId);
+					if (success) {
+						console.log('Bound subtask:', targetDbId, 'to parent:', sourceDbId);
+						uni.showToast({ title: '已设为子任务', icon: 'success' });
+					}
+				} else if (sourceType == 'task' && targetType == 'note') {
+					// Task -> Note: Link note to task (Note -> Task ref)
+					const success = await CanvasBiz.createConnectionAsync(sourceDbId, targetDbId);
+					if (success) {
+						console.log('Linked note:', targetDbId, 'to task:', sourceDbId);
+						uni.showToast({ title: '笔记已关联', icon: 'success' });
+					}
+				} else if (sourceType == 'note' && targetType == 'task') {
+					// Note -> Task: Link note to task
+					const success = await CanvasBiz.createConnectionAsync(targetDbId, sourceDbId);
+					if (success) {
+						console.log('Linked note:', sourceDbId, 'to task:', targetDbId);
+						uni.showToast({ title: '笔记已关联', icon: 'success' });
+					}
+				} else if (sourceType == 'note' && targetType == 'note') {
+					// Note -> Note: make target a child of source
+					const success = await CanvasBiz.createConnectionAsync(sourceDbId, targetDbId);
+					if (success) {
+						console.log('Linked note:', targetDbId, 'to note:', sourceDbId);
+						uni.showToast({ title: '笔记已关联', icon: 'success' });
+					}
+				}
+			},
+			// findNodeById is already defined above
+			findNodeAt(screenX : number, screenY : number) : VisionNode | null {
+				// Input is Screen Coordinates
+				// Apply container offset if available
+				let adjScreenX = screenX;
+				let adjScreenY = screenY;
+				if (this.canvasRect != null) {
+					adjScreenX -= (this.canvasRect!.left ?? 0);
+					adjScreenY -= (this.canvasRect!.top ?? 0);
+				}
+				// Map to Logical Coordinates
+				// With transform: translate3d(ox, oy, 0) scale(s):
+				// Screen = (World * Scale) + Offset
+				// World = (Screen - Offset) / Scale
+				const logicalX = (adjScreenX - this.offsetX) / this.scale;
+				const logicalY = (adjScreenY - this.offsetY) / this.scale;
+				// Reverse for loop for z-index order (Top first)
+				for (let i = this.nodes.length - 1; i >= 0; i--) {
+					const node = this.nodes[i];
+					// Optimization: Check visibility
+					if (!this.isNodeVisible(node)) continue;
+					// Use specific node dimensions
+					if (logicalX >= node.x && logicalX <= node.x + node.width && logicalY >= node.y && logicalY <= node.y + node.height) {
+						return node;
+					}
+				}
+				return null;
+			},
+			resetView() {
+				this.offsetX = 0;
+				this.offsetY = 0;
+				this.scale = 1.0;
+				this.drawAll();
+			},
+			autoLayout() {
+				console.log("Starting Auto Layout...");
+				// Simple Tree Layout (Horizontal, Left -> Right)
+				// 1. Build Graph
+				const parentMap = new Map<string, string[]>(); // parentId -> childIds[]
+				const reverseMap = new Map<string, string>(); // childId -> parentId
+				const nodesMap = new Map<string, VisionNode>();
+				this.nodes.forEach(n => {
+					nodesMap.set(n.id, n);
+					// Init empty arrays
+					if (!parentMap.has(n.id)) parentMap.set(n.id, []);
+				});
+				this.connections.forEach(c => {
+					const s = c.getString('sourceId');
+					const t = c.getString('targetId');
+					if (s != null && t != null && nodesMap.has(s) && nodesMap.has(t)) {
+						parentMap.get(s)!.push(t);
+						reverseMap.set(t, s);
+					}
+				});
+				// 2. Find Roots (Nodes with no incoming edges)
+				// Also include disconnected nodes as roots
+				const roots: string[] = [];
+				this.nodes.forEach(n => {
+					if (!reverseMap.has(n.id)) {
+						roots.push(n.id);
+					}
+				});
+				// 3. Recursive Layout
+				let currentY = 100;
+				const startX = 100;
+				roots.forEach(rid => {
+					// Call the new method
+					const h = this.layoutTreeRecursive(rid, startX, currentY, nodesMap, parentMap);
+currentY += h;
+});
+this.drawAll();
+// Force minimap update by triggering reactivity on nodes array
+this.nodes = this.nodes.slice();
+uni.showToast({ title: '已自动排列', icon: 'success' });
+},
+layoutTreeRecursive(nodeId: string, x: number, y: number, nodesMap: Map<string, VisionNode>, parentMap: Map<string, string[]>): number {
+const levelSep = 300; // Horizontal gap
+const nodeSep = 180;  // Vertical gap
+const node = nodesMap.get(nodeId);
+				if (node == null) return 0;
+				const children = parentMap.get(nodeId)!.sort();
+				let subtreeHeight = 0;
+				if (children.length == 0) {
+					// Leaf
+					subtreeHeight = nodeSep;
+					// Set Position
+					node.x = x;
+					node.y = y;
+					this.saveNodePosition(node);
+				} else {
+					// Parent
+					let childY = y;
+					children.forEach(cid => {
+						const h = this.layoutTreeRecursive(cid, x + levelSep, childY, nodesMap, parentMap);
+						childY += h;
+						subtreeHeight += h;
+					});
+					// Center self
+					node.x = x;
+					node.y = y + (subtreeHeight / 2) - (nodeSep / 2);
+					this.saveNodePosition(node);
+				}
+				return subtreeHeight;
+			}
+		}
+	}
+</script>
+<style>
+	/* Bottom Input Panel - Log and Input */
+	.bottom-input-panel {
+		position: absolute;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		z-index: 2600;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		background-color: transparent;
+		padding-bottom: 16px;
+	}
+	/* Wrapper for consistent width and alignment */
+	.input-panel-wrapper {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+	}
+	/* Log Bubble Container - Left aligned with input */
+	.log-bubble-container {
+		width: 280px;
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		margin-bottom: 8px;
+		z-index: 2601;
+	}
+	.log-bubble {
+		width: 280px;
+		background-color: transparent;
+		border-radius: 16px;
+		overflow: hidden;
+		border: none;
+	}
+	.log-resize-handle {
+		height: 18px;
+		width: 280px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		background-color: transparent;
+	}
+	.log-resize-bar {
+		width: 32px;
+		height: 4px;
+		background-color: rgba(0,0,0,0.25);
+		border-radius: 2px;
+	}
+	.log-scroll {
+		padding: 4px 12px 12px 12px;
+	}
+	.log-item {
+		display: flex;
+		flex-direction: row;
+		align-items: flex-start;
+		margin-bottom: 8px;
+		max-width: 280px;
+	}
+	.log-inline-content {
+		display: flex;
+		flex-direction: row;
+		flex-wrap: wrap;
+		align-items: center;
+		background-color: rgba(0, 0, 0, 0.4);
+		border-radius: 14px;
+		padding: 6px 12px;
+	}
+	.child-log-item {
+		margin-left: 20px;
+	}
+	.desc-color {
+		color: #dfdfdf !important;
+	}
+	.log-reply-hint {
+		font-size: 10px;
+		color: rgba(255,255,255,0.4);
+		margin-left: 8px;
+	}
+	.log-badge {
+		height: 18px;
+		border-radius: 6px;
+		padding: 0 4px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		margin-right: 6px;
+	}
+	.badge-user {
+		background-color: rgba(255, 107, 129, 0.9);
+	}
+	.badge-sys {
+		background-color: rgba(84, 160, 255, 0.9);
+	}
+	.log-badge-text {
+		color: #ffffff;
+		font-size: 10px;
+		font-weight: bold;
+	}
+	.log-author {
+		font-size: 14px;
+		color: rgba(255, 255, 255, 0.7);
+		margin-right: 4px;
+		font-weight: bold;
+	}
+	.log-text {
+		font-size: 14px;
+		color: #ffffff;
+		line-height: 1.4;
+	}
+	/* Input Bar Wrapper - full width of parent */
+	.input-bar-wrapper {
+		width: 100%;
+		background-color: rgba(255, 255, 255, 0.98);
+		border-radius: 24px;
+		box-shadow: 0 2px 16px rgba(0,0,0,0.12);
+		padding: 4px;
+		z-index: 2602;
+	}
+	/* Top Left: Minimap Area - Independent positioned, only covers its content */
+	.minimap-area {
+		position: absolute;
+		top: 60px;
+		left: 10px;
+		z-index: 200;
+	}
+	/* Top Middle: Tags Area - Independent positioned between minimap and group */
+	.tabs-area {
+		position: absolute;
+		top: 64px;
+		left: 220px; /* After minimap */
+		right: 160px; /* Before group switcher */
+		height: 36px;
+		z-index: 200;
+		overflow: hidden;
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+	}
+	/* Top Right: Group Area - Independent positioned, only covers its content */
+	.group-area {
+		position: absolute;
+		top: 60px;
+		right: 10px;
+		z-index: 3000; /* Higher for dropdown to show above everything */
+		overflow: visible; /* IMPORTANT: Allow dropdown to overflow */
+	}
+	/* Minimap Card Style */
+	.minimap-card {
+		position: relative;
+		background-color: rgba(30, 30, 35, 0.9);
+		border-radius: 14px;
+		border: 1px solid rgba(255,255,255,0.15);
+		overflow: visible;
+		display: flex;
+		flex-direction: column;
+		flex-shrink: 0;
+		z-index: 100;
+		box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+		min-width: 50px;
+		max-width: 200px;
+	}
+	.minimap-card-header {
+		height: 32px;
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		padding: 0 10px;
+		background-color: rgba(255,255,255,0.05);
+		pointer-events: auto; /* Ensure header is clickable for toggle */
+	}
+	.minimap-card-title {
+		font-size: 13px;
+		color: rgba(255,255,255,0.9);
+		font-weight: 500;
+	}
+	.minimap-card-toggle {
+		font-size: 10px;
+		color: rgba(255,255,255,0.6);
+	}
+	.minimap-card-body {
+		padding: 8px;
+	}
+	.minimap-canvas {
+		background-color: rgba(0,0,0,0.3);
+		border-radius: 8px;
+		position: relative;
+		overflow: visible;
+		pointer-events: auto; /* Ensure canvas is interactive for touch events */
+	}
+	.minimap-dot {
+		position: absolute;
+		border-radius: 2px;
+		min-width: 4px;
+		min-height: 4px;
+	}
+	.minimap-viewport {
+		position: absolute;
+		border: 2px solid rgba(255, 255, 255, 0.9);
+		background-color: rgba(255, 255, 255, 0.15);
+		border-radius: 3px;
+		pointer-events: none;
+		z-index: 10;
+	}
+	/* Minimap Sliders */
+	.minimap-slider-x {
+		width: 100%;
+		margin-top: 6px;
+	}
+	.minimap-slider-y-wrapper {
+		position: absolute;
+		right: -30px;
+		top: 8px;
+		width: 80px;
+		height: 20px;
+		transform: rotate(90deg);
+		transform-origin: left top;
+	}
+	.minimap-slider-y {
+		width: 100%;
+	}
+	.sub-tabs-scroll {
+		width: 100%;
+		height: 100%;
+		pointer-events: auto;
+		display: flex;
+		flex-direction: row;
+	}
+	.sub-tab-item {
+		display: flex; /* Changed from inline-flex which might not work as expected in all environments */
+		flex-direction: row;
+		align-items: center;
+		padding: 4px 10px;
+		margin-right: 6px;
+		background-color: rgba(255, 255, 255, 0.2);
+		border-radius: 14px;
+		border: 1px solid rgba(255,255,255,0.3);
+		flex-shrink: 0; /* Prevent items from shrinking */
+		pointer-events: auto; /* Ensure clickable */
+	}
+	.sub-tab-text {
+		font-size: 12px;
+		color: #333;
+		font-weight: 500;
+	}
+	.sub-tab-close {
+		width: 16px;
+		height: 16px;
+		border-radius: 8px;
+		background-color: rgba(0,0,0,0.1);
+		margin-left: 6px;
+		align-items: center;
+		justify-content: center;
+		display: flex;
+	}
+	.sub-tab-close-text {
+		font-size: 10px;
+		color: #555;
+		line-height: 1;
+	}
+	.group-switcher-btn {
+		height: 36px;
+		padding: 0 12px;
+		/* Match Sub Tab Style more closely to look like "Last Tab" */
+		background-color: rgba(255, 255, 255, 0.2);
+		border-radius: 14px; /* Match sub-tab-item radius (14px) */
+		border: 1px solid rgba(255,255,255,0.3);
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		box-shadow: none; /* Remove shadow to match flat tab style */
+		max-width: 140px; /* Limit max width */
+		pointer-events: auto; /* Ensure clickable */
+	}
+	.group-switcher-text {
+		color: #333;
+		font-size: 13px;
+		font-weight: 600;
+		margin: 0 6px;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+		overflow: hidden;
+		flex: 1; /* Allow it to shrink if needed inside the btn */
+		text-align: right;
+	}
+	.group-switcher-arrow {
+		font-size: 10px;
+		color: #666;
+		margin-left: 6px;
+	}
+	/* Dropdown Menu Styles */
+	.group-dropdown {
+		position: absolute;
+		top: 42px;
+		right: 0;
+		width: 180px;
+		max-height: 240px;
+background-color: rgba(255, 255, 255, 0.95);
+		border-radius: 12px;
+		box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+		border: 1px solid rgba(0,0,0,0.1);
+		display: flex;
+		flex-direction: column;
+		overflow: hidden;
+		z-index: 3000;
+		pointer-events: auto; /* Ensure dropdown is clickable */
+	}
+	.group-dropdown-item {
+		padding: 10px 14px;
+		border-bottom: 1px solid rgba(0,0,0,0.05);
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		pointer-events: auto; /* Ensure items are clickable */
+	}
+	.group-dropdown-text {
+		font-size: 13px;
+		color: #333;
+	}
+	.group-dropdown-sub {
+		font-size: 12px;
+		color: #999;
+		font-style: italic;
+	}
+	.group-dropdown-separator {
+		height: 4px;
+		background-color: rgba(0,0,0,0.03);
+		width: 100%;
+	}
+	.group-dropdown-header {
+		padding: 6px 14px;
+		background-color: rgba(245,247,250, 0.5);
+	}
+	.group-dropdown-header-text {
+		font-size: 11px;
+		color: #888;
+		font-weight: bold;
+	}
+	.group-dropdown-scroll {
+		max-height: 180px;
+		flex: 1;
+	}
+	.vision-canvas-container {
+		flex: 1;
+		width: 100%;
+		height: 100%;
+		background-color: #f5f5f7;
+		position: relative;
+		overflow: hidden;
+	}
+	/* Binding Modal Styles */
+	.binding-container {
+		display: flex;
+		flex-direction: column;
+		height: 400px;
+	}
+	.binding-search-bar {
+		flex-direction: row;
+		padding: 10px;
+		border-bottom: 1px solid #eee;
+		align-items: center;
+	}
+	.binding-input {
+		flex: 1;
+		background-color: #f5f5f7;
+		padding: 8px 12px;
+		border-radius: 8px;
+		font-size: 14px;
+		margin-right: 10px;
+	}
+	.binding-search-btn {
+		padding: 8px 12px;
+		background-color: #000;
+		border-radius: 8px;
+	}
+	.binding-btn-text {
+		color: #fff;
+		font-size: 13px;
+		font-weight: bold;
+	}
+	.binding-list {
+		flex: 1;
+		width: 100%;
+	}
+	.binding-item {
+		flex-direction: row;
+		padding: 12px;
+		border-bottom: 1px solid #f9f9f9;
+		align-items: center;
+	}
+	.checkbox {
+		width: 20px;
+		height: 20px;
+		border-radius: 4px;
+		border: 1px solid #ccc;
+		margin-right: 12px;
+		align-items: center;
+		justify-content: center;
+		display: flex;
+	}
+	.checkbox-inner {
+		width: 12px;
+		height: 12px;
+		background-color: #007aff;
+		border-radius: 2px;
+	}
+	.binding-content {
+		flex: 1;
+		justify-content: center;
+	}
+	.binding-title {
+		font-size: 14px;
+		color: #333;
+		margin-bottom: 2px;
+	}
+	.binding-sub {
+		font-size: 12px;
+		color: #888;
+	}
+	.empty-state {
+		padding: 40px;
+		align-items: center;
+		justify-content: center;
+	}
+	.empty-text {
+		color: #999;
+		font-size: 14px;
+	}
+	/* Picker Styles */
+	.picker-overlay {
+		position: absolute;
+		top: 0;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		background-color: rgba(0,0,0,0.3);
+		z-index: 200;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+	.picker-modal {
+		width: 320px;
+		height: 480px;
+		background-color: #fff;
+		border-radius: 16px;
+		display: flex;
+		flex-direction: column;
+		overflow: hidden;
+		box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+	}
+	.picker-header {
+		padding: 16px;
+		border-bottom: 1px solid #eee;
+		background-color: #f9f9f9;
+	}
+	.picker-title {
+		font-size: 16px;
+		font-weight: bold;
+		margin-bottom: 12px;
+	}
+	.picker-tabs {
+		display: flex;
+		flex-direction: row;
+		background-color: #eee;
+		border-radius: 8px;
+		padding: 2px;
+	}
+	.picker-tab {
+		flex: 1;
+		text-align: center;
+		padding: 6px 0;
+		font-size: 14px;
+		color: #666;
+		border-radius: 6px;
+	}
+	.picker-list {
+		flex: 1;
+		padding: 8px;
+	}
+	.picker-item {
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		padding: 12px;
+		border-bottom: 1px solid #f0f0f0;
+	}
+	.picker-item-icon {
+		font-size: 18px;
+		margin-right: 12px;
+	}
+	.picker-item-info {
+		flex: 1;
+	}
+	.picker-item-title {
+		font-size: 14px;
+		color: #333;
+		margin-bottom: 2px;
+	}
+	.picker-item-sub {
+		font-size: 10px;
+		color: #999;
+	}
+	.tool-separator {
+		width: 1px;
+		height: 24px;
+		background-color: #ddd;
+		margin: 0 8px;
+	}
+	.tool-switch {
+		background-color: #fff7e6;
+	}
+	.tool-label {
+		font-size: 9px;
+		margin-top: 2px;
+		color: #555;
+	}
+	.grid-background {
+		position: absolute;
+		top: -2500px;
+		left: -2500px;
+		width: 5000px;
+		height: 5000px;
+		z-index: 1;
+	}
+	.connections-canvas {
+		position: absolute;
+		top: 0;
+		left: 0;
+		width: 100%;
+		height: 100%;
+		z-index: 5;
+		pointer-events: none;
+	}
+	.canvas-area {
+		flex: 1;
+		width: 100%;
+		height: 100%;
+		z-index: 10;
+		position: absolute;
+		top: 0;
+		left: 0;
+		overflow: visible; /* CRITICAL: Allow children to overflow */
+		/* Ensure touch events work on Android */
+	}
+	.node-wrapper {
+		position: absolute;
+		z-index: 20;
+		pointer-events: auto; /* Re-enable clicks for nodes */
+	}
+	.floating-toolbar {
+		position: absolute;
+		right: 10px;
+		top: 220px;
+		background-color: rgba(255, 255, 255, 0.95);
+		border-radius: 24px;
+		padding: 4px;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+		z-index: 2650; /* Above log panel (2601) and bottom-input-panel (2600) */
+		pointer-events: auto;
+		transition-property: all;
+		transition-duration: 0.3s;
+	}
+	.tool-btn {
+		width: 40px;
+		height: 40px;
+		justify-content: center;
+		align-items: center;
+		margin: 2px 0;
+		border-radius: 20px;
+	}
+	.tool-icon {
+		font-size: 18px;
+	}
+</style>
+

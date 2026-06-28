@@ -1,0 +1,144 @@
+﻿<template>
+	<view class="note-editor">
+		<view class="toolbar">
+			<view class="toolbar-left">
+				<text class="title-text">鐩稿叧绗旇</text>
+			</view>
+			<view class="toolbar-right">
+				<view v-if="notes.length > 1" class="toolbar-action" @click="toggleList">
+					<text v-if="showList" class="action-text">鏀惰捣</text>
+					<text v-if="!showList" class="action-text">灞曞紑</text>
+				</view>
+				<view class="toolbar-action" @click="createNote">
+					<text class="action-text">+ 鏂板</text>
+				</view>
+			</view>
+		</view>
+
+		<view v-if="loading" class="note-empty">
+			<text class="note-empty-text">鍔犺浇涓?..</text>
+		</view>
+		<view v-else-if="notes.length == 0" class="note-empty">
+			<text class="note-empty-text">鏆傛棤鐩稿叧绗旇</text>
+		</view>
+		<view v-else>
+			<view v-if="activeNoteId > 0" class="latest-editor">
+				<NoteInlineEditor :noteId="activeNoteId" @saved="onNoteSaved"></NoteInlineEditor>
+			</view>
+			<view v-if="showList" class="note-list">
+				<view v-for="n in notes" :key="n.id" class="note-item" @click="selectNote(n.id)">
+					<view class="note-item-head">
+						<text class="note-title">{{ n.title }}</text>
+						<text v-if="n.id == activeNoteId" class="note-active">褰撳墠</text>
+					</view>
+				</view>
+			</view>
+		</view>
+	</view>
+</template>
+
+<script lang="uts">
+import { TaskBiz, type Task } from '@/services/biz/TaskBiz.uts'
+import { NoteBiz } from '@/services/biz/NoteBiz.uts'
+import NoteInlineEditor from '@/components/note/NoteInlineEditor.uvue'
+
+// Adapter type for compatibility with NoteInlineEditor
+type NoteItem = {
+	id: string;
+	title: string;
+	content: string;
+}
+
+export default {
+	name: 'task-note-list',
+	components: { NoteInlineEditor },
+	props: {
+		taskId: { type: String, required: true }
+	},
+	data() {
+		return {
+			notes: [] as NoteItem[],
+			loading: false,
+			showList: false,
+			activeNoteId: ""
+		}
+	},
+	mounted() {
+		this.loadNotes()
+		uni.$on('note-updated', this.onNoteUpdated)
+		uni.$on('task-updated', this.onNoteUpdated)
+	},
+	destroyed() {
+		uni.$off('note-updated', this.onNoteUpdated)
+		uni.$off('task-updated', this.onNoteUpdated)
+	},
+	methods: {
+		onNoteUpdated(_p: any | null) {
+			this.loadNotes()
+		},
+		async loadNotes() {
+			this.loading = true
+			try {
+				const id = (this.taskId as any).toString()
+				if (id != '' && id != '0') {
+					// Use unified TaskBiz to get child notes
+					const tasks = await TaskBiz.getNotesByTask(id)
+					// Map Task to NoteItem for UI compatibility
+					this.notes = tasks.map((t: Task): NoteItem => {
+						return {
+							id: t.id,
+							title: t.title,
+							content: t.description ?? ''
+						}
+					})
+				} else {
+					this.notes = [] as NoteItem[]
+				}
+				if (this.notes.length > 0) {
+					const firstId = this.notes[0].id
+					let exists = false
+					for (let i = 0; i < this.notes.length; i++) {
+						if (this.notes[i].id == this.activeNoteId) {
+							exists = true
+							break
+						}
+					}
+					if (!exists) this.activeNoteId = firstId
+				} else {
+					this.activeNoteId = ""
+					this.showList = false
+				}
+			} catch (_e2) {
+				this.notes = [] as NoteItem[]
+				this.activeNoteId = ""
+				this.showList = false
+			} finally {
+				this.loading = false
+			}
+		},
+		async createNote() {
+			const id = (this.taskId as any).toString()
+			if (id == '' || id == '0') return
+
+			const created = await NoteBiz.saveNoteAndLinkAsync('新笔记', '', id)
+			if (created != null && created.node.id != '') {
+				const newId = created.node.id
+				this.activeNoteId = newId
+				await this.loadNotes()
+				uni.showToast({ title: '已创建笔记', icon: 'success' })
+			}
+		},
+		toggleList() {
+			this.showList = !this.showList
+		},
+		selectNote(noteId: string) {
+			this.activeNoteId = noteId
+			this.showList = false
+		},
+		onNoteSaved(_noteId: string) {
+			this.loadNotes()
+		}
+	}
+}
+</script>
+

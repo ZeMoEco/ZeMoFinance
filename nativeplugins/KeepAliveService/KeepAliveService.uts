@@ -1,0 +1,50 @@
+
+// #ifdef APP-ANDROID
+import Intent from "android.content.Intent";
+import Settings from "android.provider.Settings";
+import Uri from "android.net.Uri";
+import UTSAndroid from "io.dcloud.uts.UTSAndroid";
+// #endif
+class TickReceiver {
+    private callback: (remainingSeconds: number) => void;
+
+    constructor(callback: (remainingSeconds: number) => void) {
+        this.callback = callback;
+    }
+
+    onReceive(context: any, intent: Intent) {
+        const remainingSeconds = intent.getIntExtra("remainingSeconds", 0);
+        this.callback(remainingSeconds);
+    }
+}
+
+let moduleCallback: ((remainingSeconds: number) => void) | null = null;
+let receiver: TickReceiver | null = null;
+
+export default class KeepAliveService {
+    static start(duration: number) {
+        const intent = new Intent("zenith.most.KeepAliveService");
+        intent.setPackage(UTSAndroid.getAppContext()?.getPackageName());
+        intent.putExtra("duration", duration);
+        UTSAndroid.getAppContext()?.startService(intent);
+    }
+
+    static stop() {
+        const intent = new Intent("zenith.most.KeepAliveService");
+        intent.setPackage(UTSAndroid.getAppContext()?.getPackageName());
+        UTSAndroid.getAppContext()?.stopService(intent);
+    }
+
+    static addTickListener(callback: (remainingSeconds: number) => void) {
+        moduleCallback = callback;
+        receiver = new TickReceiver(callback);
+        // Register broadcast receiver for ACTION_TICK
+        // This would need to be implemented with proper broadcast receiver registration
+    }
+
+    static removeTickListener() {
+        moduleCallback = null;
+        receiver = null;
+        // Unregister broadcast receiver
+    }
+}

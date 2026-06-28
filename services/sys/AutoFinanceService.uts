@@ -1,0 +1,127 @@
+// #ifdef APP-ANDROID
+import { Intent } from "android.content";
+import { Settings } from "android.provider";
+import { UTSAndroid } from 'io.dcloud.uts';
+// #endif
+import { FinanceBiz } from "@/services/biz/FinanceBiz.uts";
+import { TaskBiz } from "@/services/biz/TaskBiz.uts";
+import { FinancePipSnapshotService } from "@/services/sys/FinancePipSnapshotService.uts";
+
+export class AutoFinanceService {
+
+    static startListening() {
+        // #ifdef APP-ANDROID
+        const context = UTSAndroid.getUniActivity();
+        if (context == null) return;
+
+        // 1. Check if permission is granted (Simple check by trying to read enabled listeners, or just guide user)
+        // A robust check involves parsing Settings.Secure.ENABLED_NOTIFICATION_LISTENERS
+        // For now, we just open the settings page for the user to enable it.
+        
+        const intent = new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS);
+        context.startActivity(intent);
+        // #endif
+    }
+
+    static initReceiver() {
+        // #ifdef APP-ANDROID
+        // KeepAlive: receiver wiring is deferred to plugin layer to avoid UTS constructor issues.
+        console.log("[AutoFinance] initReceiver skipped in UTS layer");
+        // #endif
+    }
+
+    static async onPaymentReceived(amount: number, merchant: string, type: string, source: string) {
+        // 1. Find or Create Account (e.g., "微信零钱" or "支付宝")
+        const accounts = await FinanceBiz.listAccountNodes();
+        let targetAccount = accounts.find(a => a.name.includes(source));
+        
+        let accountId = '';
+        if (targetAccount != null) {
+            accountId = targetAccount.id;
+        } else {
+            // Create default account if not exists
+            const accName = source == "WeChat" ? "微信零钱" : "支付宝";
+            await FinanceBiz.createAccountNode(accName, "电子钱包", 0);
+            // Re-fetch
+            const newAccounts = await FinanceBiz.listAccountNodes();
+            const newAcc = newAccounts.find(a => a.name == accName);
+            if (newAcc != null) accountId = newAcc.id;
+        }
+
+        if (accountId != '') {
+            // 2. Record Transaction
+            const normalizedAmount = Math.abs(amount);
+            if (normalizedAmount <= 0) return;
+            const normalizedType = amount < 0 ? "expense" : (type == "income" ? "income" : "expense");
+            const category = normalizedType == "income" ? "其他收入" : "其他支出";
+            const note = `自动记账: ${merchant}`;
+
+            const txnId = await FinanceBiz.createTransactionForNodes({
+                account_id: accountId,
+                amount: normalizedAmount,
+                type: normalizedType,
+                category: category,
+                description: note
+            });
+            if (txnId != null && txnId != '') {
+                await FinancePipSnapshotService.syncSnapshot();
+            }
+            
+            uni.showToast({
+                title: `自动记账: ${normalizedAmount}`,
+                icon: 'success'
+            });
+        }
+    }
+
+    static async createPickupTaskFromBookkeeping(
+        note: string,
+        storageTargetId: string,
+        storageTargetName: string,
+        relatedShoppingTaskIds: string[] = []
+    ): Promise<string | null> {
+        const trimmed = (note ?? '').toString().trim();
+        const title = trimmed == '' ? '取快递' : `取快递: ${trimmed}`;
+        const metadata = JSON.stringify({
+            source: 'bookkeeping',
+            storage_target_id: storageTargetId,
+            storage_target_name: storageTargetName,
+            related_shopping_task_ids: relatedShoppingTaskIds
+        });
+
+        const pickupTaskId = await TaskBiz.createTask({
+            title: title,
+            status: 'todo',
+            tags: ['category:快递', 'scene:pickup'],
+            metadata: metadata
+        });
+
+        return pickupTaskId;
+    }
+
+    static async completePickupTaskAndStore(
+        pickupTaskId: string,
+        storageTaskId: string,
+        storageTargetName: string,
+        parcelName: string = ''
+    ): Promise<boolean> {
+        const completed = await TaskBiz.completeTask(pickupTaskId);
+        if (!completed.success) return false;
+
+        const lines = [] as string[];
+        lines.push(`来源任务: ${pickupTaskId}`);
+        lines.push(`包裹名称: ${parcelName == '' ? '未填写' : parcelName}`);
+        lines.push(`收纳位置: ${storageTargetName == '' ? '未命名收纳盒' : storageTargetName}`);
+        lines.push(`时间: ${Date.now()}`);
+
+        const itemName = (parcelName ?? '').toString().trim() == '' ? '快递包裹' : parcelName.toString().trim();
+        const itemId = await TaskBiz.createStorageItem(storageTaskId, {
+            item_name: itemName,
+            note: lines.join('\n'),
+            source_task_id: pickupTaskId,
+            source_task_title: '取快递任务',
+            attachments: [] as string[]
+        });
+        return itemId != null && itemId != '';
+    }
+}

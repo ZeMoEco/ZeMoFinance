@@ -1,0 +1,44 @@
+// import { AIInferResult } from './OnDeviceAIService.uts';
+
+// export class TaskNLPPostprocess {
+// 	static parseFromAny(raw: any): AIInferResult | null {
+// 		if (raw == null) return null;
+// 		let obj: any = null;
+// 		if (typeof raw === 'string') {
+// 			const s = raw.toString().trim();
+// 			if (s == '') return null;
+// 			try {
+// 				obj = JSON.parse(s);
+// 			} catch (_e) {
+// 				return null;
+// 			}
+// 		} else {
+// 			obj = raw;
+// 		}
+// 		if (obj == null) return null;
+
+// 		const title = obj.title != null ? obj.title.toString() : null;
+// 		const category = obj.category != null ? obj.category.toString() : null;
+// 		const group = obj.group != null ? obj.group.toString() : null;
+// 		const parentHint = obj.parentHint != null ? obj.parentHint.toString() : null;
+// 		let tags: string[] | null = null;
+
+// 		try {
+// 			const t = obj.tags;
+// 			if (Array.isArray(t)) {
+// 				tags = [] as string[];
+// 				(t as Array<any>).forEach((x) => {
+// 					if (x != null) tags!.push(x.toString());
+// 				});
+// 			}
+// 		} catch (_e2) {}
+
+// 		return {
+// 			title,
+// 			category,
+// 			group,
+// 			parentHint,
+// 			tags
+// 		} as AIInferResult;
+// 	}
+// }

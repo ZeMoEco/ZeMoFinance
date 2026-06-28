@@ -1,0 +1,130 @@
+// native/ZemoService.uts
+import { Service, Intent, NotificationChannel, NotificationManager, Notification, Build, Context } from 'android.app';
+import { AudioRecord, MediaRecorder, AudioFormat } from 'android.media';
+import { PowerManager } from 'android.os.PowerManager';
+import { Thread } from 'java.lang';
+
+// 引入 Sherpa-onnx 的 Java 类 (根据 aar 里的包名)
+import { Vad, KeywordSpotter, OnlineRecognizer } from 'com.k2fsa.sherpa.onnx';
+
+// 假设我们把模型复制到了这个路径
+const MODEL_DIR = "/static/zemo_assets/models"; 
+
+export class ZemoService extends Service {
+    private isRunning = false;
+    private wakeLock: PowerManager.WakeLock | null = null;
+    private audioRecord: AudioRecord | null = null;
+    
+    // Sherpa 引擎
+    private vad: Vad | null = null;
+    private kws: KeywordSpotter | null = null;
+
+    override onCreate() {
+        super.onCreate();
+        console.log("Zemo 服务启动");
+        
+        // 1. 开启前台保活 (状态栏显示 "Zemo 正在听...")
+        this.startForegroundService();
+        
+        // 2. 申请 CPU 唤醒锁 (息屏不休眠)
+        const pm = getSystemService(Context.POWER_SERVICE) as PowerManager;
+        this.wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Zemo:Listening");
+        this.wakeLock?.acquire();
+
+        // 3. 初始化 AI 引擎 (放在子线程，避免卡死主线程)
+        new Thread(() => {
+            this.initAI();
+            this.startLoop();
+        }).start();
+    }
+
+    private initAI() {
+        // 配置 VAD
+        const vadConfig = new VadModelConfig();
+        vadConfig.sileroVad.model = MODEL_DIR + "/silero_vad.onnx";
+        this.vad = new Vad(vadConfig);
+
+        // 配置 KWS (唤醒词)
+        const kwsConfig = new KeywordSpotterConfig();
+        kwsConfig.modelConfig.transducer.encoder = MODEL_DIR + "/encoder-epoch-99-avg-1.onnx"; // KWS模型
+        kwsConfig.modelConfig.transducer.decoder = MODEL_DIR + "/decoder-epoch-99-avg-1.onnx";
+        kwsConfig.modelConfig.transducer.joiner = MODEL_DIR + "/joiner-epoch-99-avg-1.onnx";
+        kwsConfig.keywordsFile = MODEL_DIR + "/keywords.txt"; // 里面写着 "zemo 1.0"
+        this.kws = new KeywordSpotter(kwsConfig);
+        
+        console.log("AI 引擎加载完毕");
+    }
+
+    private startLoop() {
+        // 配置录音参数 (16k采样率)
+        const sampleRate = 16000;
+        const bufferSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT) * 2;
+        this.audioRecord = new AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize);
+
+        this.audioRecord.startRecording();
+        this.isRunning = true;
+        
+        const buffer = new FloatArray(bufferSize / 2); // Sherpa 需要 Float 数组
+        const shortBuffer = new ShortArray(bufferSize); // AudioRecord 读出来是 Short
+
+        while (this.isRunning) {
+            const readCount = this.audioRecord.read(shortBuffer, 0, bufferSize);
+            if (readCount > 0) {
+                // Short 转 Float (归一化)
+                for (let i = 0; i < readCount; i++) {
+                    buffer[i] = shortBuffer[i] / 32768.0;
+                }
+                
+                // --- 流水线核心 ---
+                
+                // 1. VAD 检测 (省电过滤)
+                this.vad?.acceptWaveform(buffer);
+                if (this.vad?.isSpeech()) {
+                     // 2. 只有有人说话，才送给 KWS 检测唤醒词
+                     const stream = this.kws?.createStream();
+                     stream?.acceptWaveform(buffer);
+                     
+                     if (this.kws?.isReady(stream)) {
+                         this.kws?.decode(stream);
+                         const result = this.kws?.getResult(stream);
+                         if (result.keyword != "") {
+                             console.log("检测到唤醒词: " + result.keyword); // 听到 "Zemo" 了！
+                             
+                             // 3. 触发后续逻辑 (比如广播通知 UI，或者开始 ASR)
+                             this.onWakeUp();
+                         }
+                     }
+                }
+            }
+        }
+    }
+    
+    private onWakeUp() {
+        // 这里发送广播给主界面，或者直接 TTS 说话
+        console.log("主人，我在！");
+        // TODO: 可以在这里加入 Speaker ID 校验逻辑
+    }
+
+    private startForegroundService() {
+        const channelId = "zemo_service";
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            const chan = new NotificationChannel(channelId, "Zemo Listener", NotificationManager.IMPORTANCE_LOW);
+            const manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager;
+            manager.createNotificationChannel(chan);
+        }
+        const notification = new Notification.Builder(this, channelId)
+            .setContentTitle("Zemo")
+            .setContentText("正在等待唤醒...")
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .build();
+        startForeground(1, notification);
+    }
+
+    override onDestroy() {
+        this.isRunning = false;
+        this.wakeLock?.release();
+        this.audioRecord?.stop();
+        this.audioRecord?.release();
+        super.onDestroy();
+    }
+}

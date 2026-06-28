@@ -1,0 +1,410 @@
+<template>
+	<view class="recording-widget" 
+		:class="{ 'floating': !embedded }" 
+		:style="widgetStyle" 
+		@touchstart="onTouchStart" 
+		@touchmove="onTouchMove" 
+		@touchend="onTouchEnd" 
+		@click.stop="">
+		
+		<!-- Left: Skill Recording Controls -->
+		<view class="left-panel" @click.stop="toggleRecording">
+			<view class="status-dot" :class="{ 'recording': isRecording }"></view>
+			<text class="widget-title" :style="{ color: titleColor }" v-if="!isRecording">技能录制</text>
+			<text class="step-count" :style="{ color: titleColor }" v-else>Step: {{ stepCount }}</text>
+			<view class="controls">
+				<image v-if="!isRecording" class="icon-btn" src="/static/rpa/icon-record.png" @click="toggleRecording"></image>
+				<image v-else class="icon-btn" src="/static/rpa/icon-pause.png" @click="toggleRecording"></image>
+				<image class="icon-btn" src="/static/rpa/icon-stop.png" @click="finishRecording"></image>
+			</view>
+		</view>
+
+		<!-- Separator -->
+		<view class="separator" :style="{ backgroundColor: separatorColor }"></view>
+
+		<!-- Right: Vision-like Group Selector -->
+		<view class="right-panel" @click="toggleGroupSelector">
+			<view class="group-display">
+				<text class="group-label" :style="{ color: labelColor }">{{ currentGroupLabel }}</text>
+				<text class="group-arrow" :style="{ color: arrowColor }">▼</text>
+			</view>
+			
+			<!-- Simple Multi-level Dropdown (Popup) -->
+			<view v-if="showGroupSelector" class="group-dropdown" :style="dropdownStyle">
+				<view class="dropdown-header">
+					<text class="dropdown-back" v-if="selectionStack.length > 0" @click.stop="goBackGroup">◀ 返回</text>
+					<text class="dropdown-title">选择分组</text>
+				</view>
+				<scroll-view direction="vertical" class="dropdown-list">
+					<view v-for="(item, index) in currentLevelOptions" :key="index" class="dropdown-item" @click.stop="selectGroupItem(item)">
+						<text class="item-name">{{ item.name }}</text>
+						<text class="item-indicator" v-if="item.children && item.children.length > 0">▶</text>
+						<text class="item-check" v-else-if="isSelected(item)">✓</text>
+					</view>
+				</scroll-view>
+			</view>
+		</view>
+	</view>
+</template>
+
+<script>
+	import { RPARecorder } from '../utssdk/services/RPARecorder.uts';
+
+	type GroupOption = {
+		id: string
+		name: string
+		children?: GroupOption[]
+	}
+
+	export default {
+		name: "RecordingWidget",
+		emits: ['finish', 'record-start'],
+		props: {
+			embedded: {
+				type: Boolean,
+				default: false
+			},
+			theme: {
+				type: String, 
+				default: 'dark' // 'dark' (floating) or 'light' (embedded)
+			},
+			backgroundColor: { type: String, default: null } 
+		},
+		data() {
+			return {
+				x: 20,
+				y: 200,
+				startX: 0,
+				startY: 0,
+				initialX: 0,
+				initialY: 0,
+				isDragging: false,
+				isRecording: false,
+				stepCount: 0,
+				timer: 0,
+				
+				// Group Selection Data
+				showGroupSelector: false,
+				selectedGroup: null as GroupOption | null, // Leaf node selection
+				selectionStack: [] as GroupOption[], // Stack of parent groups traversed
+				rootOptions: [
+					{
+						id: 'g1', name: '常用技能', children: [
+							{ id: 'g1-1', name: '办公' },
+							{ id: 'g1-2', name: '社交' }
+						]
+					},
+					{
+						id: 'g2', name: '系统操作', children: [
+							{ id: 'g2-1', name: '设置', children: [
+								{ id: 'g2-1-1', name: '网络' },
+								{ id: 'g2-1-2', name: '显示' }
+							]},
+							{ id: 'g2-2', name: '文件管理' }
+						]
+					},
+					{ id: 'g3', name: '自定义' }
+				] as GroupOption[]
+			}
+		},
+		computed: {
+			titleColor(): string { return this.theme == 'light' ? '#333' : '#fff'; },
+			labelColor(): string { return this.theme == 'light' ? '#666' : '#e0e0e0'; },
+			arrowColor(): string { return this.theme == 'light' ? '#999' : '#aaa'; },
+			separatorColor(): string { return this.theme == 'light' ? '#eee' : 'rgba(255,255,255,0.2)'; },
+			
+			widgetStyle(): any {
+				if (this.embedded) {
+					return {
+						position: 'relative',
+						transform: 'none',
+						backgroundColor: this.backgroundColor ?? '#ffffff',
+						boxShadow: '0 2px 10px rgba(0,0,0,0.05)',
+						border: '1px solid rgba(0,0,0,0.05)',
+						borderRadius: '24px' // embedded style
+					}
+				} else {
+					return {
+						transform: `translate(${this.x}px, ${this.y}px)`
+					}
+				}
+			},
+			dropdownStyle(): any {
+				// If embedded, position differently? 
+				// Simple absolute is usually fine relative to parent
+				return {
+					backgroundColor: this.theme == 'light' ? '#fff' : '#2c2c2c',
+					border: this.theme == 'light' ? '1px solid #eee' : '1px solid rgba(255,255,255,0.1)',
+					color: this.theme == 'light' ? '#333' : '#fff'
+				}
+			},
+			
+			currentGroupLabel(): string {
+				if (this.selectedGroup != null) {
+					return this.selectedGroup!.name;
+				}
+				return '选择分组';
+			},
+			currentLevelOptions(): GroupOption[] {
+				if (this.selectionStack.length > 0) {
+					const parent = this.selectionStack[this.selectionStack.length - 1];
+					return parent.children ?? [];
+				}
+				return this.rootOptions;
+			}
+		},
+		mounted() {
+			this.timer = setInterval(() => {
+				this.isRecording = RPARecorder.isRecording;
+				this.stepCount = RPARecorder.script.length;
+			}, 1000);
+		},
+		unmounted() {
+			clearInterval(this.timer);
+		},
+		methods: {
+			onTouchStart(e: TouchEvent) {
+				if (this.embedded) return; // Disable drag for embedded
+				
+				const touch = e.touches[0];
+				this.startX = touch.clientX;
+				this.startY = touch.clientY;
+				this.initialX = this.x;
+				this.initialY = this.y;
+				this.isDragging = false;
+			},
+			onTouchMove(e: TouchEvent) {
+				if (this.embedded) return;
+
+				const touch = e.touches[0];
+				const dx = touch.clientX - this.startX;
+				const dy = touch.clientY - this.startY;
+				this.x = this.initialX + dx;
+				this.y = this.initialY + dy;
+				this.isDragging = true;
+				e.stopPropagation();
+			},
+			onTouchEnd() {
+			},
+			toggleRecording() {
+				if (this.isDragging) return;
+				
+				if (this.isRecording) {
+					// Pause
+				} else {
+					// Start with group
+					const groupInfo = this.selectedGroup != null ? { groupId: this.selectedGroup!.id, groupName: this.selectedGroup!.name } : null;
+					this.$emit('record-start', groupInfo);
+					RPARecorder.start(null); 
+				}
+				this.isRecording = RPARecorder.isRecording;
+			},
+			finishRecording() {
+				if (this.isDragging) return;
+				RPARecorder.stop();
+				this.isRecording = false;
+				this.$emit('finish', RPARecorder.script);
+			},
+			
+			// Group Selection Methods
+			toggleGroupSelector() {
+				if (this.isDragging) return;
+				this.showGroupSelector = !this.showGroupSelector;
+				if (!this.showGroupSelector) {
+					// this.selectionStack = [];
+				}
+			},
+			selectGroupItem(item: GroupOption) {
+				if (item.children != null && item.children!.length > 0) {
+					this.selectionStack.push(item);
+				} else {
+					this.selectedGroup = item;
+					this.showGroupSelector = false;
+					this.selectionStack = [];
+				}
+			},
+			goBackGroup() {
+				this.selectionStack.pop();
+			},
+			isSelected(item: GroupOption): boolean {
+				return this.selectedGroup?.id == item.id;
+			}
+		}
+	}
+</script>
+
+<style scoped>
+	.recording-widget {
+		position: fixed;
+		left: 0;
+		top: 0;
+		z-index: 9999;
+		background-color: rgba(30, 30, 30, 0.85); /* Darker, sleek background */
+		backdrop-filter: blur(10px);
+		border-radius: 20px;
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		padding: 4px;
+		box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+		border: 1px solid rgba(255,255,255,0.1);
+	}
+	
+	.left-panel {
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		padding: 0 8px;
+	}
+
+	.status-dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background-color: #ccc;
+		margin-right: 8px;
+	}
+	.status-dot.recording {
+		background-color: #ff3b30;
+		box-shadow: 0 0 8px #ff3b30;
+		animation: pulse 1s infinite;
+	}
+	
+	@keyframes pulse {
+		0% { opacity: 1; transform: scale(1); }
+		50% { opacity: 0.6; transform: scale(1.2); }
+		100% { opacity: 1; transform: scale(1); }
+	}
+
+	.widget-title {
+		font-size: 14px;
+		color: #fff;
+		margin-right: 12px;
+		font-weight: 500;
+	}
+	
+	.step-count {
+		font-size: 12px;
+		color: #eee;
+		min-width: 40px;
+		margin-right: 8px;
+	}
+
+	.controls {
+		display: flex;
+		flex-direction: row;
+	}
+
+	.icon-btn {
+		width: 28px;
+		height: 28px;
+		margin-left: 6px;
+	}
+
+	.separator {
+		width: 1px;
+		height: 20px;
+		background-color: rgba(255,255,255,0.2);
+		margin: 0 8px;
+	}
+
+	/* Right Panel - Group Selector */
+	.right-panel {
+		position: relative;
+		padding: 4px 12px 4px 8px;
+		/* background-color: rgba(255,255,255,0.05); */
+		border-radius: 0 16px 16px 0;
+		cursor: pointer;
+	}
+	
+	.group-display {
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+	}
+	
+	.group-label {
+		color: #e0e0e0;
+		font-size: 13px;
+		margin-right: 6px;
+		max-width: 80px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	
+	.group-arrow {
+		color: #aaa;
+		font-size: 10px;
+	}
+
+	/* Dropdown Style */
+	.group-dropdown {
+		position: absolute;
+		top: 100%;
+		right: 0;
+		margin-top: 8px;
+		width: 160px;
+		background-color: #2c2c2c;
+		border-radius: 12px;
+		box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+		border: 1px solid rgba(255,255,255,0.1);
+		display: flex;
+		flex-direction: column;
+		overflow: hidden;
+	}
+	
+	.dropdown-header {
+		padding: 8px 10px;
+		background-color: #3a3a3a;
+		border-bottom: 1px solid rgba(255,255,255,0.05);
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+	}
+	
+	.dropdown-back {
+		font-size: 12px;
+		color: #8da5ff;
+		margin-right: 8px;
+	}
+	
+	.dropdown-title {
+		font-size: 12px;
+		color: #aaa;
+		flex: 1;
+		text-align: right;
+	}
+
+	.dropdown-list {
+		max-height: 200px;
+	}
+	
+	.dropdown-item {
+		padding: 10px 12px;
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		border-bottom: 1px solid rgba(255,255,255,0.03);
+	}
+	
+	.dropdown-item:active {
+		background-color: rgba(255,255,255,0.1);
+	}
+
+	.item-name {
+		font-size: 13px;
+		color: #eee;
+		flex: 1;
+	}
+	
+	.item-indicator {
+		font-size: 10px;
+		color: #888;
+	}
+	
+	.item-check {
+		font-size: 12px;
+		color: #4cd964;
+	}
+</style>

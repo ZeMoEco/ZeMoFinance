@@ -1,0 +1,369 @@
+<template>
+  <view class="image-preview-mask" @click="close">
+    <swiper v-if="urls.length > 0" class="preview-swiper" :current="currentIndex" :duration="200" @change="onSwiperChange">
+      <swiper-item v-for="(url, index) in urls" :key="index" class="swiper-item">
+        <view :id="'zwrap_' + index" class="zoom-wrap" 
+            :style="index === currentIndex ? getTransformStyle : ''"
+            @touchstart="onTouchStart"
+            @touchmove="onTouchMove"
+            @touchend="onTouchEnd"
+            @touchcancel="onTouchEnd"
+            @click.stop
+        >
+            <image v-if="Math.abs(index - currentIndex) <= 1" :src="url" class="full-image" mode="aspectFit"></image>
+        </view>
+      </swiper-item>
+    </swiper>
+    <view v-if="urls.length > 0" class="indicator-wrap">
+      <text class="indicator-text">{{ currentIndex + 1 }} / {{ urls.length }}</text>
+    </view>
+  </view>
+</template>
+
+<script lang="uts">
+import { ZemoPreviewImageOptions, AppDialogApi } from '@/components/sys/AppDialogApi.uts';
+
+let _lastDistance = 0 as number;
+let _lastScale = 1 as number;
+let _lastAngle = 0 as number;
+let _lastX = 0 as number;
+let _lastY = 0 as number;
+let _touchStartX = 0 as number;
+let _touchStartY = 0 as number;
+let _hasMoved = false as boolean;
+let _touchStartTime = 0 as number;
+let _longPressTimer = -1 as number;
+let _activeElement = null as UniElement | null;
+
+
+export default {
+  data() {
+    return {
+      urls: [] as string[],
+      currentIndex: 0,
+      
+      // 缩放和拖拽控制
+      scaleValue: 1 as number,
+      translateX: 0 as number,
+      translateY: 0 as number,
+      rotateValue: 0 as number,
+      
+      isScaling: false,
+      isPanning: false,
+      
+      
+      }
+  },
+    computed: {
+      getTransformStyle(): string {
+          if (this.scaleValue === 1 && this.translateX === 0 && this.translateY === 0 && this.rotateValue === 0) {
+              return '';
+          }
+          const trans = `translate(${this.translateX}px, ${this.translateY}px) scale(${this.scaleValue}) rotate(${this.rotateValue}deg)`;
+          if (this.isScaling || this.isPanning) {
+              return `transform: ${trans}; transition-property: none;`;
+          }
+          return `transform: ${trans}; transition-property: transform; transition-duration: 300ms; transition-timing-function: ease-out;`;
+      }
+  },
+  onLoad(options: UTSJSONObject) {
+      if (AppDialogApi.currentPreviewOptions != null) {
+          this.urls = AppDialogApi.currentPreviewOptions!.urls as string[];
+          this.currentIndex = AppDialogApi.currentPreviewOptions!.current ?? 0;
+      }
+      _activeElement = null;
+      this.resetZoom();
+  },
+  onBackPress(): boolean | null {
+      // DialogPage 原生拦截返回键会走到这里
+      // 虽然默认行为也是关闭，但我们需要同步状态变量
+      AppDialogApi.isPreviewOpenGlobal = false;
+      return false; // let the dialog page close normally
+  },
+  onUnload() {
+      AppDialogApi.isPreviewOpenGlobal = false;
+  },
+  methods: {
+    close() {
+      const pages = getCurrentPages();
+      if (pages.length > 0) {
+          const topPage = pages[pages.length - 1];
+          const dialogs = topPage.getDialogPages();
+          if (dialogs.length > 0) {
+              uni.closeDialogPage({
+                  dialogPage: dialogs[dialogs.length - 1],
+                  success: () => {
+                      AppDialogApi.isPreviewOpenGlobal = false;
+                  }
+              });
+          }
+      }
+    },
+    resetZoom() {
+      this.scaleValue = 1;
+      this.translateX = 0;
+      this.translateY = 0;
+      this.rotateValue = 0;
+      this.isScaling = false;
+      this.isPanning = false;
+    },
+    updateTransform(useAnimation: boolean) {
+        // Vue 响应式自动处理
+    },
+    onSwiperChange(e: SwiperChangeEvent) {
+      this.currentIndex = parseInt(e.detail.current.toString());
+      this.resetZoom();
+      _activeElement = uni.getElementById('zwrap_' + this.currentIndex) as UniElement | null;
+    },
+    onTouchStart(e: UniTouchEvent) {
+        if (this.scaleValue > 1) {
+            e.stopPropagation();
+        }
+        
+        if (_activeElement == null) {
+            _activeElement = uni.getElementById('zwrap_' + this.currentIndex) as UniElement | null;
+        }
+
+        const touches = e.touches;
+        if (touches.length > 0) {
+            _touchStartX = touches[0].clientX;
+            _touchStartY = touches[0].clientY;
+        }
+        _hasMoved = false;
+        _touchStartTime = Date.now();
+        
+        if (_longPressTimer !== -1) {
+            clearTimeout(_longPressTimer);
+            _longPressTimer = -1;
+        }
+        
+        if (touches.length == 1) {
+            _longPressTimer = setTimeout(() => {
+                if (!_hasMoved && !this.isScaling) {
+                    this.onLongPress(this.urls[this.currentIndex]);
+                }
+            }, 500); 
+        }
+        
+        if (touches.length == 2) {
+            e.stopPropagation();
+            this.isScaling = true;
+            this.isPanning = false;
+            const t1 = touches[0];
+            const t2 = touches[1];
+            const dx = t1.clientX - t2.clientX;
+            const dy = t1.clientY - t2.clientY;
+            _lastDistance = Math.sqrt(dx * dx + dy * dy);
+            _lastScale = this.scaleValue;
+            _lastAngle = Math.atan2(dy, dx) * 180 / Math.PI;
+            this.updateTransform(false);
+        } else if (touches.length == 1) {
+            if (this.scaleValue > 1) {
+                this.isPanning = true;
+                this.isScaling = false;
+                _lastX = touches[0].clientX;
+                _lastY = touches[0].clientY;
+                this.updateTransform(false);
+            }
+        }
+    },
+    onTouchMove(e: UniTouchEvent) {
+          if (!this.isScaling && this.scaleValue <= 1) {
+              if (!_hasMoved) {
+                  const touches = e.touches;
+                  if (touches.length > 0) {
+                      const dxMove = touches[0].clientX - _touchStartX;
+                      const dyMove = touches[0].clientY - _touchStartY;
+                      if (Math.abs(dxMove) > 10 || Math.abs(dyMove) > 10) {
+                          _hasMoved = true;
+                          if (_longPressTimer !== -1) {
+                              clearTimeout(_longPressTimer);
+                              _longPressTimer = -1;
+                          }
+                      }
+                  }
+              }
+              return;
+          }
+          
+          e.stopPropagation(); 
+          e.preventDefault();  
+          
+          const touches = e.touches;
+          if (this.isScaling && touches.length == 2) {
+              const t1 = touches[0];
+              const t2 = touches[1];
+              const dx = t1.clientX - t2.clientX;
+              const dy = t1.clientY - t2.clientY;
+              const distance = Math.sqrt(dx * dx + dy * dy);
+              
+              const scale = _lastScale * (distance / _lastDistance);
+              this.scaleValue = Math.min(Math.max(scale, 0.5), 5); 
+              
+              const currentAngle = Math.atan2(dy, dx) * 180 / Math.PI;
+              let dAngle = currentAngle - _lastAngle;
+              if (dAngle > 180) dAngle -= 360;
+              if (dAngle < -180) dAngle += 360;
+              this.rotateValue += dAngle;
+              _lastAngle = currentAngle;
+              
+          } else if (this.isPanning && touches.length == 1 && this.scaleValue > 1) {
+              const t1 = touches[0];
+              const dx = t1.clientX - _lastX;
+              const dy = t1.clientY - _lastY;
+              
+              this.translateX += dx;
+              this.translateY += dy;
+              
+              _lastX = t1.clientX;
+              _lastY = t1.clientY;
+          }
+      },
+    onTouchEnd(e: UniTouchEvent) {
+          if (_longPressTimer !== -1) {
+              clearTimeout(_longPressTimer);
+              _longPressTimer = -1;
+          }
+          
+          const touches = e.touches;
+          if (touches.length < 2) {
+              if (this.isScaling) this.isScaling = false;
+          }
+          if (touches.length == 0) {
+              const duration = Date.now() - _touchStartTime;
+              if (!_hasMoved && duration < 300) {
+                  this.close();
+                  return;
+              }
+              
+              if (this.isPanning) this.isPanning = false;
+              
+              let changed = false;
+              if (this.scaleValue < 1) {
+                  this.scaleValue = 1;
+                  this.translateX = 0;
+                  this.translateY = 0;
+                  changed = true;
+              }
+              if (this.rotateValue !== 0) {
+                  this.rotateValue = 0;
+                  changed = true;
+              }
+              if (changed) {
+                  this.updateTransform(true);
+              }
+          }
+      },
+    
+    onLongPress(url: string) {
+        uni.showActionSheet({
+            itemList: ['保存到相册', '分享'],
+            success: (res) => {
+                if (res.tapIndex == 0) {
+                    this.saveImageWrap(url);
+                } else if (res.tapIndex == 1) {
+                    this.shareImage(url);
+                }
+            }
+        });
+    },
+    saveImageWrap(url: string) {
+        if (url.startsWith('http://') || url.startsWith('https://')) {
+            uni.showLoading({ title: '下载中...' });
+            uni.downloadFile({
+                url: url,
+                success: (res) => {
+                    uni.hideLoading();
+                    if (res.statusCode == 200) {
+                        this.saveToAlbum(res.tempFilePath);
+                    } else {
+                        uni.showToast({ title: '下载失败', icon: 'none' });
+                    }
+                },
+                fail: () => {
+                    uni.hideLoading();
+                    uni.showToast({ title: '下载失败', icon: 'none' });
+                }
+            });
+        } else {
+            this.saveToAlbum(url);
+        }
+    },
+    saveToAlbum(path: string) {
+        uni.saveImageToPhotosAlbum({
+            filePath: path,
+            success: () => {
+                uni.showToast({ title: '已保存至相册', icon: 'success' });
+            },
+            fail: (err) => {
+                uni.showToast({ title: '保存失败: ' + err.errMsg, icon: 'none' });
+                console.error('saveImage fail', err);
+            }
+        });
+    },
+    shareImage(url: string) {
+        uni.shareWithSystem({
+            type: 'image',
+            imageUrl: url,
+            success: () => {
+                console.log('分享成功');
+            },
+            fail: (err) => {
+                console.log('分享失败或取消', err);
+            }
+        });
+    }
+  }
+}
+</script>
+
+<style scoped>
+.image-preview-mask {
+  width: 100%;
+  height: 100%;
+  background-color: rgba(0, 0, 0, 0.95);
+  flex-direction: column;
+}
+
+.preview-swiper {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+}
+
+.swiper-item {
+  width: 100%;
+  height: 100%;
+  align-items: center;
+  justify-content: center;
+}
+
+.zoom-wrap {
+  width: 100%;
+  height: 100%;
+  align-items: center;
+  justify-content: center;
+}
+
+.full-image {
+  width: 100%;
+  height: 100%;
+}
+
+.indicator-wrap {
+  position: absolute;
+  bottom: 40px;
+  left: 0;
+  right: 0;
+  align-items: center;
+  justify-content: center;
+}
+
+.indicator-text {
+  color: #ffffff;
+  font-size: 16px;
+  background-color: rgba(0, 0, 0, 0.5);
+  padding: 4px 12px;
+  border-radius: 12px;
+}
+</style>

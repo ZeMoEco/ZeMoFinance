@@ -1,0 +1,49 @@
+import { DB } from '@/utils/DB/DB.uts';
+
+/**
+ * 全局 KV 配置管理服务 (ConfigService)
+ * 【核心职责】：负责系统与用户的全局偏好设置 (如：明暗主题、侧边栏宽度、视图默认排序规则)。
+ * 【约束】：这是系统内针对 `user_kv` 单一键值对表提供高频读取服务的组件。通过在内存中缓存 (Memory Cache) 实现 O(1) 的超高频毫秒级读取，降低 SQLite 的 IO 压力。
+ */
+export class ConfigService {
+  
+  // 内存态：为极高频读取 (如渲染帧需要读取的视图缩放比) 提供纳秒级穿透
+  private static cache: Map<string, string> = new Map<string, string>();
+
+  public static async initCacheAsync(): Promise<void> {
+    const rows = await DB.query(`SELECT k, v FROM user_kv WHERE user_id = 0`);
+    ConfigService.cache.clear();
+    for (let i = 0; i < rows.length; i++) {
+      const key = rows[i].get('k')?.toString() ?? '';
+      const value = rows[i].get('v')?.toString() ?? '';
+      if (key != '') ConfigService.cache.set(key, value);
+    }
+  }
+
+  public static async setConfigAsync(key: string, value: string): Promise<boolean> {
+    const now = Date.now();
+    const ok = await DB.exec(
+      `INSERT OR REPLACE INTO user_kv (user_id, k, v, updated_at) VALUES (0, ?, ?, ?)`,
+      [key, value, now]
+    );
+    if (ok) ConfigService.cache.set(key, value);
+    return ok;
+  }
+
+  public static async getConfigAsync(key: string, defaultValue: string = ''): Promise<string> {
+    const cached = ConfigService.cache.get(key);
+    if (cached != null) return cached;
+
+    const rows = await DB.query(`SELECT v FROM user_kv WHERE user_id = 0 AND k = ? LIMIT 1`, [key]);
+    if (rows.length == 0) return defaultValue;
+
+    const dbValue = rows[0].get('v')?.toString() ?? defaultValue;
+    ConfigService.cache.set(key, dbValue);
+    return dbValue;
+  }
+
+  public static async removeConfigAsync(key: string): Promise<boolean> {
+    ConfigService.cache.delete(key);
+    return await DB.exec(`DELETE FROM user_kv WHERE user_id = 0 AND k = ?`, [key]);
+  }
+}

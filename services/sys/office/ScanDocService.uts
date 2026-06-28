@@ -1,0 +1,99 @@
+import { FileUtil } from '@/utils/file/file.uts'
+import { RUNTIME_NOTE_DOCS_DIR } from '@/utils/constant.uts'
+import { formatDateForFile, joinPath } from '@/utils/common/tools.uts'
+
+// #ifdef APP-ANDROID
+import File from 'java.io.File'
+import FileOutputStream from 'java.io.FileOutputStream'
+import PdfDocument from 'android.graphics.pdf.PdfDocument'
+import Paint from 'android.graphics.Paint'
+import BitmapFactory from 'android.graphics.BitmapFactory'
+import Rect from 'android.graphics.Rect'
+// #endif
+
+export type ScanDocResult = {
+	ok: boolean
+	type: 'pdf' | 'word'
+	path?: string
+	message?: string
+}
+
+export class ScanDocService {
+	static async exportPdfFromImages(title: string, imagePaths: string[]): Promise<ScanDocResult> {
+		// #ifdef APP-ANDROID
+		try {
+			await FileUtil.ensureRuntimeDirs()
+			const time = formatDateForFile(new Date())
+			const safeTitle = ScanDocService.sanitizeFileName(title)
+			const filePath = joinPath(RUNTIME_NOTE_DOCS_DIR, `Scan_${safeTitle}_${time}.pdf`)
+
+			const doc = new PdfDocument()
+			const pageWidth: Int = 595
+			const pageHeight: Int = 842
+			const margin: Int = 20
+
+			for (let i = 0; i < imagePaths.length; i++) {
+				const path = imagePaths[i]
+				const bmp = BitmapFactory.decodeFile(path)
+				if (bmp == null) continue
+				const pageInfo = new PdfDocument.PageInfo.Builder(pageWidth, pageHeight, (i + 1).toInt()).create()
+				const page = doc.startPage(pageInfo)
+				const canvas = page.getCanvas()
+
+				const maxW: Int = pageWidth - margin * 2
+				const maxH: Int = pageHeight - margin * 2
+				const scaleW = maxW.toFloat() / bmp.getWidth().toFloat()
+				const scaleH = maxH.toFloat() / bmp.getHeight().toFloat()
+				const scale = Math.min(scaleW, scaleH)
+				const drawW = (bmp.getWidth() * scale).toInt()
+				const drawH = (bmp.getHeight() * scale).toInt()
+				const left = ((pageWidth - drawW) / 2).toInt()
+				const top = ((pageHeight - drawH) / 2).toInt()
+
+				const dst = new Rect(left, top, left + drawW, top + drawH)
+				canvas.drawBitmap(bmp, null, dst, null)
+				doc.finishPage(page)
+			}
+
+			const outFile = new File(filePath)
+			const fos = new FileOutputStream(outFile)
+			doc.writeTo(fos)
+			fos.flush()
+			fos.close()
+			doc.close()
+
+			return { ok: true, type: 'pdf', path: filePath }
+		} catch (e) {
+			return { ok: false, type: 'pdf', message: (e as Error).message }
+		}
+		// #endif
+
+		// #ifndef APP-ANDROID
+		return { ok: false, type: 'pdf', message: '当前平台未实现' }
+		// #endif
+	}
+
+	static async exportWordFromImages(title: string, imagePaths: string[]): Promise<ScanDocResult> {
+		try {
+			await FileUtil.ensureRuntimeDirs()
+			const time = formatDateForFile(new Date())
+			const safeTitle = ScanDocService.sanitizeFileName(title)
+			const filePath = joinPath(RUNTIME_NOTE_DOCS_DIR, `Scan_${safeTitle}_${time}.doc`)
+			let html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${safeTitle}</title></head><body>`
+			for (let i = 0; i < imagePaths.length; i++) {
+				const p = imagePaths[i]
+				html += `<div style="margin-bottom:16px;"><img src="${p}" style="max-width:100%;" /></div>`
+			}
+			html += `</body></html>`
+			const ok = await FileUtil.writeTextFile(filePath, html, 'utf8')
+			if (!ok) return { ok: false, type: 'word', message: '写入文件失败' }
+			return { ok: true, type: 'word', path: filePath }
+		} catch (e) {
+			return { ok: false, type: 'word', message: (e as Error).message }
+		}
+	}
+
+	private static sanitizeFileName(name: string): string {
+		return name.replace(/[\\/:*?"<>|]/g, '_')
+	}
+}

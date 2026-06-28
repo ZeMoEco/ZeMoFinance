@@ -1,0 +1,114 @@
+// uni_modules/zemo-rpa/utssdk/app-android/utils/AppUtils.uts
+// #ifdef APP-ANDROID
+import Settings from 'android.provider.Settings';
+import Context from 'android.content.Context';
+
+import PackageManager from 'android.content.pm.PackageManager';
+import ApplicationInfo from 'android.content.pm.ApplicationInfo';
+import Intent from 'android.content.Intent';
+import Bitmap from 'android.graphics.Bitmap';
+import Canvas from 'android.graphics.Canvas';
+import UTSAndroid from 'io.dcloud.uts.UTSAndroid';
+import { Base64 } from 'java.util.Base64';
+import ByteArrayOutputStream from 'java.io.ByteArrayOutputStream';
+import Drawable from 'android.graphics.drawable.Drawable';
+import BitmapDrawable from 'android.graphics.drawable.BitmapDrawable';
+
+export type AppInfo = {
+    appName: string;
+    packageName: string;
+    iconBase64: string | null;
+}
+
+export class AppUtils {
+    
+    static getInstalledApps(context: Context): AppInfo[] {
+        const pm = context.getPackageManager();
+        // GET_META_DATA = 128
+        const packages = pm.getInstalledPackages(0);
+        const apps: AppInfo[] = [];
+
+        for (let i: Int = 0; i < packages.size; i++) {
+            const pkg = packages.get(i);
+            // Filter system apps if needed, but for now let's keep user apps primarily
+            // ApplicationInfo.FLAG_SYSTEM = 1
+            // ApplicationInfo.FLAG_UPDATED_SYSTEM_APP = 128
+            
+            const isSystem = ((pkg.applicationInfo?.flags ?? 0) & ApplicationInfo.FLAG_SYSTEM) != 0;
+             // Allow some system apps or just user apps? Let's just return all for now or filter launchable
+            
+            const launchIntent = pm.getLaunchIntentForPackage(pkg.packageName);
+            if (launchIntent != null) {
+                const appName = pkg.applicationInfo?.loadLabel(pm)?.toString() ?? pkg.packageName;
+                const packageName = pkg.packageName;
+                
+                // Icon handling might be expensive, maybe load lazy or just return null for now if list is long
+                // For this demo, let's try to load it. 
+                // Getting icon as base64 is heavy.
+                // In uniapp x, maybe we just pass package name and load icon in component? 
+                // native image tag can verify local paths, but package icons are drawable.
+                
+                // Let's rely on package name.
+                
+                apps.push({
+                    appName: appName,
+                    packageName: packageName,
+                    iconBase64: null // Skip icon for performance for now
+                } as AppInfo);
+            }
+        }
+        return apps;
+    }
+
+    static checkAccessibilityPermission(context: Context): boolean {
+        let accessibilityEnabled = 0;
+        try {
+            accessibilityEnabled = Settings.Secure.getInt(
+                context.getContentResolver(),
+                Settings.Secure.ACCESSIBILITY_ENABLED
+            );
+        } catch (e) {
+            console.error("Error reading accessibility settings", e);
+        }
+        
+        if (accessibilityEnabled == 1) {
+            const settingValue = Settings.Secure.getString(
+                context.getContentResolver(),
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            );
+            
+            if (settingValue != null) {
+                const services = settingValue.split(':');
+                for (let i = 0; i < services.length; i++) {
+                    const accessibilityService = services[i];
+                    if (accessibilityService.includes(context.getPackageName())) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    static openAccessibilitySettings(context: Context) {
+        const intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        context.startActivity(intent);
+    }
+
+    static launchApp(context: Context, packageName: string): boolean {
+        try {
+            const pm = context.getPackageManager();
+            const launchIntent = pm.getLaunchIntentForPackage(packageName);
+            if (launchIntent != null) {
+                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                context.startActivity(launchIntent);
+                return true;
+            }
+        } catch (e) {
+            console.error(e);
+        }
+        return false;
+    }
+}
+// #endif

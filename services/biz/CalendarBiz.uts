@@ -1,0 +1,697 @@
+﻿import { DB } from '@/utils/DB/DB.uts';
+import { pad2, toDateStr } from '@/utils/common/tools.uts'
+
+export type DailyStat = {
+    date: string;
+    count: number;
+    topTaskTitles: string[];
+    balance: number;
+}
+
+export type DailyCashflowStat = {
+    date: string;
+    income: number;
+    expense: number;
+    balance: number;
+    count: number;
+}
+
+export type CalendarTransaction = {
+    id: string;
+    account_id: string;
+    account_name: string;
+    amount: number;
+    type: string;
+    category: string;
+    description: string;
+    time: number;
+    includeInFlow: boolean;
+}
+
+export type DayDetail = {
+    tasks: Array<Map<string, any | null>>;
+    timeline: Array<Map<string, any | null>>;
+    transactions: Array<Map<string, any | null>>;
+}
+
+export type PendingTask = {
+    id: string;
+    title: string;
+    status: string;
+    start_at: number;
+    end_at: number;
+}
+
+type CacheBox = {
+    value: any;
+    expiresAt: number;
+}
+
+export class CalendarBiz {
+    private static readonly CACHE_TTL_MS: number = 15000;
+    private static readonly DEBUG: boolean = false;
+    private static timelineViewReady: boolean = false;
+
+    private static monthlyStatsCache = new Map<string, CacheBox>();
+    private static dayDetailsCache = new Map<string, CacheBox>();
+    private static tasksByRangeCache = new Map<string, CacheBox>();
+    private static pendingByRangeCache = new Map<string, CacheBox>();
+    private static pendingForDayCache = new Map<string, CacheBox>();
+    private static completedRangeCache = new Map<string, CacheBox>();
+
+    private static makeRangeKey(startTs: number, endTs: number): string {
+        return `${startTs}_${endTs}`;
+    }
+
+    private static makeMonthKey(year: number, month: number): string {
+        return `${year}_${month}`;
+    }
+
+    private static isSystemLogAction(action: string): boolean {
+        const a = (action ?? '').toString().trim().toUpperCase();
+        if (a == '') return false;
+        return a == 'CREATE'
+            || a == 'UPDATE'
+            || a == 'DELETE'
+            || a == 'MOVE'
+            || a == 'STATUS_CHANGE'
+            || a == 'XP_UPDATE'
+            || a == 'COINS_UPDATE'
+            || a == 'PROFILE_UPDATE'
+            || a == 'REWARD_CREATE'
+            || a == 'REWARD_UPDATE'
+            || a == 'REWARD_DELETE'
+            || a == 'REWARD_REDEEM'
+            || a == 'ATTRIBUTE_CREATE'
+            || a == 'ATTRIBUTE_SEED';
+    }
+
+    private static looksLikeSystemPayload(content: string | null): boolean {
+        const text = (content ?? '').toString().trim();
+        if (text == '') return false;
+        if (text == 'Task updated') return true;
+        if (text.startsWith('完成归档 ') || text.startsWith('放弃归档 ') || text.startsWith('自动归档 ')) return true;
+        if (text.startsWith('{') && text.endsWith('}')) return true;
+        return false;
+    }
+
+    private static shouldIncludeInFlow(properties: string | null): boolean {
+        const raw = (properties ?? '').toString().trim();
+        if (raw == '') return true;
+        try {
+            const props = JSON.parse(raw) as any;
+            const flag = props['include_in_flow'];
+            if (flag == null) return true;
+            const text = flag.toString();
+            return text != 'false' && text != '0';
+        } catch (_e) {
+            return true;
+        }
+    }
+
+    private static shouldHideTimelineRow(sourceType: string, entityId: string | null, action: string, content: string | null): boolean {
+        if (sourceType != 'log') return false;
+        const eid = (entityId ?? '').toString();
+        if (eid.startsWith('user_')) return true;
+        if (this.isSystemLogAction(action)) return true;
+        if (this.looksLikeSystemPayload(content)) return true;
+        return false;
+    }
+
+    private static async ensureTimelineViewReady(): Promise<void> {
+        if (this.timelineViewReady) return;
+        try {
+            const ok = await DB.rebuildTimelineFeedView();
+            this.timelineViewReady = ok;
+            if (this.DEBUG) console.log('[CalendarBiz] ensureTimelineViewReady rebuilt=', ok);
+        } catch (e) {
+            if (this.DEBUG) console.log('[CalendarBiz] ensureTimelineViewReady failed', e);
+        }
+    }
+
+    private static async queryTimelineView(sql: string, args: Array<any | null>): Promise<Array<Map<string, any | null>>> {
+        await this.ensureTimelineViewReady();
+        try {
+            return await DB.query(sql, args);
+        } catch (_e) {
+            const rebuilt = await DB.rebuildTimelineFeedView();
+            if (!rebuilt) throw _e;
+            this.timelineViewReady = true;
+            return await DB.query(sql, args);
+        }
+    }
+
+    private static readCache(cache: Map<string, CacheBox>, key: string): any | null {
+        const box = cache.get(key);
+        if (box == null) return null;
+        if (Date.now() > box.expiresAt) {
+            cache.delete(key);
+            return null;
+        }
+        return box.value;
+    }
+
+    private static writeCache(cache: Map<string, CacheBox>, key: string, value: any): void {
+        cache.set(key, {
+            value: value,
+            expiresAt: Date.now() + this.CACHE_TTL_MS
+        } as CacheBox);
+    }
+
+    public static clearRuntimeCache(): void {
+        this.monthlyStatsCache.clear();
+        this.dayDetailsCache.clear();
+        this.tasksByRangeCache.clear();
+        this.pendingByRangeCache.clear();
+        this.pendingForDayCache.clear();
+        this.completedRangeCache.clear();
+        this.timelineViewReady = false;
+    }
+    
+    /**
+     * 获取指定月份的每日任务完成统�?
+     * @param year 年份
+     * @param month 月份 (1-12)
+     */
+    static async getMonthlyStats(year: number, month: number): Promise<DailyStat[]> {
+        const cacheKey = this.makeMonthKey(year, month);
+        const cached = this.readCache(this.monthlyStatsCache, cacheKey) as DailyStat[] | null;
+        if (cached != null) return cached;
+
+        // Calculate timestamp range for the month
+        const startDate = new Date(year, month - 1, 1, 0, 0, 0);
+        const nextMonth = new Date(year, month, 1, 0, 0, 0);
+        const endDateTs = nextMonth.getTime() - 1;
+        const startDateTs = startDate.getTime();
+
+        const doneSql =
+            "SELECT " +
+            "strftime('%Y-%m-%d', CAST(created_at AS INTEGER) / 1000, 'unixepoch', 'localtime') as date_key, " +
+            "COUNT(*) as done_count, " +
+            "GROUP_CONCAT(content, '\n') as done_titles " +
+            "FROM vw_timeline_feed " +
+            "WHERE source_type = 'task_done' AND CAST(created_at AS INTEGER) >= ? AND CAST(created_at AS INTEGER) <= ? " +
+            "GROUP BY date_key";
+        const doneRows = await this.queryTimelineView(doneSql, [startDateTs, endDateTs]);
+
+        const statsMap = new Map<string, DailyStat>();
+        doneRows.forEach(row => {
+            const dateStr = row.get('date_key')?.toString() ?? '';
+            if (dateStr == '') return;
+
+            const count = parseInt(row.get('done_count')?.toString() ?? '0');
+            const titlesRaw = row.get('done_titles')?.toString() ?? '';
+            const topTitles = [] as string[];
+            if (titlesRaw != '') {
+                const all = titlesRaw.split('\n');
+                for (let i = 0; i < all.length && topTitles.length < 2; i++) {
+                    const title = all[i] != null ? all[i].toString().trim() : '';
+                    if (title != '') topTitles.push(title);
+                }
+            }
+
+            statsMap.set(dateStr, {
+                date: dateStr,
+                count: count,
+                topTaskTitles: topTitles,
+                balance: 0
+            } as DailyStat);
+        });
+
+        const billSql =
+            "SELECT " +
+            "strftime('%Y-%m-%d', transaction_time / 1000, 'unixepoch', 'localtime') as date_key, " +
+            "SUM(CASE WHEN lower(COALESCE(type, 'expense')) = 'income' THEN amount ELSE -amount END) as day_balance " +
+            "FROM transactions " +
+            "WHERE is_deleted = 0 AND transaction_time >= ? AND transaction_time <= ? " +
+            "GROUP BY date_key";
+        const billRows = await DB.query(billSql, [startDateTs, endDateTs]);
+        billRows.forEach(row => {
+            const dateStr = row.get('date_key')?.toString() ?? '';
+            if (dateStr == '') return;
+
+            if (!statsMap.has(dateStr)) {
+                statsMap.set(dateStr, {
+                    date: dateStr,
+                    count: 0,
+                    topTaskTitles: [] as string[],
+                    balance: 0
+                } as DailyStat);
+            }
+
+            const stat = statsMap.get(dateStr)!;
+            stat.balance = parseFloat(row.get('day_balance')?.toString() ?? '0');
+        });
+
+        const res: DailyStat[] = [];
+        statsMap.forEach((value, key) => {
+            res.push(value);
+        });
+
+        this.writeCache(this.monthlyStatsCache, cacheKey, res);
+        return res;
+    }
+
+    static async getMonthlyAmountStats(year: number, month: number): Promise<DailyStat[]> {
+        const cashflowRows = await this.getMonthlyCashflowStats(year, month);
+        const res: DailyStat[] = [];
+        cashflowRows.forEach(item => {
+            res.push({
+                date: item.date,
+                count: item.count,
+                topTaskTitles: [] as string[],
+                balance: item.balance
+            } as DailyStat);
+        });
+        return res;
+    }
+
+    static async getMonthlyCashflowStats(year: number, month: number): Promise<DailyCashflowStat[]> {
+        const startDate = new Date(year, month - 1, 1, 0, 0, 0);
+        const nextMonth = new Date(year, month, 1, 0, 0, 0);
+        const startDateTs = startDate.getTime();
+        const endDateTs = nextMonth.getTime();
+
+        const billSql =
+            "SELECT " +
+            "strftime('%Y-%m-%d', transaction_time / 1000, 'unixepoch', 'localtime') as date_key, " +
+            "SUM(CASE WHEN amount >= 0 AND lower(COALESCE(type, 'expense')) = 'income' THEN ABS(amount) ELSE 0 END) as income_total, " +
+            "SUM(CASE WHEN amount < 0 OR lower(COALESCE(type, 'expense')) != 'income' THEN ABS(amount) ELSE 0 END) as expense_total, " +
+            "COUNT(*) as trans_count " +
+            "FROM transactions " +
+            "WHERE is_deleted = 0 AND transaction_time >= ? AND transaction_time < ? " +
+            "AND CASE WHEN json_valid(COALESCE(properties, '{}')) THEN COALESCE(json_extract(properties, '$.include_in_flow'), 1) ELSE 1 END != 0 " +
+            "GROUP BY date_key";
+        const billRows = await DB.query(billSql, [startDateTs, endDateTs]);
+
+        const res: DailyCashflowStat[] = [];
+        billRows.forEach(row => {
+            const dateStr = row.get('date_key')?.toString() ?? '';
+            if (dateStr == '') return;
+            const income = parseFloat(row.get('income_total')?.toString() ?? '0');
+            const expense = parseFloat(row.get('expense_total')?.toString() ?? '0');
+            res.push({
+                date: dateStr,
+                income: income,
+                expense: expense,
+                balance: income - expense,
+                count: parseInt(row.get('trans_count')?.toString() ?? '0')
+            } as DailyCashflowStat);
+        });
+        return res;
+    }
+
+    static async getDayTransactions(startTs: number, endTs: number): Promise<CalendarTransaction[]> {
+        const transSql =
+            "SELECT t.*, a.name AS account_name FROM transactions t " +
+            "LEFT JOIN accounts a ON a.id = t.account_id AND a.is_deleted = 0 " +
+            "WHERE t.is_deleted = 0 AND t.transaction_time >= ? AND t.transaction_time <= ? " +
+            "ORDER BY t.transaction_time DESC";
+        const transRows = await DB.query(transSql, [startTs, endTs]);
+
+        const transactionList: CalendarTransaction[] = [];
+        transRows.forEach(row => {
+            const rawAmount = parseFloat(row.get("amount")?.toString() ?? "0");
+            const rawType = row.get("type")?.toString() ?? "expense";
+            const normalizedType = rawAmount < 0 ? "expense" : (rawType.toLowerCase() == "income" ? "income" : "expense");
+            transactionList.push({
+                id: row.get("id")?.toString() ?? "",
+                account_id: row.get("account_id")?.toString() ?? "",
+                account_name: row.get("account_name")?.toString() ?? "",
+                amount: Math.abs(rawAmount),
+                type: normalizedType,
+                category: row.get("category")?.toString() ?? "",
+                description: row.get("description")?.toString() ?? "",
+                time: parseInt(row.get("transaction_time")?.toString() ?? "0"),
+                includeInFlow: this.shouldIncludeInFlow(row.get("properties")?.toString() ?? "")
+            } as CalendarTransaction);
+        });
+        return transactionList;
+    }
+
+    /**
+     * 获取指定时间范围内的详情 (完成的任�?+ 时间�?
+     */
+    static async getDayDetails(startTs: number, endTs: number): Promise<DayDetail> {
+        const cacheKey = this.makeRangeKey(startTs, endTs);
+        const cached = this.readCache(this.dayDetailsCache, cacheKey) as DayDetail | null;
+        if (cached != null) return cached;
+        
+        // 1. Completed Tasks (task_done branch in unified timeline view)
+        const taskSql = "SELECT source_id as id, COALESCE(entity_id, '') as task_id, content, CAST(created_at AS INTEGER) as created_at FROM vw_timeline_feed WHERE source_type = 'task_done' AND CAST(created_at AS INTEGER) >= ? AND CAST(created_at AS INTEGER) <= ? ORDER BY CAST(created_at AS INTEGER) DESC";
+        const doneRows = await this.queryTimelineView(taskSql, [startTs, endTs]);
+
+        const taskRows: Array<Map<string, any | null>> = [];
+        const countMap = new Map<string, number>();
+        doneRows.forEach(row => {
+            const title = row.get("content")?.toString() ?? "";
+            if (title == '') return;
+            const taskIdStr = row.get("task_id") != null ? row.get("task_id")!.toString() : "";
+            const key = taskIdStr + "_" + title;
+            countMap.set(key, (countMap.get(key) ?? 0) + 1);
+        });
+
+        const addedKeys = new Set<string>();
+        doneRows.forEach(row => {
+            let title = row.get("content")?.toString() ?? "";
+            if (title == '') return;
+
+            const taskIdStr = row.get("task_id") != null ? row.get("task_id")!.toString() : "";
+            const key = taskIdStr + "_" + title;
+            if (addedKeys.has(key)) return;
+            addedKeys.add(key);
+
+            const count = countMap.get(key) ?? 1;
+            if (count > 1) {
+                title = title + " (今日已完成 " + count + " 次)";
+            }
+
+            const taskMap = new Map<string, any | null>();
+            taskMap.set("id", row.get("task_id"));
+            taskMap.set("title", title);
+            taskMap.set("status", "done");
+            taskMap.set("updated_at", row.get("created_at"));
+            taskMap.set("metadata", null);
+            taskMap.set("is_abandoned", false);
+            taskRows.push(taskMap);
+        });
+
+        // 2. Timeline Entries (all feed entries for the day)
+        const timelineSql = "SELECT f.source_id as id, CASE WHEN f.source_type IN ('task_done','log') THEN f.entity_id ELSE NULL END as task_id, f.entity_id as entity_id, f.content as content, CAST(f.created_at AS INTEGER) as start_time, f.source_type as source_type, l.action as log_action FROM vw_timeline_feed f LEFT JOIN logs l ON f.source_type = 'log' AND l.id = f.source_id WHERE CAST(f.created_at AS INTEGER) >= ? AND CAST(f.created_at AS INTEGER) <= ? AND (f.source_type != 'log' OR (COALESCE(f.entity_id, '') NOT LIKE 'user_%' AND UPPER(COALESCE(l.action, '')) NOT IN ('CREATE','UPDATE','DELETE','MOVE','STATUS_CHANGE','XP_UPDATE','COINS_UPDATE','PROFILE_UPDATE','REWARD_CREATE','REWARD_UPDATE','REWARD_DELETE','REWARD_REDEEM','ATTRIBUTE_CREATE','ATTRIBUTE_SEED'))) ORDER BY CAST(f.created_at AS INTEGER) DESC";
+        const timelineRows = await this.queryTimelineView(timelineSql, [startTs, endTs]);
+        const allTimelineRows: Array<Map<string, any | null>> = [];
+        for (let i = 0; i < timelineRows.length; i++) {
+            const row = timelineRows[i];
+            const sourceType = row.get('source_type')?.toString() ?? '';
+            const entityId = row.get('entity_id')?.toString() ?? null;
+            const logAction = row.get('log_action')?.toString() ?? '';
+            const content = row.get('content')?.toString() ?? null;
+            if (this.shouldHideTimelineRow(sourceType, entityId, logAction, content)) continue;
+            allTimelineRows.push(row);
+        }
+
+        if (this.DEBUG) {
+            const day = new Date(startTs);
+            const dayStr = `${day.getFullYear()}-${pad2(day.getMonth() + 1)}-${pad2(day.getDate())}`;
+            console.log('[CalendarBiz] getDayDetails', dayStr, 'doneRows=', doneRows.length, 'timelineRows=', allTimelineRows.length);
+            if (doneRows.length == 0 && allTimelineRows.length == 0) {
+                try {
+                    const diagRows = await DB.query("SELECT COUNT(*) as total_rows, MIN(created_at) as min_ts, MAX(created_at) as max_ts FROM vw_timeline_feed", []);
+                    if (diagRows.length > 0) {
+                        const r = diagRows[0];
+                        console.log('[CalendarBiz] timeline diag total=', r.get('total_rows'), 'min=', r.get('min_ts'), 'max=', r.get('max_ts'), 'rangeStart=', startTs, 'rangeEnd=', endTs);
+                    }
+                } catch (e) {
+                    console.log('[CalendarBiz] timeline diag failed', e);
+                }
+            }
+        }
+
+        // 3. Transactions
+        const transSql = "SELECT t.*, a.name AS account_name FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id AND a.is_deleted = 0 WHERE t.is_deleted = 0 AND t.transaction_time >= ? AND t.transaction_time <= ? ORDER BY t.transaction_time DESC";
+        const transRows = await DB.query(transSql, [startTs, endTs]);
+        
+        const transactionList: Array<Map<string, any | null>> = [];
+        transRows.forEach(row => {
+            const tMap = new Map<string, any | null>();
+            tMap.set("id", row.get("id"));
+            tMap.set("amount", row.get("amount"));
+            tMap.set("type", row.get("type"));
+            tMap.set("category", row.get("category"));
+            tMap.set("description", row.get("description"));
+            tMap.set("time", row.get("transaction_time"));
+            tMap.set("account_name", row.get("account_name"));
+            tMap.set("include_in_flow", this.shouldIncludeInFlow(row.get("properties")?.toString() ?? ""));
+            transactionList.push(tMap);
+        });
+
+        const detail = {
+            tasks: taskRows,
+            timeline: allTimelineRows,
+            transactions: transactionList
+        } as DayDetail;
+
+        this.writeCache(this.dayDetailsCache, cacheKey, detail);
+        return detail;
+    }
+
+    /**
+     * 获取指定时间范围内所有「完成任务」标题（来自 vw_timeline_feed.task_done），按 YYYY-MM-DD 分组。
+     */
+    static async getTaskTitlesInRange(startTs: number, endTs: number): Promise<Map<string, string[]>> {
+        const cacheKey = this.makeRangeKey(startTs, endTs);
+        const cached = this.readCache(this.tasksByRangeCache, cacheKey) as Map<string, string[]> | null;
+        if (cached != null) return cached;
+
+        const sql =
+            "SELECT " +
+            "strftime('%Y-%m-%d', CAST(created_at AS INTEGER) / 1000, 'unixepoch', 'localtime') as date_key, " +
+            "GROUP_CONCAT(content, '\n') as titles " +
+            "FROM vw_timeline_feed " +
+            "WHERE source_type = 'task_done' AND CAST(created_at AS INTEGER) >= ? AND CAST(created_at AS INTEGER) <= ? " +
+            "GROUP BY date_key ORDER BY date_key DESC";
+        const results = await this.queryTimelineView(sql, [startTs, endTs]);
+
+        const map = new Map<string, string[]>();
+
+        results.forEach(row => {
+            const dateStr = row.get('date_key')?.toString() ?? '';
+            if (dateStr == '') return;
+
+            const raw = row.get('titles')?.toString() ?? '';
+            if (raw == '') {
+                map.set(dateStr, [] as string[]);
+                return;
+            }
+
+            const arr = [] as string[];
+            const parts = raw.split('\n');
+            for (let i = 0; i < parts.length; i++) {
+                const title = parts[i] != null ? parts[i].toString().trim() : '';
+                if (title != '') arr.push(title);
+            }
+            map.set(dateStr, arr);
+        });
+
+		this.writeCache(this.tasksByRangeCache, cacheKey, map);
+		return map;
+	}
+
+    /**
+     * 获取指定时间范围内的「未完成/进行中」任务，�?YYYY-MM-DD 分组�?
+     * 规则：优先用 start_at 分组；若 start_at=0 �?end_at>0，则�?end_at 分组�?
+     */
+    private static async queryPendingTaskRows(startTs: number, endTs: number): Promise<Array<Map<string, any | null>>> {
+        const sql =
+            "WITH task_scope AS (" +
+            "SELECT id, content as title, " +
+            "COALESCE(status, json_extract(properties, '$.status'), 'todo') as status, " +
+            "CAST(COALESCE(json_extract(properties, '$.start_at'), 0) AS INTEGER) as start_at, " +
+            "CAST(COALESCE(json_extract(properties, '$.end_at'), 0) AS INTEGER) as end_at, " +
+            "updated_at " +
+            "FROM nodes WHERE UPPER(type) = 'TASK' AND is_deleted = 0" +
+            ") " +
+            "SELECT id, title, status, start_at, end_at, updated_at FROM task_scope " +
+            "WHERE lower(COALESCE(status, 'todo')) NOT IN ('done', 'completed', 'archived') AND (" +
+            "(start_at >= ? AND start_at <= ?) " +
+            "OR (end_at >= ? AND end_at <= ?) " +
+            "OR (start_at <= ? AND end_at >= ? AND end_at > 0)" +
+            ") ORDER BY start_at ASC, updated_at DESC";
+
+        return await DB.query(sql, [startTs, endTs, startTs, endTs, endTs, startTs]);
+    }
+
+    static async getPendingTasksInRange(startTs: number, endTs: number): Promise<Map<string, PendingTask[]>> {
+        const cacheKey = this.makeRangeKey(startTs, endTs);
+        const cached = this.readCache(this.pendingByRangeCache, cacheKey) as Map<string, PendingTask[]> | null;
+        if (cached != null) return cached;
+
+        const rows = await this.queryPendingTaskRows(startTs, endTs);
+
+        const map = new Map<string, PendingTask[]>();
+        rows.forEach(row => {
+            const id = row.get('id')?.toString() ?? '';
+            if (id == '') return;
+            const title = row.get('title')?.toString() ?? '';
+            const status = row.get('status')?.toString() ?? 'todo';
+            const start_at = parseInt(row.get('start_at')?.toString() ?? '0');
+            const end_at = parseInt(row.get('end_at')?.toString() ?? '0');
+
+            const ts = start_at > 0 ? start_at : (end_at > 0 ? end_at : 0);
+            if (ts <= 0) return;
+            const date = new Date(ts);
+            const y = date.getFullYear();
+            const m = (date.getMonth() + 1).toString().padStart(2, '0');
+            const d = date.getDate().toString().padStart(2, '0');
+            const dateStr = `${y}-${m}-${d}`;
+
+            const t: PendingTask = { id, title, status, start_at, end_at };
+            let arr = map.get(dateStr);
+            if (arr == null) {
+                arr = [] as PendingTask[];
+                map.set(dateStr, arr);
+            }
+            arr.push(t);
+        });
+
+        this.writeCache(this.pendingByRangeCache, cacheKey, map);
+        return map;
+    }
+
+    /**
+     * 获取一天内的未完成/进行中任务列表（用于气泡弹窗）�?
+     */
+    static async getPendingTasksForDay(startTs: number, endTs: number): Promise<PendingTask[]> {
+        const cacheKey = this.makeRangeKey(startTs, endTs);
+        const cached = this.readCache(this.pendingForDayCache, cacheKey) as PendingTask[] | null;
+        if (cached != null) return cached;
+
+        const rows = await this.queryPendingTaskRows(startTs, endTs);
+
+        const out: PendingTask[] = [];
+        rows.forEach(row => {
+            const id = row.get('id')?.toString() ?? '';
+            if (id == '') return;
+            out.push({
+                id,
+                title: row.get('title')?.toString() ?? '',
+                status: row.get('status')?.toString() ?? 'todo',
+                start_at: parseInt(row.get('start_at')?.toString() ?? '0'),
+                end_at: parseInt(row.get('end_at')?.toString() ?? '0'),
+            } as PendingTask);
+        });
+
+        this.writeCache(this.pendingForDayCache, cacheKey, out);
+        return out;
+    }
+
+    /**
+     * 获取指定时间范围内所有「完成任务」记录（�?created_at 时间戳），用于月汇总弹窗展示�?
+     */
+    static async getCompletedTasksInRange(startTs: number, endTs: number): Promise<Array<Map<string, any | null>>> {
+        const cacheKey = this.makeRangeKey(startTs, endTs);
+        const cached = this.readCache(this.completedRangeCache, cacheKey) as Array<Map<string, any | null>> | null;
+        if (cached != null) return cached;
+
+        const sql =
+            "SELECT " +
+            "COALESCE(entity_id, '') as task_id, " +
+            "content, " +
+            "MAX(CAST(created_at AS INTEGER)) as latest_created_at, " +
+            "COUNT(*) as done_count " +
+            "FROM vw_timeline_feed " +
+            "WHERE source_type = 'task_done' AND CAST(created_at AS INTEGER) >= ? AND CAST(created_at AS INTEGER) <= ? " +
+            "GROUP BY COALESCE(entity_id, ''), content " +
+            "ORDER BY latest_created_at DESC";
+        const results = await this.queryTimelineView(sql, [startTs, endTs]);
+
+        const out: Array<Map<string, any | null>> = [];
+        results.forEach(row => {
+            const title = row.get('content')?.toString() ?? '';
+            if (title == '') return;
+            let finalTitle = title;
+            const count = parseInt(row.get('done_count')?.toString() ?? '1');
+            if (count > 1) {
+                finalTitle = title + " (今日已完成 " + count + " 次)";
+            }
+
+            const m = new Map<string, any | null>();
+            m.set('id', row.get('task_id'));
+            m.set('title', finalTitle);
+            m.set('created_at', row.get('latest_created_at'));
+            m.set('metadata', null);
+            m.set('isAbandoned', false);
+            out.push(m);
+        });
+
+        this.writeCache(this.completedRangeCache, cacheKey, out);
+        return out;
+    }
+}
+
+// Shared layout builders for calendar views (month/week/year)
+
+export type DateCellLike = {
+    dateStr: string
+    inMonth: boolean
+}
+
+export function buildMonthRows(year: number, month: number): DateCellLike[][] {
+    const jsMonth = month - 1
+    const firstDay = new Date(year, jsMonth, 1)
+    const startOffset = firstDay.getDay() // 0-6 (Sun-first)
+    const lastDay = new Date(year, jsMonth + 1, 0)
+    const daysInMonth = lastDay.getDate()
+
+    const cells: DateCellLike[] = []
+    for (let i = 0; i < startOffset; i++) {
+        cells.push({ dateStr: '', inMonth: false })
+    }
+    for (let d = 1; d <= daysInMonth; d++) {
+        const dateStr = `${year}-${pad2(month)}-${pad2(d)}`
+        cells.push({ dateStr, inMonth: true })
+    }
+    while (cells.length % 7 != 0) {
+        cells.push({ dateStr: '', inMonth: false })
+    }
+
+    const rows: DateCellLike[][] = []
+    for (let i = 0; i < cells.length; i += 7) {
+        rows.push(cells.slice(i, i + 7))
+    }
+    return rows
+}
+
+export function buildWeekCellsFromSelected(selectedDateStr: string, currentYear: number, currentMonth: number): DateCellLike[] {
+    const d = selectedDateStr != '' ? new Date(selectedDateStr.replace(/-/g, '/')) : new Date()
+    const dayOfWeek = d.getDay() // 0 Sun
+    const start = new Date(d)
+    start.setDate(d.getDate() - dayOfWeek)
+
+    const cells: DateCellLike[] = []
+    for (let i = 0; i < 7; i++) {
+        const dd = new Date(start)
+        dd.setDate(start.getDate() + i)
+        cells.push({
+            dateStr: toDateStr(dd),
+            inMonth: (dd.getMonth() + 1) == currentMonth && dd.getFullYear() == currentYear,
+        })
+    }
+    return cells
+}
+
+// Year mini calendar uses Monday-first and fixed 6 weeks (42 cells)
+export function buildMiniMonthRows(year: number, month: number): DateCellLike[][] {
+    const jsMonth = month - 1
+    const firstDay = new Date(year, jsMonth, 1)
+    const startOffset = (firstDay.getDay() + 6) % 7 // Mon-first
+    const lastDay = new Date(year, jsMonth + 1, 0)
+    const daysInMonth = lastDay.getDate()
+
+    const cells: DateCellLike[] = []
+    for (let i = 0; i < startOffset; i++) {
+        cells.push({ dateStr: '', inMonth: false })
+    }
+    for (let d = 1; d <= daysInMonth; d++) {
+        const dateStr = `${year}-${pad2(month)}-${pad2(d)}`
+        cells.push({ dateStr, inMonth: true })
+    }
+    while (cells.length < 42) {
+        cells.push({ dateStr: '', inMonth: false })
+    }
+
+    const rows: DateCellLike[][] = []
+    for (let i = 0; i < 42; i += 7) {
+        rows.push(cells.slice(i, i + 7))
+    }
+    return rows
+}
+
+export function buildYearMonthRows(year: number): Array<DateCellLike[][]> {
+    const out: Array<DateCellLike[][]> = []
+    for (let m = 1; m <= 12; m++) {
+        out.push(buildMiniMonthRows(year, m))
+    }
+    return out
+}
+

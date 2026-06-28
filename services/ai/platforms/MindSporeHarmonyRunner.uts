@@ -1,0 +1,39 @@
+// // #ifdef APP-HARMONY
+// // TODO: 引入 MindSpore Lite 并在此调用
+// // #endif
+
+// import { FileUtil } from '@/utils/file/file.uts'
+// import { ModelConfig } from '../ModelConfig.uts'
+
+// export class MindSporeHarmonyRunner {
+// 	static async embedText(_text: string, _scene: string = 'task'): Promise<number[] | null> {
+// 		// #ifdef APP-HARMONY
+// 		await MindSporeHarmonyRunner.ensureModelFile();
+// 		// TODO: 使用 MindSpore Lite 推理，输出 embedding 向量
+// 		return null
+// 		// #endif
+
+// 		// #ifndef APP-HARMONY
+// 		return null
+// 		// #endif
+// 	}
+
+// 	private static async ensureModelFile(): Promise<void> {
+// 		try {
+// 			await FileUtil.ensureDir(ModelConfig.TASK_MODEL_RUNTIME_DIR);
+// 			const fsm = uni.getFileSystemManager();
+// 			fsm.access({
+// 				path: ModelConfig.TASK_MODEL_MS_RUNTIME_PATH,
+// 				success: () => {},
+// 				fail: (_e: any) => {
+// 					fsm.copyFile({
+// 						srcPath: ModelConfig.TASK_MODEL_MS_ASSET_PATH,
+// 						destPath: ModelConfig.TASK_MODEL_MS_RUNTIME_PATH,
+// 						success: () => {},
+// 						fail: (_e2: any) => {}
+// 					})
+// 				}
+// 			})
+// 		} catch (_e3) {}
+// 	}
+// }

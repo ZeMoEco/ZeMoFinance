@@ -1,0 +1,114 @@
+<!-- components/GlobalBackground.uvue -->
+<template>
+  <view>
+    <view class="global-bg-container">
+      <!-- 1. 图片层 -->
+      <image 
+        v-if="bgImage != ''" 
+        :src="bgImage" 
+        class="bg-image" 
+        mode="aspectFill" 
+      />
+      <!-- 2. 兜底渐变层 (没图时显示) -->
+      <view v-else class="bg-gradient"></view>
+      
+      <!-- 3. 遮罩层 (可选：加一点点黑，让前景文字更清晰) -->
+      <view class="bg-overlay"></view>
+    </view>
+
+  <permission-modal v-model:show="permShow" :permissions="permList" />
+  </view>
+</template>
+
+<script lang="uts">
+import { BackgroundService } from "@/services/sys/BackgroundService.uts";
+import PermissionModal from "@/components/sys/PermissionModal.uvue";
+import type { PermissionKey } from "@/services/sys/Permission.uts";
+
+export default {
+  name: "GlobalBackground",
+  components: { PermissionModal },
+  data() {
+    return {
+      permShow: false,
+      permList: ['overlay', 'notification', 'exactAlarm'] as PermissionKey[]
+    }
+  },
+  mounted() {
+    BackgroundService.getInstance().init()
+    uni.$on('permission-modal', (payload: any) => {
+      let nextList: PermissionKey[] = ['overlay', 'notification', 'exactAlarm']
+      let nextShow = true
+      const readValue = (key: string): any | null => {
+        try {
+          const m = payload as Map<string, any>
+          if (m.has(key)) return m.get(key)
+        } catch (_e0) { }
+        try {
+          const obj = payload as UTSJSONObject
+          const val = obj.get(key) as any
+          if (val != null) return val
+        } catch (_e1) { }
+        return null
+      }
+
+      const permsVal = readValue('permissions')
+      if (permsVal != null) {
+        nextList = permsVal as PermissionKey[]
+      }
+
+      const showVal = readValue('show')
+      if (showVal === false || showVal == 0 || showVal == 'false' || showVal == '0') {
+        nextShow = false
+      }
+
+      this.permList = nextList
+      this.permShow = nextShow
+    })
+  },
+  destroyed() {
+    uni.$off('permission-modal', null)
+  },
+  computed: {
+    // 自动从 Service 获取当前壁纸
+    bgImage(): string {
+      return BackgroundService.getInstance().state.bgImage;
+    }
+  }
+}
+</script>
+
+<style scoped>
+.global-bg-container {
+  position: fixed; /* Revert to fixed to ensure it works across all pages */
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  width: 100%;
+  height: 100%;
+  z-index: -1; /* Keep it low, but not too low to disappear behind default backgrounds if they are transparent */
+  pointer-events: none; 
+}
+
+.bg-image {
+  width: 100%;
+  height: 100%;
+  position: absolute;
+}
+
+.bg-gradient {
+  width: 100%;
+  height: 100%;
+  position: absolute;
+  /* 渐变在部分端不支持，使用纯色兜底 */
+  background-color: #000000;
+}
+
+.bg-overlay {
+  width: 100%;
+  height: 100%;
+  position: absolute;
+  background-color: rgba(0,0,0, 0.1); /* 10% 的黑色遮罩 */
+}
+</style>

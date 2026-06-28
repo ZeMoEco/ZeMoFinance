@@ -1,0 +1,50 @@
+<template>
+	<permission-modal v-model:show="show" :permissions="list" />
+</template>
+
+<script lang="uts">
+import PermissionModal from '@/components/sys/PermissionModal.uvue'
+import type { PermissionKey } from '@/services/sys/Permission.uts'
+
+export default {
+	components: { PermissionModal },
+	data() {
+		return {
+			show: false,
+			list: ['overlay', 'notification', 'exactAlarm'] as PermissionKey[]
+		}
+	},
+	mounted() {
+		uni.$on('permission-modal', (payload: any) => {
+            console.log('[PermModalHost] Received permission-modal event', JSON.stringify(payload))
+			let nextList: PermissionKey[] = ['overlay', 'notification', 'exactAlarm']
+			let nextShow = true
+			try {
+                // Fix: Handle both generic Map and UTSJSONObject
+                let permsVal: any | null = null;
+                let showVal: any | null = null;
+
+                if (payload instanceof Map) {
+                    const m = payload as Map<string, any>;
+                    permsVal = m.get('permissions');
+                    showVal = m.get('show');
+                } else {
+                    const obj = payload as UTSJSONObject;
+                    permsVal = obj.get('permissions');
+                    showVal = obj.get('show');
+                }
+
+                if (permsVal != null) nextList = permsVal as PermissionKey[];
+                if (showVal === false) nextShow = false;
+			} catch (_e) {
+				// ignore
+			}
+			this.list = nextList
+			this.show = nextShow
+		})
+	},
+	destroyed() {
+		uni.$off('permission-modal', null)
+	}
+}
+</script>

@@ -1,0 +1,80 @@
+import { Node, NodeType } from '../../utils/types/index.uts';
+import { DB } from '@/utils/DB/DB.uts';
+import { genId } from '@/utils/common/id.uts';
+
+export type CreateNodeOptions = {
+  id?: string | null
+  createdAt?: number | null
+  updatedAt?: number | null
+  entityVersion?: number | null
+  lastEventId?: string | null
+}
+
+export type UpdateNodeContentOptions = {
+  updatedAt?: number | null
+  lastEventId?: string | null
+}
+
+/**
+ * 纯净实体服务 (NodeService)
+ * 【核心职责】：仅管理节点的最基础物理生命周期 (创建、基础更新、销毁)
+ * 【约束】：禁止在此处处理关联边、面具、流水等图拓扑逻辑！
+ */
+export class NodeService {
+
+  private static mapRowToNode(row: Map<string, any | null>): Node {
+    const rawType = row.get('type')?.toString().toUpperCase() ?? '';
+    const nodeType = rawType.indexOf('NOTE') >= 0 ? NodeType.Note : NodeType.Task;
+    return {
+      id: row.get('id')?.toString() ?? '',
+      type: nodeType,
+      status: row.get('status')?.toString() ?? '',
+      content: row.get('content')?.toString() ?? '',
+      properties: row.get('properties')?.toString() ?? '',
+      created_at: parseInt(row.get('created_at')?.toString() ?? '0'),
+      updated_at: parseInt(row.get('updated_at')?.toString() ?? '0')
+    } as Node;
+  }
+  
+  public static async createNodeAsync(type: NodeType, content: string, options: CreateNodeOptions | null = null): Promise<Node | null> {
+    const now = options?.createdAt == null ? Date.now() : parseInt(options.createdAt.toString());
+    const updatedAt = options?.updatedAt == null ? now : parseInt(options.updatedAt.toString());
+    const id = options?.id == null || options.id.toString().trim() == '' ? genId('node') : options.id.toString().trim();
+    const entityVersion = options?.entityVersion == null ? 1 : parseInt(options.entityVersion.toString());
+    const lastEventId = options?.lastEventId == null || options.lastEventId.toString().trim() == '' ? null : options.lastEventId.toString().trim();
+    const node: Node = {
+      id,
+      type,
+      content,
+      created_at: now,
+      updated_at: updatedAt
+    };
+    const ok = await DB.exec(
+      `INSERT INTO nodes (id, type, content, created_at, updated_at, entity_version, last_event_id) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [node.id, node.type.toString(), node.content, node.created_at, node.updated_at, entityVersion, lastEventId]
+    );
+    return ok ? node : null;
+  }
+
+  public static async getNodeAsync(id: string): Promise<Node | null> {
+    const rows = await DB.query(`SELECT * FROM nodes WHERE id = ? LIMIT 1`, [id]);
+    if (rows.length == 0) return null;
+    return this.mapRowToNode(rows[0]);
+  }
+
+  public static async updateNodeContentAsync(id: string, newContent: string, options: UpdateNodeContentOptions | null = null): Promise<boolean> {
+    const updatedAt = options?.updatedAt == null ? Date.now() : parseInt(options.updatedAt.toString());
+    const lastEventId = options?.lastEventId == null || options.lastEventId.toString().trim() == '' ? null : options.lastEventId.toString().trim();
+    if (lastEventId != null) {
+      return await DB.exec(
+        `UPDATE nodes SET content = ?, updated_at = ?, entity_version = COALESCE(entity_version, 0) + 1, last_event_id = ? WHERE id = ?`,
+        [newContent, updatedAt, lastEventId, id]
+      );
+    }
+    return await DB.exec(`UPDATE nodes SET content = ?, updated_at = ? WHERE id = ?`, [newContent, updatedAt, id]);
+  }
+
+  public static async deleteNodeAsync(id: string): Promise<boolean> {
+    return await DB.exec(`DELETE FROM nodes WHERE id = ?`, [id]);
+  }
+}

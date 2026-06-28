@@ -1,0 +1,296 @@
+export enum RPAActionType {
+	CLICK = "CLICK",
+	LONG_PRESS = "LONG_PRESS",
+	SWIPE = "SWIPE",
+	INPUT = "INPUT",
+	SLEEP = "SLEEP",
+	OPEN_APP = "OPEN_APP",
+	BACK = "BACK",
+	HOME = "HOME",
+	SCROLL = "SCROLL",
+	ASSERT = "ASSERT",          // 断言/检查点 — 用于 AI 判断分支
+	BRANCH = "BRANCH",          // 分支节点 — 条件跳转
+	WAIT_RENDER = "WAIT_RENDER" // 等待渲染完成 (MediaProjection 检测)
+}
+
+/**
+ * 执行模式
+ */
+export enum ExecutionMode {
+	/** 前台执行 — 用户可看到操作过程 */
+	FOREGROUND = "FOREGROUND",
+	/** 后台执行 — 最小化到通知栏，通过无障碍服务静默执行 */
+	BACKGROUND = "BACKGROUND",
+	/** 平行视界模式 — 分屏执行，MediaProjection 检测渲染完成 */
+	PARALLEL_VISION = "PARALLEL_VISION"
+}
+
+/**
+ * 单个步骤的执行输入方式
+ */
+export enum StepInputMode {
+	/** 自动选择 (优先无障碍，降级 HID) */
+	AUTO = "AUTO",
+	/** 强制使用无障碍服务 */
+	ACCESSIBILITY = "ACCESSIBILITY",
+	/** 强制使用蓝牙 HID */
+	BLUETOOTH_HID = "BLUETOOTH_HID",
+	/** 强制使用坐标点击 (手势模拟) */
+	COORDINATE = "COORDINATE"
+}
+
+/**
+ * 执行输入模式 (全局)
+ */
+export enum ExecutionInputMode {
+	/** 通过无障碍服务执行 (默认) */
+	ACCESSIBILITY = "ACCESSIBILITY",
+	/** 通过蓝牙 HID 模拟硬件输入 */
+	BLUETOOTH_HID = "BLUETOOTH_HID"
+}
+
+/**
+ * 脚本执行配置
+ */
+export type RPAExecutionConfig = {
+	/** 执行模式: 前台 / 后台 / 平行视界 */
+	mode: ExecutionMode
+	/** 输入模式: 无障碍 / 蓝牙HID */
+	inputMode: ExecutionInputMode
+	/** 步骤间默认等待时间 (ms) */
+	stepDelay: number
+	/** 失败后重试次数 */
+	retryCount: number
+	/** 失败时是否继续执行下一步 */
+	continueOnError: boolean
+	/** 执行循环次数 (0 = 仅一次, >0 = 循环 n 次) */
+	loopCount: number
+	/** 是否启用 AI 分支判断 */
+	enableAIBranching: boolean
+}
+
+export type RPARect = {
+	left : number
+	top : number
+	right : number
+	bottom : number
+}
+
+/**
+ * 无障碍节点详情 — 录制时采集的完整控件信息
+ */
+export type RPANodeDetail = {
+	/** 控件 Resource ID (如 com.app:id/btn_ok) */
+	resourceId: string
+	/** 控件文本 */
+	text: string
+	/** 内容描述 (ContentDescription) */
+	contentDescription: string
+	/** 控件类名 (如 android.widget.Button) */
+	className: string
+	/** 是否可点击 */
+	clickable: boolean
+	/** 是否可长按 */
+	longClickable: boolean
+	/** 是否可勾选 */
+	checkable: boolean
+	/** 是否已勾选 */
+	checked: boolean
+	/** 是否可编辑 */
+	editable: boolean
+	/** 是否可滚动 */
+	scrollable: boolean
+	/** 是否可聚焦 */
+	focusable: boolean
+	/** 是否已选中 */
+	selected: boolean
+	/** 是否可用 */
+	enabled: boolean
+	/** 控件在层级树中的深度 */
+	depth: number
+	/** 控件索引 (在父容器中的位置) */
+	indexInParent: number
+	/** 父容器类名 */
+	parentClassName: string
+	/** 控件在层级树中的路径 (如 FrameLayout/LinearLayout/Button) */
+	treePath: string
+	/** 控件边界 */
+	bounds: RPARect | null
+}
+
+/**
+ * 页面签名 — 用于检测是否进入了相同页面(避免重复录制)
+ */
+export type RPAPageSignature = {
+	/** 应用包名 */
+	appPackage: string
+	/** Activity 名称 (如 com.app/.MainActivity) */
+	activityName: string
+	/** 页面标题 (若可获取) */
+	pageTitle: string
+	/** 页面关键控件指纹 (用于区分同 Activity 的不同页面状态) */
+	fingerprint: string
+}
+
+/**
+ * 分支条件
+ */
+export type RPABranchCondition = {
+	/** 条件类型: text_match | element_exist | ocr_match | ai_judge */
+	type: string
+	/** 匹配值 */
+	value: string
+	/** 目标步骤 ID (满足条件时跳转) */
+	targetStepId: string
+	/** 条件描述 */
+	description: string
+}
+
+/**
+ * 录制步骤 — 核心数据模型
+ */
+export class RPAStep {
+	// ===== 1. 基础信息 =====
+	id : string = ""
+	actionType : RPAActionType = RPAActionType.CLICK
+	/** 步骤在脚本中的序号 (从 0 开始) */
+	index: number = 0
+	/** 录制时间戳 */
+	timestamp: number = 0
+
+	// ===== 2. HID 硬件数据/绝对坐标 =====
+	x : number = 0
+	y : number = 0
+	endX : number = 0
+	endY : number = 0
+	duration : number = 0
+	screenWidth : number = 0
+	screenHeight : number = 0
+
+	// ===== 3. 视觉/CV 数据 =====
+	templateImage : string = "" // 截图裁剪出的 Base64
+	templateOffsetX : number = 0
+	templateOffsetY : number = 0
+	confidence : number = 0.8
+
+	// ===== 4. 无障碍/软件数据 =====
+	accessibilityId : string = ""
+	widgetText : string = ""
+	bounds : RPARect | null = null
+	/** 详细的无障碍节点信息 (录制时完整采集) */
+	nodeDetail: RPANodeDetail | null = null
+
+	// ===== 5. 页面上下文 =====
+	appPackage : string = ""     // 目标应用包名
+	/** 当前 Activity 名称 */
+	activityName: string = ""
+	/** 页面签名 (用于检测重复页面) */
+	pageSignature: RPAPageSignature | null = null
+
+	// ===== 6. 单步执行控制 =====
+	/** 该步骤的执行输入方式 (可在 Map 中单独切换) */
+	stepInputMode: StepInputMode = StepInputMode.AUTO
+	waitAfter : number = 0       // 步骤执行后额外等待时间 (ms)
+	/** 步骤描述/备注 (AI 可调用的语义描述，用户可编辑) */
+	description : string = ""
+	/** AI 可调用的标签 (如 "登录", "搜索商品", "提交订单") */
+	aiLabel: string = ""
+
+	// ===== 7. 分支与连接 (Canvas/Map) =====
+	/** 分支条件列表 (满足条件跳转到不同步骤) */
+	branches: RPABranchCondition[] = []
+	/** 所属 Canvas 分组 ID (like Obsidian groups) */
+	canvasGroupId: string = ""
+	/** 父步骤 ID (用于分支场景: 同页面不同操作路径) */
+	parentStepId: string = ""
+	/** 子步骤 ID 列表 */
+	childStepIds: string[] = []
+	/** 下一步骤 ID (默认线性流，分支时可能不同) */
+	nextStepId: string = ""
+
+	// ===== 8. Canvas 布局 (Map 视图用) =====
+	/** 节点在 Canvas 上的 X 坐标 */
+	canvasX: number = 0
+	/** 节点在 Canvas 上的 Y 坐标 */
+	canvasY: number = 0
+
+	constructor() {}
+}
+
+/**
+ * RPA Canvas Map 分组 — 类似 Obsidian Canvas Group
+ */
+export class RPACanvasGroup {
+	id: string = ""
+	/** 分组名称 */
+	name: string = ""
+	/** 分组颜色 */
+	color: string = "#409EFF"
+	/** 包含的步骤 ID 列表 */
+	stepIds: string[] = []
+	/** 分组在 Canvas 上的位置 */
+	x: number = 0
+	y: number = 0
+	width: number = 400
+	height: number = 300
+	/** 是否折叠 */
+	collapsed: boolean = false
+
+	constructor(id: string = "", name: string = "") {
+		this.id = id;
+		this.name = name;
+	}
+}
+
+/**
+ * RPA Canvas 连接线
+ */
+export class RPACanvasEdge {
+	id: string = ""
+	/** 起点步骤 ID */
+	fromStepId: string = ""
+	/** 终点步骤 ID */
+	toStepId: string = ""
+	/** 连接标签 (如条件描述) */
+	label: string = ""
+	/** 连接颜色 */
+	color: string = "#aaa"
+	/** 连接类型: default | branch | fallback */
+	type: string = "default"
+
+	constructor(id: string = "", from: string = "", to: string = "") {
+		this.id = id;
+		this.fromStepId = from;
+		this.toStepId = to;
+	}
+}
+
+/**
+ * 完整的 RPA 脚本 — 包含步骤、分组、连接线等 Canvas 数据
+ */
+export class RPAScript {
+	version: number = 2
+	/** 脚本名称 */
+	name: string = ""
+	/** 脚本描述 */
+	description: string = ""
+	/** 关联的应用包名 */
+	appPackage: string = ""
+	/** 关联的应用名称 */
+	appName: string = ""
+	/** 所有步骤 */
+	steps: RPAStep[] = []
+	/** Canvas 分组 */
+	groups: RPACanvasGroup[] = []
+	/** Canvas 连接线 */
+	edges: RPACanvasEdge[] = []
+	/** 创建时间 */
+	createdAt: number = 0
+	/** 更新时间 */
+	updatedAt: number = 0
+
+	constructor() {
+		this.createdAt = Date.now();
+		this.updatedAt = Date.now();
+	}
+}

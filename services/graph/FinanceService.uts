@@ -1,0 +1,131 @@
+import { Account, Transaction, TransactionType, MountingEdgeType } from '../../utils/types/index.uts';
+import { EdgeService } from './EdgeService.uts';
+import { DB } from '@/utils/DB/DB.uts';
+import { genId } from '@/utils/common/id.uts';
+
+/**
+ * 资产与资金流转服务 (FinanceService)
+ * 【核心职责】：处理现实世界的账户资金、并与图谱体系 (Node) 建立支出/收入挂载。
+ * 【约束】：资金变动、流水记录与图谱挂载必须处于绝对的强 ACID 事务下，并支持基于 Node 的成本核算。
+ */
+export class FinanceService {
+
+  private static mapRowToAccount(row: Map<string, any | null>): Account {
+    return {
+      id: row.get('id')?.toString() ?? '',
+      name: row.get('name')?.toString() ?? '',
+      balance: parseFloat(row.get('balance')?.toString() ?? '0'),
+      created_at: parseInt(row.get('created_at')?.toString() ?? '0'),
+      updated_at: parseInt(row.get('updated_at')?.toString() ?? '0')
+    } as Account;
+  }
+
+  private static mapRowToTransaction(row: Map<string, any | null>): Transaction {
+    const rawAmount = parseFloat(row.get('amount')?.toString() ?? '0');
+    const rawType = row.get('type')?.toString() ?? '';
+    return {
+      id: row.get('id')?.toString() ?? '',
+      account_id: row.get('account_id')?.toString() ?? '',
+      type: rawAmount < 0 ? TransactionType.Expense.toString() : rawType,
+      amount: Math.abs(rawAmount),
+      created_at: parseInt((row.get('transaction_time') ?? row.get('created_at'))?.toString() ?? '0')
+    } as Transaction;
+  }
+
+  public static async createAccountAsync(name: string, initialBalance: number = 0): Promise<Account | null> {
+    const now = Date.now();
+    const id = genId('acc');
+    const ok = await DB.exec(
+      `INSERT INTO accounts (id, user_id, name, type, balance, currency, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, '1', name, 'cash', initialBalance, 'CNY', now, now]
+    );
+    if (!ok) return null;
+    return { id, name, balance: initialBalance, created_at: now, updated_at: now } as Account;
+  }
+
+  public static async recordTransactionAsync(
+    accountId: string,
+    type: TransactionType,
+    amount: number,
+    nodeId: string | null = null
+  ): Promise<Transaction | null> {
+    const now = Date.now();
+    const id = genId('fin');
+    const normalizedType = amount < 0 ? TransactionType.Expense : type;
+    const val = Math.abs(amount);
+    if (isNaN(val) || val <= 0) return null;
+
+    const ok = await DB.tx<boolean>(async () => {
+      const accountRows = await DB.query(
+        `SELECT balance, category FROM accounts WHERE id = ? AND is_deleted = 0 LIMIT 1`,
+        [accountId]
+      );
+      if (accountRows.length == 0) return false;
+
+      const category = (accountRows[0].get('category')?.toString() ?? '').toLowerCase();
+      const parsedBalance = parseFloat(accountRows[0].get('balance')?.toString() ?? '0');
+      const rawBalance = isNaN(parsedBalance) ? 0.0 : parsedBalance;
+      const currentBalance = category == 'credit' ? Math.abs(rawBalance) : rawBalance;
+      let balanceChange = 0;
+      if (category == 'credit') {
+        if (normalizedType === TransactionType.Income) balanceChange = -val;
+        else if (normalizedType === TransactionType.Expense || normalizedType === TransactionType.Transfer) balanceChange = val;
+      } else {
+        if (normalizedType === TransactionType.Income) balanceChange = val;
+        else if (normalizedType === TransactionType.Expense || normalizedType === TransactionType.Transfer) balanceChange = -val;
+      }
+      const nextBalance = currentBalance + balanceChange;
+
+      const updated = await DB.exec(
+        `UPDATE accounts SET balance = ?, updated_at = ? WHERE id = ?`,
+        [nextBalance, now, accountId]
+      );
+      if (!updated) return false;
+
+      const inserted = await DB.exec(
+        `INSERT INTO transactions (id, account_id, type, amount, transaction_time, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+        [id, accountId, normalizedType.toString(), val, now, now]
+      );
+      if (!inserted) return false;
+
+      if (nodeId != null && nodeId.length > 0) {
+        const edge = await EdgeService.createEdgeAsync(
+          nodeId,
+          nodeId,
+          MountingEdgeType.HasTransaction as any,
+          JSON.stringify({ transaction_id: id })
+        );
+        if (edge == null) return false;
+      }
+
+      return true;
+    });
+
+    if (!ok) return null;
+    return {
+      id,
+      account_id: accountId,
+      type: normalizedType.toString(),
+      amount: val,
+      created_at: now
+    } as Transaction;
+  }
+
+  public static async getAllAccountsAsync(): Promise<Account[]> {
+    const rows = await DB.query(`SELECT * FROM accounts ORDER BY created_at ASC`);
+    return rows.map((r) => this.mapRowToAccount(r));
+  }
+
+  public static async getNodeTransactionsAsync(nodeId: string): Promise<Transaction[]> {
+    const rows = await DB.query(
+      `
+      SELECT t.* FROM transactions t
+      INNER JOIN edges e ON e.source_id = ? AND e.target_id = ? AND e.relation_type = ?
+      WHERE e.properties LIKE '%' || t.id || '%'
+      ORDER BY t.created_at DESC
+      `,
+      [nodeId, nodeId, MountingEdgeType.HasTransaction as string]
+    );
+    return rows.map((r) => this.mapRowToTransaction(r));
+  }
+}

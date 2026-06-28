@@ -1,0 +1,424 @@
+// Android-specific RPAStep serialization helpers
+import { RPAStep, RPAActionType, RPARect, RPANodeDetail, RPAPageSignature, RPABranchCondition, RPAScript, RPACanvasGroup, RPACanvasEdge, StepInputMode } from '../../utils/RPAStep.uts';
+import JSONObject from 'org.json.JSONObject';
+import JSONArray from 'org.json.JSONArray';
+
+/**
+ * 将 RPAStep 序列化为 JSON 字符串
+ */
+export function rpaStepToJSON(step : RPAStep) : string {
+	try {
+		const obj = new JSONObject()
+		obj.put("id", step.id)
+		obj.put("index", step.index)
+		obj.put("timestamp", step.timestamp)
+		obj.put("actionType", step.actionType as string)
+		
+		obj.put("x", step.x)
+		obj.put("y", step.y)
+		obj.put("endX", step.endX)
+		obj.put("endY", step.endY)
+		obj.put("duration", step.duration)
+		obj.put("screenWidth", step.screenWidth)
+		obj.put("screenHeight", step.screenHeight)
+		
+		obj.put("templateImage", step.templateImage)
+		obj.put("templateOffsetX", step.templateOffsetX)
+		obj.put("templateOffsetY", step.templateOffsetY)
+		obj.put("confidence", step.confidence)
+		
+		obj.put("accessibilityId", step.accessibilityId)
+		obj.put("widgetText", step.widgetText)
+		
+		if (step.bounds != null) {
+			const boundsObj = new JSONObject()
+			boundsObj.put("left", step.bounds!.left)
+			boundsObj.put("top", step.bounds!.top)
+			boundsObj.put("right", step.bounds!.right)
+			boundsObj.put("bottom", step.bounds!.bottom)
+			obj.put("bounds", boundsObj)
+		}
+		
+		if (step.nodeDetail != null) {
+			const nodeObj = new JSONObject()
+			nodeObj.put("resourceId", step.nodeDetail!.resourceId)
+			nodeObj.put("text", step.nodeDetail!.text)
+			nodeObj.put("contentDescription", step.nodeDetail!.contentDescription)
+			nodeObj.put("className", step.nodeDetail!.className)
+			nodeObj.put("clickable", step.nodeDetail!.clickable)
+			nodeObj.put("longClickable", step.nodeDetail!.longClickable)
+			nodeObj.put("checkable", step.nodeDetail!.checkable)
+			nodeObj.put("checked", step.nodeDetail!.checked)
+			nodeObj.put("editable", step.nodeDetail!.editable)
+			nodeObj.put("scrollable", step.nodeDetail!.scrollable)
+			nodeObj.put("focusable", step.nodeDetail!.focusable)
+			nodeObj.put("selected", step.nodeDetail!.selected)
+			nodeObj.put("enabled", step.nodeDetail!.enabled)
+			nodeObj.put("depth", step.nodeDetail!.depth)
+			nodeObj.put("indexInParent", step.nodeDetail!.indexInParent)
+			nodeObj.put("parentClassName", step.nodeDetail!.parentClassName)
+			nodeObj.put("treePath", step.nodeDetail!.treePath)
+			if (step.nodeDetail!.bounds != null) {
+				const boundsObj = new JSONObject()
+				boundsObj.put("left", step.nodeDetail!.bounds!.left)
+				boundsObj.put("top", step.nodeDetail!.bounds!.top)
+				boundsObj.put("right", step.nodeDetail!.bounds!.right)
+				boundsObj.put("bottom", step.nodeDetail!.bounds!.bottom)
+				nodeObj.put("bounds", boundsObj)
+			}
+			obj.put("nodeDetail", nodeObj)
+		}
+		
+		obj.put("appPackage", step.appPackage)
+		obj.put("activityName", step.activityName)
+		
+		if (step.pageSignature != null) {
+			const sigObj = new JSONObject()
+			sigObj.put("appPackage", step.pageSignature!.appPackage)
+			sigObj.put("activityName", step.pageSignature!.activityName)
+			sigObj.put("pageTitle", step.pageSignature!.pageTitle)
+			sigObj.put("fingerprint", step.pageSignature!.fingerprint)
+			obj.put("pageSignature", sigObj)
+		}
+		
+		obj.put("stepInputMode", step.stepInputMode as string)
+		obj.put("waitAfter", step.waitAfter)
+		obj.put("description", step.description)
+		obj.put("aiLabel", step.aiLabel)
+		
+		const branchesArr = new JSONArray()
+		for (let i = 0; i < step.branches.length; i++) {
+			const b = step.branches[i]
+			const bObj = new JSONObject()
+			bObj.put("type", b.type)
+			bObj.put("value", b.value)
+			bObj.put("targetStepId", b.targetStepId)
+			bObj.put("description", b.description)
+			branchesArr.put(bObj)
+		}
+		obj.put("branches", branchesArr)
+		
+		obj.put("canvasGroupId", step.canvasGroupId)
+		obj.put("parentStepId", step.parentStepId)
+		obj.put("nextStepId", step.nextStepId)
+		
+		const childIdsArr = new JSONArray()
+		for (let i = 0; i < step.childStepIds.length; i++) {
+			childIdsArr.put(step.childStepIds[i])
+		}
+		obj.put("childStepIds", childIdsArr)
+		
+		obj.put("canvasX", step.canvasX)
+		obj.put("canvasY", step.canvasY)
+		
+		return obj.toString()
+	} catch (e) {
+		console.error("rpaStepToJSON failed: " + e)
+		return JSON.stringify(step)
+	}
+}
+
+/**
+ * 将 RPAScript 序列化为 JSON 字符串
+ */
+export function rpaScriptToJSON(script: RPAScript): string {
+	try {
+		const obj = new JSONObject()
+		obj.put("version", script.version)
+		obj.put("name", script.name)
+		obj.put("description", script.description)
+		obj.put("appPackage", script.appPackage)
+		obj.put("appName", script.appName)
+		obj.put("createdAt", script.createdAt)
+		obj.put("updatedAt", script.updatedAt)
+
+		const stepsArr = new JSONArray()
+		for (let i = 0; i < script.steps.length; i++) {
+			stepsArr.put(new JSONObject(rpaStepToJSON(script.steps[i])))
+		}
+		obj.put("steps", stepsArr)
+
+		const groupsArr = new JSONArray()
+		for (let i = 0; i < script.groups.length; i++) {
+			const g = script.groups[i]
+			const gObj = new JSONObject()
+			gObj.put("id", g.id)
+			gObj.put("name", g.name)
+			gObj.put("color", g.color)
+			gObj.put("x", g.x)
+			gObj.put("y", g.y)
+			gObj.put("width", g.width)
+			gObj.put("height", g.height)
+			gObj.put("collapsed", g.collapsed)
+			const stepIdsArr = new JSONArray()
+			for (let j = 0; j < g.stepIds.length; j++) {
+				stepIdsArr.put(g.stepIds[j])
+			}
+			gObj.put("stepIds", stepIdsArr)
+			groupsArr.put(gObj)
+		}
+		obj.put("groups", groupsArr)
+
+		const edgesArr = new JSONArray()
+		for (let i = 0; i < script.edges.length; i++) {
+			const e = script.edges[i]
+			const eObj = new JSONObject()
+			eObj.put("id", e.id)
+			eObj.put("fromStepId", e.fromStepId)
+			eObj.put("toStepId", e.toStepId)
+			eObj.put("label", e.label)
+			eObj.put("color", e.color)
+			eObj.put("type", e.type)
+			edgesArr.put(eObj)
+		}
+		obj.put("edges", edgesArr)
+
+		return obj.toString()
+	} catch (e) {
+		console.error("rpaScriptToJSON failed: " + e)
+		return JSON.stringify(script)
+	}
+}
+
+/**
+ * 从 JSON 字符串反序列化为 RPAStep
+ */
+export function rpaStepFromJSON(jsonStr : string) : RPAStep | null {
+	try {
+		const jsonMap = new JSONObject(jsonStr)
+		const step = new RPAStep()
+
+		// Basic Info
+		step.id = jsonMap.optString("id", "")
+		step.index = jsonMap.optInt("index", 0)
+		step.timestamp = jsonMap.optLong("timestamp", 0)
+		
+		const actionTypeStr = jsonMap.optString("actionType", "CLICK")
+		step.actionType = parseActionType(actionTypeStr)
+
+		// HID Data
+		step.x = jsonMap.optDouble("x", 0.0)
+		step.y = jsonMap.optDouble("y", 0.0)
+		step.endX = jsonMap.optDouble("endX", 0.0)
+		step.endY = jsonMap.optDouble("endY", 0.0)
+		step.duration = jsonMap.optDouble("duration", 0.0)
+		step.screenWidth = jsonMap.optDouble("screenWidth", 0.0)
+		step.screenHeight = jsonMap.optDouble("screenHeight", 0.0)
+
+		// CV Data
+		step.templateImage = jsonMap.optString("templateImage", "")
+		step.templateOffsetX = jsonMap.optDouble("templateOffsetX", 0.0)
+		step.templateOffsetY = jsonMap.optDouble("templateOffsetY", 0.0)
+		step.confidence = jsonMap.optDouble("confidence", 0.8)
+
+		// Accessibility Data
+		step.accessibilityId = jsonMap.optString("accessibilityId", "")
+		step.widgetText = jsonMap.optString("widgetText", "")
+
+		if (jsonMap.has("bounds") && !jsonMap.isNull("bounds")) {
+			step.bounds = parseRect(jsonMap.getJSONObject("bounds"))
+		}
+
+		// Node Detail
+		if (jsonMap.has("nodeDetail") && !jsonMap.isNull("nodeDetail")) {
+			step.nodeDetail = parseNodeDetail(jsonMap.getJSONObject("nodeDetail"))
+		}
+
+		// Page Context
+		step.appPackage = jsonMap.optString("appPackage", "")
+		step.activityName = jsonMap.optString("activityName", "")
+
+		if (jsonMap.has("pageSignature") && !jsonMap.isNull("pageSignature")) {
+			step.pageSignature = parsePageSignature(jsonMap.getJSONObject("pageSignature"))
+		}
+
+		// Step Execution Control
+		const inputModeStr = jsonMap.optString("stepInputMode", "AUTO")
+		step.stepInputMode = parseStepInputMode(inputModeStr)
+		step.waitAfter = jsonMap.optDouble("waitAfter", 0.0)
+		step.description = jsonMap.optString("description", "")
+		step.aiLabel = jsonMap.optString("aiLabel", "")
+
+		// Branch & Canvas
+		if (jsonMap.has("branches") && !jsonMap.isNull("branches")) {
+			const branchArr = jsonMap.getJSONArray("branches")
+			for (let i = 0; i < branchArr.length(); i++) {
+				const bObj = branchArr.getJSONObject(i.toInt())
+				const branch: RPABranchCondition = {
+					type: bObj.optString("type", ""),
+					value: bObj.optString("value", ""),
+					targetStepId: bObj.optString("targetStepId", ""),
+					description: bObj.optString("description", "")
+				}
+				step.branches.push(branch)
+			}
+		}
+
+		step.canvasGroupId = jsonMap.optString("canvasGroupId", "")
+		step.parentStepId = jsonMap.optString("parentStepId", "")
+		step.nextStepId = jsonMap.optString("nextStepId", "")
+
+		if (jsonMap.has("childStepIds") && !jsonMap.isNull("childStepIds")) {
+			const ids = jsonMap.getJSONArray("childStepIds")
+			for (let i = 0; i < ids.length(); i++) {
+				step.childStepIds.push(ids.getString(i.toInt()))
+			}
+		}
+
+		// Canvas Layout
+		step.canvasX = jsonMap.optDouble("canvasX", 0.0)
+		step.canvasY = jsonMap.optDouble("canvasY", 0.0)
+
+		return step
+	} catch (e) {
+		console.error("rpaStepFromJSON failed: " + e)
+		return null
+	}
+}
+
+/**
+ * 从 JSON 字符串解析完整的 RPAScript 对象 (v2)
+ */
+export function rpaScriptFromJSON(jsonStr: string): RPAScript | null {
+	try {
+		const obj = new JSONObject(jsonStr)
+		const script = new RPAScript()
+		
+		script.version = obj.optInt("version", 1)
+		script.name = obj.optString("name", "")
+		script.description = obj.optString("description", "")
+		script.appPackage = obj.optString("appPackage", "")
+		script.appName = obj.optString("appName", "")
+		script.createdAt = obj.optLong("createdAt", 0)
+		script.updatedAt = obj.optLong("updatedAt", 0)
+
+		// Parse Steps
+		if (obj.has("steps") && !obj.isNull("steps")) {
+			const stepsArr = obj.getJSONArray("steps")
+			for (let i = 0; i < stepsArr.length(); i++) {
+				const stepJson = stepsArr.getJSONObject(i.toInt()).toString()
+				const step = rpaStepFromJSON(stepJson)
+				if (step != null) {
+					script.steps.push(step)
+				}
+			}
+		}
+
+		// Parse Groups
+		if (obj.has("groups") && !obj.isNull("groups")) {
+			const groupsArr = obj.getJSONArray("groups")
+			for (let i = 0; i < groupsArr.length(); i++) {
+				const gObj = groupsArr.getJSONObject(i.toInt())
+				const group = new RPACanvasGroup(
+					gObj.optString("id", ""),
+					gObj.optString("name", "")
+				)
+				group.color = gObj.optString("color", "#409EFF")
+				group.x = gObj.optDouble("x", 0.0)
+				group.y = gObj.optDouble("y", 0.0)
+				group.width = gObj.optDouble("width", 400.0)
+				group.height = gObj.optDouble("height", 300.0)
+				group.collapsed = gObj.optBoolean("collapsed", false)
+
+				if (gObj.has("stepIds") && !gObj.isNull("stepIds")) {
+					const ids = gObj.getJSONArray("stepIds")
+					for (let j = 0; j < ids.length(); j++) {
+						group.stepIds.push(ids.getString(j.toInt()))
+					}
+				}
+				script.groups.push(group)
+			}
+		}
+
+		// Parse Edges
+		if (obj.has("edges") && !obj.isNull("edges")) {
+			const edgesArr = obj.getJSONArray("edges")
+			for (let i = 0; i < edgesArr.length(); i++) {
+				const eObj = edgesArr.getJSONObject(i.toInt())
+				const edge = new RPACanvasEdge(
+					eObj.optString("id", ""),
+					eObj.optString("fromStepId", ""),
+					eObj.optString("toStepId", "")
+				)
+				edge.label = eObj.optString("label", "")
+				edge.color = eObj.optString("color", "#aaa")
+				edge.type = eObj.optString("type", "default")
+				script.edges.push(edge)
+			}
+		}
+
+		return script
+	} catch (e) {
+		console.error("rpaScriptFromJSON failed: " + e)
+		return null
+	}
+}
+
+// ===== Helper Functions =====
+
+function parseActionType(str: string): RPAActionType {
+	if (str == "SWIPE") return RPAActionType.SWIPE
+	if (str == "INPUT") return RPAActionType.INPUT
+	if (str == "SLEEP") return RPAActionType.SLEEP
+	if (str == "LONG_PRESS") return RPAActionType.LONG_PRESS
+	if (str == "OPEN_APP") return RPAActionType.OPEN_APP
+	if (str == "BACK") return RPAActionType.BACK
+	if (str == "HOME") return RPAActionType.HOME
+	if (str == "SCROLL") return RPAActionType.SCROLL
+	if (str == "ASSERT") return RPAActionType.ASSERT
+	if (str == "BRANCH") return RPAActionType.BRANCH
+	if (str == "WAIT_RENDER") return RPAActionType.WAIT_RENDER
+	return RPAActionType.CLICK
+}
+
+function parseStepInputMode(str: string): StepInputMode {
+	if (str == "ACCESSIBILITY") return StepInputMode.ACCESSIBILITY
+	if (str == "BLUETOOTH_HID") return StepInputMode.BLUETOOTH_HID
+	if (str == "COORDINATE") return StepInputMode.COORDINATE
+	return StepInputMode.AUTO
+}
+
+function parseRect(obj: JSONObject): RPARect {
+	return {
+		left: obj.optDouble("left", 0.0),
+		top: obj.optDouble("top", 0.0),
+		right: obj.optDouble("right", 0.0),
+		bottom: obj.optDouble("bottom", 0.0)
+	} as RPARect
+}
+
+function parseNodeDetail(obj: JSONObject): RPANodeDetail {
+	let detailBounds: RPARect | null = null
+	if (obj.has("bounds") && !obj.isNull("bounds")) {
+		detailBounds = parseRect(obj.getJSONObject("bounds"))
+	}
+	return {
+		resourceId: obj.optString("resourceId", ""),
+		text: obj.optString("text", ""),
+		contentDescription: obj.optString("contentDescription", ""),
+		className: obj.optString("className", ""),
+		clickable: obj.optBoolean("clickable", false),
+		longClickable: obj.optBoolean("longClickable", false),
+		checkable: obj.optBoolean("checkable", false),
+		checked: obj.optBoolean("checked", false),
+		editable: obj.optBoolean("editable", false),
+		scrollable: obj.optBoolean("scrollable", false),
+		focusable: obj.optBoolean("focusable", false),
+		selected: obj.optBoolean("selected", false),
+		enabled: obj.optBoolean("enabled", true),
+		depth: obj.optInt("depth", 0),
+		indexInParent: obj.optInt("indexInParent", 0),
+		parentClassName: obj.optString("parentClassName", ""),
+		treePath: obj.optString("treePath", ""),
+		bounds: detailBounds
+	} as RPANodeDetail
+}
+
+function parsePageSignature(obj: JSONObject): RPAPageSignature {
+	return {
+		appPackage: obj.optString("appPackage", ""),
+		activityName: obj.optString("activityName", ""),
+		pageTitle: obj.optString("pageTitle", ""),
+		fingerprint: obj.optString("fingerprint", "")
+	} as RPAPageSignature
+}

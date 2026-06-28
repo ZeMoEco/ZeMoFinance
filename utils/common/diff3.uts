@@ -1,0 +1,264 @@
+export type Diff3MergeResult = {
+  merged: string
+  hadConflict: boolean
+}
+
+type Edit = {
+  start: number
+  end: number
+  lines: string[]
+}
+
+type MergeEditsResult = {
+  lines: string[]
+  hadConflict: boolean
+}
+
+type IndexPair = number[]
+
+function pushAll(dst: string[], src: string[]): void {
+  for (let i = 0; i < src.length; i++) dst.push(src[i])
+}
+
+function splitLines(text: string): string[] {
+  const s = (text ?? '').toString()
+  // keep simple: normalize to \n, ignore trailing \r
+  const lines = s.split(/\r?\n/)
+  return lines
+}
+
+function computeLcsTable(a: string[], b: string[]): number[][] {
+  const n = a.length
+  const m = b.length
+  const dp: number[][] = []
+  for (let i = 0; i <= n; i++) {
+    const row: number[] = []
+    for (let j = 0; j <= m; j++) row.push(0)
+    dp.push(row)
+  }
+  for (let i = 1; i <= n; i++) {
+    const ai = a[i - 1]
+    for (let j = 1; j <= m; j++) {
+      if (ai === b[j - 1]) dp[i][j] = dp[i - 1][j - 1] + 1
+      else dp[i][j] = dp[i - 1][j] >= dp[i][j - 1] ? dp[i - 1][j] : dp[i][j - 1]
+    }
+  }
+  return dp
+}
+
+function backtrackMatches(a: string[], b: string[], dp: number[][]): IndexPair[] {
+  const matches: IndexPair[] = []
+  let i = a.length
+  let j = b.length
+  while (i > 0 && j > 0) {
+    if (a[i - 1] === b[j - 1]) {
+      matches.push([i - 1, j - 1])
+      i = i - 1
+      j = j - 1
+    } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+      i = i - 1
+    } else {
+      j = j - 1
+    }
+  }
+  matches.reverse()
+  return matches
+}
+
+function computeEdits(baseLines: string[], otherLines: string[]): Edit[] {
+  const dp = computeLcsTable(baseLines, otherLines)
+  const matches = backtrackMatches(baseLines, otherLines, dp)
+
+  const edits: Edit[] = []
+
+  let prevBase = 0
+  let prevOther = 0
+
+  for (let k = 0; k <= matches.length; k++) {
+    const isSentinel = k === matches.length
+    const curBase = isSentinel ? baseLines.length : matches[k][0]
+    const curOther = isSentinel ? otherLines.length : matches[k][1]
+
+    if (curBase > prevBase || curOther > prevOther) {
+      edits.push({
+        start: prevBase,
+        end: curBase,
+        lines: otherLines.slice(prevOther, curOther)
+      } as Edit)
+    }
+
+    if (!isSentinel) {
+      prevBase = curBase + 1
+      prevOther = curOther + 1
+    }
+  }
+
+  return edits
+}
+
+function mergeEdits(baseLines: string[], localEdits: Edit[], remoteEdits: Edit[]): MergeEditsResult {
+  const out: string[] = []
+  let hadConflict = false
+
+  let i = 0
+  let li = 0
+  let ri = 0
+
+  function nextLocalStart(): number {
+    return li < localEdits.length ? localEdits[li].start : baseLines.length + 1
+  }
+  function nextRemoteStart(): number {
+    return ri < remoteEdits.length ? remoteEdits[ri].start : baseLines.length + 1
+  }
+
+  while (i <= baseLines.length) {
+    // End sentinel: once we pass the base, only handle insertions at end.
+    if (i === baseLines.length) {
+      const ls = nextLocalStart()
+      const rs = nextRemoteStart()
+      if (ls === i && rs === i) {
+        const le = localEdits[li]
+        const re = remoteEdits[ri]
+        if (le.end === re.end && le.lines.join('\n') === re.lines.join('\n')) {
+          pushAll(out, le.lines)
+        } else {
+          // conflict insertion at end
+          hadConflict = true
+          out.push('<<<<<<< LOCAL')
+          pushAll(out, le.lines)
+          out.push('=======')
+          pushAll(out, re.lines)
+          out.push('>>>>>>> REMOTE')
+        }
+        li++
+        ri++
+        // i remains at end
+        continue
+      }
+      if (ls === i) {
+        pushAll(out, localEdits[li].lines)
+        li++
+        continue
+      }
+      if (rs === i) {
+        pushAll(out, remoteEdits[ri].lines)
+        ri++
+        continue
+      }
+      break
+    }
+
+    const ls = nextLocalStart()
+    const rs = nextRemoteStart()
+
+    const next = ls < rs ? ls : rs
+
+    if (i < next) {
+      out.push(baseLines[i])
+      i = i + 1
+      continue
+    }
+
+    // i == next, apply edits
+    const hasL = ls === i
+    const hasR = rs === i
+
+    if (hasL && hasR) {
+      const le = localEdits[li]
+      const re = remoteEdits[ri]
+
+      const overlapEnd = le.end > re.end ? le.end : re.end
+
+      // If both touch exactly same base range and replacements identical => ok
+      if (le.end === re.end && le.lines.join('\n') === re.lines.join('\n')) {
+        pushAll(out, le.lines)
+      } else {
+        hadConflict = true
+        out.push('<<<<<<< LOCAL')
+        pushAll(out, le.lines)
+        out.push('=======')
+        pushAll(out, re.lines)
+        out.push('>>>>>>> REMOTE')
+      }
+
+      i = overlapEnd
+      li++
+      ri++
+      continue
+    }
+
+    if (hasL) {
+      const le = localEdits[li]
+      // If local edit overlaps a future remote edit start, treat as conflict
+      if (ri < remoteEdits.length && remoteEdits[ri].start < le.end) {
+        const re = remoteEdits[ri]
+        const overlapEnd = le.end > re.end ? le.end : re.end
+        hadConflict = true
+        out.push('<<<<<<< LOCAL')
+        pushAll(out, le.lines)
+        out.push('=======')
+        pushAll(out, re.lines)
+        out.push('>>>>>>> REMOTE')
+        i = overlapEnd
+        li++
+        ri++
+        continue
+      }
+      pushAll(out, le.lines)
+      i = le.end
+      li++
+      continue
+    }
+
+    if (hasR) {
+      const re = remoteEdits[ri]
+      if (li < localEdits.length && localEdits[li].start < re.end) {
+        const le = localEdits[li]
+        const overlapEnd = le.end > re.end ? le.end : re.end
+        hadConflict = true
+        out.push('<<<<<<< LOCAL')
+        pushAll(out, le.lines)
+        out.push('=======')
+        pushAll(out, re.lines)
+        out.push('>>>>>>> REMOTE')
+        i = overlapEnd
+        li++
+        ri++
+        continue
+      }
+      pushAll(out, re.lines)
+      i = re.end
+      ri++
+      continue
+    }
+
+    // Should not reach
+    out.push(baseLines[i])
+    i = i + 1
+  }
+
+  return { lines: out, hadConflict } as MergeEditsResult
+}
+
+export function diff3Merge(baseText: string, localText: string, remoteText: string): Diff3MergeResult {
+  const baseLines = splitLines(baseText)
+  const localLines = splitLines(localText)
+  const remoteLines = splitLines(remoteText)
+
+  // Fast paths
+  if ((localText ?? '').toString() === (remoteText ?? '').toString()) {
+    return { merged: (localText ?? '').toString(), hadConflict: false }
+  }
+  if ((baseText ?? '').toString() === (localText ?? '').toString()) {
+    return { merged: (remoteText ?? '').toString(), hadConflict: false }
+  }
+  if ((baseText ?? '').toString() === (remoteText ?? '').toString()) {
+    return { merged: (localText ?? '').toString(), hadConflict: false }
+  }
+
+  const localEdits = computeEdits(baseLines, localLines)
+  const remoteEdits = computeEdits(baseLines, remoteLines)
+
+  const m = mergeEdits(baseLines, localEdits, remoteEdits)
+  return { merged: m.lines.join('\n'), hadConflict: m.hadConflict }
+}

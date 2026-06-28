@@ -1,0 +1,566 @@
+/**
+ * PromptFactorService - 策略因子管理服务
+ * 
+ * 功能：
+ * 1. 动态拼装Prompt：根据场景标签从因子库组装完整Prompt
+ * 2. 因子CRUD：创建、读取、更新、删除因子
+ * 3. 执行日志记录：用于精准优化单个因子
+ * 4. 因子自优化：根据执行结果自动调整因子
+ */
+import { DB } from '@/utils/DB/DB.uts';
+
+// #ifdef APP-ANDROID
+//import { UTSJSONObject } from 'io.dcloud.uts';
+// #endif
+
+// ============ 类型定义 ============
+export type FactorType = 'instruction' | 'rule' | 'format' | 'error_correction';
+
+export type PromptFactor = {
+    id: number;
+    factor_type: FactorType;
+    scene_tag: string;
+    name: string;
+    content: string;
+    priority: number;
+    version: number;
+    success_count: number;
+    fail_count: number;
+    is_active: boolean;
+    metadata: string | null;
+    created_at: number;
+    updated_at: number;
+}
+
+export type AISkill = {
+    id: number;
+    skill_name: string;
+    display_name: string;
+    description: string;
+    keywords: string[];
+    handler_name: string;
+    parameters_schema: object | null;
+    examples: string[];
+    is_enabled: boolean;
+    priority: number;
+}
+
+export type FactorExecutionLog = {
+    factor_id: number;
+    scene_tag: string;
+    user_input: string;
+    ai_output: string;
+    is_success: boolean;
+    error_type: string | null;
+    feedback: string | null;
+    execution_time_ms: number;
+}
+
+export type AssembledPrompt = {
+    full_prompt: string;
+    used_factors: PromptFactor[];
+    scene_tag: string;
+}
+
+// 用于插入默认因子的内部类型
+type DefaultFactorEntry = {
+    type: FactorType;
+    scene: string;
+    name: string;
+    content: string;
+    priority: number;
+}
+
+// 用于插入默认技能的内部类型
+type DefaultSkillEntry = {
+    skill_name: string;
+    display_name: string;
+    description: string;
+    keywords: string;
+    handler_name: string;
+    parameters_schema: string;
+    examples: string;
+    priority: number;
+}
+
+// 技能匹配结果类型
+type SkillMatchResult = {
+    skill: AISkill;
+    score: number;
+}
+
+// 创建因子输入类型
+export type CreateFactorInput = {
+    factor_type: FactorType;
+    scene_tag: string;
+    name: string;
+    content: string;
+    priority: number;
+    is_active: boolean;
+    metadata: string | null;
+}
+
+// ============ 服务实现 ============
+export class PromptFactorService {
+    
+    private static readonly FACTOR_TYPE_ORDER: FactorType[] = ['instruction', 'rule', 'format', 'error_correction'];
+    
+    /**
+     * 初始化因子表（首次运行时调用）
+     */
+    static async initTables(): Promise<boolean> {
+        try {
+            // 创建 prompt_factors 表
+            await DB.exec(`
+                CREATE TABLE IF NOT EXISTS prompt_factors (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    factor_type TEXT NOT NULL,
+                    scene_tag TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    priority INTEGER DEFAULT 0,
+                    version INTEGER DEFAULT 1,
+                    success_count INTEGER DEFAULT 0,
+                    fail_count INTEGER DEFAULT 0,
+                    is_active INTEGER DEFAULT 1,
+                    metadata TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+            `, null);
+            
+            // 创建 ai_skills 表
+            await DB.exec(`
+                CREATE TABLE IF NOT EXISTS ai_skills (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    skill_name TEXT NOT NULL UNIQUE,
+                    display_name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    keywords TEXT,
+                    handler_name TEXT NOT NULL,
+                    parameters_schema TEXT,
+                    examples TEXT,
+                    is_enabled INTEGER DEFAULT 1,
+                    priority INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+            `, null);
+            
+            // 创建 factor_execution_logs 表
+            await DB.exec(`
+                CREATE TABLE IF NOT EXISTS factor_execution_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    factor_id INTEGER NOT NULL,
+                    scene_tag TEXT NOT NULL,
+                    user_input TEXT,
+                    ai_output TEXT,
+                    is_success INTEGER DEFAULT 1,
+                    error_type TEXT,
+                    feedback TEXT,
+                    execution_time_ms INTEGER,
+                    created_at INTEGER NOT NULL
+                )
+            `, null);
+            
+            // 插入默认因子
+            await PromptFactorService.insertDefaultFactors();
+            await PromptFactorService.insertDefaultSkills();
+            
+            return true;
+        } catch (e) {
+            console.error('[PromptFactorService] initTables failed:', e);
+            return false;
+        }
+    }
+    
+    /**
+     * 插入默认因子
+     */
+    private static async insertDefaultFactors(): Promise<void> {
+        const now = Date.now();
+        const defaults: DefaultFactorEntry[] = [
+            // 指令因子
+            { type: 'instruction', scene: 'general', name: '基础角色定义', content: '你是ZeMo智能助手，专注于帮助用户管理任务、时间和生活。', priority: 100 },
+            { type: 'instruction', scene: 'task_parse', name: '任务解析指令', content: '分析用户输入，识别其真实意图。如果用户想要完成某个目标，请识别可以使用的技能。', priority: 90 },
+            { type: 'instruction', scene: 'rest_assist', name: '休息辅助指令', content: '当用户表达需要休息时，主动推荐使用番茄钟或休息计时器。', priority: 90 },
+            // 规则因子
+            { type: 'rule', scene: 'general', name: 'RAG检索规则', content: '根据用户意图，从技能库中检索最匹配的技能。优先匹配关键词，其次匹配语义描述。', priority: 80 },
+            { type: 'rule', scene: 'rest_assist', name: '休息时长规则', content: '默认休息时间为5分钟。如用户明确指定时间（如10分钟），则使用用户指定的时间。', priority: 80 },
+            // 格式因子
+            { type: 'format', scene: 'general', name: '响应格式要求', content: '回复要简洁友好，不超过50字。执行操作后需确认已完成。', priority: 70 },
+            { type: 'format', scene: 'rest_assist', name: '休息响应格式', content: '休息提醒回复格式：先表达关心，再说明倒计时时长。如：好好休息，我X分钟后叫你。', priority: 70 },
+            // 纠错因子
+            { type: 'error_correction', scene: 'general', name: '避免重复执行', content: '不要对同一指令重复执行。如已创建任务/计时器，不要再次创建。', priority: 60 },
+            { type: 'error_correction', scene: 'general', name: '避免过度推断', content: '只执行用户明确要求的操作，不要自作主张添加额外功能。', priority: 60 }
+        ];
+        
+        for (const f of defaults) {
+            const exists = await DB.query(`SELECT id FROM prompt_factors WHERE name = ? AND scene_tag = ?`, [f.name, f.scene]);
+            if (exists.length === 0) {
+                await DB.exec(`
+                    INSERT INTO prompt_factors (factor_type, scene_tag, name, content, priority, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                `, [f.type, f.scene, f.name, f.content, f.priority, now, now]);
+            }
+        }
+    }
+    
+    /**
+     * 插入默认技能
+     */
+    private static async insertDefaultSkills(): Promise<void> {
+        const now = Date.now();
+        const skills: DefaultSkillEntry[] = [
+            {
+                skill_name: 'pomodoro_break',
+                display_name: '番茄钟休息',
+                description: '启动休息计时器，帮助用户放松休息一段时间后提醒',
+                keywords: '["休息", "放松", "歇一会", "累了", "番茄钟", "break"]',
+                handler_name: 'startBreakTimer',
+                parameters_schema: '{"durationMinutes": {"type": "number", "default": 5}}',
+                examples: '["我想休息10分钟", "让我歇会", "太累了想放松一下"]',
+                priority: 100
+            },
+            {
+                skill_name: 'pomodoro_focus',
+                display_name: '番茄钟专注',
+                description: '启动专注计时器，帮助用户集中注意力工作',
+                keywords: '["专注", "工作", "学习", "集中", "番茄钟", "focus", "pomodoro"]',
+                handler_name: 'startFocusTimer',
+                parameters_schema: '{"taskTitle": {"type": "string"}, "durationMinutes": {"type": "number", "default": 25}}',
+                examples: '["我要专注工作25分钟", "开始学习", "集中精力"]',
+                priority: 100
+            },
+            {
+                skill_name: 'task_create',
+                display_name: '创建任务',
+                description: '创建一个新的待办任务',
+                keywords: '["创建任务", "添加任务", "新建", "todo", "记一下"]',
+                handler_name: 'createTask',
+                parameters_schema: '{"title": {"type": "string", "required": true}, "description": {"type": "string"}}',
+                examples: '["创建任务买菜", "帮我记一下明天要开会"]',
+                priority: 90
+            }
+        ];
+        
+        for (const s of skills) {
+            const exists = await DB.query(`SELECT id FROM ai_skills WHERE skill_name = ?`, [s.skill_name]);
+            if (exists.length === 0) {
+                await DB.exec(`
+                    INSERT INTO ai_skills (skill_name, display_name, description, keywords, handler_name, parameters_schema, examples, priority, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `, [s.skill_name, s.display_name, s.description, s.keywords, s.handler_name, s.parameters_schema, s.examples, s.priority, now, now]);
+            }
+        }
+    }
+
+    // ============ 因子拼装 ============
+    
+    /**
+     * 根据场景标签动态拼装Prompt
+     * @param sceneTag 场景标签（如 rest_assist, task_parse）
+     * @param additionalContext 附加上下文（如用户输入、检索到的技能信息）
+     */
+    static async assemblePrompt(sceneTag: string, additionalContext: string = ''): Promise<AssembledPrompt> {
+        // 1. 获取通用因子 + 场景特定因子
+        const factors = await PromptFactorService.getFactorsForScene(sceneTag);
+        
+        // 2. 按类型和优先级排序
+        factors.sort((a, b) => {
+            const typeOrderA = PromptFactorService.FACTOR_TYPE_ORDER.indexOf(a.factor_type as FactorType);
+            const typeOrderB = PromptFactorService.FACTOR_TYPE_ORDER.indexOf(b.factor_type as FactorType);
+            if (typeOrderA !== typeOrderB) return typeOrderA - typeOrderB;
+            return b.priority - a.priority;
+        });
+        
+        // 3. 拼装Prompt
+        let promptParts: string[] = [];
+        
+        // 按类型分组拼装
+        const instructionFactors = factors.filter(f => f.factor_type === 'instruction');
+        const ruleFactors = factors.filter(f => f.factor_type === 'rule');
+        const formatFactors = factors.filter(f => f.factor_type === 'format');
+        const errorFactors = factors.filter(f => f.factor_type === 'error_correction');
+        
+        if (instructionFactors.length > 0) {
+            promptParts.push('【角色与指令】');
+            promptParts.push(...instructionFactors.map(f => f.content));
+        }
+        
+        if (ruleFactors.length > 0) {
+            promptParts.push('\n【执行规则】');
+            promptParts.push(...ruleFactors.map(f => `- ${f.content}`));
+        }
+        
+        if (formatFactors.length > 0) {
+            promptParts.push('\n【输出格式】');
+            promptParts.push(...formatFactors.map(f => `- ${f.content}`));
+        }
+        
+        if (errorFactors.length > 0) {
+            promptParts.push('\n【注意事项】');
+            promptParts.push(...errorFactors.map(f => `- ${f.content}`));
+        }
+        
+        if (additionalContext !== '') {
+            promptParts.push('\n【上下文信息】');
+            promptParts.push(additionalContext);
+        }
+        
+        return {
+            full_prompt: promptParts.join('\n'),
+            used_factors: factors,
+            scene_tag: sceneTag
+        };
+    }
+    
+    /**
+     * 获取指定场景的所有因子（包含通用因子）
+     */
+    static async getFactorsForScene(sceneTag: string): Promise<PromptFactor[]> {
+        const rows = await DB.query(`
+            SELECT * FROM prompt_factors 
+            WHERE is_active = 1 AND (scene_tag = ? OR scene_tag = 'general')
+            ORDER BY priority DESC
+        `, [sceneTag]);
+        
+        return rows.map(r => PromptFactorService.rowToFactor(r));
+    }
+    
+    /**
+     * 转换数据库行为PromptFactor对象
+     */
+    private static rowToFactor(row: Map<string, any | null>): PromptFactor {
+        return {
+            id: (row.get('id') ?? 0) as number,
+            factor_type: (row.get('factor_type') ?? 'instruction') as FactorType,
+            scene_tag: (row.get('scene_tag') ?? '') as string,
+            name: (row.get('name') ?? '') as string,
+            content: (row.get('content') ?? '') as string,
+            priority: (row.get('priority') ?? 0) as number,
+            version: (row.get('version') ?? 1) as number,
+            success_count: (row.get('success_count') ?? 0) as number,
+            fail_count: (row.get('fail_count') ?? 0) as number,
+            is_active: ((row.get('is_active') ?? 1) as number) === 1,
+            metadata: row.get('metadata') as string | null,
+            created_at: (row.get('created_at') ?? 0) as number,
+            updated_at: (row.get('updated_at') ?? 0) as number
+        };
+    }
+    
+    // ============ 技能检索 (增强版) ============
+    
+    /**
+     * 根据用户输入检索匹配的技能（增强版RAG）
+     * 结合关键词匹配、语义相似度和示例匹配
+     * @param userInput 用户输入文本
+     * @returns 匹配的技能列表
+     */
+    static async matchSkills(userInput: string): Promise<AISkill[]> {
+        const allSkills = await PromptFactorService.getAllSkills();
+        const inputLower = userInput.toLowerCase();
+        const inputChars = new Set(inputLower.split(''));
+        
+        // 增强关键词匹配
+        const matched: SkillMatchResult[] = [];
+        
+        for (const skill of allSkills) {
+            let score = 0;
+            
+            // 1. 精确关键词匹配 (高权重)
+            for (const kw of skill.keywords) {
+                const kwLower = kw.toLowerCase();
+                if (inputLower.includes(kwLower)) {
+                    score += 15;
+                    // 完整单词匹配额外加分
+                    if (inputLower === kwLower || inputLower.startsWith(kwLower + ' ') || 
+                        inputLower.endsWith(' ' + kwLower) || inputLower.includes(' ' + kwLower + ' ')) {
+                        score += 5;
+                    }
+                }
+            }
+            
+            // 2. 部分匹配 (中权重)
+            for (const kw of skill.keywords) {
+                const kwLower = kw.toLowerCase();
+                // 检查是否有部分重叠
+                if (kwLower.length > 2) {
+                    for (let i = 0; i <= inputLower.length - 2; i++) {
+                        const substr = inputLower.substring(i, i + 2);
+                        if (kwLower.includes(substr)) {
+                            score += 1;
+                        }
+                    }
+                }
+            }
+            
+            // 3. 描述字符重叠匹配
+            const descLower = skill.description.toLowerCase();
+            let descOverlap = 0;
+            for (const char of inputChars) {
+                if (descLower.includes(char) && char !== ' ') {
+                    descOverlap++;
+                }
+            }
+            score += Math.min(descOverlap, 5); // 最多5分
+            
+            // 4. 示例匹配 (高权重)
+            for (const ex of skill.examples) {
+                const exLower = ex.toLowerCase();
+                if (inputLower.includes(exLower) || exLower.includes(inputLower)) {
+                    score += 12;
+                }
+                // 模糊匹配
+                const exWords = exLower.split(/\s+/);
+                for (const word of exWords) {
+                    if (word.length > 2 && inputLower.includes(word)) {
+                        score += 3;
+                    }
+                }
+            }
+            
+            // 5. 意图关键词检测
+            const intentKeywords: Map<string, string[]> = new Map();
+            intentKeywords.set('休息', ['pomodoro_break']);
+            intentKeywords.set('歇', ['pomodoro_break']);
+            intentKeywords.set('累', ['pomodoro_break']);
+            intentKeywords.set('专注', ['pomodoro_focus']);
+            intentKeywords.set('工作', ['pomodoro_focus']);
+            intentKeywords.set('学习', ['pomodoro_focus']);
+            intentKeywords.set('创建', ['task_create']);
+            intentKeywords.set('添加', ['task_create']);
+            intentKeywords.set('任务', ['task_create']);
+            intentKeywords.set('记', ['task_create']);
+            
+            intentKeywords.forEach((skillNames, keyword) => {
+                if (inputLower.includes(keyword) && skillNames.includes(skill.skill_name)) {
+                    score += 8;
+                }
+            });
+            
+            if (score > 0) {
+                matched.push({ skill, score: score + skill.priority });
+            }
+        }
+        
+        // 按分数排序，取Top结果
+        matched.sort((a, b) => b.score - a.score);
+        return matched.map(m => m.skill);
+    }
+    
+    /**
+     * 获取所有启用的技能
+     */
+    static async getAllSkills(): Promise<AISkill[]> {
+        const rows = await DB.query(`
+            SELECT * FROM ai_skills WHERE is_enabled = 1 ORDER BY priority DESC
+        `, null);
+        
+        return rows.map(r => PromptFactorService.rowToSkill(r));
+    }
+    
+    private static rowToSkill(row: Map<string, any | null>): AISkill {
+        let keywords: string[] = [];
+        let examples: string[] = [];
+        let schema: object | null = null;
+        
+        // 解析 JSON 字符串为数组
+        const kwVal = row.get('keywords');
+        if (kwVal != null) {
+            const kwStr = kwVal as string;
+            // 简单解析: ["休息", "放松"] 格式
+            if (kwStr.startsWith('[') && kwStr.endsWith(']')) {
+                const inner = kwStr.substring(1, kwStr.length - 1);
+                if (inner.length > 0) {
+                    keywords = inner.split(',').map((s: string): string => {
+                        let trimmed = s.trim();
+                        if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+                            trimmed = trimmed.substring(1, trimmed.length - 1);
+                        }
+                        return trimmed;
+                    });
+                }
+            }
+        }
+        
+        const exVal = row.get('examples');
+        if (exVal != null) {
+            const exStr = exVal as string;
+            if (exStr.startsWith('[') && exStr.endsWith(']')) {
+                const inner = exStr.substring(1, exStr.length - 1);
+                if (inner.length > 0) {
+                    examples = inner.split(',').map((s: string): string => {
+                        let trimmed = s.trim();
+                        if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+                            trimmed = trimmed.substring(1, trimmed.length - 1);
+                        }
+                        return trimmed;
+                    });
+                }
+            }
+        }
+        
+        // schema 保持为 null，后续如需要可扩展
+        
+        return {
+            id: (row.get('id') ?? 0) as number,
+            skill_name: (row.get('skill_name') ?? '') as string,
+            display_name: (row.get('display_name') ?? '') as string,
+            description: (row.get('description') ?? '') as string,
+            keywords: keywords,
+            handler_name: (row.get('handler_name') ?? '') as string,
+            parameters_schema: schema,
+            examples: examples,
+            is_enabled: ((row.get('is_enabled') ?? 0) as number) === 1,
+            priority: (row.get('priority') ?? 0) as number
+        };
+    }
+    
+    // ============ 因子优化 ============
+    
+    /**
+     * 记录因子执行日志
+     */
+    static async logExecution(log: FactorExecutionLog): Promise<void> {
+        const now = Date.now();
+        await DB.exec(`
+            INSERT INTO factor_execution_logs (factor_id, scene_tag, user_input, ai_output, is_success, error_type, feedback, execution_time_ms, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [log.factor_id, log.scene_tag, log.user_input, log.ai_output, log.is_success ? 1 : 0, log.error_type, log.feedback, log.execution_time_ms, now]);
+        
+        // 更新因子统计
+        if (log.is_success) {
+            await DB.exec(`UPDATE prompt_factors SET success_count = success_count + 1 WHERE id = ?`, [log.factor_id]);
+        } else {
+            await DB.exec(`UPDATE prompt_factors SET fail_count = fail_count + 1 WHERE id = ?`, [log.factor_id]);
+        }
+    }
+    
+    /**
+     * 更新单个因子内容（精准优化）
+     */
+    static async updateFactor(factorId: number, newContent: string): Promise<boolean> {
+        const now = Date.now();
+        const ok = await DB.exec(`
+            UPDATE prompt_factors 
+            SET content = ?, version = version + 1, updated_at = ?
+            WHERE id = ?
+        `, [newContent, now, factorId]);
+        return ok;
+    }
+    
+    /**
+     * 创建新因子
+     */
+    static async createFactor(factor: CreateFactorInput): Promise<number> {
+        const now = Date.now();
+        await DB.exec(`
+            INSERT INTO prompt_factors (factor_type, scene_tag, name, content, priority, is_active, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [factor.factor_type, factor.scene_tag, factor.name, factor.content, factor.priority, factor.is_active ? 1 : 0, factor.metadata, now, now]);
+        
+        const result = await DB.query(`SELECT last_insert_rowid() as id`, null);
+        return result.length > 0 ? (result[0].get('id') ?? -1) as number : -1;
+    }
+}

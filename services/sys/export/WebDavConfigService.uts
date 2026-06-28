@@ -1,0 +1,114 @@
+import { type WebDavConfig } from '@/services/sys/export/WebDAVService.uts'
+
+export type WebDavCollabConfig = {
+  enabled: boolean
+  backupUrl: string
+  collabBaseUrl: string
+  username: string
+  password: string
+  webdavSyncFrequencyMinutes: number
+  localSyncEnabled: boolean
+  localSyncRootPath: string
+  localBackupFileUri: string
+  localSyncFileUri: string
+}
+
+export type RequireCollabConfigResult = {
+  ok: boolean
+  message: string
+  cfg: WebDavConfig | null
+  baseUrl: string
+}
+
+export class WebDavConfigService {
+  static load(): WebDavCollabConfig {
+    let enabled = false
+    let backupUrl = ''
+    let collabBaseUrl = ''
+    let username = ''
+    let password = ''
+    let webdavSyncFrequencyMinutes = 0
+    let localSyncEnabled = false
+    let localSyncRootPath = ''
+    let localBackupFileUri = ''
+    let localSyncFileUri = ''
+
+    try {
+      const en = uni.getStorageSync('webdav_enabled')
+      enabled = (en != null && en.toString() == '1')
+    } catch (_e0) { enabled = false }
+
+    try {
+      const u = uni.getStorageSync('webdav_url')
+      backupUrl = u != null ? u.toString() : ''
+    } catch (_e1) { backupUrl = '' }
+
+    try {
+      const b = uni.getStorageSync('webdav_collab_base_url')
+      collabBaseUrl = b != null ? b.toString() : ''
+    } catch (_e2) { collabBaseUrl = '' }
+
+    try {
+      const u2 = uni.getStorageSync('webdav_username')
+      username = u2 != null ? u2.toString() : ''
+    } catch (_e3) { username = '' }
+
+    try {
+      const p = uni.getStorageSync('webdav_password')
+      password = p != null ? p.toString() : ''
+    } catch (_e4) { password = '' }
+
+    try {
+      const f = uni.getStorageSync('webdav_sync_frequency_minutes')
+      const parsed = f != null ? parseInt(f.toString()) : 0
+      webdavSyncFrequencyMinutes = !isNaN(parsed) && parsed > 0 ? parsed : 0
+    } catch (_e5) { webdavSyncFrequencyMinutes = 0 }
+
+    try {
+      const en = uni.getStorageSync('local_sync_enabled')
+      localSyncEnabled = (en != null && en.toString() == '1')
+    } catch (_e6) { localSyncEnabled = false }
+
+    try {
+      const p = uni.getStorageSync('local_sync_root_path')
+      localSyncRootPath = p != null ? p.toString() : ''
+    } catch (_e7) { localSyncRootPath = '' }
+
+    try {
+      const p = uni.getStorageSync('local_sync_backup_file_uri')
+      localBackupFileUri = p != null ? p.toString() : ''
+    } catch (_e8) { localBackupFileUri = '' }
+
+    try {
+      const p = uni.getStorageSync('local_sync_week_file_uri')
+      localSyncFileUri = p != null ? p.toString() : ''
+    } catch (_e9) { localSyncFileUri = '' }
+
+    return { enabled, backupUrl, collabBaseUrl, username, password, webdavSyncFrequencyMinutes, localSyncEnabled, localSyncRootPath, localBackupFileUri, localSyncFileUri } as WebDavCollabConfig
+  }
+
+  static requireCollabConfig(): RequireCollabConfigResult {
+    const c = WebDavConfigService.load()
+    if (!c.enabled) return { ok: false, message: '未启用 WebDAV 同步', cfg: null, baseUrl: '' }
+    if (c.username.toString().trim() == '') return { ok: false, message: 'WebDAV 用户名为空，请先配置', cfg: null, baseUrl: '' }
+    if (c.collabBaseUrl.toString().trim() == '') return { ok: false, message: 'WebDAV 协同目录 URL 为空，请先配置', cfg: null, baseUrl: '' }
+
+    const cfg: WebDavConfig = { url: '', username: c.username, password: c.password }
+    return { ok: true, message: 'ok', cfg, baseUrl: c.collabBaseUrl.toString() }
+  }
+
+  static normalizeBaseUrl(url: string): string {
+    let u = (url ?? '').toString().trim()
+    while (u.endsWith('/')) u = u.substring(0, u.length - 1)
+    return u
+  }
+
+  static buildNoteUrl(baseUrl: string, noteId: string): string {
+    const b = WebDavConfigService.normalizeBaseUrl(baseUrl)
+    return `${b}/notes/${noteId}.md`
+  }
+
+  static buildLockUrl(noteUrl: string): string {
+    return `${noteUrl}.lock`
+  }
+}

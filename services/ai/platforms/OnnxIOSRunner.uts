@@ -1,0 +1,17 @@
+// // #ifdef APP-IOS
+// // TODO: 引入 ONNX Runtime iOS Framework 并在此调用
+// // #endif
+
+// export class OnnxIOSRunner {
+// 	static async inferTask(_text: string, _scene: string = 'task'): Promise<string | null> {
+// 		// #ifdef APP-IOS
+// 		// TODO: 使用 ORTSession/ORTEnv 推理，并返回 JSON 字符串
+// 		return null
+// 		// #endif
+
+// 		// #ifndef APP-IOS
+// 		return null
+// 		// #endif
+// 	}
+// }
+	

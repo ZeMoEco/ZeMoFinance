@@ -1,0 +1,158 @@
+<template>
+	<scroll-view 
+		class="spring-scroll-view" 
+		direction="vertical" 
+		:scroll-y="scrollEnabled"
+		:show-scrollbar="false"
+		:bounces="false" 
+		:refresher-enabled="refresherEnabled && scrollEnabled" 
+		refresher-background="transparent" 
+		:refresher-triggered="(refresherEnabled && scrollEnabled) ? refreshing : false" 
+		@refresherrefresh="onRefresh" 
+		@scrolltolower="onScrollToLower" 
+		@scroll="onScroll" 
+		@touchstart="onTouchStart" 
+		@touchmove="onTouchMove" 
+		@touchend="onTouchEnd" 
+		@touchcancel="onTouchEnd">
+
+		<!-- 顶部隐形占位 -->
+		<view slot="refresher" class="refresher-slot"></view>
+
+		<!-- 内容包裹层 -->
+		<!-- 【关键修复】min-height 设为 100% + 1px，强制 scroll-view 认为内容可滚动，
+		     从而在短列表时也能触发 scrolltolower -->
+		<view class="bounce-content" :style="bounceStyle">
+			<slot></slot>
+			<!-- 底部安全垫片 -->
+			<view class="bottom-spacer"></view>
+		</view>
+
+	</scroll-view>
+</template>
+
+<script lang="uts">
+	export default {
+		name: "SpringScrollView",
+		emits: ['refresh', 'scrolltolower'],
+		props: {
+			refreshing: {
+				type: Boolean,
+				default: false
+			},
+			refresherEnabled: {
+				type: Boolean,
+				default: true
+			},
+			scrollEnabled: {
+				type: Boolean,
+				default: true
+			}
+		},
+		data() {
+			return {
+				isAtBottom: false,
+				lastScrollTop: 0,
+				
+				startY: 0,
+				currentY: 0,
+				bounceDelta: 0,
+				isTouching: false,
+			}
+		},
+		computed: {
+			bounceStyle() : string {
+				const transition = this.isTouching ? 'none' : 'transform 0.5s cubic-bezier(0.25, 0.46, 0.45, 0.94)';
+				const transform = this.bounceDelta != 0 ? `translateY(${this.bounceDelta}px)` : 'none';
+				return `transform: ${transform}; transition: ${transition};`;
+			}
+		},
+		methods: {
+			onRefresh() {
+				if (!(this.refresherEnabled as boolean) || !(this.scrollEnabled as boolean)) return
+				this.$emit('refresh');
+			},
+
+			onScroll(e : ScrollEvent) {
+				if (!(this.scrollEnabled as boolean)) return
+				const currentTop = e.detail.scrollTop;
+				// 如果向上滚动超过 5px，说明离开了底部
+				if (currentTop < this.lastScrollTop - 5) {
+					this.isAtBottom = false;
+				}
+				this.lastScrollTop = currentTop;
+			},
+
+			onScrollToLower() {
+				if (!(this.scrollEnabled as boolean)) return
+				// 触底时标记状态
+				this.isAtBottom = true;
+				this.$emit('scrolltolower');
+			},
+
+			onTouchStart(e : TouchEvent) {
+				if (!(this.scrollEnabled as boolean)) return
+				this.isTouching = true;
+				this.startY = e.touches[0].clientY;
+				this.currentY = this.startY;
+			},
+
+			onTouchMove(e : TouchEvent) {
+				if (!(this.scrollEnabled as boolean)) return
+				this.currentY = e.touches[0].clientY;
+				const diff = this.currentY - this.startY;
+
+				// 逻辑优化：
+				// 1. 如果 isAtBottom 为 true，允许上拉回弹
+				// 2. 如果列表非常短（scrollTop几乎为0），且是向上拉(diff < 0)，也允许回弹
+				//    (这解决了短列表初始加载没触发 scrolltolower 导致无法回弹的问题)
+				
+				const isShortList = this.lastScrollTop < 5; 
+				
+				if ((this.isAtBottom || isShortList) && diff < 0) {
+					// 阻尼计算
+					this.bounceDelta = diff * 0.4; 
+				}
+			},
+
+			onTouchEnd() {
+				if (!(this.scrollEnabled as boolean)) return
+				this.isTouching = false;
+				if (this.bounceDelta != 0) {
+					this.bounceDelta = 0;
+				}
+				// 注意：这里不重置 isAtBottom，交由 onScroll 判断
+			}
+		}
+	}
+</script>
+
+<style>
+	.spring-scroll-view {
+		width: 100%;
+		height: 100%;
+		flex: 1;
+		overflow: hidden;
+	}
+
+	.refresher-slot {
+		width: 100%;
+		height: 0px;
+	}
+
+	.bounce-content {
+		width: 100%;
+		display: flex;
+		flex-direction: column;
+		/* 兜底：保持最小高度，结合底部 spacer 触发滚动检测 */
+		min-height: 1px;
+		padding-bottom: 1px;
+	}
+
+	.bottom-spacer {
+		width: 100%;
+		height: 40px;
+		/* 防止垫片压缩 */
+		flex-shrink: 0; 
+	}
+</style>

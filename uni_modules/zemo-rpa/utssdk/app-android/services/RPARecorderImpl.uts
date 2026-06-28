@@ -1,0 +1,22 @@
+// uni_modules/zemo-rpa/utssdk/app-android/services/RPARecorderImpl.uts
+import Context from 'android.content.Context';
+import { initGlobalInputListener } from './GlobalInputListener.uts';
+
+export class RPARecorderImpl {
+
+    /**
+     * 检查录制所需权限
+     */
+    static checkPermissions() : boolean {
+        // 省略 具体检查逻辑，通常依赖 Native API
+        return true; 
+    }
+
+    /**
+     * 初始化环境
+     */
+      static init(context: any) {
+        // Android specific initialization if needed
+        initGlobalInputListener();
+     }
+}

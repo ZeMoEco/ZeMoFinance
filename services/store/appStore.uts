@@ -1,0 +1,101 @@
+import { reactive } from 'vue';
+import { Node, MaskEdgeType } from '../../utils/types/index.uts';
+
+// 定义内存响应式中枢的数据结构
+type AppState = {
+  // 1. 活跃图实体的内存缓存 (Key: Node UUID)
+  // 当 NodeService 从数据库拉取了节点后推入此 Map。
+  // UI 列表只需 v-for 此集合，修改某一项时底层无需重建整个列表。
+  activeNodes: Map<string, Node>;
+
+  // 2. 节点面具聚合视图 (Key: Node UUID -> 内部 Map<MaskType, Properties>)
+  // 专门解决“修改状态卡全屏闪烁”的问题。单一组件只绑定自己所在 id 的 masks。
+  nodeMasks: Map<string, Map<MaskEdgeType, string>>;
+};
+
+// ==========================================
+// 唯一的全局内存数据仓库：Vue3 Reactive 驱动
+// ==========================================
+export const appState = reactive<AppState>({
+  activeNodes: new Map<string, Node>(),
+  nodeMasks: new Map<string, Map<MaskEdgeType, string>>()
+} as AppState);
+
+/**
+ * 状态集线器引擎 (AppStore)
+ * 【核心职责】：将图网络（SQLite）的数据变迁，平滑折射到 UI 层。
+ * 【约束】：这是所有 UI 组件订阅数据的唯一真理源 (Single Source of Truth)。
+ * 彻底替换低效的 global $emit 或 uni.$on 广播体系。
+ */
+export class AppStore {
+  
+  // -------------------------
+  // 实体 (Node) 靶向投递
+  // -------------------------
+
+  /**
+   * 靶向投递单一核心节点
+   * 当数据库进行 updateNodeContent 后调用此行为，UI对应的 <text> 瞬间靶向更新
+   */
+  public static setNode(node: Node) {
+    appState.activeNodes.set(node.id, node);
+  }
+
+  /**
+   * 批量将数据库推演出的实体挂载至内存响应区
+   */
+  public static setNodes(nodes: Node[]) {
+    for(let i = 0; i < nodes.length; i++) {
+        const n = nodes[i];
+        appState.activeNodes.set(n.id, n);
+    }
+  }
+
+  /**
+   * 靶向剿灭：节点于物理层消亡后，内存同步摘除，组件自动销毁
+   */
+  public static deleteNode(nodeId: string) {
+    appState.activeNodes.delete(nodeId);
+    appState.nodeMasks.delete(nodeId);
+  }
+
+
+  // -------------------------
+  // 面具 (Mask / Edge) 靶向透传
+  // -------------------------
+
+  /**
+   * 为内存中的卡片戴上/更换 面具配置
+   * 组件层如果使用了 computed(() => appState.nodeMasks.get(id)?.get(HAS_STATUS))
+   * 那么此处仅用一行 set 代码，就能精准点亮前端唯一那张卡片的状态图标。
+   */
+  public static setNodeMask(nodeId: string, maskType: MaskEdgeType, properties: string) {
+    let masks = appState.nodeMasks.get(nodeId);
+    if (masks == null) {
+      masks = new Map<MaskEdgeType, string>();
+      appState.nodeMasks.set(nodeId, masks);
+    }
+    masks.set(maskType, properties);
+  }
+
+  /**
+   * 摘除内存中的面具属性
+   */
+  public static removeNodeMask(nodeId: string, maskType: MaskEdgeType) {
+    const masks = appState.nodeMasks.get(nodeId);
+    if (masks != null) {
+      masks.delete(maskType);
+    }
+  }
+
+  /**
+   * 便捷读取：从内存仓库直接提取组件所需的面具参数（不产生数据库 IO）
+   */
+  public static getNodeMask(nodeId: string, maskType: MaskEdgeType): string | null {
+    const masks = appState.nodeMasks.get(nodeId);
+    if (masks != null) {
+      return masks.get(maskType) as string | null;
+    }
+    return null;
+  }
+}

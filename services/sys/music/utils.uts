@@ -1,0 +1,23 @@
+export function extractQQPlaylistId(input: string): string {
+    // If it's just numbers, assume it's an ID
+    if (/^\d+$/.test(input)) {
+        return input;
+    }
+
+    // Try to match id param
+    const idMatch = input.match(/[?&]id=(\d+)/);
+    if (idMatch != null && idMatch.length > 1) {
+        return idMatch[1] ?? "";
+    }
+
+    // Try to match /playlist/id
+    const playlistMatch = input.match(/\/playlist\/(\d+)/);
+    if (playlistMatch != null && playlistMatch.length > 1) {
+        return playlistMatch[1] ?? "";
+    }
+
+    // Try to match taoge.html?id=
+    // Covered by first regex
+
+    return "";
+}

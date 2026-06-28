@@ -1,0 +1,394 @@
+// services/sys/music/PluginExecutor.uts
+
+// #ifdef APP-ANDROID
+import UTSAndroid from "io.dcloud.uts.UTSAndroid";
+import Context from 'android.content.Context';
+import WebView from 'android.webkit.WebView';
+import WebViewClient from 'android.webkit.WebViewClient';
+import WebResourceRequest from 'android.webkit.WebResourceRequest';
+import WebResourceError from 'android.webkit.WebResourceError';
+import WebSettings from 'android.webkit.WebSettings';
+import JavascriptInterface from 'android.webkit.JavascriptInterface';
+import Handler from 'android.os.Handler';
+import Looper from 'android.os.Looper';
+// #endif
+
+// #ifdef APP-ANDROID
+import { UTSJSONObject } from 'io.dcloud.uts';
+// #endif
+
+// #ifdef APP-IOS
+import { WKWebView, WKScriptMessageHandler, WKUserContentController, WKScriptMessage, WKWebViewConfiguration } from 'WebKit';
+import { NSObject, CGRect } from 'Foundation';
+// #endif
+
+// =================================================================================================
+// 1. 坚如磐石的沙盒 HTML
+// =================================================================================================
+const sandboxHtml = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>HeadlessService</title>
+</head>
+<body>
+<script>
+  window.onerror = function(msg, url, line) {
+    if(window.AndroidBridge) window.AndroidBridge.onMessage(JSON.stringify({ type: 'log', data: "❌ JS Crash: " + msg + " at line " + line }));
+  };
+
+  function sendToNative(payload) {
+    try {
+      const json = JSON.stringify(payload);
+      if(window.AndroidBridge) window.AndroidBridge.onMessage(json);
+      else if(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.NativeBridge) {
+        window.webkit.messageHandlers.NativeBridge.postMessage(json);
+      }
+    } catch(e) { console.error(e); }
+  }
+
+  window.nativeLog = function(msg) { sendToNative({ type: 'log', data: msg }); };
+  window.nativeEmit = function(reqId, status, data) { sendToNative({ type: 'cmd_callback', reqId: reqId, status: status, data: data }); };
+
+  nativeLog("System: JS Environment Init...");
+
+  const pendingHttp = {};
+  window.handleHttpResponse = function(reqId, response) {
+    const task = pendingHttp[reqId];
+    if (!task) return;
+    delete pendingHttp[reqId];
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      task.resolve({ data: response.data, status: response.statusCode, headers: response.header });
+    } else {
+      task.reject(new Error("Http Error: " + response.statusCode + " " + (response.errMsg || "")));
+    }
+  };
+
+  function coreRequest(config) {
+    return new Promise((resolve, reject) => {
+      const reqId = "http_" + Date.now() + "_" + Math.floor(Math.random() * 10000);
+      pendingHttp[reqId] = { resolve, reject };
+      if (typeof config === 'string') config = { url: config };
+       
+      sendToNative({ 
+        type: 'http_request', 
+        reqId: reqId, 
+        data: { 
+          url: config.url, 
+          method: config.method || 'GET', 
+          headers: config.headers || {}, 
+          data: config.data || null 
+        } 
+      });
+      
+      // JS端超时保护 (20s)
+      setTimeout(() => {
+        if(pendingHttp[reqId]) {
+            delete pendingHttp[reqId];
+            reject(new Error("Network Timeout (JS Side)"));
+        }
+      }, 20000);
+    });
+  }
+
+  const mockAxios = function(config) { return coreRequest(config); };
+  mockAxios.get = function(url, config) { return coreRequest(Object.assign({}, config, { method: 'GET', url: url })); };
+  mockAxios.post = function(url, data, config) { return coreRequest(Object.assign({}, config, { method: 'POST', url: url, data: data })); };
+  mockAxios.create = function() { return mockAxios; };
+  mockAxios.default = mockAxios;
+
+  var module = { exports: {} };
+  var exports = module.exports;
+  window.require = function(moduleName) { 
+    if (moduleName === 'axios') return mockAxios; 
+    if (moduleName === 'crypto-js') return {}; 
+    if (moduleName === 'he') return { decode: function(s){return s;} }; 
+    return {}; 
+  };
+
+  window.handleNativeCommand = async function(payload) {
+    try {
+      nativeLog("JS: 收到命令 " + payload.action);
+
+      if (payload.script) {
+        module = { exports: {} }; exports = module.exports;
+        try {
+          eval(payload.script);
+          window.currentPlugin = module.exports;
+        } catch(e) {
+          throw new Error("脚本执行错误: " + e.message);
+        }
+      }
+
+      if (!window.currentPlugin) throw new Error("插件未初始化");
+
+      if (payload.action === 'run_search') {
+        const query = payload.query;
+        const page = payload.page || 1;
+        if (!window.currentPlugin.search) throw new Error("无 search 方法");
+         
+        const res = await window.currentPlugin.search(query, page, 'music');
+        nativeEmit(payload.reqId, 'success', res);
+      } 
+      else if (payload.action === 'get_media') {
+        if (!window.currentPlugin.getMediaSource) throw new Error("无 getMediaSource 方法");
+        nativeLog("JS: 执行 getMediaSource...");
+        const res = await window.currentPlugin.getMediaSource(payload.song, 'standard');
+        nativeLog("JS: getMediaSource 完成");
+        nativeEmit(payload.reqId, 'success', res);
+      }
+      else if (payload.action === 'get_lyric') {
+         if (window.currentPlugin.getLyric) {
+           const res = await window.currentPlugin.getLyric(payload.song);
+           nativeEmit(payload.reqId, 'success', res);
+         } else {
+           nativeEmit(payload.reqId, 'error', "不支持歌词");
+         }
+      }
+
+    } catch (err) {
+      nativeLog("JS Error: " + err.message);
+      nativeEmit(payload.reqId, 'error', err.message);
+    }
+  };
+   
+  nativeLog("System: JS Service Ready");
+</script>
+</body>
+</html>
+`;
+
+// =================================================================================================
+// 2. 桥接与原生实现
+// =================================================================================================
+
+function handleJsMessage(jsonStr: string) {
+  // #ifdef APP-ANDROID
+  try {
+    const msg = JSON.parse(jsonStr) as UTSJSONObject;
+    const typeVal = msg.get('type');
+    const type = typeVal != null ? typeVal.toString() : '';
+
+    if (type == 'log') {
+      const logData = msg.get('data');
+      console.log(" [JS Service]:", logData);
+    } 
+    else if (type == 'http_request') {
+      const reqIdVal = msg.get('reqId');
+      const reqId = reqIdVal != null ? reqIdVal.toString() : '';
+      const config = msg.get('data') as UTSJSONObject;
+      doNativeRequest(reqId, config);
+    } 
+    else if (type == 'cmd_callback') {
+      const reqIdVal = msg.get('reqId');
+      const reqId = reqIdVal != null ? reqIdVal.toString() : '';
+      const callback = _callbackMap.get(reqId);
+      if (callback != null) {
+        callback(msg);
+      }
+    }
+  } catch (e) {
+    console.error("Bridge Parse Error", e);
+  }
+  // #endif
+}
+
+function doNativeRequest(reqId: string, config: UTSJSONObject) {
+  // #ifdef APP-ANDROID
+  try {
+    const urlVal = config.get('url');
+    const url = urlVal != null ? urlVal.toString() : '';
+    if (url == '' || (!url.startsWith('http') && !url.startsWith('https'))) {
+         const errObj = new UTSJSONObject();
+         errObj.set('statusCode', 0);
+         errObj.set('errMsg', 'Invalid URL: ' + url);
+         evalJS(`handleHttpResponse('${reqId}', ${JSON.stringify(errObj)})`);
+         return;
+    }
+    
+    const methodVal = config.get('method');
+    let method = methodVal != null ? methodVal.toString().toUpperCase() : 'GET';
+    const headersVal = config.get('headers');
+    const headers = headersVal != null ? (headersVal as UTSJSONObject) : new UTSJSONObject();
+    const data = config.get('data');
+
+    uni.request({
+      url: url,
+      method: method,
+      header: headers,
+      data: data,
+      success: (res) => {
+        const resObj = new UTSJSONObject();
+        resObj.set('statusCode', res.statusCode);
+        resObj.set('data', res.data);
+        resObj.set('header', res.header);
+        evalJS(`handleHttpResponse('${reqId}', ${JSON.stringify(resObj)})`);
+      },
+      fail: (err) => {
+        console.error(`❌ Net Error [${url}]`, err);
+        const resObj = new UTSJSONObject();
+        resObj.set('statusCode', 0);
+        resObj.set('errMsg', err.errMsg);
+        evalJS(`handleHttpResponse('${reqId}', ${JSON.stringify(resObj)})`);
+      }
+    });
+  } catch (e) {
+     console.error("Critical Native Request Error", e);
+     const resObj = new UTSJSONObject();
+     resObj.set('statusCode', 0);
+     resObj.set('errMsg', "Native Exception");
+     evalJS(`handleHttpResponse('${reqId}', ${JSON.stringify(resObj)})`);
+  }
+  // #endif
+}
+
+function evalJS(jsCode: string) {
+  // #ifdef APP-ANDROID
+  new Handler(Looper.getMainLooper()).post(() => {
+    if (_headlessWebView != null) {
+        (_headlessWebView as WebView).evaluateJavascript(jsCode, null);
+    } else {
+        console.warn("⚠️ evalJS called but WebView is null");
+    }
+  });
+  // #endif
+}
+
+// =================================================================================================
+// 3. Android 桥接类
+// =================================================================================================
+// #ifdef APP-ANDROID
+class AndroidBridge {
+  @JavascriptInterface
+  public onMessage(msg : string) : void {
+    handleJsMessage(msg);
+  }
+}
+// #endif
+
+// #ifdef APP-IOS
+class IOSBridge extends NSObject implements WKScriptMessageHandler {
+  public userContentController(uc : WKUserContentController, msg : WKScriptMessage) : void {
+    let s = msg.body instanceof String ? msg.body as string : JSON.stringify(msg.body);
+    handleJsMessage(s);
+  }
+}
+// #endif
+
+// =================================================================================================
+// 4. 全局状态与导出
+// =================================================================================================
+let _headlessWebView : any | null = null;
+let _isWebViewReady = false; 
+const _pendingQueue : Array<string> = []; 
+
+type BridgeCallback = (data: any) => void;
+const _callbackMap = new Map<string, BridgeCallback>();
+
+export function initPluginExecutor() {
+  // #ifdef APP-ANDROID
+  new Handler(Looper.getMainLooper()).post(() => {
+    try {
+      if (_headlessWebView != null) return;
+
+      const context = UTSAndroid.getAppContext();
+      if (context == null) return;
+
+      const wv = new WebView(context);
+      _headlessWebView = wv;
+      _isWebViewReady = false; 
+
+      const settings = wv.getSettings();
+      settings.setJavaScriptEnabled(true);
+      settings.setDomStorageEnabled(true);
+      settings.setBlockNetworkImage(true); 
+      settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+
+      wv.addJavascriptInterface(new AndroidBridge(), "AndroidBridge");
+            
+      // 【修复关键点】WebViewClient() 必须加括号调用构造函数
+      wv.setWebViewClient(new class extends WebViewClient() {
+        override onPageFinished(view: WebView | null, url: string | null) {
+          super.onPageFinished(view, url);
+          console.log("✅ [WebView] 引擎就绪 (onPageFinished)");
+          _isWebViewReady = true;
+          
+          while(_pendingQueue.length > 0) {
+             const js = _pendingQueue.shift();
+             if (js != null) {
+                 console.log(" 执行积压指令");
+                 view?.evaluateJavascript(js, null);
+             }
+          }
+        }
+        override onReceivedError(view: WebView | null, request: WebResourceRequest | null, error: WebResourceError | null) {
+          let errDesc = "Unknown Error";
+          if (error != null) errDesc = error.getDescription().toString();
+          console.error("❌ [WebView] 加载出错: " + errDesc);
+        }
+      });
+      
+      wv.loadDataWithBaseURL("file:///android_asset/", sandboxHtml, "text/html", "utf-8", null);
+      console.log(" [PluginExecutor] Android Service Initializing...");
+    } catch (e) {
+      console.error("❌ Init Failed", e);
+    }
+  });
+  // #endif
+}
+
+// #ifdef APP-ANDROID
+export function executePluginCommand(commandObj: UTSJSONObject): Promise<any> {
+    return new Promise((resolve, reject) => {
+        const reqId = "cmd_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
+        commandObj["reqId"] = reqId;
+
+        _callbackMap.set(reqId, (res: any) => {
+            const result = res as UTSJSONObject;
+            const status = result['status'] as string;
+
+            if (status == 'success') {
+                let successData = result['data'];
+                if (successData == null) successData = new UTSJSONObject();
+                resolve(successData);
+            } else {
+                const errData = result['data'];
+                const errMsg = (errData != null) ? `${errData}` : "Unknown Error";
+                reject(new Error(errMsg));
+            }
+            _callbackMap.delete(reqId);
+        });
+
+        const jsonStr = JSON.stringify(commandObj);
+        const jsCode = `handleNativeCommand(${jsonStr})`;
+
+        if (_isWebViewReady && _headlessWebView != null) {
+            evalJS(jsCode);
+        } else {
+            console.log("⏳ WebView 未就绪，指令加入队列: " + (commandObj['action'] ?? "unknown"));
+            _pendingQueue.push(jsCode);
+            if (_headlessWebView == null) {
+                initPluginExecutor();
+            }
+        }
+
+        setTimeout(() => {
+            if (_callbackMap.has(reqId)) {
+                console.warn(`⚠️ Command Timeout: ${commandObj['action']} (Ready: ${_isWebViewReady})`);
+                reject(new Error("Execution Timeout (WebView Ready: " + _isWebViewReady + ")"));
+                _callbackMap.delete(reqId);
+            }
+        }, 15000);
+    });
+}
+// #endif
+
+// #ifndef APP-ANDROID
+/* eslint-disable @typescript-eslint/no-unused-vars */
+export function executePluginCommand(commandObj : any) : Promise<any> {
+	return new Promise((_, reject) => {
+		reject(new Error("Plugin execution only supported on Android"));
+	});
+}
+// #endif

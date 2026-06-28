@@ -1,0 +1,1822 @@
+import { DB, SqlArgs } from '@/utils/DB/DB.uts';
+import { AttachmentService } from '../graph/AttachmentService.uts';
+import { genId } from '@/utils/common/id.uts';
+import { DBInit } from '@/utils/DB/DBInit.uts';
+import { FINANCE_HOME_PENDING_TRANSACTION_CHANGE_KEY } from '@/utils/constant.uts';
+
+export type AccountNode = {
+  id: string;
+  book_id: string;
+  name: string;
+  type: string;
+  balance: number;
+  currency: string;
+  created_at: number;
+  // 资产分类扩展字段
+  category: string;          // 'cash' | 'investment' | 'credit' | 'heavy'
+  provider: string;          // 发卡机构 / 提供商
+  card_no: string;           // 卡号 / 账户尾号 (accounts.card_no)
+  include_in_total: boolean; // 是否计入总资产
+  code: string;              // 投资标的代码 (基金/股票代码)
+  sub_type: string;          // 子类型 (基金/股票/ETF/储蓄卡/信用卡 等)
+  profit_rate: number;       // 收益率 (%)
+  profit_amount: number;     // 本次行情涨跌额
+  market_value: number;      // 当前市值 (投资类)
+  units: number;             // 持有份额/股数
+  latest_nav: number;        // 最新净值/价格
+  estimate_nav: number;      // 估算净值/价格
+  quote_time: string;        // 行情时间
+  data_source: string;       // 行情来源
+  credit_limit: number;      // 授信额度 (信贷类)
+  credit_kind: string;       // 信贷类型: credit_card | borrowed | lent | other
+  installment_total: number; // 分期原始总额
+  installment_count: number; // 分期期数
+  installment_paid: number;  // 已还期数
+  installment_due_day: number; // 每月还款日
+  installment_next_due_at: number; // 下次还款时间戳
+};
+
+/**
+ * 新增/编辑资产账户载荷
+ */
+export type AssetAccountPayload = {
+  name: string;
+  category: string;          // 'cash' | 'investment' | 'credit' | 'heavy'
+  balance: number;
+  book_id?: string | null;
+  provider?: string | null;
+  card_no?: string | null;
+  include_in_total?: boolean | null;
+  code?: string | null;
+  sub_type?: string | null;
+  profit_rate?: number | null;
+  profit_amount?: number | null;
+  market_value?: number | null;
+  units?: number | null;
+  latest_nav?: number | null;
+  estimate_nav?: number | null;
+  quote_time?: string | null;
+  data_source?: string | null;
+  credit_limit?: number | null;
+  credit_kind?: string | null;
+  installment_total?: number | null;
+  installment_count?: number | null;
+  installment_paid?: number | null;
+  installment_due_day?: number | null;
+  installment_next_due_at?: number | null;
+};
+
+export type BookNode = {
+  id: string;
+  name: string;
+  is_default: number;
+  created_at: number;
+};
+
+export type TransactionMount = {
+  id: string;
+  account_id: string;
+  account_name?: string | null;
+  amount: number;
+  type: string;
+  category: string | null;
+  description: string | null;
+  location: string | null;
+  transaction_time: number;
+  created_at: number;
+  balance_snapshot: number;
+  properties?: string | null;
+};
+
+export type CreateTransactionForNodesPayload = {
+  account_id: string;
+  amount: number;
+  type: string;
+  category: string;
+  description?: string | null;
+  location?: string | null;
+  transaction_time?: number | null;
+  source_node_id?: string | null;
+  item_node_id?: string | null;
+  location_node_id?: string | null;
+  properties?: string | null;
+  receipt_paths?: string[];
+};
+
+export type CreditDebtEventPayload = {
+  credit_account_id: string;
+  fund_account_id?: string | null;
+  amount: number;
+  action: string; // card | borrow | lend
+  category: string;
+  description?: string | null;
+  location?: string | null;
+  transaction_time?: number | null;
+  linked_transaction_id?: string | null;
+  properties?: string | null;
+};
+
+export type UpdateTransactionPayload = {
+  account_id?: string | null;
+  amount?: number;
+  type?: string;
+  category?: string | null;
+  description?: string | null;
+  location?: string | null;
+  transaction_time?: number | null;
+  source_node_id?: string | null;
+  item_node_id?: string | null;
+  location_node_id?: string | null;
+  properties?: string | null;
+};
+
+/**
+ * 财务与资金资产业务逻辑 (FinanceBiz)
+ *
+ * 节点/关系分层约定:
+ * 1) Nodes: 账户实体 (AccountNode)
+ * 2) Relational: 账户列表与归属拓扑 (当前前端场景使用扁平拓扑)
+ * 3) Mounting: 交易流水挂载到账户节点 (TransactionMount)
+ */
+export class FinanceBiz {
+  static readonly DEFAULT_BOOK_ID: string = 'book_default';
+  static readonly BOOK_NODE_TYPE: string = 'BOOK';
+  static readonly BOOK_EDGE_RELATION: string = 'CONTAINS_ACCOUNT';
+  private static didBookGraphInit: boolean = false;
+
+  // 资产分类
+  static readonly CATEGORY_CASH: string = 'cash';
+  static readonly CATEGORY_INVESTMENT: string = 'investment';
+  static readonly CATEGORY_CREDIT: string = 'credit';
+  static readonly CATEGORY_HEAVY: string = 'heavy';
+
+  static readonly CREDIT_KIND_CARD: string = 'credit_card';
+  static readonly CREDIT_KIND_BORROWED: string = 'borrowed';
+  static readonly CREDIT_KIND_LENT: string = 'lent';
+  static readonly CREDIT_KIND_OTHER: string = 'other';
+
+  private static markPendingTransactionChange(): void {
+    try {
+      uni.setStorageSync(FINANCE_HOME_PENDING_TRANSACTION_CHANGE_KEY, Date.now().toString());
+    } catch (_e) {}
+  }
+
+  private static nextEdgeId(): string {
+    return genId('edge');
+  }
+
+  private static nextAccountId(): string {
+    return genId('acc');
+  }
+
+  private static nextBookId(): string {
+    return genId('book');
+  }
+
+  private static nextTransactionId(): string {
+    return genId('fin');
+  }
+
+  private static nextTransferLinkId(): string {
+    return genId('finlink');
+  }
+
+  private static mapRowsToBooks(rows: Array<Map<string, any | null>>): BookNode[] {
+    return rows.map((row): BookNode => {
+      const propsRaw = row.get('properties')?.toString() ?? '';
+      let isDefault = 0;
+      if (propsRaw != '') {
+        try {
+          // Avoid UTSJSONObject dependency; parse flag from raw JSON string.
+          const normalized = propsRaw.replace(/\s/g, '');
+          if (normalized.indexOf('"is_default":1') >= 0) {
+            isDefault = 1;
+          }
+        } catch (_e) {}
+      }
+      return {
+        id: row.get('id')?.toString() ?? FinanceBiz.DEFAULT_BOOK_ID,
+        name: row.get('content')?.toString() ?? '日常账本',
+        is_default: isDefault,
+        created_at: parseInt(row.get('created_at')?.toString() ?? '0')
+      };
+    });
+  }
+
+  private static normalizeAccountCategory(category: string | null): string {
+    const c = (category ?? '').toString().trim();
+    if (c == FinanceBiz.CATEGORY_INVESTMENT) return FinanceBiz.CATEGORY_INVESTMENT;
+    if (c == FinanceBiz.CATEGORY_CREDIT) return FinanceBiz.CATEGORY_CREDIT;
+    if (c == FinanceBiz.CATEGORY_HEAVY) return FinanceBiz.CATEGORY_HEAVY;
+    return FinanceBiz.CATEGORY_CASH;
+  }
+
+  private static inferDefaultCategory(type: string, name: string = '', provider: string = '', subType: string = ''): string {
+    const text = `${type} ${name} ${provider} ${subType}`;
+    if (
+      text.includes('信用') ||
+      text.includes('信贷') ||
+      text.includes('贷款') ||
+      text.includes('欠款') ||
+      text.includes('借款') ||
+      text.includes('负债') ||
+      text.includes('授信') ||
+      text.includes('花呗') ||
+      text.includes('借呗') ||
+      text.includes('白条') ||
+      text.includes('债')
+    ) return FinanceBiz.CATEGORY_CREDIT;
+    if (
+      text.includes('基金') ||
+      text.includes('股票') ||
+      text.includes('投资') ||
+      text.includes('理财') ||
+      text.includes('证券') ||
+      text.includes('持仓') ||
+      text.includes('ETF') ||
+      text.includes('etf') ||
+      text.includes('净值') ||
+      text.includes('份额') ||
+      text.includes('账户现金')
+    ) return FinanceBiz.CATEGORY_INVESTMENT;
+    if (
+      text.includes('重资产') ||
+      text.includes('固定资产') ||
+      text.includes('房') ||
+      text.includes('车')
+    ) return FinanceBiz.CATEGORY_HEAVY;
+    return FinanceBiz.CATEGORY_CASH;
+  }
+
+  static normalizeCreditKind(kind: string | null, subType: string = ''): string {
+    const raw = (kind ?? '').toString().trim();
+    if (raw == FinanceBiz.CREDIT_KIND_CARD) return FinanceBiz.CREDIT_KIND_CARD;
+    if (raw == FinanceBiz.CREDIT_KIND_BORROWED) return FinanceBiz.CREDIT_KIND_BORROWED;
+    if (raw == FinanceBiz.CREDIT_KIND_LENT) return FinanceBiz.CREDIT_KIND_LENT;
+    if (raw == FinanceBiz.CREDIT_KIND_OTHER) return FinanceBiz.CREDIT_KIND_OTHER;
+    const text = subType.trim();
+    if (text.indexOf('别人欠我') >= 0 || text.indexOf('借给别人') >= 0 || text.indexOf('借出') >= 0 || text.indexOf('应收') >= 0) return FinanceBiz.CREDIT_KIND_LENT;
+    if (text.indexOf('欠别人') >= 0 || text.indexOf('借入') >= 0 || text.indexOf('欠款') >= 0) return FinanceBiz.CREDIT_KIND_BORROWED;
+    if (text.indexOf('信用卡') >= 0) return FinanceBiz.CREDIT_KIND_CARD;
+    return FinanceBiz.CREDIT_KIND_CARD;
+  }
+
+  static isInstallmentCreditAccount(acc: AccountNode): boolean {
+    if (acc.category != FinanceBiz.CATEGORY_CREDIT) return false;
+    const kind = FinanceBiz.normalizeCreditKind(acc.credit_kind, acc.sub_type);
+    return kind == FinanceBiz.CREDIT_KIND_CARD && acc.installment_count > 0;
+  }
+
+  static isReceivableCreditAccount(acc: AccountNode): boolean {
+    if (acc.category != FinanceBiz.CATEGORY_CREDIT) return false;
+    return FinanceBiz.normalizeCreditKind(acc.credit_kind, acc.sub_type) == FinanceBiz.CREDIT_KIND_LENT;
+  }
+
+  private static mapRowToAccount(row: Map<string, any | null>, mappedBookId: string): AccountNode {
+    const type = row.get('type')?.toString() ?? '一般';
+    const name = row.get('name')?.toString() ?? '未命名';
+    const categoryRaw = row.get('category')?.toString() ?? '';
+    let category = categoryRaw != '' ? FinanceBiz.normalizeAccountCategory(categoryRaw) : FinanceBiz.inferDefaultCategory(type, name);
+    let hasStoredCategory = categoryRaw != '';
+    let provider = '';
+    let cardNo = row.get('card_no')?.toString() ?? '';
+    let includeInTotal = true;
+    let code = '';
+    let subType = '';
+    let profitRate = 0.0;
+    let profitAmount = 0.0;
+    let marketValue = 0.0;
+    let units = 0.0;
+    let latestNav = 0.0;
+    let estimateNav = 0.0;
+    let quoteTime = '';
+    let dataSource = '';
+    let creditLimit = 0.0;
+    let creditKind = '';
+    let installmentTotal = 0.0;
+    let installmentCount = 0;
+    let installmentPaid = 0;
+    let installmentDueDay = 0;
+    let installmentNextDueAt = 0;
+
+    const propsRaw = row.get('properties')?.toString() ?? '';
+    if (propsRaw != '') {
+      try {
+        const obj = JSON.parse(propsRaw) as UTSJSONObject;
+        const c = obj.get('category');
+        if (!hasStoredCategory && c != null && c.toString() != '') {
+          category = FinanceBiz.normalizeAccountCategory(c.toString());
+          hasStoredCategory = true;
+        }
+        const p = obj.get('provider');
+        if (p != null) provider = p.toString();
+        const inc = obj.get('include_in_total');
+        if (inc != null) includeInTotal = (inc.toString() == 'true' || inc.toString() == '1');
+        const cd = obj.get('code');
+        if (cd != null) code = cd.toString();
+        const st = obj.get('sub_type');
+        if (st != null) subType = st.toString();
+        const pr = obj.get('profit_rate');
+        if (pr != null) { const v = parseFloat(pr.toString()); if (!isNaN(v)) profitRate = v; }
+        const pa = obj.get('profit_amount');
+        if (pa != null) { const v = parseFloat(pa.toString()); if (!isNaN(v)) profitAmount = v; }
+        const mv = obj.get('market_value');
+        if (mv != null) { const v = parseFloat(mv.toString()); if (!isNaN(v)) marketValue = v; }
+        const un = obj.get('units');
+        if (un != null) { const v = parseFloat(un.toString()); if (!isNaN(v)) units = v; }
+        const nav = obj.get('latest_nav');
+        if (nav != null) { const v = parseFloat(nav.toString()); if (!isNaN(v)) latestNav = v; }
+        const enav = obj.get('estimate_nav');
+        if (enav != null) { const v = parseFloat(enav.toString()); if (!isNaN(v)) estimateNav = v; }
+        const qt = obj.get('quote_time');
+        if (qt != null) quoteTime = qt.toString();
+        const ds = obj.get('data_source');
+        if (ds != null) dataSource = ds.toString();
+        const cl = obj.get('credit_limit');
+        if (cl != null) { const v = parseFloat(cl.toString()); if (!isNaN(v)) creditLimit = v; }
+        const ck = obj.get('credit_kind');
+        if (ck != null) creditKind = ck.toString();
+        const it = obj.get('installment_total');
+        if (it != null) { const v = parseFloat(it.toString()); if (!isNaN(v)) installmentTotal = v; }
+        const ic = obj.get('installment_count');
+        if (ic != null) { const v = parseInt(ic.toString()); if (!isNaN(v)) installmentCount = v; }
+        const ip = obj.get('installment_paid');
+        if (ip != null) { const v = parseInt(ip.toString()); if (!isNaN(v)) installmentPaid = v; }
+        const iday = obj.get('installment_due_day');
+        if (iday != null) { const v = parseInt(iday.toString()); if (!isNaN(v)) installmentDueDay = v; }
+        const ind = obj.get('installment_next_due_at');
+        if (ind != null) { const v = parseInt(ind.toString()); if (!isNaN(v)) installmentNextDueAt = v; }
+      } catch (_e) {}
+    }
+
+    if (!hasStoredCategory) {
+      category = FinanceBiz.inferDefaultCategory(type, name, provider, subType);
+    }
+    creditKind = category == FinanceBiz.CATEGORY_CREDIT ? FinanceBiz.normalizeCreditKind(creditKind, subType) : '';
+
+    const rawBalance = parseFloat(row.get('balance')?.toString() ?? '0');
+    const balance = FinanceBiz.normalizeAccountBalanceForCategory(category, rawBalance);
+
+    return {
+      id: row.get('id')?.toString() ?? '',
+      book_id: mappedBookId == '' ? FinanceBiz.DEFAULT_BOOK_ID : mappedBookId,
+      name: name,
+      type: type,
+      balance: balance,
+      currency: row.get('currency')?.toString() ?? 'CNY',
+      created_at: parseInt(row.get('created_at')?.toString() ?? '0'),
+      category: category,
+      provider: provider,
+      card_no: cardNo,
+      include_in_total: includeInTotal,
+      code: code,
+      sub_type: subType,
+      profit_rate: profitRate,
+      profit_amount: profitAmount,
+      market_value: marketValue,
+      units: units,
+      latest_nav: latestNav,
+      estimate_nav: estimateNav,
+      quote_time: quoteTime,
+      data_source: dataSource,
+      credit_limit: creditLimit,
+      credit_kind: creditKind,
+      installment_total: installmentTotal,
+      installment_count: installmentCount,
+      installment_paid: installmentPaid,
+      installment_due_day: installmentDueDay,
+      installment_next_due_at: installmentNextDueAt
+    } as AccountNode;
+  }
+
+  private static buildAccountProps(payload: AssetAccountPayload): string {
+    const obj = new UTSJSONObject();
+    const category = FinanceBiz.normalizeAccountCategory(payload.category);
+    obj.set('category', category);
+    obj.set('provider', payload.provider ?? '');
+    obj.set('include_in_total', (payload.include_in_total ?? true));
+    obj.set('code', payload.code ?? '');
+    obj.set('sub_type', payload.sub_type ?? '');
+    obj.set('profit_rate', payload.profit_rate ?? 0.0);
+    obj.set('profit_amount', payload.profit_amount ?? 0.0);
+    obj.set('market_value', payload.market_value ?? 0.0);
+    obj.set('units', payload.units ?? 0.0);
+    obj.set('latest_nav', payload.latest_nav ?? 0.0);
+    obj.set('estimate_nav', payload.estimate_nav ?? 0.0);
+    obj.set('quote_time', payload.quote_time ?? '');
+    obj.set('data_source', payload.data_source ?? '');
+    obj.set('credit_limit', payload.credit_limit ?? 0.0);
+    obj.set('credit_kind', category == FinanceBiz.CATEGORY_CREDIT ? FinanceBiz.normalizeCreditKind(payload.credit_kind ?? '', payload.sub_type ?? '') : '');
+    obj.set('installment_total', category == FinanceBiz.CATEGORY_CREDIT ? (payload.installment_total ?? 0.0) : 0.0);
+    obj.set('installment_count', category == FinanceBiz.CATEGORY_CREDIT ? (payload.installment_count ?? 0) : 0);
+    obj.set('installment_paid', category == FinanceBiz.CATEGORY_CREDIT ? (payload.installment_paid ?? 0) : 0);
+    obj.set('installment_due_day', category == FinanceBiz.CATEGORY_CREDIT ? (payload.installment_due_day ?? 0) : 0);
+    obj.set('installment_next_due_at', category == FinanceBiz.CATEGORY_CREDIT ? (payload.installment_next_due_at ?? 0) : 0);
+    return JSON.stringify(obj);
+  }
+
+  private static async ensureDefaultBook(userId: number): Promise<string> {
+    if (userId <= 0) return FinanceBiz.DEFAULT_BOOK_ID;
+    if (!FinanceBiz.didBookGraphInit) {
+      await this.migrateLegacyBooksToGraph();
+      FinanceBiz.didBookGraphInit = true;
+    }
+
+    const rows = await DB.query(
+      'SELECT id FROM nodes WHERE id = ? AND type = ? AND is_deleted = 0 LIMIT 1',
+      [FinanceBiz.DEFAULT_BOOK_ID, FinanceBiz.BOOK_NODE_TYPE]
+    );
+    if (rows.length > 0) return FinanceBiz.DEFAULT_BOOK_ID;
+
+    const now = Date.now();
+    const props = JSON.stringify({ is_default: 1, scope: 'finance_book' });
+    const ok = await DB.exec(
+      'INSERT INTO nodes (id, type, status, content, properties, due_at, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [FinanceBiz.DEFAULT_BOOK_ID, FinanceBiz.BOOK_NODE_TYPE, 'active', '日常账本', props, null, now, now, 0]
+    );
+    if (!ok) return FinanceBiz.DEFAULT_BOOK_ID;
+    return FinanceBiz.DEFAULT_BOOK_ID;
+  }
+
+  private static async ensureBookNode(bookId: string, bookName: string, isDefault: number = 0): Promise<void> {
+    const id = (bookId ?? '').toString().trim() == '' ? FinanceBiz.DEFAULT_BOOK_ID : bookId;
+    const existing = await DB.query('SELECT id FROM nodes WHERE id = ? AND type = ? AND is_deleted = 0 LIMIT 1', [id, FinanceBiz.BOOK_NODE_TYPE]);
+    if (existing.length > 0) return;
+    const now = Date.now();
+    const props = JSON.stringify({ is_default: isDefault, scope: 'finance_book' });
+    await DB.exec(
+      'INSERT INTO nodes (id, type, status, content, properties, due_at, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [id, FinanceBiz.BOOK_NODE_TYPE, 'active', bookName, props, null, now, now, 0]
+    );
+  }
+
+  private static async ensureBookEdge(bookId: string, accountId: string): Promise<void> {
+    if (bookId == '' || accountId == '') return;
+    const existing = await DB.query(
+      'SELECT id FROM edges WHERE source_id = ? AND target_id = ? AND relation_type = ? AND is_deleted = 0 LIMIT 1',
+      [bookId, accountId, FinanceBiz.BOOK_EDGE_RELATION]
+    );
+    if (existing.length > 0) return;
+    const now = Date.now();
+    const edgeId = this.nextEdgeId();
+    await DB.exec(
+      'INSERT OR REPLACE INTO edges (id, source_id, target_id, relation_type, rank, properties, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [edgeId, bookId, accountId, FinanceBiz.BOOK_EDGE_RELATION, '500', '', now, now, 0]
+    );
+  }
+
+  private static async migrateLegacyBooksToGraph(): Promise<void> {
+    try {
+      await this.ensureBookNode(FinanceBiz.DEFAULT_BOOK_ID, '日常账本', 1);
+
+      const legacyBookTable = await DB.query("SELECT name FROM sqlite_master WHERE type='table' AND name='books' LIMIT 1");
+      if (legacyBookTable.length > 0) {
+        const legacyBooks = await DB.query('SELECT id, name, is_default FROM books WHERE is_deleted = 0 ORDER BY created_at ASC');
+        for (let i = 0; i < legacyBooks.length; i++) {
+          const id = legacyBooks[i].get('id')?.toString() ?? '';
+          const name = legacyBooks[i].get('name')?.toString() ?? '账本';
+          const isDefault = parseInt(legacyBooks[i].get('is_default')?.toString() ?? '0');
+          if (id != '') {
+            await this.ensureBookNode(id, name, isNaN(isDefault) ? 0 : isDefault);
+          }
+        }
+      }
+
+      const cols = await DB.query('PRAGMA table_info(accounts)');
+      let hasBookId = false;
+      for (let i = 0; i < cols.length; i++) {
+        const n = cols[i].get('name')?.toString() ?? '';
+        if (n == 'book_id') {
+          hasBookId = true;
+          break;
+        }
+      }
+
+      if (hasBookId) {
+        const rows = await DB.query('SELECT id, book_id FROM accounts WHERE is_deleted = 0');
+        for (let i = 0; i < rows.length; i++) {
+          const aid = rows[i].get('id')?.toString() ?? '';
+          const bidRaw = rows[i].get('book_id')?.toString() ?? '';
+          const bid = bidRaw == '' ? FinanceBiz.DEFAULT_BOOK_ID : bidRaw;
+          if (aid == '') continue;
+          await this.ensureBookNode(bid, bid == FinanceBiz.DEFAULT_BOOK_ID ? '日常账本' : bid, bid == FinanceBiz.DEFAULT_BOOK_ID ? 1 : 0);
+          await this.ensureBookEdge(bid, aid);
+        }
+      } else {
+        const rows = await DB.query('SELECT id FROM accounts WHERE is_deleted = 0');
+        for (let i = 0; i < rows.length; i++) {
+          const aid = rows[i].get('id')?.toString() ?? '';
+          if (aid == '') continue;
+          await this.ensureBookEdge(FinanceBiz.DEFAULT_BOOK_ID, aid);
+        }
+      }
+
+      if (legacyBookTable.length > 0) {
+        await DB.exec('DROP TABLE IF EXISTS books');
+      }
+    } catch (_e) {
+      // keep runtime tolerant; default book creation still happens downstream.
+    }
+  }
+
+  private static inferReceiptName(filePath: string, index: number): string {
+    const parts = filePath.split(/\\|\//);
+    const fallback = `receipt_${index + 1}`;
+    if (parts.length == 0) return fallback;
+    const candidate = parts[parts.length - 1];
+    return candidate.length > 0 ? candidate : fallback;
+  }
+
+  private static mapRowsToTransactions(rows: Array<Map<string, any | null>>): TransactionMount[] {
+    return rows.map((row): TransactionMount => {
+      const rawAmount = parseFloat(row.get("amount")?.toString() ?? "0");
+      const rawType = row.get("type")?.toString() ?? "expense";
+      return {
+        id: row.get("id")?.toString() ?? "",
+        account_id: row.get("account_id")?.toString() ?? "",
+        account_name: row.get("account_name")?.toString() ?? null,
+        amount: FinanceBiz.normalizeStoredAmount(rawAmount),
+        type: FinanceBiz.normalizeTransactionTypeForAmount(rawType, rawAmount),
+        category: row.get("category")?.toString() ?? null,
+        description: row.get("description")?.toString() ?? null,
+        location: row.get("location")?.toString() ?? null,
+        transaction_time: parseInt(row.get("transaction_time")?.toString() ?? "0"),
+        created_at: parseInt(row.get("created_at")?.toString() ?? "0"),
+        balance_snapshot: parseFloat(row.get("balance_snapshot")?.toString() ?? "0"),
+        properties: row.get("properties")?.toString() ?? null
+      };
+    });
+  }
+
+  private static normalizeTransactionType(rawType: string): string {
+    const t = (rawType ?? '').toString().trim().toLowerCase();
+    return t == 'income' ? 'income' : 'expense';
+  }
+
+  private static normalizeTransactionTypeForAmount(rawType: string, amount: number): string {
+    if (!isNaN(amount) && amount < 0) return 'expense';
+    return FinanceBiz.normalizeTransactionType(rawType);
+  }
+
+  private static normalizeStoredAmount(amount: number): number {
+    if (isNaN(amount)) return 0.0;
+    return Math.abs(amount);
+  }
+
+  private static normalizeAccountBalanceForCategory(category: string, balance: number): number {
+    if (isNaN(balance)) return 0.0;
+    const normalizedCategory = FinanceBiz.normalizeAccountCategory(category);
+    if (normalizedCategory == FinanceBiz.CATEGORY_CREDIT) return Math.abs(balance);
+    return balance;
+  }
+
+  private static calculateBalanceDelta(type: string, amount: number): number {
+    return this.calculateBalanceDeltaForCategory(FinanceBiz.CATEGORY_CASH, type, amount);
+  }
+
+  private static calculateBalanceDeltaForCategory(category: string, type: string, amount: number): number {
+    const normalizedType = this.normalizeTransactionType(type);
+    const val = this.normalizeStoredAmount(amount);
+    if (FinanceBiz.normalizeAccountCategory(category) == FinanceBiz.CATEGORY_CREDIT) {
+      return normalizedType == 'income' ? -val : val;
+    }
+    return normalizedType == 'income' ? val : -val;
+  }
+
+  private static roundMoney(value: number): number {
+    if (isNaN(value)) return 0.0;
+    return Math.round(value * 100.0) / 100.0;
+  }
+
+  private static roundRate(value: number): number {
+    if (isNaN(value)) return 0.0;
+    return Math.round(value * 10000.0) / 10000.0;
+  }
+
+  private static roundUnits(value: number): number {
+    if (isNaN(value) || value <= 0.0) return 0.0;
+    return Math.round(value * 10000.0) / 10000.0;
+  }
+
+  private static async ensurePrimaryUserId(): Promise<number> {
+    try {
+      return await DBInit.ensurePrimaryUserId();
+    } catch (_e) {
+      return 0;
+    }
+  }
+
+  // Node APIs
+  static async listAccountNodes(bookId: string | null = null): Promise<AccountNode[]> {
+    await this.ensureDefaultBook(await FinanceBiz.ensurePrimaryUserId());
+    let sql = "SELECT a.*, (SELECT e.source_id FROM edges e WHERE e.target_id = a.id AND e.relation_type = ? AND e.is_deleted = 0 LIMIT 1) AS mapped_book_id FROM accounts a WHERE a.is_deleted = 0";
+    const args = [FinanceBiz.BOOK_EDGE_RELATION] as SqlArgs;
+    if (bookId != null && bookId != '') {
+      sql += ' AND EXISTS (SELECT 1 FROM edges e2 WHERE e2.source_id = ? AND e2.target_id = a.id AND e2.relation_type = ? AND e2.is_deleted = 0)';
+      args.push(bookId);
+      args.push(FinanceBiz.BOOK_EDGE_RELATION);
+    }
+    sql += ' ORDER BY a.created_at ASC';
+    const results = await DB.query(sql, args);
+
+    return results.map((row): AccountNode => {
+      const mapped = row.get('mapped_book_id')?.toString() ?? '';
+      return FinanceBiz.mapRowToAccount(row, mapped);
+    });
+  }
+
+  static async getAccountNode(id: string): Promise<AccountNode | null> {
+    const sql = "SELECT a.*, (SELECT e.source_id FROM edges e WHERE e.target_id = a.id AND e.relation_type = ? AND e.is_deleted = 0 LIMIT 1) AS mapped_book_id FROM accounts a WHERE a.id = ? AND a.is_deleted = 0";
+    const results = await DB.query(sql, [FinanceBiz.BOOK_EDGE_RELATION, id]);
+    if (results.length == 0) return null;
+
+    const row = results[0];
+    const mapped = row.get('mapped_book_id')?.toString() ?? '';
+    return FinanceBiz.mapRowToAccount(row, mapped);
+  }
+
+  static async createAccountNode(name: string, type: string, initialBalance: number, bookId: string | null = null): Promise<boolean> {
+    const userId = await FinanceBiz.ensurePrimaryUserId();
+    if (userId <= 0) return false;
+    const defaultBookId = await this.ensureDefaultBook(userId);
+    const targetBookId = (bookId != null && bookId != '') ? bookId : defaultBookId;
+
+    const now = Date.now();
+    const id = this.nextAccountId();
+    const safeType = (type ?? '').toString().trim() == '' ? '现金' : type;
+    try {
+      await DB.beginTransaction();
+      const category = FinanceBiz.inferDefaultCategory(safeType, name);
+      const safeBalance = FinanceBiz.normalizeAccountBalanceForCategory(category, initialBalance);
+      const sql = "INSERT INTO accounts (id, user_id, name, type, balance, currency, category, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+      const args: SqlArgs = [id, userId, name, safeType, safeBalance, "CNY", category, now, now];
+      const ok = await DB.exec(sql, args);
+      if (!ok) throw new Error('create account failed');
+
+      const edgeId = this.nextEdgeId();
+      const eok = await DB.exec(
+        'INSERT OR REPLACE INTO edges (id, source_id, target_id, relation_type, rank, properties, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [edgeId, targetBookId, id, FinanceBiz.BOOK_EDGE_RELATION, '500', '', now, now, 0]
+      );
+      if (!eok) throw new Error('map account book failed');
+
+      await DB.setTransactionSuccessful();
+      return true;
+    } catch (e) {
+      console.error(`[FinanceBiz] createAccountNode failed: ${e}`);
+      return false;
+    } finally {
+      await DB.endTransaction();
+    }
+  }
+
+  private static deriveTypeLabel(category: string, subType: string): string {
+    const st = (subType ?? '').trim();
+    if (st != '') return st;
+    if (category == FinanceBiz.CATEGORY_INVESTMENT) return '投资';
+    if (category == FinanceBiz.CATEGORY_CREDIT) return '信贷';
+    if (category == FinanceBiz.CATEGORY_HEAVY) return '重资产';
+    return '现金';
+  }
+
+  /**
+   * 新增资产账户 (支持 资金/投资/信贷/重资产 四类, 携带扩展属性)
+   */
+  static async createAssetAccount(payload: AssetAccountPayload): Promise<string | null> {
+    const userId = await FinanceBiz.ensurePrimaryUserId();
+    if (userId <= 0) return null;
+    const name = (payload.name ?? '').trim();
+    if (name == '') return null;
+
+    const defaultBookId = await this.ensureDefaultBook(userId);
+    const targetBookId = (payload.book_id != null && payload.book_id != '') ? payload.book_id! : defaultBookId;
+    const category = FinanceBiz.normalizeAccountCategory(payload.category);
+    const typeLabel = FinanceBiz.deriveTypeLabel(category, payload.sub_type ?? '');
+    const safeBalance = FinanceBiz.normalizeAccountBalanceForCategory(category, payload.balance);
+    const props = FinanceBiz.buildAccountProps(payload);
+
+    const now = Date.now();
+    const id = this.nextAccountId();
+    try {
+      await DB.beginTransaction();
+      const sql = "INSERT INTO accounts (id, user_id, name, type, balance, currency, category, card_no, properties, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+      const args: SqlArgs = [id, userId, name, typeLabel, safeBalance, "CNY", category, (payload.card_no ?? '').trim(), props, now, now];
+      const ok = await DB.exec(sql, args);
+      if (!ok) throw new Error('create asset account failed');
+
+      const edgeId = this.nextEdgeId();
+      const eok = await DB.exec(
+        'INSERT OR REPLACE INTO edges (id, source_id, target_id, relation_type, rank, properties, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [edgeId, targetBookId, id, FinanceBiz.BOOK_EDGE_RELATION, '500', '', now, now, 0]
+      );
+      if (!eok) throw new Error('map account book failed');
+
+      await DB.setTransactionSuccessful();
+      return id;
+    } catch (e) {
+      console.error(`[FinanceBiz] createAssetAccount failed: ${e}`);
+      return null;
+    } finally {
+      await DB.endTransaction();
+    }
+  }
+
+  /**
+   * 更新资产账户 (名称/余额/扩展属性)
+   */
+  static async updateAssetAccount(id: string, payload: AssetAccountPayload): Promise<boolean> {
+    if (id == '') return false;
+    const name = (payload.name ?? '').trim();
+    if (name == '') return false;
+    const category = FinanceBiz.normalizeAccountCategory(payload.category);
+    const typeLabel = FinanceBiz.deriveTypeLabel(category, payload.sub_type ?? '');
+    const safeBalance = FinanceBiz.normalizeAccountBalanceForCategory(category, payload.balance);
+    const props = FinanceBiz.buildAccountProps(payload);
+    const userId = await FinanceBiz.ensurePrimaryUserId();
+    const defaultBookId = userId > 0 ? await this.ensureDefaultBook(userId) : FinanceBiz.DEFAULT_BOOK_ID;
+    const targetBookId = (payload.book_id != null && payload.book_id != '') ? payload.book_id! : defaultBookId;
+    const now = Date.now();
+    try {
+      await DB.beginTransaction();
+      const sql = "UPDATE accounts SET name = ?, type = ?, balance = ?, category = ?, card_no = ?, properties = ?, updated_at = ? WHERE id = ? AND is_deleted = 0";
+      const args: SqlArgs = [name, typeLabel, safeBalance, category, (payload.card_no ?? '').trim(), props, now, id];
+      const ok = await DB.exec(sql, args);
+      if (!ok) throw new Error('update asset account failed');
+
+      const delOk = await DB.exec(
+        'UPDATE edges SET is_deleted = 1, updated_at = ? WHERE target_id = ? AND relation_type = ? AND is_deleted = 0',
+        [now, id, FinanceBiz.BOOK_EDGE_RELATION]
+      );
+      if (!delOk) throw new Error('clear old book relation failed');
+
+      const edgeId = this.nextEdgeId();
+      const addOk = await DB.exec(
+        'INSERT OR REPLACE INTO edges (id, source_id, target_id, relation_type, rank, properties, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [edgeId, targetBookId, id, FinanceBiz.BOOK_EDGE_RELATION, '500', '', now, now, 0]
+      );
+      if (!addOk) throw new Error('add new book relation failed');
+
+      await DB.setTransactionSuccessful();
+      return true;
+    } catch (e) {
+      console.error(`[FinanceBiz] updateAssetAccount failed: ${e}`);
+      return false;
+    } finally {
+      await DB.endTransaction();
+    }
+  }
+
+  static async recordInvestmentHoldingSnapshot(
+    accountId: string,
+    amount: number,
+    units: number,
+    nav: number,
+    quoteTime: string,
+    description: string
+  ): Promise<string | null> {
+    if (accountId == '') return null;
+    const val = Math.abs(amount);
+    if (val <= 0) return null;
+    const now = Date.now();
+    const id = this.nextTransactionId();
+    const props = JSON.stringify({
+      units: units,
+      nav: nav,
+      quote_time: quoteTime,
+      source: 'investment_holding_snapshot'
+    });
+    const ok = await DB.exec(
+      `INSERT INTO transactions (id, account_id, amount, type, category, description, transaction_time, created_at, updated_at, balance_snapshot, properties)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, accountId, val, 'income', '初始持仓', description, now, now, now, val, props]
+    );
+    return ok ? id : null;
+  }
+
+  static async updateInvestmentQuote(accountId: string, quotePayload: AssetAccountPayload): Promise<boolean> {
+    if (accountId == '') return false;
+    const current = await this.getAccountNode(accountId);
+    if (current == null) return false;
+    let nextBalance = current.balance;
+    let units = current.units;
+    const requestedUnits = quotePayload.units ?? 0.0;
+    if (units <= 0 && requestedUnits > 0) units = requestedUnits;
+    const estimate = quotePayload.estimate_nav ?? current.estimate_nav;
+    const nav = quotePayload.latest_nav ?? current.latest_nav;
+    const price = estimate > 0 ? estimate : nav;
+    if (units <= 0 && current.balance > 0 && price > 0) {
+      units = FinanceBiz.roundUnits(current.balance / price);
+    }
+    let profitAmount = 0.0;
+    let profitRate = quotePayload.profit_rate ?? current.profit_rate;
+    if (units > 0 && price > 0) {
+      const currentUnitPrice = current.balance > 0 ? current.balance / units : (current.estimate_nav > 0 ? current.estimate_nav : current.latest_nav);
+      if (currentUnitPrice > 0) {
+        profitAmount = FinanceBiz.roundMoney((price - currentUnitPrice) * units);
+        profitRate = FinanceBiz.roundRate(((price - currentUnitPrice) / currentUnitPrice) * 100.0);
+        nextBalance = FinanceBiz.roundMoney(current.balance + profitAmount);
+      } else {
+        nextBalance = FinanceBiz.roundMoney(units * price);
+      }
+    }
+    const payload = {
+      name: quotePayload.name != '' ? quotePayload.name : current.name,
+      category: current.category,
+      balance: nextBalance,
+      book_id: current.book_id,
+      provider: current.provider,
+      card_no: current.card_no,
+      include_in_total: current.include_in_total,
+      code: current.code,
+      sub_type: current.sub_type,
+      profit_rate: profitRate,
+      profit_amount: profitAmount,
+      market_value: nextBalance,
+      units: units,
+      latest_nav: nav,
+      estimate_nav: estimate,
+      quote_time: quotePayload.quote_time ?? current.quote_time,
+      data_source: quotePayload.data_source ?? current.data_source,
+      credit_limit: current.credit_limit
+    } as AssetAccountPayload;
+    return await this.updateAssetAccount(accountId, payload);
+  }
+
+  private static async findInvestmentCashAccount(provider: string): Promise<AccountNode | null> {
+    const target = provider.trim() == '' ? '默认账户' : provider.trim();
+    const accounts = await this.listAccountNodes(null);
+    for (let i = 0; i < accounts.length; i++) {
+      const acc = accounts[i];
+      if (acc.category != FinanceBiz.CATEGORY_INVESTMENT) continue;
+      if (acc.sub_type != '账户现金') continue;
+      const name = acc.provider.trim() == '' ? '默认账户' : acc.provider.trim();
+      if (name == target) return acc;
+    }
+    return null;
+  }
+
+  private static async ensureInvestmentCashAccount(provider: string, bookId: string, includeInTotal: boolean, initialBalance: number): Promise<AccountNode | null> {
+    const existing = await this.findInvestmentCashAccount(provider);
+    if (existing != null) return existing;
+
+    const userId = await FinanceBiz.ensurePrimaryUserId();
+    if (userId <= 0) return null;
+    const defaultBookId = await this.ensureDefaultBook(userId);
+    const targetBookId = bookId == '' ? defaultBookId : bookId;
+    const target = provider.trim() == '' ? '默认账户' : provider.trim();
+    const now = Date.now();
+    const id = this.nextAccountId();
+    const payload = {
+      name: `${target}可用资金`,
+      category: FinanceBiz.CATEGORY_INVESTMENT,
+      balance: initialBalance,
+      book_id: targetBookId,
+      provider: target,
+      include_in_total: includeInTotal,
+      code: '',
+      sub_type: '账户现金',
+      profit_rate: 0.0,
+      profit_amount: 0.0,
+      market_value: initialBalance,
+      units: 0.0,
+      latest_nav: 0.0,
+      estimate_nav: 0.0,
+      quote_time: '',
+      data_source: 'investment_trade_cash',
+      credit_limit: 0.0
+    } as AssetAccountPayload;
+    const props = FinanceBiz.buildAccountProps(payload);
+    const ok = await DB.exec(
+      "INSERT INTO accounts (id, user_id, name, type, balance, currency, category, card_no, properties, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      [id, userId, payload.name, '账户现金', initialBalance, 'CNY', FinanceBiz.CATEGORY_INVESTMENT, '', props, now, now]
+    );
+    if (!ok) return null;
+    const edgeId = this.nextEdgeId();
+    const eok = await DB.exec(
+      'INSERT OR REPLACE INTO edges (id, source_id, target_id, relation_type, rank, properties, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [edgeId, targetBookId, id, FinanceBiz.BOOK_EDGE_RELATION, '500', '', now, now, 0]
+    );
+    if (!eok) return null;
+    return await this.getAccountNode(id);
+  }
+
+  static async tradeInvestmentHolding(
+    accountId: string,
+    tradeType: string,
+    amount: number,
+    units: number,
+    nav: number,
+    quoteTime: string,
+    description: string
+  ): Promise<boolean> {
+    if (accountId == '') return false;
+    const current = await this.getAccountNode(accountId);
+    if (current == null || current.category != FinanceBiz.CATEGORY_INVESTMENT || current.sub_type == '账户现金') return false;
+    const isReduce = tradeType == 'reduce';
+    const safeUnits = Math.abs(units);
+    const safeAmount = Math.abs(amount);
+    if (safeUnits <= 0 || safeAmount <= 0) return false;
+    if (isReduce && current.units > 0 && safeUnits - current.units > 0.0001) return false;
+
+    const cash = isReduce
+      ? await this.ensureInvestmentCashAccount(current.provider, current.book_id, current.include_in_total, 0.0)
+      : await this.findInvestmentCashAccount(current.provider);
+    if (cash == null) return false;
+    if (!isReduce && cash.balance + 0.0001 < safeAmount) return false;
+
+    const now = Date.now();
+    const txnTime = now;
+    const nextUnits = isReduce ? Math.max(0.0, current.units - safeUnits) : current.units + safeUnits;
+    const tradeUnitPrice = safeAmount / safeUnits;
+    let rawNextBalance = isReduce ? Math.max(0.0, current.balance - safeAmount) : current.balance + safeAmount;
+    if (isReduce && nextUnits <= 0.0001) rawNextBalance = 0.0;
+    const nextBalance = FinanceBiz.roundMoney(rawNextBalance);
+    const cashNextBalance = FinanceBiz.roundMoney(isReduce ? cash.balance + safeAmount : cash.balance - safeAmount);
+    const tradeNav = tradeUnitPrice > 0 ? tradeUnitPrice : nav;
+    const holdingProps = FinanceBiz.buildAccountProps({
+      name: current.name,
+      category: current.category,
+      balance: nextBalance,
+      book_id: current.book_id,
+      provider: current.provider,
+      card_no: current.card_no,
+      include_in_total: current.include_in_total,
+      code: current.code,
+      sub_type: current.sub_type,
+      profit_rate: 0.0,
+      profit_amount: 0.0,
+      market_value: nextBalance,
+      units: nextUnits,
+      latest_nav: current.latest_nav,
+      estimate_nav: current.estimate_nav,
+      quote_time: quoteTime == '' ? current.quote_time : quoteTime,
+      data_source: current.data_source,
+      credit_limit: current.credit_limit
+    } as AssetAccountPayload);
+    const cashProps = FinanceBiz.buildAccountProps({
+      name: cash.name,
+      category: cash.category,
+      balance: cashNextBalance,
+      book_id: cash.book_id,
+      provider: cash.provider,
+      card_no: cash.card_no,
+      include_in_total: cash.include_in_total,
+      code: cash.code,
+      sub_type: cash.sub_type,
+      profit_rate: cash.profit_rate,
+      profit_amount: 0.0,
+      market_value: cashNextBalance,
+      units: cash.units,
+      latest_nav: cash.latest_nav,
+      estimate_nav: cash.estimate_nav,
+      quote_time: cash.quote_time,
+      data_source: cash.data_source,
+      credit_limit: cash.credit_limit
+    } as AssetAccountPayload);
+
+    try {
+      await DB.beginTransaction();
+      const holdingOk = await DB.exec(
+        'UPDATE accounts SET balance = ?, properties = ?, updated_at = ? WHERE id = ? AND is_deleted = 0',
+        [nextBalance, holdingProps, now, current.id]
+      );
+      if (!holdingOk) throw new Error('update holding failed');
+      const cashOk = await DB.exec(
+        'UPDATE accounts SET balance = ?, properties = ?, updated_at = ? WHERE id = ? AND is_deleted = 0',
+        [cashNextBalance, cashProps, now, cash.id]
+      );
+      if (!cashOk) throw new Error('update cash failed');
+
+      const tradeProps = JSON.stringify({
+        source: 'investment_holding_trade',
+        trade_type: isReduce ? 'reduce' : 'add',
+        units: safeUnits,
+        nav: tradeNav,
+        quote_time: quoteTime,
+        cash_account_id: cash.id
+      });
+      const cashPropsJson = JSON.stringify({
+        source: 'investment_holding_trade_cash',
+        trade_type: isReduce ? 'reduce' : 'add',
+        holding_id: current.id,
+        holding_name: current.name,
+        units: safeUnits,
+        nav: tradeNav
+      });
+      const holdingTxnId = this.nextTransactionId();
+      const cashTxnId = this.nextTransactionId();
+      const holdingType = isReduce ? 'expense' : 'income';
+      const cashType = isReduce ? 'income' : 'expense';
+      const category = isReduce ? '理财卖出' : '理财买入';
+      const desc = description == '' ? `${isReduce ? '卖出' : '买入'} ${current.name}` : description;
+      const sql = 'INSERT INTO transactions (id, account_id, amount, type, category, description, transaction_time, created_at, updated_at, balance_snapshot, properties) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)';
+      const holdingInserted = await DB.exec(sql, [holdingTxnId, current.id, safeAmount, holdingType, category, desc, txnTime, now, now, nextBalance, tradeProps]);
+      if (!holdingInserted) throw new Error('insert holding transaction failed');
+      const cashInserted = await DB.exec(sql, [cashTxnId, cash.id, safeAmount, cashType, category, desc, txnTime, now, now, cashNextBalance, cashPropsJson]);
+      if (!cashInserted) throw new Error('insert cash transaction failed');
+
+      await DB.setTransactionSuccessful();
+      FinanceBiz.markPendingTransactionChange();
+      return true;
+    } catch (e) {
+      console.error(`[FinanceBiz] tradeInvestmentHolding failed: ${e}`);
+      return false;
+    } finally {
+      await DB.endTransaction();
+    }
+  }
+
+  static async updateAccountBook(accountId: string, bookId: string): Promise<boolean> {
+    if (accountId == '' || bookId == '') return false;
+    const now = Date.now();
+    try {
+      await DB.beginTransaction();
+      const delOk = await DB.exec(
+        'UPDATE edges SET is_deleted = 1, updated_at = ? WHERE target_id = ? AND relation_type = ? AND is_deleted = 0',
+        [now, accountId, FinanceBiz.BOOK_EDGE_RELATION]
+      );
+      if (!delOk) throw new Error('clear old book relation failed');
+
+      const edgeId = this.nextEdgeId();
+      const addOk = await DB.exec(
+        'INSERT OR REPLACE INTO edges (id, source_id, target_id, relation_type, rank, properties, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [edgeId, bookId, accountId, FinanceBiz.BOOK_EDGE_RELATION, '500', '', now, now, 0]
+      );
+      if (!addOk) throw new Error('add new book relation failed');
+
+      await DB.setTransactionSuccessful();
+      return true;
+    } catch (e) {
+      console.error(`[FinanceBiz] updateAccountBook failed: ${e}`);
+      return false;
+    } finally {
+      await DB.endTransaction();
+    }
+  }
+
+  static async listBooks(): Promise<BookNode[]> {
+    const userId = await FinanceBiz.ensurePrimaryUserId();
+    if (userId <= 0) return [] as BookNode[];
+    await this.ensureDefaultBook(userId);
+
+    const rows = await DB.query(
+      'SELECT id, content, properties, created_at FROM nodes WHERE type = ? AND is_deleted = 0 ORDER BY created_at ASC',
+      [FinanceBiz.BOOK_NODE_TYPE]
+    );
+    return this.mapRowsToBooks(rows);
+  }
+
+  static async createBook(name: string): Promise<string | null> {
+    const userId = await FinanceBiz.ensurePrimaryUserId();
+    if (userId <= 0) return null;
+    const trimmed = (name ?? '').toString().trim();
+    if (trimmed == '') return null;
+
+    const now = Date.now();
+    const id = this.nextBookId();
+    const props = JSON.stringify({ is_default: 0, scope: 'finance_book' });
+    const ok = await DB.exec(
+      'INSERT INTO nodes (id, type, status, content, properties, due_at, created_at, updated_at, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [id, FinanceBiz.BOOK_NODE_TYPE, 'active', trimmed, props, null, now, now, 0]
+    );
+    return ok ? id : null;
+  }
+
+  static async updateAccountNode(id: string, name: string, type: string, balance: number): Promise<boolean> {
+    const category = FinanceBiz.inferDefaultCategory(type, name);
+    const sql = "UPDATE accounts SET name = ?, type = ?, balance = ?, category = ?, updated_at = ? WHERE id = ? AND is_deleted = 0";
+    const args: SqlArgs = [name, type, FinanceBiz.normalizeAccountBalanceForCategory(category, balance), category, Date.now(), id];
+    return await DB.exec(sql, args);
+  }
+
+  static async deleteAccountNode(id: string): Promise<boolean> {
+    const now = Date.now();
+    try {
+      await DB.beginTransaction();
+      const ok = await DB.exec("UPDATE accounts SET is_deleted = 1, updated_at = ? WHERE id = ?", [now, id]);
+      if (!ok) throw new Error('delete account failed');
+      const eok = await DB.exec(
+        'UPDATE edges SET is_deleted = 1, updated_at = ? WHERE target_id = ? AND relation_type = ? AND is_deleted = 0',
+        [now, id, FinanceBiz.BOOK_EDGE_RELATION]
+      );
+      if (!eok) throw new Error('delete account relation failed');
+      await DB.setTransactionSuccessful();
+      return true;
+    } catch (e) {
+      console.error(`[FinanceBiz] deleteAccountNode failed: ${e}`);
+      return false;
+    } finally {
+      await DB.endTransaction();
+    }
+  }
+
+  // Mounting APIs
+  static async createTransactionForNodes(payload: CreateTransactionForNodesPayload): Promise<string | null> {
+    const accountNodeId = payload.account_id ?? '';
+    if (accountNodeId == '') return null;
+
+    const normalizedType = this.normalizeTransactionTypeForAmount(payload.type, payload.amount);
+    const absAmount = this.normalizeStoredAmount(payload.amount);
+    if (absAmount <= 0) return null;
+
+    const now = Date.now();
+    const txnTime = payload.transaction_time != null && payload.transaction_time! > 0 ? payload.transaction_time! : now;
+    const sourceNodeId = payload.source_node_id ?? null;
+    const itemNodeId = payload.item_node_id ?? null;
+    const locationNodeId = payload.location_node_id ?? null;
+    const props = payload.properties == null ? null : payload.properties.toString();
+    const receiptPaths = payload.receipt_paths ?? ([] as string[]);
+    const txnId = this.nextTransactionId();
+
+    try {
+      const createdId = await DB.tx(async () => {
+        const txnEventId = genId('evt');
+
+        const balanceSql = "SELECT balance, category FROM accounts WHERE id = ? AND is_deleted = 0";
+        const balanceRes = await DB.query(balanceSql, [accountNodeId]);
+        if (balanceRes.length == 0) throw new Error("Account not found");
+
+        const accountCategory = FinanceBiz.normalizeAccountCategory(balanceRes[0].get("category")?.toString() ?? '');
+        const currentBalance = FinanceBiz.normalizeAccountBalanceForCategory(accountCategory, parseFloat(balanceRes[0].get("balance")?.toString() ?? "0"));
+        const delta = this.calculateBalanceDeltaForCategory(accountCategory, normalizedType, absAmount);
+        const newBalance = currentBalance + delta;
+
+        const updateSql = "UPDATE accounts SET balance = ?, updated_at = ?, entity_version = COALESCE(entity_version, 0) + 1, last_event_id = ? WHERE id = ? AND is_deleted = 0";
+        const updateSuccess = await DB.exec(updateSql, [newBalance, now, txnEventId, accountNodeId]);
+        if (!updateSuccess) throw new Error("Failed to update account balance");
+
+        const insertSql = `INSERT INTO transactions
+          (id, account_id, amount, type, category, description, location, transaction_time, created_at, updated_at, balance_snapshot, source_node_id, item_node_id, location_node_id, properties, entity_version, last_event_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+        const insertArgs: SqlArgs = [
+          txnId,
+          accountNodeId,
+          absAmount,
+          normalizedType,
+          payload.category,
+          payload.description ?? null,
+          payload.location ?? null,
+          txnTime,
+          now,
+          now,
+          newBalance,
+          sourceNodeId,
+          itemNodeId,
+          locationNodeId,
+          props,
+          1,
+          txnEventId,
+        ];
+        const insertSuccess = await DB.exec(insertSql, insertArgs);
+        if (!insertSuccess) throw new Error("Failed to insert transaction");
+
+        if (sourceNodeId != null && sourceNodeId != '' && receiptPaths.length > 0) {
+          for (let i = 0; i < receiptPaths.length; i++) {
+            const p = receiptPaths[i];
+            if (p == null || p == '') continue;
+            const fileName = this.inferReceiptName(p, i);
+            const mounted = await AttachmentService.mountAttachmentAsync(sourceNodeId, fileName, p, 0, 'receipt', {
+              syncEventId: txnEventId,
+              entityVersion: 1,
+            });
+            if (mounted == null) throw new Error('Failed to mount receipt attachment');
+          }
+        }
+
+
+        return txnId;
+      });
+      if (createdId != null && createdId != '') FinanceBiz.markPendingTransactionChange();
+      return createdId;
+    } catch (e) {
+      console.error(`[FinanceBiz] createTransactionForNodes failed: ${e}`);
+      return null;
+    }
+  }
+
+  static async updateTransaction(transactionId: string, payload: UpdateTransactionPayload): Promise<boolean> {
+    if (transactionId == '') return false;
+
+    try {
+      await DB.beginTransaction();
+
+      const txnRows = await DB.query(
+        `SELECT id, account_id, amount, type FROM transactions WHERE id = ? AND is_deleted = 0 LIMIT 1`,
+        [transactionId]
+      );
+      if (txnRows.length == 0) throw new Error('Transaction not found');
+
+      const txn = txnRows[0];
+      const oldAccountId = txn.get('account_id')?.toString() ?? '';
+      if (oldAccountId == '') throw new Error('Transaction account missing');
+      const requestedAccountId = payload.account_id != null ? payload.account_id!.toString() : '';
+      const nextAccountId = requestedAccountId != '' ? requestedAccountId : oldAccountId;
+
+      const oldAmount = parseFloat(txn.get('amount')?.toString() ?? '0');
+      const oldType = this.normalizeTransactionTypeForAmount(txn.get('type')?.toString() ?? 'expense', oldAmount);
+
+      const requestedAmount = payload.amount != null ? payload.amount : oldAmount;
+      const nextAmount = this.normalizeStoredAmount(requestedAmount);
+      const nextType = payload.type != null ? this.normalizeTransactionTypeForAmount(payload.type, requestedAmount) : this.normalizeTransactionTypeForAmount(oldType, requestedAmount);
+      if (nextAmount <= 0) throw new Error('Invalid transaction amount');
+
+      let nextBalance = 0.0;
+      const now = Date.now();
+
+      if (nextAccountId == oldAccountId) {
+        const accountRows = await DB.query(`SELECT balance, category FROM accounts WHERE id = ? AND is_deleted = 0 LIMIT 1`, [oldAccountId]);
+        if (accountRows.length == 0) throw new Error('Account not found');
+        const accountCategory = FinanceBiz.normalizeAccountCategory(accountRows[0].get('category')?.toString() ?? '');
+        const accountBalance = FinanceBiz.normalizeAccountBalanceForCategory(accountCategory, parseFloat(accountRows[0].get('balance')?.toString() ?? '0'));
+        const oldDelta = this.calculateBalanceDeltaForCategory(accountCategory, oldType, oldAmount);
+        const newDelta = this.calculateBalanceDeltaForCategory(accountCategory, nextType, nextAmount);
+        nextBalance = accountBalance - oldDelta + newDelta;
+        const accountOk = await DB.exec(
+          `UPDATE accounts SET balance = ?, updated_at = ? WHERE id = ? AND is_deleted = 0`,
+          [nextBalance, now, oldAccountId]
+        );
+        if (!accountOk) throw new Error('Update account balance failed');
+      } else {
+        const oldAccountRows = await DB.query(`SELECT balance, category FROM accounts WHERE id = ? AND is_deleted = 0 LIMIT 1`, [oldAccountId]);
+        const nextAccountRows = await DB.query(`SELECT balance, category FROM accounts WHERE id = ? AND is_deleted = 0 LIMIT 1`, [nextAccountId]);
+        if (oldAccountRows.length == 0 || nextAccountRows.length == 0) throw new Error('Account not found');
+        const oldAccountCategory = FinanceBiz.normalizeAccountCategory(oldAccountRows[0].get('category')?.toString() ?? '');
+        const nextAccountCategory = FinanceBiz.normalizeAccountCategory(nextAccountRows[0].get('category')?.toString() ?? '');
+        const oldAccountBalance = FinanceBiz.normalizeAccountBalanceForCategory(oldAccountCategory, parseFloat(oldAccountRows[0].get('balance')?.toString() ?? '0'));
+        const nextAccountBalance = FinanceBiz.normalizeAccountBalanceForCategory(nextAccountCategory, parseFloat(nextAccountRows[0].get('balance')?.toString() ?? '0'));
+        const oldDelta = this.calculateBalanceDeltaForCategory(oldAccountCategory, oldType, oldAmount);
+        const newDelta = this.calculateBalanceDeltaForCategory(nextAccountCategory, nextType, nextAmount);
+        const oldAccountNextBalance = oldAccountBalance - oldDelta;
+        nextBalance = nextAccountBalance + newDelta;
+        const oldAccountOk = await DB.exec(
+          `UPDATE accounts SET balance = ?, updated_at = ? WHERE id = ? AND is_deleted = 0`,
+          [oldAccountNextBalance, now, oldAccountId]
+        );
+        if (!oldAccountOk) throw new Error('Update old account balance failed');
+        const nextAccountOk = await DB.exec(
+          `UPDATE accounts SET balance = ?, updated_at = ? WHERE id = ? AND is_deleted = 0`,
+          [nextBalance, now, nextAccountId]
+        );
+        if (!nextAccountOk) throw new Error('Update next account balance failed');
+      }
+
+      const sets = [] as string[];
+      const args: SqlArgs = [];
+
+      sets.push('amount = ?');
+      args.push(nextAmount);
+      sets.push('type = ?');
+      args.push(nextType);
+      sets.push('account_id = ?');
+      args.push(nextAccountId);
+      sets.push('balance_snapshot = ?');
+      args.push(nextBalance);
+
+      if (payload.category != null) {
+        sets.push('category = ?');
+        args.push(payload.category == null ? null : payload.category);
+      }
+      if (payload.description != null) {
+        sets.push('description = ?');
+        args.push(payload.description == null ? null : payload.description);
+      }
+      if (payload.location != null) {
+        sets.push('location = ?');
+        args.push(payload.location == null ? null : payload.location);
+      }
+      if (payload.transaction_time != null) {
+        sets.push('transaction_time = ?');
+        args.push(payload.transaction_time == null ? Date.now() : payload.transaction_time);
+      }
+      if (payload.source_node_id != null) {
+        sets.push('source_node_id = ?');
+        args.push(payload.source_node_id == null || payload.source_node_id == '' ? null : payload.source_node_id);
+      }
+      if (payload.item_node_id != null) {
+        sets.push('item_node_id = ?');
+        args.push(payload.item_node_id == null || payload.item_node_id == '' ? null : payload.item_node_id);
+      }
+      if (payload.location_node_id != null) {
+        sets.push('location_node_id = ?');
+        args.push(payload.location_node_id == null || payload.location_node_id == '' ? null : payload.location_node_id);
+      }
+      if (payload.properties != null) {
+        sets.push('properties = ?');
+        args.push(payload.properties == null ? null : payload.properties.toString());
+      }
+
+      sets.push('updated_at = ?');
+      args.push(now);
+      args.push(transactionId);
+
+      const sql = `UPDATE transactions SET ${sets.join(', ')} WHERE id = ? AND is_deleted = 0`;
+      const ok = await DB.exec(sql, args);
+      if (!ok) throw new Error('Update transaction failed');
+
+      await DB.setTransactionSuccessful();
+      FinanceBiz.markPendingTransactionChange();
+      return true;
+    } catch (e) {
+      console.error(`[FinanceBiz] updateTransaction failed: ${e}`);
+      return false;
+    } finally {
+      await DB.endTransaction();
+    }
+  }
+
+  static async deleteTransaction(transactionId: string): Promise<boolean> {
+    if (transactionId == '') return false;
+
+    try {
+      await DB.beginTransaction();
+      const txnRows = await DB.query(
+        `SELECT id, account_id, amount, type FROM transactions WHERE id = ? AND is_deleted = 0 LIMIT 1`,
+        [transactionId]
+      );
+      if (txnRows.length == 0) throw new Error('Transaction not found');
+
+      const txn = txnRows[0];
+      const accountId = txn.get('account_id')?.toString() ?? '';
+      if (accountId == '') throw new Error('Transaction account missing');
+      const amount = parseFloat(txn.get('amount')?.toString() ?? '0');
+      const type = this.normalizeTransactionTypeForAmount(txn.get('type')?.toString() ?? 'expense', amount);
+
+      const accountRows = await DB.query(`SELECT balance, category FROM accounts WHERE id = ? AND is_deleted = 0 LIMIT 1`, [accountId]);
+      if (accountRows.length == 0) throw new Error('Account not found');
+      const accountCategory = FinanceBiz.normalizeAccountCategory(accountRows[0].get('category')?.toString() ?? '');
+      const accountBalance = FinanceBiz.normalizeAccountBalanceForCategory(accountCategory, parseFloat(accountRows[0].get('balance')?.toString() ?? '0'));
+      const nextBalance = accountBalance - this.calculateBalanceDeltaForCategory(accountCategory, type, amount);
+      const now = Date.now();
+
+      const accountOk = await DB.exec(
+        `UPDATE accounts SET balance = ?, updated_at = ? WHERE id = ? AND is_deleted = 0`,
+        [nextBalance, now, accountId]
+      );
+      if (!accountOk) throw new Error('Update account balance failed');
+
+      const deleteOk = await DB.exec(
+        `UPDATE transactions SET is_deleted = 1, updated_at = ? WHERE id = ? AND is_deleted = 0`,
+        [now, transactionId]
+      );
+      if (!deleteOk) throw new Error('Delete transaction failed');
+
+      await DB.setTransactionSuccessful();
+      FinanceBiz.markPendingTransactionChange();
+      return true;
+    } catch (e) {
+      console.error(`[FinanceBiz] deleteTransaction failed: ${e}`);
+      return false;
+    } finally {
+      await DB.endTransaction();
+    }
+  }
+
+  static async mountTransactionToAccount(
+    accountNodeId: string,
+    amount: number,
+    type: string,
+    category: string,
+    description: string,
+    location: string | null = null,
+    sourceNodeId: string | null = null,
+    receiptPaths: string[] = []
+  ): Promise<boolean> {
+    const payload = {
+      account_id: accountNodeId,
+      amount: amount,
+      type: type,
+      category: category,
+      description: description,
+      location: location,
+      source_node_id: sourceNodeId,
+      item_node_id: null,
+      location_node_id: null,
+      properties: sourceNodeId != null && sourceNodeId != '' ? JSON.stringify({ source_node_id: sourceNodeId }) : null,
+      receipt_paths: receiptPaths
+    } as CreateTransactionForNodesPayload;
+
+    const id = await this.createTransactionForNodes(payload);
+    return id != null && id != '';
+  }
+
+  static async transferBetweenAccounts(
+    fromAccountId: string,
+    toAccountId: string,
+    amount: number,
+    description: string,
+    category: string = '转账',
+    location: string | null = null,
+    properties: string | null = null
+  ): Promise<boolean> {
+    if (fromAccountId == '' || toAccountId == '' || fromAccountId == toAccountId) return false;
+    const val = this.normalizeStoredAmount(amount);
+    if (val <= 0) return false;
+
+    const now = Date.now();
+    try {
+      await DB.beginTransaction();
+
+      const fromRows = await DB.query("SELECT * FROM accounts WHERE id = ? AND is_deleted = 0", [fromAccountId]);
+      const toRows = await DB.query("SELECT * FROM accounts WHERE id = ? AND is_deleted = 0", [toAccountId]);
+      if (fromRows.length == 0 || toRows.length == 0) throw new Error('Transfer account not found');
+
+      const fromAcc = FinanceBiz.mapRowToAccount(fromRows[0], '');
+      const toAcc = FinanceBiz.mapRowToAccount(toRows[0], '');
+      const fromCategory = fromAcc.category;
+      const toCategory = toAcc.category;
+      const isTargetCredit = toCategory == FinanceBiz.CATEGORY_CREDIT;
+      const isTargetReceivable = isTargetCredit && FinanceBiz.isReceivableCreditAccount(toAcc);
+      const effectiveCategory = isTargetCredit ? (isTargetReceivable ? '应收收款' : '债务还款') : category;
+      const descRaw = description.trim();
+      const effectiveDescription = descRaw == '' || (isTargetCredit && descRaw == '账户转账') ? effectiveCategory : descRaw;
+      const fromBalance = FinanceBiz.normalizeAccountBalanceForCategory(fromCategory, fromAcc.balance);
+      const toBalance = FinanceBiz.normalizeAccountBalanceForCategory(toCategory, toAcc.balance);
+      if (isTargetCredit && val - toBalance > 0.01) throw new Error('settle amount exceeds credit balance');
+      const nextFrom = FinanceBiz.roundMoney(fromBalance + this.calculateBalanceDeltaForCategory(fromCategory, 'expense', val));
+      const nextToRaw = toBalance + this.calculateBalanceDeltaForCategory(toCategory, 'income', val);
+      const nextTo = isTargetCredit ? FinanceBiz.roundMoney(Math.max(0.0, nextToRaw)) : FinanceBiz.roundMoney(nextToRaw);
+
+      const updateFromOk = await DB.exec(
+        "UPDATE accounts SET balance = ?, updated_at = ? WHERE id = ? AND is_deleted = 0",
+        [nextFrom, now, fromAccountId]
+      );
+      if (!updateFromOk) throw new Error('Failed to update source account');
+
+      const updateToOk = await DB.exec(
+        "UPDATE accounts SET balance = ?, updated_at = ? WHERE id = ? AND is_deleted = 0",
+        [nextTo, now, toAccountId]
+      );
+      if (!updateToOk) throw new Error('Failed to update target account');
+
+      const linkId = this.nextTransferLinkId();
+      const outTxnId = genId('fin_out');
+      const inTxnId = genId('fin_in');
+      let extraProps = {} as any;
+      try {
+        if (properties != null && properties.toString().trim() != '') {
+          extraProps = JSON.parse(properties.toString()) as any;
+        }
+      } catch (_e) {
+        extraProps = {} as any;
+      }
+      if (isTargetCredit) {
+        extraProps['source'] = 'credit_transfer_settlement';
+        extraProps['include_in_flow'] = false;
+        extraProps['is_credit_settlement'] = true;
+        extraProps['settlement_type'] = isTargetReceivable ? 'receivable' : 'payable';
+      }
+      extraProps['transfer_link_id'] = linkId;
+      extraProps['direction'] = 'out';
+      extraProps['to_account_id'] = toAccountId;
+      const outProps = JSON.stringify(extraProps);
+      extraProps['direction'] = 'in';
+      extraProps['from_account_id'] = fromAccountId;
+      extraProps['to_account_id'] = null;
+      const inProps = JSON.stringify(extraProps);
+
+      const sql = "INSERT INTO transactions (id, account_id, amount, type, category, description, location, transaction_time, created_at, updated_at, balance_snapshot, properties) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+      const outOk = await DB.exec(sql, [outTxnId, fromAccountId, val, 'expense', effectiveCategory, effectiveDescription, location, now, now, now, nextFrom, outProps]);
+      if (!outOk) throw new Error('Failed to insert out transaction');
+
+      const inOk = await DB.exec(sql, [inTxnId, toAccountId, val, 'income', effectiveCategory, effectiveDescription, location, now, now, now, nextTo, inProps]);
+      if (!inOk) throw new Error('Failed to insert in transaction');
+
+      await DB.setTransactionSuccessful();
+      FinanceBiz.markPendingTransactionChange();
+      return true;
+    } catch (e) {
+      console.error(`[FinanceBiz] Transfer failed: ${e}`);
+      return false;
+    } finally {
+      await DB.endTransaction();
+    }
+  }
+
+  static async settleCreditAccount(
+    creditAccountId: string,
+    fundAccountId: string,
+    amount: number,
+    description: string,
+    isReceivable: boolean = false
+  ): Promise<boolean> {
+    if (creditAccountId == '' || fundAccountId == '' || creditAccountId == fundAccountId) return false;
+    const val = this.normalizeStoredAmount(amount);
+    if (val <= 0) return false;
+
+    const now = Date.now();
+    try {
+      await DB.beginTransaction();
+
+      const creditRows = await DB.query("SELECT balance, category FROM accounts WHERE id = ? AND is_deleted = 0 LIMIT 1", [creditAccountId]);
+      const fundRows = await DB.query("SELECT balance, category FROM accounts WHERE id = ? AND is_deleted = 0 LIMIT 1", [fundAccountId]);
+      if (creditRows.length == 0 || fundRows.length == 0) throw new Error('settle account not found');
+
+      const creditCategory = FinanceBiz.normalizeAccountCategory(creditRows[0].get('category')?.toString() ?? '');
+      const fundCategory = FinanceBiz.normalizeAccountCategory(fundRows[0].get('category')?.toString() ?? '');
+      if (creditCategory != FinanceBiz.CATEGORY_CREDIT || fundCategory == FinanceBiz.CATEGORY_CREDIT) throw new Error('invalid settle account category');
+
+      const creditBalance = FinanceBiz.normalizeAccountBalanceForCategory(creditCategory, parseFloat(creditRows[0].get('balance')?.toString() ?? '0'));
+      const fundBalance = FinanceBiz.normalizeAccountBalanceForCategory(fundCategory, parseFloat(fundRows[0].get('balance')?.toString() ?? '0'));
+      if (val - creditBalance > 0.01) throw new Error('settle amount exceeds balance');
+
+      const fundType = isReceivable ? 'income' : 'expense';
+      const nextCredit = FinanceBiz.roundMoney(Math.max(0.0, creditBalance + this.calculateBalanceDeltaForCategory(creditCategory, 'income', val)));
+      const nextFund = FinanceBiz.roundMoney(fundBalance + this.calculateBalanceDeltaForCategory(fundCategory, fundType, val));
+
+      const creditOk = await DB.exec(
+        "UPDATE accounts SET balance = ?, updated_at = ? WHERE id = ? AND is_deleted = 0",
+        [nextCredit, now, creditAccountId]
+      );
+      if (!creditOk) throw new Error('update credit account failed');
+
+      const fundOk = await DB.exec(
+        "UPDATE accounts SET balance = ?, updated_at = ? WHERE id = ? AND is_deleted = 0",
+        [nextFund, now, fundAccountId]
+      );
+      if (!fundOk) throw new Error('update fund account failed');
+
+      const linkId = this.nextTransferLinkId();
+      const category = isReceivable ? '应收收款' : '债务还款';
+      const desc = description.trim() == '' ? category : description.trim();
+      const creditTxnId = genId('fin_credit');
+      const fundTxnId = genId('fin_fund');
+      const creditProps = JSON.stringify({
+        source: 'credit_quick_settle',
+        include_in_flow: false,
+        settlement_link_id: linkId,
+        role: 'credit',
+        fund_account_id: fundAccountId,
+        is_receivable: isReceivable
+      });
+      const fundProps = JSON.stringify({
+        source: 'credit_quick_settle',
+        include_in_flow: false,
+        settlement_link_id: linkId,
+        role: 'fund',
+        credit_account_id: creditAccountId,
+        is_receivable: isReceivable
+      });
+      const sql = "INSERT INTO transactions (id, account_id, amount, type, category, description, transaction_time, created_at, updated_at, balance_snapshot, properties) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+      const creditInserted = await DB.exec(sql, [creditTxnId, creditAccountId, val, 'income', category, desc, now, now, now, nextCredit, creditProps]);
+      if (!creditInserted) throw new Error('insert credit settle transaction failed');
+      const fundInserted = await DB.exec(sql, [fundTxnId, fundAccountId, val, fundType, category, desc, now, now, now, nextFund, fundProps]);
+      if (!fundInserted) throw new Error('insert fund settle transaction failed');
+
+      await DB.setTransactionSuccessful();
+      FinanceBiz.markPendingTransactionChange();
+      return true;
+    } catch (e) {
+      console.error(`[FinanceBiz] settleCreditAccount failed: ${e}`);
+      return false;
+    } finally {
+      await DB.endTransaction();
+    }
+  }
+
+  static async recordCreditDebtEvent(payload: CreditDebtEventPayload): Promise<boolean> {
+    const creditAccountId = (payload.credit_account_id ?? '').toString().trim();
+    const fundAccountId = (payload.fund_account_id ?? '').toString().trim();
+    const val = this.normalizeStoredAmount(payload.amount);
+    if (creditAccountId == '' || val <= 0) return false;
+
+    const actionRaw = (payload.action ?? '').toString().trim();
+    const action = actionRaw == 'borrow' || actionRaw == 'lend' || actionRaw == 'card' ? actionRaw : 'card';
+    const isBorrow = action == 'borrow';
+    const isLend = action == 'lend';
+    const linkedTransactionId = (payload.linked_transaction_id ?? '').toString().trim();
+    const shouldCreateFundTransaction = linkedTransactionId == '' && fundAccountId != '' && (isBorrow || isLend);
+    if ((isBorrow || isLend) && linkedTransactionId == '' && fundAccountId == '') return false;
+
+    const now = Date.now();
+    let txnTime = payload.transaction_time != null && payload.transaction_time! > 0 ? payload.transaction_time! : now;
+    const categoryRaw = (payload.category ?? '').toString().trim();
+    const category = categoryRaw == '' ? '信贷/债务' : categoryRaw;
+    const descRaw = payload.description == null ? '' : payload.description!.toString().trim();
+    const desc = descRaw == '' ? category : descRaw;
+
+    try {
+      await DB.beginTransaction();
+
+      const creditRows = await DB.query("SELECT balance, category FROM accounts WHERE id = ? AND is_deleted = 0 LIMIT 1", [creditAccountId]);
+      if (creditRows.length == 0) throw new Error('credit account not found');
+      const creditCategory = FinanceBiz.normalizeAccountCategory(creditRows[0].get('category')?.toString() ?? '');
+      if (creditCategory != FinanceBiz.CATEGORY_CREDIT) throw new Error('target account is not credit');
+
+      if (linkedTransactionId != '') {
+        const linkedRows = await DB.query("SELECT amount, type, transaction_time FROM transactions WHERE id = ? AND is_deleted = 0 LIMIT 1", [linkedTransactionId]);
+        if (linkedRows.length == 0) throw new Error('linked transaction not found');
+        const linkedAmount = parseFloat(linkedRows[0].get('amount')?.toString() ?? '0');
+        const linkedType = FinanceBiz.normalizeTransactionTypeForAmount(linkedRows[0].get('type')?.toString() ?? '', linkedAmount);
+        if (isBorrow && linkedType != 'income') throw new Error('borrow must link income transaction');
+        if (isLend && linkedType != 'expense') throw new Error('lend must link expense transaction');
+        if (payload.transaction_time == null || payload.transaction_time! <= 0) {
+          const linkedTime = parseInt(linkedRows[0].get('transaction_time')?.toString() ?? '0');
+          if (!isNaN(linkedTime) && linkedTime > 0) txnTime = linkedTime;
+        }
+      }
+
+      const creditBalance = FinanceBiz.normalizeAccountBalanceForCategory(creditCategory, parseFloat(creditRows[0].get('balance')?.toString() ?? '0'));
+      const creditTxnType = 'expense';
+      const nextCredit = FinanceBiz.roundMoney(creditBalance + this.calculateBalanceDeltaForCategory(creditCategory, creditTxnType, val));
+      const creditEventId = genId('evt');
+      const creditOk = await DB.exec(
+        "UPDATE accounts SET balance = ?, updated_at = ?, entity_version = COALESCE(entity_version, 0) + 1, last_event_id = ? WHERE id = ? AND is_deleted = 0",
+        [nextCredit, now, creditEventId, creditAccountId]
+      );
+      if (!creditOk) throw new Error('update credit account failed');
+
+      let nextFund = 0.0;
+      let fundTxnType = '';
+      let fundEventId = '';
+      if (shouldCreateFundTransaction) {
+        const fundRows = await DB.query("SELECT balance, category FROM accounts WHERE id = ? AND is_deleted = 0 LIMIT 1", [fundAccountId]);
+        if (fundRows.length == 0) throw new Error('fund account not found');
+        const fundCategory = FinanceBiz.normalizeAccountCategory(fundRows[0].get('category')?.toString() ?? '');
+        if (fundCategory == FinanceBiz.CATEGORY_CREDIT) throw new Error('fund account cannot be credit');
+        const fundBalance = FinanceBiz.normalizeAccountBalanceForCategory(fundCategory, parseFloat(fundRows[0].get('balance')?.toString() ?? '0'));
+        fundTxnType = isBorrow ? 'income' : 'expense';
+        nextFund = FinanceBiz.roundMoney(fundBalance + this.calculateBalanceDeltaForCategory(fundCategory, fundTxnType, val));
+        fundEventId = genId('evt');
+        const fundOk = await DB.exec(
+          "UPDATE accounts SET balance = ?, updated_at = ?, entity_version = COALESCE(entity_version, 0) + 1, last_event_id = ? WHERE id = ? AND is_deleted = 0",
+          [nextFund, now, fundEventId, fundAccountId]
+        );
+        if (!fundOk) throw new Error('update fund account failed');
+      }
+
+      const linkId = this.nextTransferLinkId();
+      let extraProps = {} as any;
+      try {
+        if (payload.properties != null && payload.properties!.toString().trim() != '') {
+          extraProps = JSON.parse(payload.properties!.toString()) as any;
+        }
+      } catch (_e) {
+        extraProps = {} as any;
+      }
+
+      extraProps['source'] = 'credit_debt_record';
+      extraProps['credit_debt_link_id'] = linkId;
+      extraProps['action'] = action;
+      extraProps['role'] = 'credit';
+      extraProps['fund_account_id'] = shouldCreateFundTransaction ? fundAccountId : null;
+      extraProps['linked_transaction_id'] = linkedTransactionId == '' ? null : linkedTransactionId;
+      const creditProps = JSON.stringify(extraProps);
+
+      const sql = "INSERT INTO transactions (id, account_id, amount, type, category, description, location, transaction_time, created_at, updated_at, balance_snapshot, properties, entity_version, last_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+      const creditTxnId = this.nextTransactionId();
+      const creditInserted = await DB.exec(sql, [creditTxnId, creditAccountId, val, creditTxnType, category, desc, payload.location ?? null, txnTime, now, now, nextCredit, creditProps, 1, creditEventId]);
+      if (!creditInserted) throw new Error('insert credit transaction failed');
+
+      if (shouldCreateFundTransaction) {
+        extraProps['role'] = 'fund';
+        extraProps['credit_account_id'] = creditAccountId;
+        extraProps['fund_account_id'] = fundAccountId;
+        extraProps['credit_transaction_id'] = creditTxnId;
+        const fundProps = JSON.stringify(extraProps);
+        const fundTxnId = this.nextTransactionId();
+        const fundInserted = await DB.exec(sql, [fundTxnId, fundAccountId, val, fundTxnType, category, desc, payload.location ?? null, txnTime, now, now, nextFund, fundProps, 1, fundEventId]);
+        if (!fundInserted) throw new Error('insert fund transaction failed');
+      }
+
+      await DB.setTransactionSuccessful();
+      FinanceBiz.markPendingTransactionChange();
+      return true;
+    } catch (e) {
+      console.error(`[FinanceBiz] recordCreditDebtEvent failed: ${e}`);
+      return false;
+    } finally {
+      await DB.endTransaction();
+    }
+  }
+
+  static async listTransactionMountsByAccount(accountNodeId: string): Promise<TransactionMount[]> {
+    const sql = "SELECT * FROM transactions WHERE account_id = ? AND is_deleted = 0 ORDER BY transaction_time DESC";
+    const results = await DB.query(sql, [accountNodeId]);
+    return this.mapRowsToTransactions(results);
+  }
+
+  static async getTransactionMount(transactionId: string): Promise<TransactionMount | null> {
+    if (transactionId == '') return null;
+    const sql = "SELECT t.*, a.name AS account_name FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id AND a.is_deleted = 0 WHERE t.id = ? AND t.is_deleted = 0 LIMIT 1";
+    const results = await DB.query(sql, [transactionId]);
+    if (results.length == 0) return null;
+    const mapped = this.mapRowsToTransactions(results);
+    return mapped.length > 0 ? mapped[0] : null;
+  }
+
+  // 聚合查询
+  static async getTotalAssets(): Promise<number> {
+    const accounts = await this.listAccountNodes();
+    return FinanceBiz.computeNetWorth(accounts);
+  }
+
+  /**
+   * 净资产 = (计入总资产的非信贷资产之和) - (计入总资产的信贷/债务之和)
+   */
+  static computeNetWorth(accounts: AccountNode[]): number {
+    let total = 0.0;
+    accounts.forEach((acc) => {
+      if (!acc.include_in_total) return;
+      const balance = FinanceBiz.normalizeAccountBalanceForCategory(acc.category, acc.balance);
+      if (acc.category == FinanceBiz.CATEGORY_CREDIT) {
+        total += FinanceBiz.isReceivableCreditAccount(acc) ? balance : -balance;
+      } else {
+        total += balance;
+      }
+    });
+    return total;
+  }
+
+  /**
+   * 按分类汇总余额 (信贷返回负债正值, 用于展示)
+   */
+  static categoryTotal(accounts: AccountNode[], category: string): number {
+    let total = 0.0;
+    accounts.forEach((acc) => {
+      if (acc.category != category) return;
+      if (category == FinanceBiz.CATEGORY_CREDIT && FinanceBiz.isReceivableCreditAccount(acc)) return;
+      total += FinanceBiz.normalizeAccountBalanceForCategory(acc.category, acc.balance);
+    });
+    return total;
+  }
+
+  /**
+   * 最近交易流水 (跨账户, 按时间倒序)
+   */
+  static async listRecentTransactions(limit: number = 10): Promise<TransactionMount[]> {
+    const safeLimit = (limit <= 0 || limit > 100) ? 10 : limit;
+    const sql = "SELECT t.*, a.name AS account_name FROM transactions t LEFT JOIN accounts a ON a.id = t.account_id AND a.is_deleted = 0 WHERE t.is_deleted = 0 ORDER BY t.transaction_time DESC LIMIT ?";
+    const results = await DB.query(sql, [safeLimit]);
+    return this.mapRowsToTransactions(results);
+  }
+
+  /**
+   * 指定月份的收入/支出合计 (year 为完整年份, month 为 1-12)
+   */
+  static async getMonthlySummary(year: number, month: number): Promise<Map<string, number>> {
+    const start = new Date(year, month - 1, 1, 0, 0, 0, 0).getTime();
+    const end = new Date(year, month, 1, 0, 0, 0, 0).getTime();
+    const sql = "SELECT type, amount FROM transactions WHERE is_deleted = 0 AND transaction_time >= ? AND transaction_time < ? AND CASE WHEN json_valid(COALESCE(properties, '{}')) THEN COALESCE(json_extract(properties, '$.include_in_flow'), 1) ELSE 1 END != 0";
+    const rows = await DB.query(sql, [start, end]);
+    let income = 0.0;
+    let expense = 0.0;
+    rows.forEach((row) => {
+      const rawAmount = parseFloat(row.get('amount')?.toString() ?? '0');
+      const type = FinanceBiz.normalizeTransactionTypeForAmount(row.get('type')?.toString() ?? 'expense', rawAmount);
+      const amount = FinanceBiz.normalizeStoredAmount(rawAmount);
+      if (type == 'income') income += amount;
+      else expense += amount;
+    });
+    const result = new Map<string, number>();
+    result.set('income', income);
+    result.set('expense', expense);
+    return result;
+  }
+
+  static async getDailySummary(timestamp: number = Date.now()): Promise<Map<string, number>> {
+    const d = new Date(timestamp);
+    const start = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0).getTime();
+    const end = start + 24 * 60 * 60 * 1000;
+    const sql = "SELECT CASE WHEN amount < 0 THEN 'expense' WHEN lower(type) = 'income' THEN 'income' ELSE 'expense' END AS type, SUM(ABS(amount)) AS total FROM transactions WHERE is_deleted = 0 AND transaction_time >= ? AND transaction_time < ? AND CASE WHEN json_valid(COALESCE(properties, '{}')) THEN COALESCE(json_extract(properties, '$.include_in_flow'), 1) ELSE 1 END != 0 GROUP BY CASE WHEN amount < 0 THEN 'expense' WHEN lower(type) = 'income' THEN 'income' ELSE 'expense' END";
+    const rows = await DB.query(sql, [start, end]);
+    const result = new Map<string, number>();
+    result.set('income', 0.0);
+    result.set('expense', 0.0);
+    rows.forEach((row) => {
+      const type = row.get('type')?.toString() ?? 'expense';
+      const total = parseFloat(row.get('total')?.toString() ?? '0');
+      if (type == 'income') result.set('income', total);
+      else result.set('expense', (result.get('expense') ?? 0.0) + total);
+    });
+    return result;
+  }
+
+  /**
+   * 本周每日支出 (周一至周日, 返回 7 个数值与总计)
+   */
+  static async getWeeklyExpenseTrend(): Promise<Map<string, number>> {
+    const now = new Date();
+    const day = now.getDay(); // 0=Sun .. 6=Sat
+    const offsetToMonday = day == 0 ? 6 : day - 1;
+    const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - offsetToMonday, 0, 0, 0, 0);
+    const start = monday.getTime();
+    const end = start + 7 * 24 * 60 * 60 * 1000;
+    const sql = "SELECT ABS(amount) AS amount, transaction_time FROM transactions WHERE is_deleted = 0 AND (lower(type) = 'expense' OR amount < 0) AND transaction_time >= ? AND transaction_time < ? AND CASE WHEN json_valid(COALESCE(properties, '{}')) THEN COALESCE(json_extract(properties, '$.include_in_flow'), 1) ELSE 1 END != 0";
+    const rows = await DB.query(sql, [start, end]);
+    const result = new Map<string, number>();
+    let total = 0.0;
+    for (let i = 0; i < 7; i++) result.set(`d${i}`, 0.0);
+    rows.forEach((row) => {
+      const amount = parseFloat(row.get('amount')?.toString() ?? '0');
+      const ts = parseInt(row.get('transaction_time')?.toString() ?? '0');
+      let idx = Math.floor((ts - start) / (24 * 60 * 60 * 1000));
+      if (idx < 0) idx = 0;
+      if (idx > 6) idx = 6;
+      const key = `d${idx}`;
+      result.set(key, (result.get(key) ?? 0.0) + amount);
+      total += amount;
+    });
+    result.set('total', total);
+    return result;
+  }
+}

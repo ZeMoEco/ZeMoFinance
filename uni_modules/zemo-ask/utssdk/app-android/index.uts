@@ -1,0 +1,586 @@
+// #ifdef APP-ANDROID
+import { UTSAndroid } from "io.dcloud.uts";
+import Context from "android.content.Context";
+import Intent from "android.content.Intent";
+import Build from "android.os.Build";
+import Settings from "android.provider.Settings";
+import Uri from "android.net.Uri";
+import WindowManager from "android.view.WindowManager";
+import FrameLayout from "android.widget.FrameLayout";
+import LinearLayout from "android.widget.LinearLayout";
+import ImageView from "android.widget.ImageView";
+import TextView from "android.widget.TextView";
+import Gravity from "android.view.Gravity";
+import PixelFormat from "android.graphics.PixelFormat";
+import Color from "android.graphics.Color";
+import GradientDrawable from "android.graphics.drawable.GradientDrawable";
+import MotionEvent from "android.view.MotionEvent";
+import Handler from "android.os.Handler";
+import Looper from "android.os.Looper";
+import File from "java.io.File";
+import FileInputStream from "java.io.FileInputStream";
+import ValueAnimator from "android.animation.ValueAnimator";
+import Vibrator from "android.os.Vibrator";
+import ViewConfiguration from "android.view.ViewConfiguration";
+import LottieAnimationView from "com.airbnb.lottie.LottieAnimationView";
+import PackageManager from "android.content.pm.PackageManager";
+// import { VoiceService } from "./src/VoiceService.uts"; // Temporarily comment out if also Android specific, or move logic
+// import JObject from "java.lang.Object";
+// import { SherpaEngine } from "./src/SherpaEngine.uts";
+// #endif
+
+// #ifdef APP-ANDROID
+import { VoiceService } from "./src/VoiceService.uts";
+import JObject from "java.lang.Object";
+import { SherpaEngine } from "./src/SherpaEngine.uts";
+import Runnable from "java.lang.Runnable"; // 新增导入
+// #endif
+
+// #ifdef APP-ANDROID
+// --- 全局变量 ---
+let gWinMgr : WindowManager | null = null;
+let gContainer : FrameLayout | null = null;
+let gParams : WindowManager.LayoutParams | null = null;
+let gMenuContainer : LinearLayout | null = null;
+let gMsgContainer : TextView | null = null;
+let gLottieView : LottieAnimationView | null = null;
+let gVibrator : Vibrator | null = null;
+// 定义一个模块作用域内的私有变量，用于存储唯一实例
+let instance : SherpaEngine | null = null;
+let gIsMenuShowing = false;
+let gIsChatting = false;
+let gIsRegistering = false;
+let gIsLongPressExecuted = false;
+let gJsCallback : ((action : string) => void) | null = null;
+let isDragging = false;
+
+const gHandler = new Handler(Looper.getMainLooper());
+const TAG = "[ZeMo]";
+
+export function classifyFinanceFields(requestsJson: string, modelPath: string, vocabPath: string, labelsPath: string): Promise<string> {
+	return Promise.resolve(JSON.stringify({ ok: false, message: '金融字段 SLM 已移除，请使用屏幕视觉模型' }));
+}
+
+export function classifyFinanceLayoutFields(requestsJson: string, modelPath: string, vocabPath: string, labelsPath: string, configPath: string): Promise<string> {
+	return Promise.resolve(JSON.stringify({ ok: false, message: '金融字段 Layout SLM 已移除，请使用屏幕视觉模型' }));
+}
+
+export function classifyScreenIntent(text: string, modelPath: string, labelsPath: string): Promise<string> {
+	return Promise.resolve(JSON.stringify({ ok: false, message: '屏幕意图模型暂仅支持 Harmony MindSpore Lite' }));
+}
+
+export function classifyScreenImageIntent(imagePath: string, modelPath: string, labelsPath: string): Promise<string> {
+	return Promise.resolve(JSON.stringify({ ok: false, message: '屏幕图片意图模型暂仅支持 Harmony MindSpore Lite' }));
+}
+
+// 修改 index.uts 中的 getSherpaEngine
+export function getSherpaEngine() : SherpaEngine {
+  if (instance == null) {
+    console.log("🛠️ [ZeMo] 开始创建 SherpaEngine 实例...");
+    instance = new SherpaEngine();
+    const context = UTSAndroid.getAppContext();
+    
+    if (context != null) {
+      // 1. 发起引擎初始化（异步）
+      instance!.init(context);
+      
+      // 2. 关键修复：在声明时立即初始化为一个空函数
+      let checkStatus : () => void = () => {}; 
+
+      // 3. 重新赋值为真实的业务逻辑
+      checkStatus = () => {
+        const engine = instance;
+        // 增加 engine == null 的安全保护
+        if (engine != null && engine.checkReady()) {
+          console.log("🚀 [ZeMo] 引擎 Ready，自动开启监听...");
+          
+          VoiceService.setChatMode(true); 
+          
+          const ctx = UTSAndroid.getAppContext();
+          if (ctx != null) {
+            // 确保该方法在 ZeMo 类中是 static 且公开的
+            ZeMo.showColoredMessage(ctx, "ZeMo 就绪，已开启人声监测", "#4CD964");
+          }
+        } else {
+          // 4. 使用匿名箭头函数包裹，确保类型匹配
+          setTimeout(() => {
+            checkStatus();
+          }, 500);
+        }
+      };
+      
+      // 5. 启动第一次轮询
+      setTimeout(() => {
+        checkStatus();
+      }, 1500);
+    }
+  }
+  return instance!;
+}
+// 也可以顺带导出类定义，方便页面做类型约束
+export { SherpaEngine };
+export class ZeMo {
+	// private static isAppRunning = false; // 标记 App 是否在运行,好像没有z作用吧
+
+	static setEventListener(callback : ((action : string) => void) | null) {
+		gJsCallback = callback;
+		// 如果 callback 不为空，说明 App 进入了前台
+		// this.isAppRunning = (callback != null);
+	}
+	// 1. 增加一个清理回调的方法
+	static clearCallback() {
+		gJsCallback = null;
+		console.log(`${TAG} JS 回调已清除`);
+	}
+
+	static ifShow() {
+		const context = UTSAndroid.getAppContext();
+		if (context == null) return;
+
+		// 1. 判断是否有悬浮窗权限 (Android 6.0+)
+		if (Settings.canDrawOverlays(context)) {
+			// 有权限，直接显示
+			ZeMo.show();
+		} else {
+			// 2. 没有权限，弹出提示框
+			uni.showModal({
+				title: '权限开启提示',
+				content: 'ZeMo 权限不够，不能显示在桌面。请开启“显示在其他应用上”的权限，以保证悬浮窗功能正常使用。',
+				showCancel: true,
+				cancelText: '暂不开启',
+				confirmText: '去设置',
+				confirmColor: '#42b983', // 使用浅薄荷绿风格颜色
+				success: (res) => {
+					if (res.confirm) {
+						// 3. 用户点击确认，跳转到系统权限设置页面
+						const intent = new Intent(
+							Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+							Uri.parse("package:" + context.getPackageName())
+						);
+						// 增加标志位确保在非 Activity 环境也能启动
+						intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+
+						const activity = UTSAndroid.getUniActivity();
+						if (activity != null) {
+							activity.startActivity(intent);
+						} else {
+							context.startActivity(intent);
+						}
+					}
+				}
+			});
+		}
+	}
+
+	// 修复：使用 getAppContext() 替代 getApp()
+	// 1. 去掉 private，改为公开 static，这样 VoiceService 才能访问
+	static checkMicPermission() : boolean {
+		const ctx = UTSAndroid.getAppContext();
+		if (ctx == null) return true;
+		if (Build.VERSION.SDK_INT >= 23) {
+			// @ts-ignore
+			return ctx.checkSelfPermission("android.permission.RECORD_AUDIO") == PackageManager.PERMISSION_GRANTED;
+		}
+		return true;
+	}
+	// 修复：使用 getAppContext() 替代 getApp()
+	static checkOverlayPermission() : boolean {
+		const ctx = UTSAndroid.getAppContext();
+		if (ctx == null) return true;
+		if (Build.VERSION.SDK_INT >= 23) {
+			return Settings.canDrawOverlays(ctx);
+		}
+		return true;
+	}
+
+	// 重点 2: 每次 show 之前，重新校验 Context
+	static show() {
+		const ctx = UTSAndroid.getAppContext();
+		if (ctx == null) return;
+
+		if (gContainer != null && gContainer!.getParent() != null) return;
+
+		gWinMgr = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager;
+
+		gContainer = new FrameLayout(ctx);
+		gParams = new WindowManager.LayoutParams();
+
+		// 必须是这个类型才能在 App 退出后留存
+		if (Build.VERSION.SDK_INT >= 26) {
+			gParams!.type = 2038; // TYPE_APPLICATION_OVERLAY
+		} else {
+			gParams!.type = 2002;
+		}
+
+		gParams!.format = PixelFormat.TRANSLUCENT;
+		gParams!.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
+		gParams!.gravity = Gravity.START | Gravity.TOP;
+		gParams!.width = 200;
+		gParams!.height = 200;
+		gParams!.x = 0;
+		gParams!.y = 400;
+
+		ZeMo.loadLottie(ctx);
+		ZeMo.setupTouchLogic(ctx);
+
+		try {
+			gWinMgr!.addView(gContainer, gParams);
+			// 确保这里被调用了！
+			ZeMo.initVoiceService(ctx);
+			// 确保单例被创建并开始初始化模型
+			getSherpaEngine();
+		} catch (e) {
+			console.error("ZeMo: Add view failed", e);
+		}
+	}
+	// --- 新增修复：带颜色的气泡显示 ---
+	static showColoredMessage(ctx : Context, txt : string, colorHex : string) {
+		// 移除之前的自动消失定时器
+		gHandler.removeCallbacksAndMessages(null);
+
+		ZeMo.showPersistentMessage(ctx, txt); // 使用持久化显示
+		if (gMsgContainer != null) {
+			const bg = new GradientDrawable();
+			bg.setColor(Color.parseColor(colorHex));
+			bg.setCornerRadius(40.0.toFloat());
+			gMsgContainer!.setBackground(bg);
+		}
+	}
+	private static initVoiceService(ctx : Context) {
+		// 监听来自 VoiceService (SherpaEngine) 的所有原生回调
+		VoiceService.onEvent = (res : string) => {
+			// 所有的 UI 操作必须包裹在 gHandler.post 中
+			gHandler.post(() => {
+				const appContext = UTSAndroid.getAppContext();
+				if (appContext == null) return;
+
+				// 核心：处理录制进度
+				if (res.startsWith("REGISTERING:")) {
+					// 拿到数字部分
+					const countStr = res.replace("REGISTERING:", "");
+					// 强制显示持久化气泡，不自动消失
+					ZeMo.showPersistentMessage(appContext, "🎙️ 正在录制声纹: " + countStr + " / 200");
+
+					// 自动保存逻辑
+					if (parseInt(countStr) >= 200) {
+						const engine = getSherpaEngine();
+						const name = engine.completeEnroll();
+						ZeMo.showColoredMessage(appContext, "✅ 录制完成，已保存为：" + name, "#4CD964");
+						// 延时 3 秒后关闭气泡
+						gHandler.postDelayed(() => { ZeMo.hideMessage(); }, 3000);
+					}
+				}
+
+				// 处理唤醒成功
+				else if (res.startsWith("WAKEUP_SUCCESS:")) {
+					const user = res.split(":")[1];
+					ZeMo.showColoredMessage(appContext, "我在，" + user + " 请说", "#A8E6CF");
+				}
+
+				// 处理识别过程（复读感）
+				else if (res.startsWith("COMMAND_PARTIAL:")) {
+					const text = res.replace("COMMAND_PARTIAL:", "");
+					ZeMo.showPersistentMessage(appContext, text);
+				}
+			});
+		};
+
+		// 启动 Service
+		const vs = new VoiceService();
+		const vsObj = vs as JObject;
+		const intent = new Intent(ctx, vsObj.getClass());
+
+		// 关键修复：判断当前应用状态
+		const activity = UTSAndroid.getUniActivity();
+
+		try {
+			ctx.startForegroundService(intent);
+			// if (Build.VERSION.SDK_INT >= 26) {
+			// 	// 如果 Activity 还在，用 Activity 启动；否则尝试用 AppContext
+			// 	if (activity != null) {
+			// 		activity.startForegroundService(intent);
+			// 	} else {
+			// 		ctx.startForegroundService(intent);
+			// 	}
+			// } else {
+			// 	ctx.startService(intent);
+			// }
+		} catch (e) {
+			// 如果还是报错，说明确实在后台，弹出气泡提示用户点击手动开启
+			console.error("启动服务失败，可能在后台", e);
+			ZeMo.showClickableBubble(ctx, "⚠ 点击唤醒语音引擎", () => {
+				// 通过点击动作启动，系统会允许
+				ZeMo.initVoiceService(ctx);
+			});
+		}
+	}
+
+	// 2. 持久显示消息 (用于说话时，不触发 2.5秒自动隐藏)
+	static showPersistentMessage(ctx : Context, txt : string) {
+		// 先移除之前的隐藏任务
+		gHandler.removeCallbacksAndMessages(null);
+
+		if (gMsgContainer == null) {
+			gMsgContainer = new TextView(ctx);
+			gMsgContainer!.setTextColor(Color.WHITE);
+			gMsgContainer!.setPadding(35, 20, 35, 20);
+			gMsgContainer!.setClickable(true);
+		}
+		gMsgContainer!.setText(txt);
+
+		const bg = new GradientDrawable();
+		bg.setColor(Color.parseColor("#CC000000")); // 半透明黑
+		bg.setCornerRadius(40.0.toFloat());
+		gMsgContainer!.setBackground(bg);
+
+		const lp = new WindowManager.LayoutParams();
+		lp.type = gParams!.type;
+		lp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+		lp.format = PixelFormat.TRANSLUCENT;
+		lp.width = -2; lp.height = -2;
+		lp.gravity = Gravity.START | Gravity.TOP;
+		if (gParams != null) {
+			lp.x = gParams!.x;
+			lp.y = gParams!.y + gParams!.height + 15;
+		}
+
+		try {
+			if (gMsgContainer!.getParent() == null) gWinMgr?.addView(gMsgContainer, lp);
+			else gWinMgr?.updateViewLayout(gMsgContainer, lp);
+		} catch (e) { }
+	}
+	private static showClickableBubble(ctx : Context, txt : string, onClick : () => void) {
+		ZeMo.showMessage(ctx, txt);
+		if (gMsgContainer != null) {
+			gHandler.removeCallbacksAndMessages(null);
+			const bg = new GradientDrawable();
+			bg.setColor(Color.parseColor("#EEFF3B30"));
+			bg.setCornerRadius(40.0.toFloat());
+			gMsgContainer!.setBackground(bg);
+			gMsgContainer!.setOnClickListener((_v) => {
+				onClick();
+			});
+		}
+	}
+
+	private static requestOverlayPermission() {
+		const ctx = UTSAndroid.getUniActivity() as Context;
+		const intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + ctx.getPackageName()));
+		intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+		ctx.startActivity(intent);
+	}
+
+	private static requestMicPermission() {
+		const activity = UTSAndroid.getUniActivity();
+		if (activity == null) return;
+
+		UTSAndroid.requestSystemPermission(activity, ["android.permission.RECORD_AUDIO"], (allGranted : boolean, _grantedList : string[]) => {
+			if (allGranted) {
+				ZeMo.showMessage(activity, "麦克风已授权");
+				ZeMo.hideMessage();
+			}
+		}, (_manual : boolean, _deniedList : string[]) => {
+			// 被拒绝
+		});
+	}
+
+
+	// --- 触摸逻辑 (保持不变) ---
+	private static gLongPressFunc = () => {
+		if (isDragging) return;
+		gIsLongPressExecuted = true;
+		if (gVibrator != null) gVibrator!.vibrate(40);
+		const ctx = UTSAndroid.getUniActivity() as Context;
+		ZeMo.showMenu(ctx);
+		if (gLottieView != null) gLottieView!.pauseAnimation();
+	};
+
+	private static setupTouchLogic(ctx : Context) {
+		if (gContainer == null) return;
+		const conf = ViewConfiguration.get(ctx);
+		const touchSlop = conf.getScaledTouchSlop();
+		const longPressTimeout = ViewConfiguration.getLongPressTimeout().toLong();
+		let startX = 0, startY = 0, startTouchX = 0.0, startTouchY = 0.0;
+		gContainer!.setOnTouchListener((_v, event) : boolean => {
+			const rawX = event.getRawX(); const rawY = event.getRawY();
+			switch (event.getAction()) {
+				case MotionEvent.ACTION_DOWN:
+					startX = gParams!.x; startY = gParams!.y; startTouchX = rawX; startTouchY = rawY;
+					isDragging = false; gIsLongPressExecuted = false;
+					gHandler.postDelayed(ZeMo.gLongPressFunc, longPressTimeout);
+					return true;
+				case MotionEvent.ACTION_MOVE:
+					if (gIsLongPressExecuted) return true;
+					const dx = rawX - startTouchX; const dy = rawY - startTouchY;
+					if (!isDragging && (Math.abs(dx) > touchSlop || Math.abs(dy) > touchSlop)) {
+						isDragging = true; gHandler.removeCallbacks(ZeMo.gLongPressFunc);
+						ZeMo.hideMenu();
+					}
+					if (isDragging && gParams != null) {
+						gParams!.x = (startX + dx).toInt(); gParams!.y = (startY + dy).toInt();
+						ZeMo.safeUpdate();
+					}
+					return true;
+				case MotionEvent.ACTION_UP:
+				case MotionEvent.ACTION_CANCEL:
+					gHandler.removeCallbacks(ZeMo.gLongPressFunc);
+					if (gLottieView != null && !gLottieView!.isAnimating()) gLottieView!.playAnimation();
+					if (!isDragging && !gIsLongPressExecuted) ZeMo.toggleChat(ctx);
+					else if (isDragging) ZeMo.autoDock(ctx);
+					isDragging = false; return true;
+			}
+			return false;
+		});
+	}
+
+	private static showMenu(ctx : Context) {
+		if (gIsMenuShowing) return;
+		gIsMenuShowing = true;
+		gMenuContainer = new LinearLayout(ctx);
+		const bg = new GradientDrawable();
+		bg.setColor(Color.parseColor("#F2222222"));
+		bg.setCornerRadius(60.0.toFloat());
+		gMenuContainer!.setBackground(bg);
+		gMenuContainer!.addView(ZeMo.createBtn(ctx, android.R.drawable.ic_menu_manage, () => {
+			ZeMo.hideMenu(); if (gJsCallback != null) gJsCallback!("GO_SETTING");
+		}));
+		const spkIcon = gIsRegistering ? android.R.drawable.ic_menu_close_clear_cancel : android.R.drawable.ic_btn_speak_now;
+		gMenuContainer!.addView(ZeMo.createBtn(ctx, spkIcon, () => {
+			ZeMo.hideMenu();
+			gIsRegistering = !gIsRegistering;
+
+			const engine = getSherpaEngine(); // 获取单例
+
+			if (gIsRegistering) {
+				// 1. 开始录制
+				ZeMo.showMessage(ctx, "正在录入声纹...");
+				
+				engine.setRegisterMode(true, "Sir"); // 默认给个名字叫主人
+			} else {
+				// 2. 停止并保存
+				const name = engine.completeEnroll();
+				if (name != null) {
+					ZeMo.showMessage(ctx, "✅ 录入成功: " + name);
+				} else {
+					ZeMo.showMessage(ctx, "❌ 录入失败，样本不足");
+				}
+			}
+		}));
+		const lp = new WindowManager.LayoutParams();
+		lp.type = gParams!.type; lp.format = PixelFormat.TRANSLUCENT;
+		lp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+		lp.width = -2; lp.height = -2; lp.gravity = Gravity.START | Gravity.TOP;
+		if (gParams != null) { lp.x = gParams!.x; lp.y = gParams!.y - 160; }
+		try { gWinMgr?.addView(gMenuContainer, lp); } catch (e) { }
+	}
+
+	private static autoDock(ctx : Context) {
+		if (gParams == null) return;
+		const dm = ctx.getResources().getDisplayMetrics();
+		const sw = dm.widthPixels;
+		const ballWidth = gParams!.width;
+		const targetX = (gParams!.x + ballWidth / 2 < sw / 2) ? 0 : sw - ballWidth;
+		const startX = gParams!.x;
+		const anim = ValueAnimator.ofFloat(0.0.toFloat(), 1.0.toFloat());
+		anim.addUpdateListener((a) => {
+			const valObj = a.getAnimatedValue();
+			if (valObj != null && gParams != null) {
+				const val = (valObj as Number).toFloat();
+				gParams!.x = (startX + (targetX - startX) * val).toInt();
+				ZeMo.safeUpdate();
+			}
+		});
+		anim.start();
+	}
+
+	private static toggleChat(ctx : Context) {
+		if (!ZeMo.checkOverlayPermission()) {
+			ZeMo.showClickableBubble(ctx, "⚠ 请开启悬浮窗权限", () => { ZeMo.requestOverlayPermission(); });
+			return;
+		}
+		if (!ZeMo.checkMicPermission()) {
+			ZeMo.showClickableBubble(ctx, "⚠ 请开启麦克风权限", () => { ZeMo.requestMicPermission(); });
+			return;
+		}
+		gIsChatting = !gIsChatting;
+		VoiceService.setChatMode(gIsChatting);
+		ZeMo.showMessage(ctx, gIsChatting ? "听音中..." : "已暂停");
+	}
+
+	static showMessage(ctx : Context, txt : string) {
+		if (gMsgContainer == null) {
+			gMsgContainer = new TextView(ctx);
+			gMsgContainer!.setTextColor(Color.WHITE);
+			gMsgContainer!.setPadding(35, 20, 35, 20);
+			gMsgContainer!.setClickable(true);
+		}
+		gMsgContainer!.setText(txt);
+		const bg = new GradientDrawable();
+		bg.setColor(Color.parseColor("#CC007AFF"));
+		bg.setCornerRadius(40.0.toFloat());
+		gMsgContainer!.setBackground(bg);
+		const lp = new WindowManager.LayoutParams();
+		lp.type = gParams!.type; lp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+		lp.format = PixelFormat.TRANSLUCENT; lp.width = -2; lp.height = -2;
+		lp.gravity = Gravity.START | Gravity.TOP;
+		if (gParams != null) { lp.x = gParams!.x; lp.y = gParams!.y + gParams!.height + 15; }
+		try {
+			if (gMsgContainer!.getParent() == null) gWinMgr?.addView(gMsgContainer, lp);
+			else gWinMgr?.updateViewLayout(gMsgContainer, lp);
+		} catch (e) { }
+		gHandler.removeCallbacksAndMessages(null);
+		gHandler.postDelayed(() => {
+			if (ZeMo.checkOverlayPermission() && ZeMo.checkMicPermission()) {
+				ZeMo.hideMessage();
+			}
+		}, 2500);
+	}
+
+	private static hideMessage() {
+		try {
+			if (gMsgContainer != null && gMsgContainer!.getParent() != null) gWinMgr?.removeView(gMsgContainer);
+		} catch (e) { }
+	}
+
+	private static hideMenu() {
+		if (gMenuContainer != null) {
+			try { gWinMgr?.removeView(gMenuContainer); } catch (e) { }
+			gMenuContainer = null;
+		}
+		gIsMenuShowing = false;
+		if (gLottieView != null) gLottieView!.resumeAnimation();
+	}
+
+	private static safeUpdate() {
+		if (gContainer != null && gParams != null && gContainer!.getParent() != null) {
+			try { gWinMgr?.updateViewLayout(gContainer, gParams); } catch (e) { }
+		}
+	}
+
+	private static loadLottie(ctx : Context) {
+		try {
+			gLottieView = new LottieAnimationView(ctx);
+			const path = UTSAndroid.convert2AbsFullPath("/uni_modules/zemo-ai/static/body.json");
+			gLottieView!.setAnimation(new FileInputStream(new File(path)), "zemo_ball");
+			gLottieView!.setRepeatCount(-1); gLottieView!.playAnimation();
+			gContainer?.addView(gLottieView);
+		} catch (e) { }
+	}
+
+	private static createBtn(ctx : Context, icon : Int, click : () => void) : ImageView {
+		const img = new ImageView(ctx);
+		img.setImageResource(icon); img.setColorFilter(Color.WHITE);
+		img.setPadding(20, 20, 20, 20); img.setLayoutParams(new LinearLayout.LayoutParams(110, 110));
+		img.setOnClickListener((_v) => click()); return img;
+	}
+
+	static hide() {
+		ZeMo.hideMenu(); ZeMo.hideMessage();
+		if (gContainer != null && gContainer!.getParent() != null) {
+			try { gWinMgr?.removeView(gContainer); } catch (e) { }
+			gContainer = null;
+		}
+		gLottieView = null;
+	}
+}
+// #endif

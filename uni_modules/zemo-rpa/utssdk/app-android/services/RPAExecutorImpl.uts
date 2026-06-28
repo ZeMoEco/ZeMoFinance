@@ -1,0 +1,276 @@
+// uni_modules/zemo-rpa/utssdk/app-android/services/RPAExecutorImpl.uts
+import AccessibilityService from 'android.accessibilityservice.AccessibilityService';
+import AccessibilityNodeInfo from 'android.view.accessibility.AccessibilityNodeInfo';
+import GestureDescription from 'android.accessibilityservice.GestureDescription';
+import Path from 'android.graphics.Path';
+import Bundle from 'android.os.Bundle';
+import Intent from 'android.content.Intent';
+import UTSAndroid from 'io.dcloud.uts.UTSAndroid';
+import { SmartExecutor } from '../../services/SmartExecutor.uts';
+import { RPAStep, RPAActionType } from '../../utils/RPAStep.uts';
+import { initGlobalInputListener } from './GlobalInputListener.uts';
+
+export class RPAExecutorImpl {
+	
+	private static service: AccessibilityService | null = null;
+	
+	static setService(s: AccessibilityService) {
+		RPAExecutorImpl.service = s;
+	}
+
+	static getServiceInstance(): AccessibilityService | null {
+		if (RPAExecutorImpl.service == null) {
+			initGlobalInputListener();
+		}
+		return RPAExecutorImpl.service;
+	}
+
+	// ===== 坐标操作 =====
+
+	static async performCoordinateClick(x: number, y: number): Promise<boolean> {
+		return await RPAExecutorImpl.performGesture(x, y, x, y, 100);
+	}
+
+	static async performLongPress(x: number, y: number, duration: number): Promise<boolean> {
+		const dur = duration > 0 ? duration : 800;
+		return await RPAExecutorImpl.performGesture(x, y, x, y, dur);
+	}
+
+	static async performSwipe(x1: number, y1: number, x2: number, y2: number, duration: number): Promise<boolean> {
+		const dur = duration > 0 ? duration : 300;
+		return await RPAExecutorImpl.performGesture(x1, y1, x2, y2, dur);
+	}
+
+	static performGesture(x1: number, y1: number, x2: number, y2: number, duration: number): Promise<boolean> {
+		return new Promise((resolve) => {
+			const service = RPAExecutorImpl.getServiceInstance();
+			if (service == null) {
+				console.error("[RPAExecutorImpl] Service is null");
+				resolve(false);
+				return;
+			}
+			
+			const path = new Path();
+			path.moveTo(x1.toFloat(), y1.toFloat());
+			path.lineTo(x2.toFloat(), y2.toFloat());
+			
+			const builder = new GestureDescription.Builder();
+			const stroke = new GestureDescription.StrokeDescription(path, 0, duration.toLong());
+			builder.addStroke(stroke);
+			const gesture = builder.build();
+			
+			const dispatchResult = service.dispatchGesture(gesture, new RPAExecutorGestureCallback(resolve), null);
+			if (!dispatchResult) {
+				resolve(false);
+			}
+		});
+	}
+
+	// ===== 全局操作 =====
+
+	/**
+	 * 执行全局操作 (BACK / HOME / RECENTS 等)
+	 */
+	static performGlobalAction(action: string): boolean {
+		const service = RPAExecutorImpl.getServiceInstance();
+		if (service == null) return false;
+
+		if (action == "BACK") {
+			return service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK);
+		} else if (action == "HOME") {
+			return service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME);
+		} else if (action == "RECENTS") {
+			return service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS);
+		} else if (action == "NOTIFICATIONS") {
+			return service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS);
+		}
+		return false;
+	}
+
+	/**
+	 * 启动应用
+	 */
+	static launchApp(packageName: string): boolean {
+		try {
+			const ctx = UTSAndroid.getUniActivity();
+			if (ctx == null) return false;
+			const pm = ctx.getPackageManager();
+			const launchIntent = pm.getLaunchIntentForPackage(packageName);
+			if (launchIntent != null) {
+				launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+				ctx.startActivity(launchIntent);
+				return true;
+			}
+		} catch (e) {
+			console.error("[RPAExecutorImpl] launchApp failed", e);
+		}
+		return false;
+	}
+
+	// ===== 无障碍操作 =====
+
+	/**
+	 * 执行无障碍操作 (查找并点击)
+	 */
+	static async performAccessibilityAction(step: RPAStep): Promise<boolean> {
+		const service = RPAExecutorImpl.service;
+		if (service == null) return false;
+
+		const root = service.getRootInActiveWindow();
+		if (root == null) return false;
+
+		let targetNode: AccessibilityNodeInfo | null = null;
+
+		// 1. Try ID
+		if (step.accessibilityId != "") {
+			const list = root.findAccessibilityNodeInfosByViewId(step.accessibilityId);
+			if (list != null && list.size > 0) {
+				targetNode = list.get(0);
+			}
+		}
+
+		// 2. Try Text
+		if (targetNode == null && step.widgetText != "") {
+			// 清理 widgetText 中的前缀标记
+			let searchText = step.widgetText;
+			if (searchText.startsWith("BTN:")) {
+				searchText = searchText.substring(4);
+				const pipeIdx = searchText.indexOf("|");
+				if (pipeIdx > 0) {
+					searchText = searchText.substring(0, pipeIdx);
+				}
+			}
+			if (searchText != "" && searchText != "RAW_CLICK" && searchText != "VISUAL_CLICK") {
+				const list = root.findAccessibilityNodeInfosByText(searchText);
+				if (list != null && list.size > 0) {
+					targetNode = list.get(0);
+				}
+			}
+		}
+
+		if (targetNode != null) {
+			// 根据 actionType 选择操作
+			if (step.actionType == RPAActionType.LONG_PRESS) {
+				return targetNode.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK);
+			}
+
+			// 默认: CLICK — 找到可点击的父节点
+			let clickable = targetNode;
+			while(clickable != null && !clickable.isClickable()) {
+				clickable = clickable.getParent();
+			}
+			
+			if (clickable != null) {
+				return clickable.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+			}
+			// 如果找不到可点击节点，降级到坐标点击
+			const rect = new android.graphics.Rect();
+			targetNode.getBoundsInScreen(rect);
+			return await RPAExecutorImpl.performCoordinateClick(rect.centerX().toFloat(), rect.centerY().toFloat());
+		}
+
+		return false;
+	}
+
+	/**
+	 * 输入文本
+	 */
+	static async performInput(text: string): Promise<boolean> {
+		const service = RPAExecutorImpl.service;
+		if (service == null) return false;
+		
+		const root = service.getRootInActiveWindow();
+		if (root == null) return false;
+		
+		const focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+		if (focused != null) {
+			const args = new Bundle();
+			args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text);
+			return focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
+		}
+		
+		return false;
+	}
+
+	// ===== 后台/前台模式 =====
+
+	/**
+	 * 进入后台执行模式
+	 */
+	static enterBackgroundMode() {
+		console.log("[RPAExecutorImpl] Entering background mode");
+		const service = RPAExecutorImpl.service;
+		if (service != null) {
+			service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME);
+		}
+		// TODO: 启动前台通知 Service 显示执行进度
+	}
+
+	/**
+	 * 退出后台执行模式
+	 */
+	static exitBackgroundMode() {
+		console.log("[RPAExecutorImpl] Exiting background mode");
+		// TODO: 取消前台通知，恢复应用前台
+	}
+
+	/**
+	 * 进入平行视界模式 — 创建分屏
+	 * 使用 MediaProjection + ImageReader 检测渲染完成
+	 */
+	static enterParallelVisionMode() {
+		console.log("[RPAExecutorImpl] Entering parallel vision mode");
+		// 步骤:
+		// 1. 请求分屏 (GLOBAL_ACTION_TOGGLE_SPLIT_SCREEN)
+		const service = RPAExecutorImpl.service;
+		if (service != null) {
+			// Android 7+ 支持分屏
+			service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_TOGGLE_SPLIT_SCREEN);
+		}
+		// 2. MediaProjection 将在 init 时已经启动，此处仅标记模式
+		// TODO: 管理 VirtualDisplay 用于渲染检测
+	}
+
+	/**
+	 * 退出平行视界模式
+	 */
+	static exitParallelVisionMode() {
+		console.log("[RPAExecutorImpl] Exiting parallel vision mode");
+		// TODO: 退出分屏模式
+	}
+
+	/**
+	 * 等待渲染完成 — 通过 MediaProjection + ImageReader
+	 * 原理: 连续截图对比，当画面稳定 (两帧差异极小) 则认为渲染完成
+	 * @param timeout 超时时间 (ms)
+	 */
+	static async waitForRenderComplete(timeout: number): Promise<boolean> {
+		console.log("[RPAExecutorImpl] waitForRenderComplete timeout=", timeout);
+		// 简单实现: 等待固定时间
+		// 完整实现需要: ScreenCaptureUtils 连续截图 → 像素对比 → 稳定判断
+		return new Promise<boolean>((resolve) => {
+			setTimeout(() => {
+				resolve(true);
+			}, Math.min(timeout, 2000));
+		});
+	}
+}
+
+class RPAExecutorGestureCallback extends AccessibilityService.GestureResultCallback {
+	resolve: (value: boolean) => void;
+	
+	constructor(resolve: (value: boolean) => void) {
+		super();
+		this.resolve = resolve;
+	}
+
+	override onCompleted(gestureDescription: GestureDescription) {
+		super.onCompleted(gestureDescription);
+		this.resolve(true);
+	}
+
+	override onCancelled(gestureDescription: GestureDescription) {
+		super.onCancelled(gestureDescription);
+		this.resolve(false);
+	}
+}

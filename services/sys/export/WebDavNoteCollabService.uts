@@ -1,0 +1,160 @@
+import { WebDAVService, type WebDavConfig, type WebDavTextResponse } from '@/services/sys/export/WebDAVService.uts'
+import { WebDavConfigService } from '@/services/sys/export/WebDavConfigService.uts'
+import { diff3Merge } from '@/utils/common/diff3.uts'
+// #ifdef APP-ANDROID
+import { UTSJSONObject } from 'io.dcloud.uts';
+// #endif
+export type NoteCollabInitResult = {
+  ok: boolean
+  enabled: boolean
+  message: string
+  noteUrl: string
+  baseText: string
+  baseEtag: string
+}
+
+export type NoteCollabSaveResult = {
+  ok: boolean
+  enabled: boolean
+  message: string
+  mergedText: string
+  hadConflict: boolean
+  newBaseText: string
+  newBaseEtag: string
+}
+
+type AcquireLockResult = {
+  locked: boolean
+  lockUrl: string
+  message: string
+}
+
+export class WebDavNoteCollabService {
+  static async initBase(noteId: string): Promise<NoteCollabInitResult> {
+    const req = WebDavConfigService.requireCollabConfig()
+    if (!req.ok || req.cfg == null) {
+      return { ok: false, enabled: false, message: req.message, noteUrl: '', baseText: '', baseEtag: '' } as NoteCollabInitResult
+    }
+    const baseUrl = WebDavConfigService.normalizeBaseUrl(req.baseUrl)
+    const noteUrl = WebDavConfigService.buildNoteUrl(baseUrl, noteId)
+    const cfg: WebDavConfig = { url: '', username: req.cfg.username, password: req.cfg.password }
+
+    // Try GET remote; if 404, treat as not existing yet.
+    const r = await WebDAVService.getText(noteUrl, cfg)
+    if (r.ok) {
+      return { ok: true, enabled: true, message: 'ok', noteUrl, baseText: r.text ?? '', baseEtag: r.etag ?? '' } as NoteCollabInitResult
+    }
+    if (r.statusCode == 404) {
+      return { ok: true, enabled: true, message: 'remote_not_found', noteUrl, baseText: '', baseEtag: '' } as NoteCollabInitResult
+    }
+    // Not fatal: still allow local editing.
+    return { ok: false, enabled: true, message: r.message != '' ? r.message : ('GET失败: HTTP ' + r.statusCode), noteUrl, baseText: '', baseEtag: '' } as NoteCollabInitResult
+  }
+
+  private static async tryAcquireLock(noteUrl: string, cfg: WebDavConfig): Promise<AcquireLockResult> {
+    // Prefer LOCK, fallback to lock-file.
+    const lock1 = await WebDAVService.tryLock(noteUrl, cfg)
+    if (lock1.ok) {
+      // Best-effort: many servers require token for UNLOCK; we don't rely on it.
+      return { locked: true, lockUrl: '', message: 'LOCK ok' } as AcquireLockResult
+    }
+
+    const lockUrl = WebDavConfigService.buildLockUrl(noteUrl)
+    // #ifdef APP-ANDROID
+    const eh = new UTSJSONObject()
+    // #endif
+    // #ifndef APP-ANDROID
+    const eh = {}
+    // #endif
+    eh['If-None-Match'] = '*'
+    const r = await WebDAVService.putText(lockUrl, 'locked', cfg, eh)
+    if (r.ok || r.statusCode == 201 || r.statusCode == 200) {
+      return { locked: true, lockUrl, message: 'lock-file ok' } as AcquireLockResult
+    }
+
+    return { locked: false, lockUrl: '', message: lock1.message } as AcquireLockResult
+  }
+
+  private static async releaseLock(lockUrl: string, cfg: WebDavConfig): Promise<void> {
+    if (lockUrl == null || lockUrl.trim() == '') return
+    try { await WebDAVService.remove(lockUrl, cfg) } catch (_e0) {}
+  }
+
+  static async syncOnSave(noteId: string, localText: string, baseText: string, baseEtag: string): Promise<NoteCollabSaveResult> {
+    const req = WebDavConfigService.requireCollabConfig()
+    if (!req.ok || req.cfg == null) {
+      return {
+        ok: false,
+        enabled: false,
+        message: req.message,
+        mergedText: localText,
+        hadConflict: false,
+        newBaseText: baseText,
+        newBaseEtag: baseEtag
+      } as NoteCollabSaveResult
+    }
+
+    const baseUrl = WebDavConfigService.normalizeBaseUrl(req.baseUrl)
+    const noteUrl = WebDavConfigService.buildNoteUrl(baseUrl, noteId)
+    const cfg: WebDavConfig = { url: '', username: req.cfg.username, password: req.cfg.password }
+
+    const lock = await WebDavNoteCollabService.tryAcquireLock(noteUrl, cfg)
+
+    // Fetch remote latest
+    const remote = await WebDAVService.getText(noteUrl, cfg)
+    let remoteText = ''
+    let remoteEtag = ''
+
+    if (remote.ok) {
+      remoteText = remote.text ?? ''
+      remoteEtag = remote.etag ?? ''
+    } else if (remote.statusCode == 404) {
+      remoteText = ''
+      remoteEtag = ''
+    } else {
+      // Can't read remote; still allow upload, but it may overwrite.
+      remoteText = baseText
+      remoteEtag = baseEtag
+    }
+
+    // If remote unchanged from base => upload local directly
+    let merged = localText
+    let hadConflict = false
+
+    if (remoteText.toString() !== baseText.toString()) {
+      const m = diff3Merge(baseText, localText, remoteText)
+      merged = m.merged
+      hadConflict = m.hadConflict
+    }
+
+    // Put merged to remote
+    const putRes: WebDavTextResponse = await WebDAVService.putText(noteUrl, merged, cfg, null)
+
+    if (lock.lockUrl != '') {
+      await WebDavNoteCollabService.releaseLock(lock.lockUrl, cfg)
+    }
+
+    if (!putRes.ok) {
+      const msg = putRes.message != '' ? putRes.message : ('PUT失败: HTTP ' + putRes.statusCode)
+      return {
+        ok: false,
+        enabled: true,
+        message: (lock.locked ? '' : ('未能加锁（可能有人正在编辑）: ' + lock.message + '\n')) + msg,
+        mergedText: merged,
+        hadConflict,
+        newBaseText: baseText,
+        newBaseEtag: baseEtag
+      } as NoteCollabSaveResult
+    }
+
+    return {
+      ok: true,
+      enabled: true,
+      message: (lock.locked ? '同步成功' : ('同步成功（未加锁）')),
+      mergedText: merged,
+      hadConflict,
+      newBaseText: merged,
+      newBaseEtag: putRes.etag ?? ''
+    } as NoteCollabSaveResult
+  }
+}

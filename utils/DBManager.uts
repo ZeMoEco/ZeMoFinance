@@ -1,0 +1,103 @@
+import { DB, SqlArgs } from './DB/DB.uts'
+
+export class DBManager {
+    private static instance: DBManager | null = null;
+    private dbName: string = "ZeMo.db";
+    private isDebug: boolean = false;
+
+    private constructor() {}
+
+    public static getInstance(): DBManager {
+        if (DBManager.instance == null) {
+            DBManager.instance = new DBManager();
+        }
+        return DBManager.instance!;
+    }
+
+    public getDatabasePath(): string {
+        return DB.getDatabasePath();
+    }
+
+    public async init(context: any | null = null): Promise<boolean> {
+        const ok = await DB.init(context, this.dbName);
+        if (!ok) {
+            return false;
+        }
+
+        // Ensure latest table/column/index definitions are present for existing databases.
+        const schemaOk = await DB.ensureSchema();
+        if (!schemaOk) {
+            console.error('[DBManager] ensureSchema failed');
+        }
+        
+        if (this.isDebug) console.log(`[DBManager] DB Ready: ${DB.getDatabasePath()}`);
+        return ok && schemaOk;
+    }
+
+    public async runScript(path: string): Promise<boolean> {
+        try {
+            const fs = uni.getFileSystemManager();
+            // #ifdef APP-ANDROID
+            // Use native file reading if necessary or rely on uni API
+            // For robustness in UTS, assuming standard uni API covers reading text from absolute path
+            // #endif
+            const candidates: string[] = [path, `/${path}`];
+            let sqlContent: string = '';
+            for (let i = 0; i < candidates.length; i++) {
+                try {
+                    sqlContent = fs.readFileSync(candidates[i], "utf-8") as string;
+                    if (sqlContent.length > 0) {
+                        break;
+                    }
+                } catch (_e) {
+                    // try next path
+                }
+            }
+            if (sqlContent.length == 0) {
+                if (path.endsWith('create_tables.sql')) {
+                    const fallbackOk = await DB.ensureSchema();
+                    if (fallbackOk) {
+                        if (this.isDebug) console.log(`[DBManager] Script fallback applied via ensureSchema: ${path}`);
+                        return true;
+                    }
+                }
+                throw new Error(`SQL script not found: ${path}`);
+            }
+            const statements = sqlContent.split(';');
+            for (let i = 0; i < statements.length; i++) {
+                const sql = statements[i].trim();
+                if (sql.length > 0) {
+                    await DB.exec(sql);
+                }
+            }
+            if (this.isDebug) console.log(`[DBManager] Script executed: ${path}`);
+            return true;
+        } catch (e) {
+            console.error(`[DBManager] runScript error: ${e}`);
+            return false;
+        }
+    }
+
+    public async executeSql(sql: string, args: SqlArgs | null = null): Promise<boolean> {
+        return await DB.exec(sql, args);
+    }
+
+    public async selectSql(sql: string, args: SqlArgs | null = null): Promise<Array<Map<string, any | null>>> {
+        return await DB.query(sql, args);
+    }
+
+    public async beginTransaction() {
+        await DB.beginTransaction();
+    }
+    public async setTransactionSuccessful() {
+        await DB.setTransactionSuccessful();
+    }
+    public async endTransaction() {
+        await DB.endTransaction();
+    }
+
+    public close() {
+        DB.close();
+        if (this.isDebug) console.log("[DBManager] DB Closed.");
+    }
+}

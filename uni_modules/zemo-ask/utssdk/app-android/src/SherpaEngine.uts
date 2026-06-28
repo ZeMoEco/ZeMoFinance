@@ -1,0 +1,182 @@
+import { UTSAndroid } from "io.dcloud.uts";
+import Context from "android.content.Context";
+import { Thread, RuntimeException } from "java.lang";
+import AudioRecord from "android.media.AudioRecord";
+import MediaRecorder from "android.media.MediaRecorder";
+import AudioFormat from "android.media.AudioFormat";
+import SherpaWrapper from "src.SherpaWrapper";
+import Log from "android.util.Log";
+
+export class SherpaEngine {
+	private wrapper : SherpaWrapper | null = null;
+	private audioRecord : AudioRecord | null = null;
+	private isRecording : boolean = false;
+	// --- 新增：初始化状态 ---
+	private isReady : boolean = false;
+	private isInitializing : boolean = false;
+
+	private mContext : Context | null = null;
+	constructor() {
+		this.wrapper = new SherpaWrapper();
+	}
+	public init(context : Context) : boolean {
+		if (this.isReady || this.isInitializing) return true;
+
+		this.mContext = context;
+		this.isInitializing = true;
+
+		// --- 关键改进：开启子线程进行初始化 ---
+		new Thread(() => {
+			console.log("🧵 [Thread] 开始后台初始化 Sherpa 引擎 (ONNX 模型加载)...");
+			const startTime = Date.now();
+
+			// 执行耗时的 init (包含模型加载和 loadAllSpeakers)
+			const success = this.wrapper!.init(context);
+
+			this.isReady = success;
+			this.isInitializing = false;
+
+			const cost = Date.now() - startTime;
+			console.log(`✅ [Thread] 引擎初始化完成，耗时: ${cost}ms, 结果: ${success}`);
+		}).start();
+
+		return true; // 立即返回，不阻塞主线程
+	}
+	// --- 新增：检查是否准备就绪 ---
+	public checkReady() : boolean {
+		return this.isReady;
+	}
+	public getLogs() : string {
+		return this.wrapper?.getLatestLogs() ?? "Wrapper not init";
+	}
+	/**
+	 * 结束注册流程并持久化
+	 */
+	public completeEnroll() : string | null {
+		if (this.mContext == null || this.wrapper == null) {
+			console.error("保存失败：上下文或引擎为空");
+			return null;
+		}
+
+		// 调用 Kotlin 的 finishRegistration
+		const savedName = this.wrapper!.finishRegistration(this.mContext!);
+
+		if (savedName != null) {
+			console.log("✅ 声纹文件已成功保存为: " + savedName + ".bin");
+			// 保存成功后强制切回唤醒模式
+			this.setWakeUpMode(true);
+		}
+		return savedName;
+	}
+
+	/**
+	 * 获取所有已注册的声纹名单
+	 */
+	public getVoiceList() : string[] {
+		if (this.wrapper == null) return [] as string[];
+
+		// 1. 获取 Kotlin 的 List
+		const nativeList = this.wrapper!.getRegisteredSpeakers();
+
+		// 2. 创建一个 UTS 的数组 (string[])
+		const result = [] as string[];
+
+		// 3. 修正：使用 .size 而不是 .size()
+		// 注意：Kotlin 的 List.size 是属性
+		for (let i = 0; i < nativeList.size; i++) {
+			// 使用 .get(index) 是正确的
+			result.push(nativeList.get(i.toInt()));
+		}
+
+		return result;
+	}
+	/**
+	 * 删除指定声纹
+	 */
+	public deleteVoice(name : string) {
+		if (this.mContext == null || this.wrapper == null) return;
+		this.wrapper!.removeSpeaker(this.mContext!, name);
+	}
+	// 修改 startRecording，增加安全检查
+	public startRecording(callback : (res : string) => void) {
+		if (!this.isReady) {
+			console.error("❌ 引擎尚未就绪，无法开始录音");
+			callback("ERROR:NotReady");
+			return;
+		}
+		if (this.isRecording) return;
+
+		const sampleRate : Int = 16000;
+		const channelConfig : Int = AudioFormat.CHANNEL_IN_MONO;
+		const audioFormat : Int = AudioFormat.ENCODING_PCM_16BIT;
+		const minBufSize : Int = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat);
+
+		this.audioRecord = new AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, channelConfig, audioFormat, minBufSize);
+		if (this.audioRecord!.getState() != AudioRecord.STATE_INITIALIZED) {
+			callback("ERROR:MicBusy");
+			return;
+		}
+
+		this.isRecording = true;
+		this.audioRecord!.startRecording();
+
+		const context = this.mContext!!;
+		const wrap = this.wrapper!!;
+		new Thread(() => {
+		    console.log("🧵 [Heartbeat] 录音线程已开启");
+		    const buffer = new ShortArray(minBufSize);
+		
+		    while (this.isRecording) {
+		        const readSize : Int = this.audioRecord?.read(buffer, 0, buffer.size) ?? 0;
+		        if (readSize > 0) {
+		            const audioRes = wrap.processAudio(buffer, readSize);
+		            const result = wrap.decode(audioRes.samples, context);
+		            
+		            if (result != "") {
+		                callback(result);
+		                
+		                // --- 自动化录制优化核心逻辑 ---
+		                if (result.startsWith("REGISTERING:")) {
+		                    const count = parseInt(result.split(":")[1]);
+		                    if (count >= 200) {
+		                        console.log("🎯 样本已达标，准备自动保存...");
+		                        // 1. 停止录音循环
+		                        this.isRecording = false; 
+		                        
+		                        // 2. 延迟执行保存（确保最后一波数据处理完）
+		                        const threadName = this.completeEnroll(); 
+		                        if (threadName != null) {
+		                           callback("REGISTER_COMPLETE:" + threadName);
+		                        }
+		                    }
+		                }
+		            }
+		        }
+		    }
+		    console.log("🚫 [Heartbeat] 录音线程已安全停止");
+		}).start();
+	}
+
+	// 这里的 en 是 boolean，匹配 Kotlin 的 setRegisterMode
+	public setRegisterMode(en : boolean, name : string | null) {
+		const finalName = (name == null) ? "DefaultUser" : name;
+		// 3. 这里的调用现在应该能被 UTS 编译器识别了
+		this.wrapper?.setRegisterMode(en, finalName);
+	}
+
+	public setWakeUpMode(en : boolean) {
+		this.wrapper?.setWakeUpMode(en);
+	}
+
+	public stopRecording() {
+		this.isRecording = false;
+		this.audioRecord?.stop();
+		// this.audioRecord?.release();
+		this.audioRecord = null;
+	}
+
+	public release() {
+		this.stopRecording();
+		// this.wrapper?.release(); 
+	}
+}

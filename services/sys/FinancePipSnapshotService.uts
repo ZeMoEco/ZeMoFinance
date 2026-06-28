@@ -1,0 +1,166 @@
+import { FinanceBiz, AccountNode } from '@/services/biz/FinanceBiz.uts'
+import { CalendarBiz } from '@/services/biz/CalendarBiz.uts'
+import { DESK_PET_PIP_SNAPSHOT_KEY } from '@/utils/constant.uts'
+
+type ZemoAskRuntime = {
+  refreshPipContent(): void
+}
+
+export class FinancePipSnapshotService {
+  private static zemoAskRuntimePromise: Promise<ZemoAskRuntime> | null = null
+
+  static async syncSnapshot(refreshPip: boolean = true): Promise<boolean> {
+    try {
+      const snapshot = await FinancePipSnapshotService.buildSnapshot()
+      uni.setStorageSync(DESK_PET_PIP_SNAPSHOT_KEY, JSON.stringify(snapshot))
+      if (refreshPip) FinancePipSnapshotService.refreshNativePip()
+      return true
+    } catch (e) {
+      console.warn('[FinancePipSnapshot] sync failed', e)
+      return false
+    }
+  }
+
+  private static refreshNativePip(): void {
+    // #ifdef APP-HARMONY
+    void FinancePipSnapshotService.getZemoAskRuntime().then((runtime: ZemoAskRuntime): void => {
+      runtime.refreshPipContent()
+    }).catch((e: Error): void => {
+      console.warn('[FinancePipSnapshot] refresh Harmony PiP failed', e)
+    })
+    // #endif
+  }
+
+  private static async getZemoAskRuntime(): Promise<ZemoAskRuntime> {
+    if (FinancePipSnapshotService.zemoAskRuntimePromise == null) {
+      FinancePipSnapshotService.zemoAskRuntimePromise = new Promise<ZemoAskRuntime>((resolve, reject) => {
+        void import('@/uni_modules/zemo-ask').then((module: Object): void => {
+          resolve(module as ZemoAskRuntime)
+        }).catch((e: Error): void => {
+          reject(e)
+        })
+      })
+    }
+    return FinancePipSnapshotService.zemoAskRuntimePromise as Promise<ZemoAskRuntime>
+  }
+
+  private static async buildSnapshot(): Promise<UTSJSONObject> {
+    const accounts = await FinanceBiz.listAccountNodes(null)
+    const netWorth = FinanceBiz.computeNetWorth(accounts)
+    const cashTotal = FinancePipSnapshotService.sumCategory(accounts, FinanceBiz.CATEGORY_CASH)
+    const investTotal = FinancePipSnapshotService.sumCategory(accounts, FinanceBiz.CATEGORY_INVESTMENT)
+    const creditTotal = FinancePipSnapshotService.sumCategory(accounts, FinanceBiz.CATEGORY_CREDIT)
+    const heavyTotal = FinancePipSnapshotService.sumCategory(accounts, FinanceBiz.CATEGORY_HEAVY)
+    const investHoldingCount = FinancePipSnapshotService.countInvestmentHoldings(accounts)
+
+    const now = new Date()
+    const daily = await FinanceBiz.getDailySummary(now.getTime())
+    const todayExpense = daily.get('expense') ?? 0.0
+
+    const metrics = new UTSJSONObject()
+    metrics.set('net_worth', FinancePipSnapshotService.buildPipMetric('我的资产', netWorth, 'CNY', '净资产总览', 'ASSET', 'ASSET CARD'))
+    metrics.set('cash', FinancePipSnapshotService.buildPipMetric('资金账户', cashTotal, `${FinancePipSnapshotService.countCategory(accounts, FinanceBiz.CATEGORY_CASH)} 个`, '可用资金合计', 'CASH', 'ASSET CARD'))
+    metrics.set('investment', FinancePipSnapshotService.buildPipMetric('理财资产', investTotal, `${investHoldingCount} 项`, '理财账户合计', 'FUND', 'ASSET CARD'))
+    metrics.set('credit', FinancePipSnapshotService.buildPipMetric('信贷负债', creditTotal, `${FinancePipSnapshotService.countCategory(accounts, FinanceBiz.CATEGORY_CREDIT)} 张`, '当前欠款合计', 'DEBT', 'ASSET CARD'))
+    metrics.set('heavy', FinancePipSnapshotService.buildPipMetric('重资产', heavyTotal, `${FinancePipSnapshotService.countCategory(accounts, FinanceBiz.CATEGORY_HEAVY)} 项`, '固定资产估值', 'HOME', 'ASSET CARD'))
+    metrics.set('today_expense', FinancePipSnapshotService.buildPipMetric('今日消耗', todayExpense, 'TODAY', '全部支出种类合计', 'TODAY', 'DAILY COST'))
+    metrics.set('calendar_month', await FinancePipSnapshotService.buildCalendarMonthMetric(now))
+
+    const snapshot = new UTSJSONObject()
+    snapshot.set('updatedAt', Date.now())
+    snapshot.set('metrics', metrics)
+    return snapshot
+  }
+
+  private static buildPipMetric(title: string, amount: number, badge: string, desc: string, tail: string, holder: string): UTSJSONObject {
+    const obj = new UTSJSONObject()
+    obj.set('title', title)
+    obj.set('amount', FinancePipSnapshotService.roundMoney(amount))
+    obj.set('badge', badge)
+    obj.set('desc', desc)
+    obj.set('tail', tail)
+    obj.set('holder', holder)
+    return obj
+  }
+
+  private static async buildCalendarMonthMetric(now: Date): Promise<UTSJSONObject> {
+    const year = now.getFullYear()
+    const month = now.getMonth() + 1
+    const stats = await CalendarBiz.getMonthlyAmountStats(year, month)
+    const balanceByDate = new Map<string, number>()
+    let monthBalance = 0.0
+    for (let i = 0; i < stats.length; i++) {
+      const stat = stats[i]
+      const amount = FinancePipSnapshotService.roundMoney(stat.balance)
+      balanceByDate.set(stat.date, amount)
+      monthBalance += amount
+    }
+    monthBalance = FinancePipSnapshotService.roundMoney(monthBalance)
+
+    const metric = FinancePipSnapshotService.buildPipMetric(`${month}月金额`, monthBalance, year.toString(), '每日收支金额', 'CAL', 'AMOUNT CALENDAR')
+    metric.set('year', year)
+    metric.set('month', month)
+    metric.set('monthLabel', `${year}.${FinancePipSnapshotService.pad2(month)}`)
+    metric.set('today', FinancePipSnapshotService.dateKey(year, month, now.getDate()))
+
+    const firstDay = new Date(year, month - 1, 1)
+    const startOffset = firstDay.getDay()
+    const daysInMonth = new Date(year, month, 0).getDate()
+    for (let i = 0; i < 42; i++) {
+      const day = i - startOffset + 1
+      if (day <= 0 || day > daysInMonth) {
+        metric.set(`d${i}`, '')
+        metric.set(`a${i}`, 0.0)
+        continue
+      }
+      const date = FinancePipSnapshotService.dateKey(year, month, day)
+      metric.set(`d${i}`, day.toString())
+      metric.set(`k${i}`, date)
+      metric.set(`a${i}`, balanceByDate.get(date) ?? 0.0)
+    }
+    return metric
+  }
+
+  private static sumCategory(accounts: AccountNode[], category: string): number {
+    let total = 0.0
+    for (let i = 0; i < accounts.length; i++) {
+      const acc = accounts[i]
+      if (acc.category != category) continue
+      if (category == FinanceBiz.CATEGORY_CREDIT && FinanceBiz.isReceivableCreditAccount(acc)) continue
+      total += category == FinanceBiz.CATEGORY_CREDIT ? Math.abs(acc.balance) : acc.balance
+    }
+    return FinancePipSnapshotService.roundMoney(total)
+  }
+
+  private static countCategory(accounts: AccountNode[], category: string): number {
+    let count = 0
+    for (let i = 0; i < accounts.length; i++) {
+      if (accounts[i].category != category) continue
+      if (category == FinanceBiz.CATEGORY_CREDIT && FinanceBiz.isReceivableCreditAccount(accounts[i])) continue
+      count++
+    }
+    return count
+  }
+
+  private static countInvestmentHoldings(accounts: AccountNode[]): number {
+    let count = 0
+    for (let i = 0; i < accounts.length; i++) {
+      const acc = accounts[i]
+      if (acc.category == FinanceBiz.CATEGORY_INVESTMENT && acc.sub_type != '账户现金') count++
+    }
+    return count
+  }
+
+  private static dateKey(year: number, month: number, day: number): string {
+    return `${year}-${FinancePipSnapshotService.pad2(month)}-${FinancePipSnapshotService.pad2(day)}`
+  }
+
+  private static pad2(value: number): string {
+    return value < 10 ? `0${value}` : value.toString()
+  }
+
+  private static roundMoney(value: number): number {
+    if (isNaN(value)) return 0.0
+    return Math.round(value * 100.0) / 100.0
+  }
+}

@@ -1,0 +1,297 @@
+// services/sys/Permission.uts
+
+// #ifdef APP-ANDROID
+import UTSAndroid from "io.dcloud.uts.UTSAndroid"
+import Intent from "android.content.Intent"
+import Settings from "android.provider.Settings"
+import Context from "android.content.Context"
+import NotificationManager from "android.app.NotificationManager"
+import AlarmManager from "android.app.AlarmManager"
+import PowerManager from "android.os.PowerManager"
+import Uri from "android.net.Uri"
+import Build from "android.os.Build"
+// #endif
+
+const AUTO_START_ACK_KEY = 'zemo_perm_autoStart_ack'
+
+export type PermissionKey = 'overlay' | 'notification' | 'exactAlarm' | 'backgroundPopup' | 'autoStart'
+
+export type PermissionState = {
+  key: PermissionKey
+  granted: boolean
+}
+
+export class SysPermission {
+  private static isAutoStartAcked(): boolean {
+    try {
+      const v = uni.getStorageSync(AUTO_START_ACK_KEY) as any
+      if (v == null) return false
+      if (v === true) return true
+      const s = v.toString()
+      return s == '1' || s.toLowerCase() == 'true'
+    } catch (_e) {
+      return false
+    }
+  }
+
+  private static setAutoStartAcked(): void {
+    try {
+      uni.setStorageSync(AUTO_START_ACK_KEY, '1')
+    } catch (_e) { }
+  }
+
+  static resetAutoStartAck(): void {
+    try {
+      uni.removeStorageSync(AUTO_START_ACK_KEY)
+    } catch (_e) {
+      try { uni.setStorageSync(AUTO_START_ACK_KEY, '') } catch (_e2) { }
+    }
+  }
+  static isOverlayGranted(): boolean {
+    // #ifdef APP-ANDROID
+    try {
+      const ctx = UTSAndroid.getAppContext()
+      if (ctx == null) return false
+      return Settings.canDrawOverlays(ctx)
+    } catch (_e) { return false }
+    // #endif
+    // #ifndef APP-ANDROID
+    return true
+    // #endif
+  }
+
+  static isNotificationGranted(): boolean {
+    // #ifdef APP-ANDROID
+    try {
+      const ctx = UTSAndroid.getAppContext()
+      if (ctx == null) return false
+      const nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+      return nm.areNotificationsEnabled()
+    } catch (_e) { return false }
+    // #endif
+    // #ifndef APP-ANDROID
+    return true
+    // #endif
+  }
+
+  static isExactAlarmGranted(): boolean {
+    // #ifdef APP-ANDROID
+    try {
+      const ctx = UTSAndroid.getAppContext()
+      if (ctx == null) return false
+      if (Build.VERSION.SDK_INT < 31) return true
+      const am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+      return am.canScheduleExactAlarms()
+    } catch (_e) { return false }
+    // #endif
+    // #ifndef APP-ANDROID
+    return true
+    // #endif
+  }
+
+  static isBackgroundPopupGranted(): boolean {
+    return SysPermission.isOverlayGranted() && SysPermission.isNotificationGranted()
+  }
+
+  static isAutoStartGranted(): boolean {
+    // Android 无统一“自启动”权限：
+    // 强制依赖用户点击确认，因为原生 API 无法准确判断各厂商的自启动开关
+    // #ifdef APP-ANDROID
+    return SysPermission.isAutoStartAcked()
+    // #endif
+    // #ifndef APP-ANDROID
+    return true
+    // #endif
+  }
+
+  static async ensureOverlay(): Promise<boolean> {
+    // #ifdef APP-ANDROID
+    try {
+      const ctx = UTSAndroid.getAppContext()
+      if (ctx == null) return false
+      if (SysPermission.isOverlayGranted()) return true
+      const intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + ctx.getPackageName()))
+      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      ctx.startActivity(intent)
+    } catch (_e) { }
+    return SysPermission.isOverlayGranted()
+    // #endif
+    // #ifndef APP-ANDROID
+    return true
+    // #endif
+  }
+
+  static async ensureNotification(): Promise<boolean> {
+    // #ifdef APP-ANDROID
+    try {
+      const ctx = UTSAndroid.getAppContext()
+      if (ctx == null) return false
+      if (SysPermission.isNotificationGranted()) return true
+      const intent = new Intent()
+      intent.setAction(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+      intent.putExtra("android.provider.extra.APP_PACKAGE", ctx.getPackageName())
+      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      ctx.startActivity(intent)
+    } catch (_e) { }
+    return SysPermission.isNotificationGranted()
+    // #endif
+    // #ifndef APP-ANDROID
+    return true
+    // #endif
+  }
+
+  static async ensureExactAlarm(): Promise<boolean> {
+    // #ifdef APP-ANDROID
+    try {
+      const ctx = UTSAndroid.getAppContext()
+      if (ctx == null) return false
+      if (SysPermission.isExactAlarmGranted()) return true
+      const intent = new Intent()
+      intent.setAction("android.settings.REQUEST_SCHEDULE_EXACT_ALARM")
+      intent.setData(Uri.parse("package:" + ctx.getPackageName()))
+      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      ctx.startActivity(intent)
+    } catch (_e) { }
+    return SysPermission.isExactAlarmGranted()
+    // #endif
+    // #ifndef APP-ANDROID
+    return true
+    // #endif
+  }
+
+  static async ensureAutoStart(): Promise<boolean> {
+    // #ifdef APP-ANDROID
+    try {
+      const ctx = UTSAndroid.getAppContext()
+      if (ctx == null) return false
+      if (SysPermission.isAutoStartGranted()) return true
+      // 直接跳转到“应用信息/应用详情”页（多数 ROM 的自启动/后台相关开关在这里）
+      const intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+      intent.setData(Uri.parse("package:" + ctx.getPackageName()))
+      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      ctx.startActivity(intent)
+	  // 用户已点击跳转：后续不再重复提醒
+	  SysPermission.setAutoStartAcked()
+    } catch (_e) { }
+    return SysPermission.isAutoStartGranted()
+    // #endif
+    // #ifndef APP-ANDROID
+    return true
+    // #endif
+  }
+
+  static async ensureBackgroundPopup(): Promise<boolean> {
+    const okNotify = await SysPermission.ensureNotification()
+    const okOverlay = await SysPermission.ensureOverlay()
+    return okNotify && okOverlay
+  }
+
+  static async ensureAll(): Promise<boolean> {
+    const a = await SysPermission.ensureNotification()
+    const b = await SysPermission.ensureOverlay()
+    const c = await SysPermission.ensureExactAlarm()
+    return a && b && c
+  }
+
+  static openAppNotificationSettings(): void {
+    // #ifdef APP-ANDROID
+    try {
+      const ctx = UTSAndroid.getAppContext()
+      if (ctx == null) return
+      const intent = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+      // 使用字符串常量，避免部分基座 Settings.EXTRA_* 缺失导致编译问题
+      intent.putExtra('android.provider.extra.APP_PACKAGE', ctx.getPackageName())
+      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      ctx.startActivity(intent)
+      return
+    } catch (_e) { }
+
+    // fallback: 应用详情页
+    try {
+      const ctx = UTSAndroid.getAppContext()
+      if (ctx == null) return
+      const intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+      intent.setData(Uri.parse('package:' + ctx.getPackageName()))
+      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      ctx.startActivity(intent)      SysPermission.setAutoStartAcked()    } catch (_e2) { }
+    // #endif
+  }
+
+  static openNotificationChannelSettings(channelId: string): void {
+    // #ifdef APP-ANDROID
+    try {
+      const ctx = UTSAndroid.getAppContext()
+      if (ctx == null) return
+
+      // Android 8.0+ 才有「渠道」详情页
+      if (Build.VERSION.SDK_INT >= 26) {
+        const intent = new Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+        intent.putExtra('android.provider.extra.APP_PACKAGE', ctx.getPackageName())
+        intent.putExtra('android.provider.extra.CHANNEL_ID', channelId)
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(intent)
+        return
+      }
+    } catch (_e) { }
+
+    // fallback
+    try { SysPermission.openAppNotificationSettings() } catch (_e2) { }
+    // #endif
+  }
+}
+
+export class Permission {
+  static resetAutoStartAck(): void {
+    try {
+      SysPermission.resetAutoStartAck()
+    } catch (_e) { }
+  }
+
+  static async ensure(key: PermissionKey): Promise<PermissionState> {
+    switch (key) {
+      case 'overlay':
+        return { key, granted: await SysPermission.ensureOverlay() }
+      case 'notification':
+        return { key, granted: await SysPermission.ensureNotification() }
+      case 'exactAlarm':
+        return { key, granted: await SysPermission.ensureExactAlarm() }
+      case 'backgroundPopup':
+        return { key, granted: await SysPermission.ensureBackgroundPopup() }
+      case 'autoStart':
+        return { key, granted: await SysPermission.ensureAutoStart() }
+    }
+    return { key: key, granted: false }
+  }
+
+  static status(key: PermissionKey): PermissionState {
+    switch (key) {
+      case 'overlay':
+        return { key, granted: SysPermission.isOverlayGranted() }
+      case 'notification':
+        return { key, granted: SysPermission.isNotificationGranted() }
+      case 'exactAlarm':
+        return { key, granted: SysPermission.isExactAlarmGranted() }
+      case 'backgroundPopup':
+        return { key, granted: SysPermission.isBackgroundPopupGranted() }
+      case 'autoStart':
+        return { key, granted: SysPermission.isAutoStartGranted() }
+    }
+    return { key: key, granted: false }
+  }
+
+  static async ensureMany(keys: PermissionKey[]): Promise<PermissionState[]> {
+    const out: PermissionState[] = []
+    for (let i = 0; i < keys.length; i++) {
+      out.push(await Permission.ensure(keys[i]))
+    }
+    return out
+  }
+
+  static statuses(keys: PermissionKey[]): PermissionState[] {
+    const out: PermissionState[] = []
+    for (let i = 0; i < keys.length; i++) {
+      out.push(Permission.status(keys[i]))
+    }
+    return out
+  }
+}

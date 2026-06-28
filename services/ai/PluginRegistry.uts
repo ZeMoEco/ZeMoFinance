@@ -1,0 +1,109 @@
+import { FunctionCallingService } from './FunctionCallingService.uts';
+
+// #ifdef APP-ANDROID
+import { UTSAndroid } from 'io.dcloud.uts';
+// #endif
+//import { UTSJSONObject } from 'io.dcloud.uts';
+
+// Define the interface for a Plugin
+export type PluginDefinition = {
+    name: string;
+    description: string;
+    implementation: string;
+    parameters: any; // JSONObject / Map
+}
+
+/**
+ * Manages plugin definitions and syncs them to the Native AI Engine.
+ */
+export class PluginRegistry {
+    private static readonly STORAGE_KEY = "zemo_ai_plugins_v2";
+    
+    // In-Memory cache of full definitions
+    private static plugins: PluginDefinition[] = [];
+
+    static init() {
+        PluginRegistry.loadAndSync();
+    }
+
+    static loadAndSync() {
+        const jsonStrRaw = uni.getStorageSync(PluginRegistry.STORAGE_KEY);
+        if (jsonStrRaw != null && jsonStrRaw != "") {
+            const jsonStr = jsonStrRaw.toString();
+            try {
+                // Determine if jsonStr is a JSON Array
+                const list = JSON.parse(jsonStr);
+                if (Array.isArray(list)) {
+                     // Cast elements if necessary, or just assign if structure matches
+                     // In UTS, we might need manual casting if strict
+                     const typedList: PluginDefinition[] = [];
+                     (list as Array<any>).forEach(item => {
+                         typedList.push(item as PluginDefinition);
+                     });
+                     PluginRegistry.plugins = typedList;
+                     
+                     // Sync to UTS FunctionCallingService
+                     FunctionCallingService.registerBatch(jsonStr);
+                     console.log("[PluginRegistry] Synced " + PluginRegistry.plugins.length + " plugins to FunctionCallingService.");
+                }
+            } catch (e) {
+                console.error("Failed to load plugins", e);
+            }
+        }
+    }
+    
+    // Returns registration success
+    static register(jsonConfig: string): boolean {
+        try {
+            // Validate JSON
+            const def = JSON.parse(jsonConfig) as PluginDefinition;
+            if (def.name == null) return false;
+            
+            // Add to list, handling duplicates
+            const newName = def.name;
+            const idx = PluginRegistry.plugins.findIndex((p) => p.name == newName);
+            
+            if (idx >= 0) {
+                PluginRegistry.plugins[idx] = def;
+            } else {
+                PluginRegistry.plugins.push(def);
+            }
+            
+            // Save & Sync
+            const fullJson = JSON.stringify(PluginRegistry.plugins);
+            uni.setStorageSync(PluginRegistry.STORAGE_KEY, fullJson);
+            
+            // Sync to FunctionCallingService
+            return FunctionCallingService.register(jsonConfig);
+        } catch (e) {
+            console.error(e);
+            return false;
+        }
+    }
+    
+    static unregister(name: string) {
+        const idx = PluginRegistry.plugins.findIndex((p) => p.name == name);
+        if(idx >= 0) {
+            PluginRegistry.plugins.splice(idx, 1);
+             const fullJson = JSON.stringify(PluginRegistry.plugins);
+             uni.setStorageSync(PluginRegistry.STORAGE_KEY, fullJson);
+             FunctionCallingService.registerBatch(fullJson);
+        }
+    }
+    
+    // Used by AIAgentExecutor to get manual definition for prompt injection if needed
+    // (Though Native FC handles it now, we might still want it for non-native logic)
+    static getAllDefinitions(): any[] {
+        const res: any[] = [];
+        PluginRegistry.plugins.forEach((v) => {
+            res.push(v);
+        });
+        return res;
+    }
+    
+    static getPlugin(name: string): PluginDefinition | null {
+         const idx = PluginRegistry.plugins.findIndex((p) => p.name == name);
+         if (idx >= 0) return PluginRegistry.plugins[idx];
+         return null;
+    }
+}

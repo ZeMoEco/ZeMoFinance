@@ -1,0 +1,508 @@
+/**
+ * FunctionCallingService - 纯UTS实现的函数调用服务
+ * 
+ * 功能:
+ * 1. 函数注册与管理
+ * 2. LLM输出解析（多格式支持）
+ * 3. Prompt构建
+ * 4. 函数执行调度
+ */
+
+// ========== 类型定义 ==========
+
+// #ifdef APP-ANDROID
+import { UTSAndroid } from 'io.dcloud.uts';
+import { UTSJSONObject } from 'io.dcloud.uts';
+// #endif
+
+export type FunctionParameter = {
+    type: string;
+    description?: string;
+    required?: boolean;
+    default?: any;
+}
+
+export type FunctionDefinition = {
+    name: string;
+    description: string;
+    parameters: Map<string, FunctionParameter>;
+    requiredParams: string[];
+    implementation: string; // "builtin:handler" | "native:ModuleId:Method" | "reflection:ClassName:Method"
+}
+
+export type ParsedFunctionCall = {
+    found: boolean;
+    functionName: string;
+    arguments: Map<string, any | null>;
+    implementation: string;
+    rawJson: string;
+}
+
+export type FunctionExecutionResult = {
+    success: boolean;
+    result: string;
+    error: string | null;
+}
+
+export type ValidationResult = {
+    valid: boolean;
+    error: string | null;
+}
+
+export type ParamInfo = {
+    name: string;
+    type: string;
+    required: boolean;
+    description: string;
+}
+
+// ========== 函数调用服务 ==========
+
+export class FunctionCallingService {
+    
+    // 函数注册表
+    private static functions: Map<string, FunctionDefinition> = new Map();
+    
+    // ========== 函数注册 ==========
+    
+    /**
+     * 注册单个函数
+     * @param defJson JSON格式的函数定义
+     */
+    static register(defJson: string): boolean {
+        try {
+            let funcName = "";
+            let funcDesc = "";
+            let funcImpl = "";
+            let parameters = new Map<string, FunctionParameter>();
+            let requiredParams: string[] = [];
+
+            // #ifdef APP-ANDROID
+            const defA = JSON.parse(defJson) as UTSJSONObject;
+            funcName = (defA.get("name") ?? "") as string;
+            if (funcName.trim() === "") return false;
+            
+            funcDesc = (defA.get("description") ?? "") as string;
+            funcImpl = (defA.get("implementation") ?? "") as string;
+            
+            const paramsObjA = (defA.get("parameters") ?? new UTSJSONObject()) as UTSJSONObject;
+            const propsA = (paramsObjA.get("properties") ?? paramsObjA) as UTSJSONObject;
+            const requiredRawA = paramsObjA.get("required");
+            const requiredA = (requiredRawA instanceof Array) ? (requiredRawA as any[]) : new Array<any>();
+
+            if (propsA != null) {
+                const propsMapA = propsA.toMap();
+                propsMapA.forEach((val : any | null, key : string) => {
+                    if (val instanceof UTSJSONObject) {
+                        const param = val as UTSJSONObject;
+                        parameters.set(key, {
+                            type: (param.get("type") ?? "string") as string,
+                            description: (param.get("description") ?? "") as string,
+                            required: requiredA.includes(key),
+                            default: param.get("default")
+                        } as FunctionParameter);
+                    }
+                });
+            }
+            
+            requiredA.forEach((r : any) => {
+                requiredParams.push(r.toString());
+            });
+            // #endif
+            
+            // #ifndef APP-ANDROID
+            const defW = JSON.parse(defJson) as Map<string, any>;
+            funcName = (defW.get("name") ?? "") as string;
+            if (funcName.trim() === "") return false;
+            
+            funcDesc = (defW.get("description") ?? "") as string;
+            funcImpl = (defW.get("implementation") ?? "") as string;
+            
+            const paramsObjW = (defW.get("parameters") ?? new Map<string, any>()) as Map<string, any>;
+            const propsW = (paramsObjW.get("properties") ?? paramsObjW) as Map<string, any>;
+            const requiredRawW = paramsObjW.get("required");
+            const requiredW = (requiredRawW instanceof Array) ? (requiredRawW as any[]) : new Array<any>();
+
+            if (propsW != null) {
+                propsW.forEach((val : any, key : string) => {
+                    const param = val as Map<string, any>;
+                    parameters.set(key, {
+                        type: (param.get("type") ?? "string") as string,
+                        description: (param.get("description") ?? "") as string,
+                        required: requiredW.includes(key),
+                        default: param.get("default")
+                    } as FunctionParameter);
+                });
+            }
+            
+            requiredW.forEach((r : any) => {
+                requiredParams.push(r.toString());
+            });
+            // #endif
+            
+            const funcDef: FunctionDefinition = {
+                name: funcName,
+                description: funcDesc,
+                parameters: parameters,
+                requiredParams: requiredParams,
+                implementation: funcImpl
+            };
+            
+            FunctionCallingService.functions.set(funcName, funcDef);
+            console.log(`[FunctionCalling] Registered: ${funcName}`);
+            return true;
+        } catch (e) {
+            console.error("[FunctionCalling] Register error:", e);
+            return false;
+        }
+    }
+    
+    /**
+     * 批量注册函数
+     * @param defsJson JSON数组格式
+     * @returns 成功注册的数量
+     */
+    static registerBatch(defsJson: string): number {
+        try {
+            const res = JSON.parse(defsJson);
+            if (!(res instanceof Array)) return 0;
+            const defs = res as any[];
+            let count = 0;
+            
+            defs.forEach((def : any) => {
+                if (FunctionCallingService.register(JSON.stringify(def))) {
+                    count++;
+                }
+            });
+            
+            return count;
+        } catch (e) {
+            console.error("[FunctionCalling] RegisterBatch error:", e);
+            return 0;
+        }
+    }
+    
+    /**
+     * 注销函数
+     */
+    static unregister(name: string): boolean {
+        return FunctionCallingService.functions.delete(name);
+    }
+    
+    /**
+     * 清空所有函数
+     */
+    static clear(): void {
+        FunctionCallingService.functions.clear();
+    }
+    
+    /**
+     * 获取函数定义
+     */
+    static getFunction(name: string): FunctionDefinition | null {
+        return FunctionCallingService.functions.get(name) ?? null;
+    }
+    
+    /**
+     * 获取所有函数名
+     */
+    static getAllNames(): string[] {
+        const names: string[] = [];
+        FunctionCallingService.functions.forEach((_ : FunctionDefinition, name : string) => {
+            names.push(name);
+        });
+        return names;
+    }
+    
+    // ========== 定义导出 ==========
+    
+    /**
+     * 获取所有函数定义的JSON（用于Prompt注入）
+     */
+    static getDefinitionsJson(): string {
+        const arr: any[] = [];
+        
+        FunctionCallingService.functions.forEach((func : FunctionDefinition) => {
+            const propsMap = new Map<string, any>();
+            
+            func.parameters.forEach((param : FunctionParameter, key : string) => {
+                const p = new Map<string, any>();
+                p.set("type", param.type);
+                p.set("description", param.description ?? "");
+                propsMap.set(key, p);
+            });
+            
+            const paramsObj = new UTSJSONObject();
+            paramsObj.set("type", "object");
+            paramsObj.set("properties", new UTSJSONObject(propsMap));
+            paramsObj.set("required", func.requiredParams);
+            
+            const def = new UTSJSONObject();
+            def.set("name", func.name);
+            def.set("description", func.description);
+            def.set("parameters", paramsObj);
+            arr.push(def);
+        });
+        
+        return JSON.stringify(arr);
+    }
+    
+    /**
+     * 获取简洁的函数列表描述
+     */
+    static getSimpleDescription(): string {
+        const lines: string[] = [];
+        
+        FunctionCallingService.functions.forEach((func : FunctionDefinition) => {
+            const paramNames: string[] = [];
+            func.parameters.forEach((_ : FunctionParameter, key : string) => {
+                paramNames.push(key);
+            });
+            lines.push(`- ${func.name}(${paramNames.join(', ')}): ${func.description}`);
+        });
+        
+        return lines.join("\n");
+    }
+    
+    // ========== LLM输出解析 ==========
+    
+    /**
+     * 解析LLM输出中的函数调用
+     * 支持多种格式：
+     * 1. {"cmd": "funcName", "params": {...}}
+     * 2. {"function_call": {"name": "...", "arguments": {...}}}
+     * 3. {"name": "...", "arguments": {...}}
+     * 4. <function_call>...</function_call>
+     */
+    static parse(llmOutput: string): ParsedFunctionCall {
+        const notFound: ParsedFunctionCall = {
+            found: false,
+            functionName: "",
+            arguments: new Map<string, any | null>(),
+            implementation: "",
+            rawJson: ""
+        };
+        
+        // 提取JSON
+        const startIdx = llmOutput.indexOf('{');
+        const endIdx = llmOutput.lastIndexOf('}');
+        
+        if (startIdx < 0 || endIdx <= startIdx) {
+            // 尝试XML格式
+            const xmlMatch = llmOutput.match(/<function_call>([\s\S]*?)<\/function_call>/);
+            if (xmlMatch != null && xmlMatch.length > 1) {
+                const subContent = xmlMatch[1];
+                if (subContent != null) {
+                    return FunctionCallingService.parse(subContent);
+                }
+            }
+            return notFound;
+        }
+        
+        const jsonStr = llmOutput.substring(startIdx, endIdx + 1);
+        
+        try {
+            let funcName = "";
+            let argsObj: any | null = null;
+            
+            const json = JSON.parse(jsonStr) as UTSJSONObject;
+            
+            // 格式1: {"cmd": "...", "params": {...}}
+            if (json.get("cmd") != null) {
+                funcName = (json.get("cmd") ?? "") as string;
+                argsObj = json.get("params");
+            }
+            // 格式2: {"function_call": {"name": "...", "arguments": {...}}}
+            else if (json.get("function_call") != null) {
+                const fcObj = json.get("function_call");
+                if (fcObj instanceof UTSJSONObject) {
+                    const fc = fcObj as UTSJSONObject;
+                    funcName = (fc.get("name") ?? "") as string;
+                    argsObj = fc.get("arguments");
+                }
+            }
+            // 格式3: {"name": "...", "arguments": {...}}
+            else if (json.get("name") != null && json.get("arguments") != null) {
+                funcName = (json.get("name") ?? "") as string;
+                argsObj = json.get("arguments");
+            }
+            
+            if (funcName === "") return notFound;
+            
+            // 转换参数
+            const args = new Map<string, any | null>();
+            if (argsObj != null) {
+                if (argsObj instanceof UTSJSONObject) {
+                    const argsJSON = argsObj as UTSJSONObject;
+                    const argsMap = argsJSON.toMap();
+                    argsMap.forEach((v : any | null, k : string) => {
+                        args.set(k, v);
+                    });
+                } else if (argsObj instanceof Map) {
+                    const argsMap = argsObj as Map<string, any>;
+                    argsMap.forEach((v : any, k : string) => {
+                        args.set(k, v);
+                    });
+                }
+            }
+            
+            // 查找实现
+            const funcDef = FunctionCallingService.functions.get(funcName);
+            const impl = funcDef?.implementation ?? "";
+            
+            return {
+                found: true,
+                functionName: funcName,
+                arguments: args,
+                implementation: impl,
+                rawJson: jsonStr
+            };
+        } catch (e) {
+            console.log("[FunctionCalling] Parse failed:", e);
+            return notFound;
+        }
+    }
+    
+    /**
+     * 解析并返回JSON字符串
+     */
+    static parseToJson(llmOutput: string): string {
+        const result = FunctionCallingService.parse(llmOutput);
+        
+        // #ifdef APP-ANDROID
+        const out = new UTSJSONObject();
+        out.set("found", result.found);
+        out.set("function", result.functionName);
+        out.set("arguments", new UTSJSONObject(result.arguments));
+        out.set("implementation", result.implementation);
+        return JSON.stringify(out);
+        // #else
+        const argsObj = new Map<string, any | null>();
+        result.arguments.forEach((v : any | null, k : string) => {
+            argsObj.set(k, v);
+        });
+        
+        const out = new Map<string, any>();
+        out.set("found", result.found);
+        out.set("function", result.functionName);
+        out.set("arguments", argsObj);
+        out.set("implementation", result.implementation);
+        return JSON.stringify(out);
+        // #endif
+    }
+    
+    // ========== Prompt构建 ==========
+    
+    /**
+     * 构建带函数调用的完整Prompt
+     */
+    static buildPrompt(systemPrompt: string, userMessage: string, ragContext: string = ""): string {
+        const parts: string[] = [];
+        
+        // 系统提示
+        parts.push(systemPrompt);
+        
+        // RAG上下文
+        if (ragContext.length > 0) {
+            parts.push("");
+            parts.push(ragContext);
+        }
+        
+        // 函数定义
+        if (FunctionCallingService.functions.size > 0) {
+            parts.push("");
+            parts.push("[可用函数]");
+            parts.push(FunctionCallingService.getDefinitionsJson());
+            parts.push("");
+            parts.push("[输出规则]");
+            parts.push("如果需要调用函数，请只输出JSON格式：{\"cmd\": \"函数名\", \"params\": {\"参数\": \"值\"}}");
+            parts.push("如果不需要调用函数，直接回复用户。");
+        }
+        
+        // 用户消息
+        parts.push("");
+        parts.push("User: " + userMessage);
+        parts.push("Assistant:");
+        
+        return parts.join("\n");
+    }
+    
+    // ========== 验证 ==========
+    
+    /**
+     * 验证函数调用参数
+     */
+    static validate(parsed: ParsedFunctionCall): ValidationResult {
+        if (!parsed.found) {
+            const result: ValidationResult = { valid: false, error: "No function call found" };
+            return result;
+        }
+        
+        const funcDef = FunctionCallingService.functions.get(parsed.functionName);
+        if (funcDef == null) {
+            const result: ValidationResult = { valid: false, error: `Unknown function: ${parsed.functionName}` };
+            return result;
+        }
+        
+        // 检查必需参数
+        for (const requiredParam of funcDef.requiredParams) {
+            if (!parsed.arguments.has(requiredParam)) {
+                const result: ValidationResult = { valid: false, error: `Missing required parameter: ${requiredParam}` };
+                return result;
+            }
+        }
+        
+        const result: ValidationResult = { valid: true, error: null };
+        return result;
+    }
+    
+    // ========== 内置函数注册辅助 ==========
+    
+    /**
+     * 快速注册内置函数
+     */
+    static registerBuiltin(
+        name: string,
+        description: string,
+        params: ParamInfo[]
+    ): boolean {
+        const propsMap = new Map<string, any>();
+        const required: string[] = [];
+        
+        params.forEach((p : ParamInfo) => {
+            const pMap = new Map<string, any>();
+            pMap.set("type", p.type);
+            pMap.set("description", p.description ?? "");
+            propsMap.set(p.name, pMap);
+            if (p.required) {
+                required.push(p.name);
+            }
+        });
+        
+        // #ifdef APP-ANDROID
+        const paramsObj = new UTSJSONObject();
+        paramsObj.set("type", "object");
+        paramsObj.set("properties", new UTSJSONObject(propsMap));
+        paramsObj.set("required", required);
+        
+        const def = new UTSJSONObject();
+        def.set("name", name);
+        def.set("description", description);
+        def.set("parameters", paramsObj);
+        def.set("implementation", "builtin:" + name);
+        // #else
+        const paramsObj = new Map<string, any>();
+        paramsObj.set("type", "object");
+        paramsObj.set("properties", propsMap);
+        paramsObj.set("required", required);
+        
+        const def = new Map<string, any>();
+        def.set("name", name);
+        def.set("description", description);
+        def.set("parameters", paramsObj);
+        def.set("implementation", "builtin:" + name);
+        // #endif
+        
+        return FunctionCallingService.register(JSON.stringify(def));
+    }
+}

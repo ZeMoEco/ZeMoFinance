@@ -1,0 +1,320 @@
+// uni_modules/zemo-rpa/utssdk/index.uts
+import { SmartExecutor, TargetParams } from './services/SmartExecutor.uts';
+import { RPAExecutor } from './services/RPAExecutor.uts';
+import { RPARecorder, RecordingState } from './services/RPARecorder.uts';
+import { RpaServiceBridge, RpaService, RpaSaveItemFn } from './services/RpaService.uts';
+import { RPAStep, RPAExecutionConfig, ExecutionMode, StepInputMode, ExecutionInputMode, RPAActionType, RPARect, RPAScript, RPACanvasGroup, RPACanvasEdge, RPANodeDetail, RPAPageSignature, RPABranchCondition } from './utils/RPAStep.uts';
+
+// 导出所有公共类型和服务
+export {
+    RPAActionType,
+    ExecutionMode,
+    StepInputMode,
+    ExecutionInputMode,
+    RPAExecutionConfig,
+    RPARect,
+    RPANodeDetail,
+    RPAPageSignature,
+    RPABranchCondition,
+    RPAStep,
+    RPACanvasGroup,
+    RPACanvasEdge,
+    RPAScript
+} from './utils/RPAStep.uts';
+export { SmartExecutor, TargetParams } from './services/SmartExecutor.uts';
+export { RPARecorder, RecordingState } from './services/RPARecorder.uts';
+export { RPAExecutor, StepExecutionResult, ExecutionProgressCallback, AIBranchDecisionCallback } from './services/RPAExecutor.uts';
+export { RpaServiceBridge, RpaService, RpaSaveItemFn } from './services/RpaService.uts';
+export { IHIDExecutor, HIDExecutorFactory, HIDConnectionState, HIDDeviceInfo } from './interface/IHIDExecutor.uts';
+export { SkillGroup, SkillSubGroup, SkillMeta, ExecutionRecord } from './services/types.uts';
+
+/**
+ * zemo-rpa 错误码范围 9020001–9020099
+ * - 9020001 无障碍服务未启用
+ * - 9020002 脚本执行超时
+ * - 9020003 目标元素未找到
+ * - 9020004 截图失败
+ */
+export type ZemoRpaErrorCode = 9020001 | 9020002 | 9020003 | 9020004;
+
+export interface ZemoRpaFail extends IUniError {
+  errCode : ZemoRpaErrorCode
+};
+
+// #ifdef APP-ANDROID
+import Context from 'android.content.Context';
+import UTSAndroid from 'io.dcloud.uts.UTSAndroid';
+import { FloatingRecorder, AppUtils } from './app-android/exports.uts';
+export { rpaStepFromJSON, rpaScriptFromJSON } from './app-android/utils/RPAStepParser.uts';
+// #endif
+
+// #ifdef APP-HARMONY
+import { FloatingRecorder } from './app-harmony/FloatingRecorder.uts';
+// #endif
+
+// #ifdef APP-IOS
+import { FloatingRecorder } from './app-ios/FloatingRecorder.uts';
+// #endif
+
+
+export class ZemoRpa {
+
+    /**
+     * Start the Recorder Floating Window
+     * @param context Context (Android/Harmony)
+     * @param groupsJson JSON string of skill groups
+     * @param selectedAppJson JSON string of selected app info
+     */
+    static startRecording(context: any | null = null, groupsJson: string | null = null, selectedAppJson: string | null = null) {
+        // #ifdef APP-ANDROID
+        FloatingRecorder.show(context as Context | null, groupsJson, selectedAppJson);
+        // #endif
+
+        // #ifdef APP-HARMONY
+        FloatingRecorder.show(context);
+        // #endif
+
+        // #ifdef APP-IOS
+        FloatingRecorder.show(context);
+        // #endif
+        
+        // #ifdef WEB
+        console.log("Web platform does not support native floating recorder");
+        // #endif
+    }
+    
+    /**
+     * Stop the Recorder
+     */
+    static stopRecording() {
+         // #ifdef APP-ANDROID || APP-HARMONY || APP-IOS
+        FloatingRecorder.hide();
+        // #endif
+    }
+
+    /**
+     * Execute a smart action (single step)
+     */
+    static async execute(params: TargetParams): Promise<boolean> {
+        return await SmartExecutor.smartClick(params);
+    }
+
+    /**
+     * 执行录制的脚本 (使用默认配置)
+     */
+    static async executeScript(script: RPAStep[]): Promise<boolean> {
+        return await RPAExecutor.executeScript(script);
+    }
+
+    /**
+     * 执行录制的脚本 (使用自定义配置)
+     * @param script 脚本步骤数组
+     * @param config 执行配置 (前台/后台模式, 重试策略等)
+     */
+    static async executeScriptWithConfig(script: RPAStep[], config: RPAExecutionConfig): Promise<boolean> {
+        return await RPAExecutor.executeScript(script, config);
+    }
+
+    /**
+     * 执行 v2 RPAScript (含分支、分组、边等)
+     * @param script RPAScript 对象
+     * @param config 执行配置
+     */
+    static async executeRPAScript(script: RPAScript, config: RPAExecutionConfig | null = null): Promise<boolean> {
+        return await RPAExecutor.executeRPAScript(script, config);
+    }
+
+    /**
+     * 停止正在执行的脚本
+     */
+    static stopExecution() {
+        RPAExecutor.stop();
+    }
+
+    /**
+     * 获取执行状态
+     */
+    static isExecuting(): boolean {
+        return RPAExecutor.isRunning;
+    }
+
+    /**
+     * 设置执行进度回调
+     */
+    static setProgressCallback(callback: ((step: number, total: number, desc: string) => void) | null) {
+        RPAExecutor.setProgressCallback(callback);
+    }
+    
+    /**
+     * Enable/Disable Debug Mode
+     */
+    static setDebug(enable: boolean) {
+        SmartExecutor.setDebug(enable);
+    }
+
+    /**
+     * 注入 DB 存储回调（由应用层调用）。
+     * 若使用 services/RpaService.uts 的 init()，则会自动注册，无需手动调用。
+     * 若需自定义存储实现，可传入自己的函数替代默认的 DB 实现。
+     */
+    static registerSaveCallback(fn : RpaSaveItemFn) {
+        RpaServiceBridge.setSaveCallback(fn);
+    }
+
+    /**
+     * 获取安装的应用列表
+     */
+    static getInstalledApps(context: any | null = null): any[] {
+        // #ifdef APP-ANDROID
+        let ctx = context as Context | null;
+        if (ctx == null) ctx = UTSAndroid.getUniActivity();
+        const apps = AppUtils.getInstalledApps(ctx!);
+        
+        // Convert AppInfo objects to standard map structure
+        const res: any[] = [];
+        apps.forEach((app) => {
+            const item = new Map<string, any>();
+            item.set("appName", app.appName);
+            item.set("packageName", app.packageName);
+            res.push(item);
+        });
+        return res;
+        // #endif
+        return [];
+    }
+
+    /**
+     * Check if Accessibility Service is enabled for this package
+     */
+    static checkAccessibilityPermission(context: any | null = null): boolean {
+        // #ifdef APP-ANDROID
+        let ctx = context as Context | null;
+        if (ctx == null) ctx = UTSAndroid.getUniActivity();
+        return AppUtils.checkAccessibilityPermission(ctx!);
+        // #endif
+        return false;
+    }
+
+    /**
+     * Open Accessibility Settings page
+     */
+    static openAccessibilitySettings(context: any | null = null) {
+        // #ifdef APP-ANDROID
+        let ctx = context as Context | null;
+        if (ctx == null) ctx = UTSAndroid.getUniActivity();
+        AppUtils.openAccessibilitySettings(ctx!);
+        // #endif
+    }
+
+    /**
+     * 启动应用
+     */
+    static launchApp(packageName: string, context: any | null = null): boolean {
+        // #ifdef APP-ANDROID
+        let ctx = context as Context | null;
+        if (ctx == null) ctx = UTSAndroid.getUniActivity();
+        return AppUtils.launchApp(ctx!, packageName);
+        // #endif
+        return false;
+    }
+
+    /**
+     * 创建默认执行配置
+     */
+    static createDefaultConfig(): RPAExecutionConfig {
+        return {
+            mode: ExecutionMode.FOREGROUND,
+            inputMode: ExecutionInputMode.ACCESSIBILITY,
+            stepDelay: 500,
+            retryCount: 1,
+            continueOnError: true,
+            loopCount: 0
+        } as RPAExecutionConfig;
+    }
+
+    /**
+     * 创建后台执行配置
+     */
+    static createBackgroundConfig(): RPAExecutionConfig {
+        return {
+            mode: ExecutionMode.BACKGROUND,
+            inputMode: ExecutionInputMode.ACCESSIBILITY,
+            stepDelay: 500,
+            retryCount: 2,
+            continueOnError: true,
+            loopCount: 0
+        } as RPAExecutionConfig;
+    }
+
+    // ===== 录制控制 =====
+
+    /**
+     * 暂停录制（可输入描述）
+     */
+    static pauseRecording() {
+        RPARecorder.pause();
+    }
+
+    /**
+     * 恢复录制
+     */
+    static resumeRecording() {
+        RPARecorder.resume();
+    }
+
+    /**
+     * 获取当前录制状态
+     */
+    static getRecordingState(): RecordingState {
+        return RPARecorder.state;
+    }
+
+    /**
+     * 获取当前录制的完整 RPAScript
+     */
+    static getCurrentScript(): RPAScript | null {
+        return RPARecorder.buildScript();
+    }
+
+    /**
+     * 设置步骤描述 (AI标签)
+     */
+    static setStepDescription(stepId: string, description: string, aiLabel: string = "") {
+        RPARecorder.setStepDescription(stepId, description, aiLabel);
+    }
+
+    /**
+     * 设置步骤输入模式 (HID/无障碍/坐标)
+     */
+    static setStepInputMode(stepId: string, mode: StepInputMode) {
+        RPARecorder.setStepInputMode(stepId, mode);
+    }
+
+    /**
+     * 添加分支条件
+     */
+    static addBranchCondition(stepId: string, condition: RPABranchCondition) {
+        RPARecorder.addBranchCondition(stepId, condition);
+    }
+
+    /**
+     * 创建 Canvas 分组
+     */
+    static createCanvasGroup(name: string, stepIds: string[]): RPACanvasGroup {
+        return RPARecorder.createCanvasGroup(name, stepIds);
+    }
+
+    /**
+     * 添加 Canvas 连线
+     */
+    static addCanvasEdge(fromStepId: string, toStepId: string, label: string = ""): RPACanvasEdge {
+        return RPARecorder.addCanvasEdge(fromStepId, toStepId, label);
+    }
+
+    /**
+     * 设置 AI 分支决策回调
+     */
+    static setAIBranchCallback(callback: ((step: RPAStep, branches: RPABranchCondition[]) => Promise<string>) | null) {
+        RPAExecutor.setAIBranchCallback(callback);
+    }
+}

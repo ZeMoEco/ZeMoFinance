@@ -1,0 +1,764 @@
+// uni_modules/zemo-rpa/utssdk/app-android/utils/FloatingRecorder.uts
+// #ifdef APP-ANDROID
+import Context from 'android.content.Context';
+import WindowManager from 'android.view.WindowManager';
+import View from 'android.view.View';
+import TextView from 'android.widget.TextView';
+import Button from 'android.widget.Button';
+import ImageView from 'android.widget.ImageView';
+import LinearLayout from 'android.widget.LinearLayout';
+import FrameLayout from 'android.widget.FrameLayout';
+import ScrollView from 'android.widget.ScrollView';
+import Gravity from 'android.view.Gravity';
+import Color from 'android.graphics.Color';
+import GradientDrawable from 'android.graphics.drawable.GradientDrawable';
+import MotionEvent from 'android.view.MotionEvent';
+import Build from 'android.os.Build';
+import Settings from 'android.provider.Settings';
+import Intent from 'android.content.Intent';
+import Uri from 'android.net.Uri';
+import Toast from 'android.widget.Toast';
+import EditText from 'android.widget.EditText';
+import PixelFormat from 'android.graphics.PixelFormat';
+import InputMethodManager from 'android.view.inputmethod.InputMethodManager';
+import UTSAndroid from 'io.dcloud.uts.UTSAndroid';
+import { RPARecorder, RecordingState } from '../../services/RPARecorder.uts';
+import { RPAExecutorImpl } from '../services/RPAExecutorImpl.uts';
+import { AppUtils } from './AppUtils.uts';
+import JSONArray from 'org.json.JSONArray';
+
+class GroupOption {
+    id: string;
+    name: string;
+    children: GroupOption[];
+    
+    constructor(id: string, name: string, children: GroupOption[] = []) {
+        this.id = id;
+        this.name = name;
+        this.children = children;
+    }
+}
+
+export class FloatingRecorder {
+    private static windowManager: WindowManager | null = null;
+    private static floatingLayout: FrameLayout | null = null;
+    private static uiContainer: LinearLayout | null = null;
+    private static layoutParams: WindowManager.LayoutParams | null = null;
+    
+    // UI Elements
+    private static statusDot: View | null = null;
+    private static statusText: TextView | null = null;
+    private static leftPanel: LinearLayout | null = null;
+    private static rightPanel: LinearLayout | null = null;
+    private static groupLabel: TextView | null = null;
+    private static dropdownList: ScrollView | null = null;
+    private static dropdownContent: LinearLayout | null = null;
+    private static savePanel: LinearLayout | null = null;
+    private static saveNameInput: EditText | null = null;
+    private static saveDescInput: EditText | null = null;
+    private static liveLogView: TextView | null = null;
+    private static liveLogLines: string[] = [];
+    private static pollTimer: number = 0;
+    private static lastStepCount: number = 0;
+    
+    // State
+    private static context: Context | null = null;
+    private static currentGroup: GroupOption | null = null;
+    private static selectionStack: GroupOption[] = [];
+    private static isDropdownOpen: boolean = false;
+    private static pendingAppPackage: string = "";
+    private static pendingAppName: string = "";
+    // Removed duplicate uiContainer declaration
+    private static uiParams: FrameLayout.LayoutParams | null = null;
+    
+    // Drag data
+    private static initialX: Int = 0;
+    private static initialY: Int = 0;
+    private static initialTouchX: Float = 0.0.toFloat();
+    private static initialTouchY: Float = 0.0.toFloat();
+    private static isMoving: boolean = false;
+
+    // Hardcoded Groups (Fallback)
+    private static rootOptions: GroupOption[] = [
+        new GroupOption('g1', '常用技能', [
+            new GroupOption('g1-1', '办公'),
+            new GroupOption('g1-2', '社交')
+        ]),
+        new GroupOption('g2', '系统操作', [
+            new GroupOption('g2-1', '设置', [
+                new GroupOption('g2-1-1', '网络'),
+                new GroupOption('g2-1-2', '显示')
+            ]),
+            new GroupOption('g2-2', '文件管理')
+        ]),
+        new GroupOption('g3', '自定义')
+    ];
+
+    private static parseGroups(json: string) {
+        try {
+            const arr = new JSONArray(json);
+            const res: GroupOption[] = [];
+            for (let i=0; i < arr.length(); i++) {
+                const g = arr.getJSONObject(i.toInt());
+                const name = g.getString("name");
+                const id = g.getString("id");
+                
+                const subs: GroupOption[] = [];
+                if (g.has("subGroups")) {
+                     const subArr = g.getJSONArray("subGroups");
+                     for (let j=0; j < subArr.length(); j++) {
+                         const s = subArr.getJSONObject(j.toInt());
+                         subs.push(new GroupOption(s.getString("id"), s.getString("name")));
+                     }
+                }
+                res.push(new GroupOption(id, name, subs));
+            }
+            if (res.length > 0) {
+                FloatingRecorder.rootOptions = res;
+            }
+        } catch(e) { console.log(e); }
+    }
+
+    private static parseSelectedApp(json: string) {
+        try {
+            const arr = new JSONArray('[' + json + ']');
+            if (arr.length() > 0) {
+                const obj = arr.getJSONObject(0);
+                FloatingRecorder.pendingAppPackage = obj.optString("packageName", "");
+                FloatingRecorder.pendingAppName = obj.optString("appName", "");
+                console.log("[FloatingRecorder] pending app:", FloatingRecorder.pendingAppPackage, FloatingRecorder.pendingAppName);
+            }
+        } catch (e) {
+            console.log("[FloatingRecorder] parseSelectedApp failed", e);
+        }
+    }
+
+    static show(context: Context | null = null, groupsJson: string | null = null, selectedAppJson: string | null = null) {
+        if (this.floatingLayout != null) return;
+        
+        if (groupsJson != null) {
+            this.parseGroups(groupsJson);
+        }
+        if (selectedAppJson != null) {
+            this.parseSelectedApp(selectedAppJson);
+        }
+        
+        let ctx = context;
+        if (ctx == null) {
+            ctx = UTSAndroid.getUniActivity();
+        }
+        if (ctx == null) return;
+        this.context = ctx;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+             if (!Settings.canDrawOverlays(ctx)) {
+                 Toast.makeText(ctx, "请开启悬浮窗权限", Toast.LENGTH_LONG).show();
+                 const intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + ctx.getPackageName()));
+                 intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                 ctx.startActivity(intent);
+                 return;
+             }
+        }
+
+        this.windowManager = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager;
+        
+        // --- Create Layout ---
+        this.createLayout(ctx);
+        
+        this.layoutParams = new WindowManager.LayoutParams();
+        const lp = this.layoutParams!;
+        lp.width = WindowManager.LayoutParams.WRAP_CONTENT;
+        lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            lp.type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
+        } else {
+            lp.type = WindowManager.LayoutParams.TYPE_PHONE;
+        }
+        lp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE 
+                 | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                 | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS 
+                 | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN;
+        lp.format = PixelFormat.TRANSLUCENT;
+        lp.gravity = Gravity.TOP | Gravity.START;
+        lp.x = 80;
+        lp.y = 300;
+
+        this.windowManager!.addView(this.floatingLayout, lp);
+        this.startStepPolling();
+        
+        this.updateStateUI();
+    }
+
+    private static startStepPolling() {
+        this.stopStepPolling();
+        this.lastStepCount = RPARecorder.script.length;
+        this.pollTimer = setInterval(() => {
+            const steps = RPARecorder.script;
+            const len = steps.length;
+            if (len > this.lastStepCount) {
+                for (let i = this.lastStepCount; i < len; i++) {
+                    const step = steps[i];
+                    const msg = "#" + (i + 1) + " " + step.actionType + " " + step.widgetText;
+                    this.pushLiveLog(msg);
+                }
+                this.lastStepCount = len;
+                this.updateStateUI();
+            }
+        }, 500);
+    }
+
+    private static stopStepPolling() {
+        if (this.pollTimer > 0) {
+            clearInterval(this.pollTimer);
+            this.pollTimer = 0;
+        }
+    }
+
+    private static pushLiveLog(line: string) {
+        this.liveLogLines.push(line);
+        if (this.liveLogLines.length > 4) {
+            this.liveLogLines.shift();
+        }
+        if (this.liveLogView != null) {
+            this.liveLogView!.setText(this.liveLogLines.join('\n'));
+        }
+    }
+
+    private static setOverlayFocusable(focusable: boolean) {
+        if (this.layoutParams == null || this.windowManager == null || this.floatingLayout == null) return;
+        const lp = this.layoutParams!;
+        if (focusable) {
+            lp.flags = (lp.flags & ~WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) 
+                     | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                     | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
+        } else {
+            lp.flags = lp.flags 
+                     | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE 
+                     | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                     | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
+        }
+        this.windowManager!.updateViewLayout(this.floatingLayout, lp);
+    }
+
+    private static showKeyboard(target: EditText | null) {
+        if (this.context == null || target == null) return;
+        try {
+            target.setFocusable(true);
+            target.setFocusableInTouchMode(true);
+            target.requestFocus();
+            const imm = this.context!.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager;
+            imm.showSoftInput(target, InputMethodManager.SHOW_IMPLICIT);
+        } catch (e) {
+            console.log("[FloatingRecorder] showKeyboard failed", e);
+        }
+    }
+
+    private static hideKeyboard(target: EditText | null) {
+        if (this.context == null || target == null) return;
+        try {
+            const imm = this.context!.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager;
+            imm.hideSoftInputFromWindow(target.getWindowToken(), 0);
+        } catch (e) {
+            console.log("[FloatingRecorder] hideKeyboard failed", e);
+        }
+    }
+    
+    private static createLayout(ctx: Context) {
+        // 1. Root FrameLayout (floating widget only, NOT full screen)
+        const frame = new FrameLayout(ctx);
+        this.floatingLayout = frame;
+
+        // Touch interceptor removed: Accessibility Service (GlobalInputListener) handles
+        // click recording via TYPE_VIEW_CLICKED events. A full-screen interceptor blocks
+        // all touches from reaching underlying apps.
+
+        // 2. UI Container (The floating widget)
+        const uiContainer = new LinearLayout(ctx);
+        uiContainer.setOrientation(LinearLayout.VERTICAL);
+        const uiParams = new FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+        uiContainer.setLayoutParams(uiParams);
+        
+        // --- UI Construction (Same as before but added to uiContainer) ---
+        
+        // UI Style
+        // To achieve "Vision-like", maybe separate parts. 
+        // Let's make root invisible background, and put background on children.
+        uiContainer.setBackgroundColor(Color.TRANSPARENT);
+
+        // Style for Top Bar
+        const rootBg = new GradientDrawable();
+        rootBg.setColor(Color.parseColor("#CC1E1E1E")); // Semi-transparent dark
+        rootBg.setCornerRadius(24.0.toFloat());
+        rootBg.setStroke(2, Color.parseColor("#44FFFFFF"));
+        
+        // --- Top Bar (Horizontal) ---
+        const topBar = new LinearLayout(ctx);
+        topBar.setOrientation(LinearLayout.HORIZONTAL);
+        topBar.setBackground(rootBg);
+        topBar.setPadding(30, 15, 30, 15);
+        topBar.setGravity(Gravity.CENTER_VERTICAL);
+        
+        // Touch Listener for Drag (Attached to TopBar)
+        topBar.setOnTouchListener((v: View, event: MotionEvent): boolean => {
+            return FloatingRecorder.onTouch(v, event);
+        });
+        
+        // Left Panel: Status + Controls
+        const left = new LinearLayout(ctx);
+        left.setOrientation(LinearLayout.HORIZONTAL);
+        left.setGravity(Gravity.CENTER_VERTICAL);
+        
+        // Status Dot
+        const dot = new View(ctx);
+        const dotBg = new GradientDrawable();
+        dotBg.setShape(GradientDrawable.OVAL);
+        dotBg.setColor(Color.DKGRAY);
+        dot.setBackground(dotBg);
+        left.addView(dot, new LinearLayout.LayoutParams(24, 24)); 
+        this.statusDot = dot;
+        
+        // Margin
+        const dotParams = dot.getLayoutParams() as LinearLayout.LayoutParams;
+        dotParams.rightMargin = 20;
+        dot.setLayoutParams(dotParams);
+        
+        // Text ("Skill Rec")
+        const tv = new TextView(ctx);
+        tv.setText("技能录制");
+        tv.setTextColor(Color.WHITE);
+        tv.setTextSize(14.0.toFloat());
+        left.addView(tv);
+        this.statusText = tv;
+        
+        // REC Button (点击开始/停止录制)
+        left.setOnClickListener((v: View) => {
+            if (!this.isMoving) {
+                this.toggleRecording();
+            }
+        });
+        
+        // Separator
+        const sep = new View(ctx);
+        sep.setBackgroundColor(Color.parseColor("#33FFFFFF"));
+        const sepParams = new LinearLayout.LayoutParams(2, 60);
+        sepParams.leftMargin = 30;
+        sepParams.rightMargin = 30;
+        topBar.addView(left);
+        topBar.addView(sep, sepParams);
+        
+        // Right Panel
+        const right = new LinearLayout(ctx);
+        right.setOrientation(LinearLayout.HORIZONTAL);
+        right.setGravity(Gravity.CENTER_VERTICAL);
+        right.setOnClickListener((v: View) => {
+             if (!this.isMoving) {
+                 this.toggleDropdown();
+             }
+        });
+        
+        // Group Name
+        const gName = new TextView(ctx);
+        gName.setText("选择分组");
+        gName.setTextColor(Color.LTGRAY);
+        gName.setTextSize(13.0.toFloat());
+        gName.setMaxLines(1);
+        right.addView(gName);
+        this.groupLabel = gName;
+        
+        // Arrow
+        const arrow = new TextView(ctx);
+        arrow.setText(" ▼");
+        arrow.setTextColor(Color.GRAY);
+        arrow.setTextSize(10.0.toFloat());
+        right.addView(arrow);
+        
+        topBar.addView(right);
+
+        // --- Close Button ---
+        const closeBtn = new TextView(ctx);
+        closeBtn.setText("X");
+        closeBtn.setTextColor(Color.LTGRAY);
+        closeBtn.setTextSize(14.0.toFloat());
+        closeBtn.setPadding(30, 0, 10, 0); 
+        closeBtn.setOnClickListener((v) => {
+             this.hide();
+        });
+        topBar.addView(closeBtn);
+        
+        // --- Dropdown List ---
+        const scroll = new ScrollView(ctx);
+        const ddBg = new GradientDrawable();
+        ddBg.setColor(Color.parseColor("#DD2C2C2C"));
+        ddBg.setCornerRadius(16.0.toFloat());
+        ddBg.setStroke(1, Color.parseColor("#33FFFFFF"));
+        scroll.setBackground(ddBg);
+        scroll.setFillViewport(true);
+        scroll.setVisibility(View.GONE); 
+        
+        const scrollParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 400); 
+        scrollParams.topMargin = 10;
+        scroll.setLayoutParams(scrollParams);
+        
+        const content = new LinearLayout(ctx);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(10, 10, 10, 10);
+        scroll.addView(content);
+        
+        this.dropdownList = scroll;
+        this.dropdownContent = content;
+
+        // --- Save Panel ---
+        const savePanel = new LinearLayout(ctx);
+        savePanel.setOrientation(LinearLayout.VERTICAL);
+        const saveBg = new GradientDrawable();
+        saveBg.setColor(Color.parseColor("#EE202020"));
+        saveBg.setCornerRadius(16.0.toFloat());
+        saveBg.setStroke(1, Color.parseColor("#44FFFFFF"));
+        savePanel.setBackground(saveBg);
+        savePanel.setPadding(20, 20, 20, 20);
+        const saveParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        saveParams.topMargin = 10;
+        savePanel.setLayoutParams(saveParams);
+        savePanel.setVisibility(View.GONE);
+
+        const saveTitle = new TextView(ctx);
+        saveTitle.setText("暂停录制并保存");
+        saveTitle.setTextColor(Color.WHITE);
+        saveTitle.setTextSize(14.0.toFloat());
+        savePanel.addView(saveTitle);
+
+        const nameInput = new EditText(ctx);
+        nameInput.setHint("技能名称");
+        nameInput.setTextColor(Color.WHITE);
+        nameInput.setHintTextColor(Color.GRAY);
+        savePanel.addView(nameInput);
+
+        const descInput = new EditText(ctx);
+        descInput.setHint("技能描述（可选）");
+        descInput.setTextColor(Color.WHITE);
+        descInput.setHintTextColor(Color.GRAY);
+        savePanel.addView(descInput);
+
+        const btnRow = new LinearLayout(ctx);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        btnRow.setGravity(Gravity.END);
+
+        const cancelBtn = new TextView(ctx);
+        cancelBtn.setText("取消");
+        cancelBtn.setTextColor(Color.LTGRAY);
+        cancelBtn.setPadding(0, 16, 24, 8);
+        cancelBtn.setOnClickListener((v) => {
+            this.hideSavePanel();
+        });
+        btnRow.addView(cancelBtn);
+
+        const confirmBtn = new TextView(ctx);
+        confirmBtn.setText("确认保存");
+        confirmBtn.setTextColor(Color.parseColor("#66CCFF"));
+        confirmBtn.setPadding(0, 16, 0, 8);
+        confirmBtn.setOnClickListener((v) => {
+            const name = this.saveNameInput?.getText()?.toString() ?? "";
+            const desc = this.saveDescInput?.getText()?.toString() ?? "";
+            const groupId = this.currentGroup?.id ?? "";
+            this.persistSkill(name, desc, groupId);
+        });
+        btnRow.addView(confirmBtn);
+
+        savePanel.addView(btnRow);
+        this.savePanel = savePanel;
+        this.saveNameInput = nameInput;
+        this.saveDescInput = descInput;
+
+        // --- Live Log Panel ---
+        const liveLog = new TextView(ctx);
+        const liveLogBg = new GradientDrawable();
+        liveLogBg.setColor(Color.parseColor("#AA111111"));
+        liveLogBg.setCornerRadius(12.0.toFloat());
+        liveLog.setBackground(liveLogBg);
+        liveLog.setTextColor(Color.parseColor("#E6FFFFFF"));
+        liveLog.setTextSize(11.0.toFloat());
+        liveLog.setPadding(16, 12, 16, 12);
+        liveLog.setVisibility(View.GONE);
+        const liveParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        liveParams.topMargin = 8;
+        liveLog.setLayoutParams(liveParams);
+        this.liveLogView = liveLog;
+
+        // Assemble UI Container
+        uiContainer.addView(topBar);
+        uiContainer.addView(scroll);
+        uiContainer.addView(savePanel);
+        uiContainer.addView(liveLog);
+        
+        // Add UI Container to Main Frame
+        frame.addView(uiContainer);
+        this.uiContainer = uiContainer;
+        
+        this.leftPanel = left;
+        this.rightPanel = right;
+    }
+    
+    private static onTouch(v: View, event: MotionEvent): boolean {
+        const rawX = event.getRawX();
+        const rawY = event.getRawY();
+
+        switch (event.getAction()) {
+            case MotionEvent.ACTION_DOWN:
+                if (this.layoutParams != null) {
+                    this.initialX = this.layoutParams!.x;
+                    this.initialY = this.layoutParams!.y;
+                    this.initialTouchX = rawX;
+                    this.initialTouchY = rawY;
+                    this.isMoving = false;
+                }
+                return true;
+
+            case MotionEvent.ACTION_MOVE:
+                 const dx = (rawX - this.initialTouchX);
+                 const dy = (rawY - this.initialTouchY);
+                 if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
+                     this.isMoving = true;
+                     this.closeDropdown(); 
+                 }
+                 if (this.layoutParams != null && this.windowManager != null && this.floatingLayout != null) {
+                     this.layoutParams!.x = this.initialX + dx.toInt();
+                     this.layoutParams!.y = this.initialY + dy.toInt();
+                     this.windowManager!.updateViewLayout(this.floatingLayout, this.layoutParams);
+                 }
+                 return true;
+
+            case MotionEvent.ACTION_UP:
+                return true;
+        }
+        return false;
+    }
+
+    static toggleRecording() {
+        if (RPARecorder.isRecording || RPARecorder.state == RecordingState.PAUSED) {
+            // 立即停止录制，防止后续UI操作被记录为步骤
+            RPARecorder.stop();
+            this.stopStepPolling();
+            this.updateStateUI();
+            Toast.makeText(this.context!, "录制已停止", Toast.LENGTH_SHORT).show();
+            console.log("[FloatingRecorder] recording stopped immediately");
+            // 然后再弹出保存面板
+            this.promptSaveSkill();
+        } else {
+            this.liveLogLines = [];
+            if (this.liveLogView != null) {
+                this.liveLogView!.setText("");
+            }
+            // 先初始化录制（这一步会记录 OPEN_APP 步骤）
+            RPARecorder.start(this.context!, this.pendingAppPackage, this.pendingAppName);
+            this.lastStepCount = 0;
+            this.pushLiveLog("开始录制: " + (this.pendingAppName != "" ? this.pendingAppName : this.pendingAppPackage));
+            Toast.makeText(this.context!, "录制已开始", Toast.LENGTH_SHORT).show();
+            console.log("[FloatingRecorder] recording started");
+            this.updateStateUI();
+            
+            // 录制开始后，延迟跳转到目标应用，确保无障碍服务在用户操作前就绪
+            if (this.pendingAppPackage != "" && this.context != null) {
+                setTimeout(() => {
+                    AppUtils.launchApp(FloatingRecorder.context!, FloatingRecorder.pendingAppPackage);
+                    console.log("[FloatingRecorder] launched target app:", FloatingRecorder.pendingAppPackage);
+                }, 500);
+            }
+            return; // updateStateUI 已在上面调用
+        }
+        this.updateStateUI();
+    }
+
+    private static promptSaveSkill() {
+        if (this.context == null) return;
+        if (RPARecorder.script.length == 0) {
+            Toast.makeText(this.context!, "没有录制到任何步骤", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (this.currentGroup == null) {
+            Toast.makeText(this.context!, "请先选择技能分组", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (this.saveNameInput != null) {
+            if (this.pendingAppName != "") {
+                this.saveNameInput!.setText(this.pendingAppName + " 自动化");
+            } else {
+                this.saveNameInput!.setText("新技能");
+            }
+        }
+        if (this.saveDescInput != null) {
+            this.saveDescInput!.setText("");
+        }
+        if (this.savePanel != null) {
+            this.closeDropdown();
+            this.setOverlayFocusable(true);
+            this.savePanel!.setVisibility(View.VISIBLE);
+            this.showKeyboard(this.saveNameInput);
+        }
+    }
+
+    private static hideSavePanel() {
+        if (this.savePanel != null) {
+            this.savePanel!.setVisibility(View.GONE);
+        }
+        this.hideKeyboard(this.saveNameInput);
+        this.hideKeyboard(this.saveDescInput);
+        this.setOverlayFocusable(false);
+    }
+
+    private static async persistSkill(name: string, description: string, groupId: string) {
+        // 录制已经在 toggleRecording 中停止，这里直接保存
+        const itemId = await RPARecorder.saveOnly(name, description, groupId);
+        if (itemId != "") {
+            Toast.makeText(this.context!, "已保存技能，步骤: " + RPARecorder.script.length, Toast.LENGTH_LONG).show();
+            console.log("[FloatingRecorder] skill saved id=", itemId, "groupId=", groupId);
+            uni.setStorageSync('zemo_rpa_saved_at', Date.now().toString());
+            uni.setStorageSync('zemo_rpa_saved_id', itemId);
+        } else {
+            Toast.makeText(this.context!, "保存失败，请检查分组后重试", Toast.LENGTH_LONG).show();
+            console.error("[FloatingRecorder] skill save failed, groupId=", groupId);
+        }
+        this.hideSavePanel();
+        this.updateStateUI();
+    }
+    
+    static toggleDropdown() {
+        this.isDropdownOpen = !this.isDropdownOpen;
+        if (this.isDropdownOpen) {
+            this.renderDropdown(this.getCurrentList());
+            this.dropdownList!.setVisibility(View.VISIBLE);
+        } else {
+            this.dropdownList!.setVisibility(View.GONE);
+        }
+    }
+    
+    static closeDropdown() {
+        if (this.isDropdownOpen) {
+            this.isDropdownOpen = false;
+            if (this.dropdownList != null) {
+                this.dropdownList!.setVisibility(View.GONE);
+            }
+        }
+    }
+
+    static getCurrentList(): GroupOption[] {
+        if (this.selectionStack.length > 0) {
+            const parent = this.selectionStack[this.selectionStack.length - 1];
+            return parent.children;
+        }
+        return this.rootOptions;
+    }
+
+    static renderDropdown(list: GroupOption[]) {
+        if (this.dropdownContent == null) return;
+        this.dropdownContent!.removeAllViews();
+        
+        // Add "Back" item if stack > 0
+        if (this.selectionStack.length > 0) {
+           const backItem = new TextView(this.context);
+           backItem.setText("◀ 返回上一级");
+           backItem.setTextColor(Color.parseColor("#88AAFF")); // Light Blue
+           backItem.setPadding(20, 20, 20, 20);
+           backItem.setTextSize(14.0.toFloat());
+           backItem.setOnClickListener((v) => {
+               this.selectionStack.pop();
+               this.renderDropdown(this.getCurrentList());
+           });
+           this.dropdownContent!.addView(backItem);
+           
+           const div = new View(this.context);
+           div.setBackgroundColor(Color.parseColor("#22FFFFFF"));
+           this.dropdownContent!.addView(div, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 1));
+        }
+
+        list.forEach((item) => {
+             const row = new LinearLayout(this.context);
+             row.setOrientation(LinearLayout.HORIZONTAL);
+             row.setPadding(20, 24, 20, 24);
+             row.setGravity(Gravity.CENTER_VERTICAL);
+             
+             const nameTv = new TextView(this.context);
+             nameTv.setText(item.name);
+             nameTv.setTextColor(Color.WHITE);
+             nameTv.setTextSize(14.0.toFloat());
+             // Flex grow
+             const params = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT);
+             params.weight = 1.0.toFloat();
+             row.addView(nameTv, params);
+             
+             if (item.children.length > 0) {
+                 const arrow = new TextView(this.context);
+                 arrow.setText("▶");
+                 arrow.setTextColor(Color.GRAY);
+                 row.addView(arrow);
+                 
+                 row.setOnClickListener((v) => {
+                     this.selectionStack.push(item);
+                     this.renderDropdown(this.getCurrentList());
+                 });
+             } else {
+                 if (this.currentGroup != null && this.currentGroup!.id == item.id) {
+                     const check = new TextView(this.context);
+                     check.setText("✓");
+                     check.setTextColor(Color.GREEN);
+                     row.addView(check);
+                 }
+                 
+                 row.setOnClickListener((v) => {
+                     this.currentGroup = item;
+                     this.isDropdownOpen = false;
+                     this.dropdownList!.setVisibility(View.GONE);
+                     this.selectionStack = []; // Reset stack
+                     this.updateStateUI();
+                 });
+             }
+             
+             this.dropdownContent!.addView(row);
+             
+             // Divider
+             const line = new View(this.context);
+             line.setBackgroundColor(Color.parseColor("#11FFFFFF"));
+             this.dropdownContent!.addView(line, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 1));
+        });
+    }
+
+    static updateStateUI() {
+        if (this.statusDot == null) return;
+        
+        const dotBg = this.statusDot!.getBackground() as GradientDrawable;
+        
+        if (RPARecorder.isRecording) {
+            dotBg.setColor(Color.RED);
+            this.statusText!.setText("录制中 " + RPARecorder.script.length + "步"); 
+             // "Step: " + RPARecorder.script.length
+            if (this.liveLogView != null) {
+                this.liveLogView!.setVisibility(View.VISIBLE);
+            }
+        } else {
+            dotBg.setColor(Color.LTGRAY);
+            this.statusText!.setText("技能录制");
+            if (this.liveLogView != null) {
+                this.liveLogView!.setVisibility(View.GONE);
+            }
+        }
+        
+        // Update Group Label
+        if (this.groupLabel != null) {
+            if (this.currentGroup != null) {
+                this.groupLabel!.setText(this.currentGroup!.name);
+            } else {
+                 this.groupLabel!.setText("选择分组");
+            }
+        }
+    }
+
+    static hide() {
+        this.stopStepPolling();
+        if (this.floatingLayout != null && this.windowManager != null) {
+            this.windowManager!.removeView(this.floatingLayout);
+            this.floatingLayout = null;
+            this.windowManager = null;
+        }
+    }
+}
+// #endif
+

@@ -1,0 +1,48 @@
+
+export * from "./interface.uts"
+import { Recognize, RecognizeOptions } from "./interface.uts"
+
+// #ifdef APP-ANDROID
+import { recognize as recognizeAndroid } from "./app-android/index.uts"
+import { recognizePpOcrV6 as recognizePpOcrV6Android } from "./app-android/index.uts"
+// #endif
+
+// #ifdef APP-IOS
+import { recognize as recognizeIOS } from "./app-ios/index.uts"
+// #endif
+
+// #ifdef APP-HARMONY
+import { recognize as recognizeHarmony } from "./app-harmony/index.uts"
+import { recognizePpOcrV6 as recognizePpOcrV6Harmony } from "./app-harmony/index.uts"
+// #endif
+
+export const recognize: Recognize = function(options: RecognizeOptions) {
+    // #ifdef APP-ANDROID
+    if (options.engine == 'ppocrv6') {
+        recognizePpOcrV6Android(options);
+        return;
+    }
+    recognizeAndroid(options);
+    return;
+    // #endif
+    
+    // #ifdef APP-IOS
+    recognizeIOS(options);
+    return;
+    // #endif
+
+    // #ifdef APP-HARMONY
+    if (options.engine == 'ppocrv6') {
+        recognizePpOcrV6Harmony(options);
+        return;
+    }
+    recognizeHarmony(options);
+    return;
+    // #endif
+    
+    // #ifndef APP-ANDROID || APP-IOS || APP-HARMONY
+    const err = new UniError("zemo-ocs", 900001, "Platform not supported");
+    options.fail?.(err);
+    options.complete?.(err);
+    // #endif
+}

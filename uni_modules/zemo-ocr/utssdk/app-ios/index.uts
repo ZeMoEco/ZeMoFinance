@@ -1,0 +1,9 @@
+
+import { Recognize, RecognizeOptions, OcrFail } from "../interface.uts"
+
+export const recognize: Recognize = function(options: RecognizeOptions) {
+    const err = new UniError("zemo-ocs", 900001, "iOS Platform not supported yet");
+    options.fail?.(err);
+    options.complete?.(err);
+}
+

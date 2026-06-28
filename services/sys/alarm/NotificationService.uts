@@ -1,0 +1,86 @@
+// #ifdef APP-ANDROID
+import UTSAndroid from "io.dcloud.uts.UTSAndroid";
+import Context from "android.content.Context";
+import NotificationManager from "android.app.NotificationManager";
+import NotificationChannel from "android.app.NotificationChannel";
+import Notification from "android.app.Notification";
+import Build from "android.os.Build";
+import Intent from "android.content.Intent";
+import PendingIntent from "android.app.PendingIntent";
+// #endif
+
+export class NotificationService {
+    // 注意：Android 的 NotificationChannel 创建后，importance/锁屏可见性等很多属性不能再改。
+    // 为确保升级生效，这里用新 ID 触发系统重新创建渠道。
+    static CHANNEL_ID = "timer_channel_v2";
+    static NOTIFICATION_ID: Int = 1001;
+
+    static createChannel() {
+        if (Build.VERSION.SDK_INT >= 26) { // Build.VERSION_CODES.O
+            const context = UTSAndroid.getAppContext();
+            if (context == null) return;
+            
+            const name = "专注计时";
+            const descriptionText = "显示当前专注或休息时间";
+            const importance: Int = 3; // NotificationManager.IMPORTANCE_DEFAULT
+            const channel = new NotificationChannel(NotificationService.CHANNEL_ID, name, importance);
+            channel.setDescription(descriptionText);
+            channel.setSound(null, null);
+            channel.enableVibration(false);
+            // 锁屏显示：由系统/用户最终决定，但这里把默认配置设为可公开显示
+            channel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+            
+            const notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager;
+            notificationManager.createNotificationChannel(channel);
+        }
+    }
+
+    static updateNotification(title: string, content: string) {
+        const context = UTSAndroid.getAppContext();
+        if (context == null) return;
+
+        const notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager;
+
+        // Ensure channel exists
+        NotificationService.createChannel();
+
+        const pm = context.getPackageManager();
+        const launchIntent = pm.getLaunchIntentForPackage(context.getPackageName());
+        let pendingIntent: PendingIntent | null = null;
+        if (launchIntent != null) {
+            // FLAG_IMMUTABLE = 67108864
+            const flags: Int = 67108864;
+            pendingIntent = PendingIntent.getActivity(context, 0, launchIntent, flags);
+        }
+
+        let builder: Notification.Builder;
+        if (Build.VERSION.SDK_INT >= 26) {
+            builder = new Notification.Builder(context, NotificationService.CHANNEL_ID);
+        } else {
+            builder = new Notification.Builder(context);
+        }
+
+        const appIcon = context.getApplicationInfo().icon;
+
+        builder.setSmallIcon(appIcon)
+            .setContentTitle(title)
+            .setContentText(content)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setCategory(Notification.CATEGORY_SERVICE);
+
+        if (pendingIntent != null) {
+            builder.setContentIntent(pendingIntent);
+        }
+
+        notificationManager.notify(NotificationService.NOTIFICATION_ID, builder.build());
+    }
+
+    static cancelNotification() {
+        const context = UTSAndroid.getAppContext();
+        if (context == null) return;
+        const notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager;
+        notificationManager.cancel(NotificationService.NOTIFICATION_ID);
+    }
+}

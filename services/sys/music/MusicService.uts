@@ -1,0 +1,1271 @@
+	import { reactive } from 'vue';
+	import { executePluginCommand } from "./PluginExecutor.uts";
+
+	// 1. Android 平台专用引入
+	// #ifdef APP-ANDROID
+	import { UTSAndroid, UTSJSONObject } from 'io.dcloud.uts';
+	// #endif
+
+	// ========================================================================
+	// 1. 类型定义
+	// ========================================================================
+	export type MusicSong = {
+		source : string
+		id : string
+		title : string
+		singer : string
+		album : string
+		coverImage : string
+		duration : number
+		playUrl : string
+		lyricUrl : string
+		httpHeaders : any | null
+	}
+
+	export type MusicPlaylist = {
+		id : string
+		title : string
+		cover : string
+		creator_name : string
+		creator_avatar : string
+		song_count : number
+	}
+
+	export type MusicSource = {
+		id : string
+		name : string
+		script : string
+		type : string
+		url ?: string
+	}
+
+	export type PlayState = {
+		currentSong : MusicSong | null
+		isPlaying : boolean
+		playlist : MusicSong[]
+		currentIndex : number
+		useInnerAudio : boolean
+		// 0: 列表循环, 1: 随机播放, 2: 单曲循环
+		playMode : number
+	}
+
+	type ImportItem = {
+		mode : string
+		content : string
+		name : string
+	}
+
+	export type MusicUserInfo = {
+		nickname : string
+		avatar : string
+	}
+
+	export type MusicUserPlaylistsResult = {
+		playlists : MusicPlaylist[]
+		userInfo : MusicUserInfo
+	}
+
+	export type ResolveResult = {
+		url : string
+		sourceId : string
+	}
+	export type UrlResolver = (song : MusicSong) => Promise<ResolveResult | null>
+
+	// 切换播放模式
+	export function changePlayMode() : string {
+		// 0 -> 1 -> 2 -> 0
+		musicState.playMode = (musicState.playMode + 1) % 3;
+
+		if (musicState.playMode == 1) return "随机播放";
+		if (musicState.playMode == 2) return "单曲循环";
+		return "列表循环";
+	}
+
+	// ========================================================================
+	// 2. 全局状态
+	// ========================================================================
+	export const musicState = reactive({
+		currentSong: null,
+		isPlaying: false,
+		playlist: [] as MusicSong[],
+		currentIndex: -1,
+		useInnerAudio: false,
+		playMode: 0
+	} as PlayState);
+
+	// 切歌保护锁
+	let _isSwitching = false;
+
+	const STORAGE_KEY_PLUGINS = "user_music_plugins";
+	const STORAGE_KEY_FAVORITES = "user_music_favorites";
+
+	let _allSources : MusicSource[] = [];
+	let _isLoaded = false;
+	let _globalUrlResolver : UrlResolver | null = null;
+	let _retryCount = 0;
+
+	// --------------------------------------------------------
+	// 双内核播放器管理
+	// --------------------------------------------------------
+	let _bgAudioManager : BackgroundAudioManager | null = null;
+	let _innerAudioContext : InnerAudioContext | null = null;
+
+	function getBgAm() : BackgroundAudioManager {
+		if (_bgAudioManager == null) {
+			_bgAudioManager = uni.getBackgroundAudioManager();
+			initBgEvents(_bgAudioManager!);
+		}
+		return _bgAudioManager!;
+	}
+
+	function getInnerAm() : InnerAudioContext {
+		if (_innerAudioContext == null) {
+			_innerAudioContext = uni.createInnerAudioContext();
+			initInnerEvents(_innerAudioContext!);
+		}
+		return _innerAudioContext!;
+	}
+
+	// --------------------------------------------------------
+	// 停止逻辑
+	// --------------------------------------------------------
+	function stopAllDrivers() {
+		// 仅停止 InnerAudio，保留 BgAudio 以维持通知栏（切歌时）
+		if (_innerAudioContext != null) {
+			_innerAudioContext!.stop();
+		}
+	}
+
+	// ========================================================================
+	// 4. 事件监听
+	// ========================================================================
+	function initBgEvents(am : BackgroundAudioManager) {
+		// 1. 播放结束
+		am.onEnded((_ : any) => {
+			console.log("🎵 BgAudio 播放结束");
+			setTimeout(() => { playNext(); }, 200);
+		});
+
+		// 2. 切歌 (兼容 Android 和 鸿蒙的系统媒体中心事件)
+		am.onNext((_ : any) => { playNext(); });
+		am.onPrev((_ : any) => { playPrev(); });
+
+		// 3. 错误处理
+		am.onError((e) => {
+			console.error("❌ BgAudio 错误:", e);
+			musicState.isPlaying = false;
+			_isSwitching = false;
+			setTimeout(() => { playNext(); }, 2000);
+		});
+
+		// 4. 播放监听
+		am.onPlay((_ : any) => {
+			console.log("▶️ 监听到播放");
+			if (!musicState.isPlaying) {
+				musicState.isPlaying = true;
+			}
+			_isSwitching = false;
+		});
+
+		// 5. 暂停监听
+		am.onPause((_ : any) => {
+			if (_isSwitching) return; // 切歌中忽略暂停事件
+
+			if (musicState.isPlaying) {
+				console.log("⏸️ 监听到暂停");
+				musicState.isPlaying = false;
+
+				// 强制同步 UI
+				setTimeout(() => {
+					am.pause();
+				}, 100);
+			}
+		});
+
+		// 6. 停止监听
+		am.onStop((_ : any) => {
+			if (_isSwitching) return;
+			console.log("⏹️ 监听到停止");
+			musicState.isPlaying = false;
+		});
+	}
+
+	function initInnerEvents(am : InnerAudioContext) {
+		am.onEnded((_ : any) => {
+			console.log("🎵 InnerAudio 播放结束");
+			playNext();
+		});
+
+		am.onPlay((_ : any) => { musicState.isPlaying = true; });
+
+		const handlePause = (_ : any) => {
+			musicState.isPlaying = false;
+		};
+		am.onPause(handlePause);
+		am.onStop(handlePause);
+
+		am.onError((e) => {
+			console.error("❌ InnerAudio 错误:", e);
+			musicState.isPlaying = false;
+			setTimeout(() => { playNext(); }, 2000);
+		});
+
+		am.onTimeUpdate((_ : any) => {
+			if (am.paused && musicState.isPlaying) {
+				musicState.isPlaying = false;
+			}
+		});
+	}
+
+	export function getAudioContext() : any {
+		if (musicState.useInnerAudio) {
+			return getInnerAm();
+		}
+		return getBgAm();
+	}
+
+	// ========================================================================
+	// 3. 核心：解析与导入功能
+	// ========================================================================
+
+	function parseImportContent(content : string, defaultUrl : string) : ImportItem[] {
+		const results : ImportItem[] = [];
+		const trimmed = content.trim();
+
+		// #ifdef APP-ANDROID
+		if (trimmed.startsWith("[")) {
+			try {
+				const list = JSON.parse(trimmed) as UTSArray<any>;
+				for (let i = 0; i < list.length; i++) {
+					processListItem(list[i], results);
+				}
+				return results;
+			} catch (e) { console.error("Array parse fail", e); }
+		}
+
+		if (trimmed.startsWith("{") && trimmed.includes("list")) {
+			try {
+				const obj = JSON.parse(trimmed) as UTSJSONObject;
+				// 安全获取 list，防止崩溃
+				if (obj["list"] != null && Array.isArray(obj["list"])) {
+					const arr = obj["list"] as UTSArray<any>;
+					for (let i = 0; i < arr.length; i++) {
+						processListItem(arr[i], results);
+					}
+				} else if (obj["plugins"] != null && Array.isArray(obj["plugins"])) {
+					const arr = obj["plugins"] as UTSArray<any>;
+					for (let i = 0; i < arr.length; i++) {
+						processListItem(arr[i], results);
+					}
+				}
+				return results;
+			} catch (e) { console.error("Object parse fail", e); }
+		}
+		// #endif
+
+		// 单链接或单脚本
+		if (trimmed.startsWith("http") && trimmed.length < 200 && !trimmed.includes("\n")) {
+			results.push({ mode: 'url', content: trimmed, name: '' } as ImportItem);
+		} else {
+			results.push({ mode: 'script', content: trimmed, name: '' } as ImportItem);
+		}
+
+		return results;
+	}
+
+	function processListItem(item : any, results : ImportItem[]) {
+		// #ifdef APP-ANDROID
+		let isObj = false;
+		try {
+			if (typeof item === 'object' && item != null) isObj = true;
+		} catch (e) { isObj = false; }
+
+		if (isObj) {
+			const obj = item as UTSJSONObject;
+			const script = (obj["script"] ?? "") as string;
+			const url = (obj["url"] ?? "") as string;
+			const name = (obj["name"] ?? "") as string;
+
+			if (script.length > 50) {
+				results.push({ mode: 'script', content: script, name: name } as ImportItem);
+			} else if (url.length > 0) {
+				results.push({ mode: 'url', content: url, name: name } as ImportItem);
+			}
+		} else {
+			try {
+				const strVal = `${item}`;
+				if (strVal.startsWith("http")) {
+					results.push({ mode: 'url', content: strVal, name: '' } as ImportItem);
+				}
+			} catch (e) { }
+		}
+		// #endif
+	}
+
+	export async function importFromUrl(url : string) : Promise<string> {
+		const targetUrl = url.trim();
+		if (targetUrl == "") return "链接不能为空";
+
+		try {
+			const res = await requestText(targetUrl);
+			const items = parseImportContent(res, targetUrl);
+			if (items.length == 0) return "未解析到有效内容";
+			let successCount = 0;
+			for (let i = 0; i < items.length; i++) {
+				const item = items[i];
+				if (item.mode == 'url') {
+					try {
+						const subScript = await requestText(item.content);
+						if (processAndSaveScript(subScript, item.content, item.name)) successCount++;
+					} catch (e) { }
+				} else {
+					if (processAndSaveScript(item.content, targetUrl, item.name)) successCount++;
+				}
+			}
+			return successCount > 0 ? `成功导入 ${successCount} 个源` : "导入失败，格式错误";
+		} catch (e) {
+			return "请求失败: " + e;
+		}
+	}
+
+	function requestText(url : string) : Promise<string> {
+		return new Promise((resolve, reject) => {
+			uni.request({
+				url: url, method: "GET", dataType: "text",
+				success: (res) => {
+					// 兼容处理：无论 status 200 还是其他，只要有数据就尝试
+					if (typeof res.data === 'string') resolve(res.data as string);
+					else if (res.data != null) resolve(JSON.stringify(res.data));
+					else reject("Empty response");
+				},
+				fail: (err) => reject(err)
+			});
+		});
+	}
+
+	function processAndSaveScript(script : string, originUrl : string, forceName : string | null) : boolean {
+		if (script.length < 20) return false;
+
+		const polyfill = `
+	  var window = {}; 
+	  var document = {}; 
+	  var module = { exports: {} }; 
+	  var exports = module.exports;
+	 `;
+
+		const adapter = `
+	  if (typeof searchMusic === 'undefined') {
+	   if (module.exports && typeof module.exports.search === 'function') searchMusic = module.exports.search;
+	   else if (typeof search === 'function') searchMusic = search;
+	  }
+	 `;
+
+		let finalScript = polyfill + "\n" + script + "\n" + adapter;
+
+		let metaName = "导入源 " + Date.now().toString().substring(8);
+		if (forceName != null && forceName != "") metaName = forceName;
+		else {
+			try {
+				const nameMatch = /@name\s+(.+)/.exec(script);
+				if (nameMatch != null && nameMatch[1] != null) metaName = nameMatch[1].trim();
+			} catch (e) { }
+		}
+
+		addPluginSource(metaName, finalScript, originUrl);
+		return true;
+	}
+
+	// ========================================================================
+	// 4. 源管理
+	// ========================================================================
+	export function getMusicSources() : MusicSource[] {
+		if (_isLoaded) return _allSources;
+		const nativeSources : MusicSource[] = [{ id: "local", name: "本地演示", type: "native", script: "" }];
+		let pluginSources : MusicSource[] = [];
+		// #ifdef APP-ANDROID
+		const saved = uni.getStorageSync(STORAGE_KEY_PLUGINS);
+		if (saved != null) {
+			try {
+				const rawArr = (Array.isArray(saved)) ? saved as Array<any> : [];
+				rawArr.forEach(item => {
+					try {
+						const obj = item as UTSJSONObject;
+						if (obj != null) {
+							pluginSources.push({
+								id: (obj['id'] ?? "") as string,
+								name: (obj['name'] ?? "未命名") as string,
+								type: (obj['type'] ?? 'plugin') as string,
+								script: (obj['script'] ?? '') as string,
+								url: (obj['url'] ?? '') as string
+							} as MusicSource);
+						}
+					} catch (e) { }
+				});
+			} catch (e) { }
+		}
+		// #endif
+		_allSources = nativeSources.concat(pluginSources);
+		_isLoaded = true;
+		return _allSources;
+	}
+
+	function savePlugins() {
+		const plugins = _allSources.filter(s => s.type != 'native');
+		uni.setStorageSync(STORAGE_KEY_PLUGINS, plugins);
+	}
+
+	export function addPluginSource(name : string, script : string, url : string = "") : boolean {
+		if (!_isLoaded) getMusicSources();
+		const existingIdx = _allSources.findIndex(s => (url != "" && s.url == url) || s.script == script);
+		const newSource : MusicSource = {
+			id: (existingIdx >= 0) ? _allSources[existingIdx].id : "plugin_" + Date.now(),
+			name: name, type: "plugin", script: script, url: url
+		};
+		if (existingIdx >= 0) _allSources[existingIdx] = newSource;
+		else _allSources.push(newSource);
+		savePlugins();
+		return true;
+	}
+
+	export function removeMusicSource(id : string) {
+		if (!_isLoaded) getMusicSources();
+		const index = _allSources.findIndex(s => s.id == id);
+		if (index >= 0) {
+			_allSources.splice(index, 1);
+			savePlugins();
+		}
+	}
+
+	export function clearMusicSources() {
+		_allSources = _allSources.filter(s => s.type == 'native');
+		uni.removeStorageSync(STORAGE_KEY_PLUGINS);
+	}
+
+	// ========================================================================
+	// 5. 播放控制 (双核驱动)
+	// ========================================================================
+
+	export function registerUrlResolver(resolver : UrlResolver) {
+		_globalUrlResolver = resolver;
+	}
+
+	export function playSong(song : MusicSong) {
+		console.log("▶️ 尝试播放:", song.title);
+
+		_isSwitching = true;
+
+		musicState.currentSong = song;
+		musicState.isPlaying = true;
+		musicState.useInnerAudio = false;
+
+		const index = musicState.playlist.findIndex(s => s.id == song.id);
+		if (index >= 0) {
+			musicState.currentIndex = index;
+			musicState.playlist[index] = song;
+		} else {
+			musicState.playlist.push(song);
+			musicState.currentIndex = musicState.playlist.length - 1;
+		}
+
+		if (song.playUrl == "") {
+			console.warn("链接为空");
+			_isSwitching = false;
+			return;
+		}
+
+		if (_innerAudioContext != null) _innerAudioContext!.stop();
+
+		playWithBgAudio(song);
+
+		setTimeout(() => {
+			_isSwitching = false;
+		}, 1500);
+	}
+
+	function playWithBgAudio(song : MusicSong) {
+		const am = getBgAm();
+		let finalUrl = song.playUrl.trim();
+
+		if (finalUrl.startsWith("http://") && !finalUrl.includes("127.0.0.1")) {
+			finalUrl = finalUrl.replace("http://", "https://");
+		}
+
+		am.title = (song.title != "") ? song.title : "未知标题";
+		am.singer = (song.singer != "") ? song.singer : "未知艺术家";
+		am.epname = (song.album != "") ? song.album : "";
+		am.coverImgUrl = (song.coverImage != "") ? song.coverImage : "https://vkceyugu.cdn.bspapp.com/VKCEYUGU-dc-site/b4804d90-3f1f-11eb-9c16-53c6180a377d.png";
+
+		try {
+			am.src = finalUrl;
+		} catch (e) {
+			console.error("BgAudio src 错误", e);
+			musicState.useInnerAudio = true;
+			playWithInnerAudio(song);
+			return;
+		}
+
+		setTimeout(() => {
+			if (musicState.isPlaying) {
+				am.play();
+			} else {
+				console.log("✋ 加载中途被打断，强制刷新通知栏 UI");
+				am.pause();
+			}
+		}, 100);
+	}
+
+	function playWithInnerAudio(song : MusicSong) {
+		const am = getInnerAm();
+		let finalUrl = song.playUrl.trim();
+		if (finalUrl.startsWith("http://") && !finalUrl.includes("127.0.0.1")) {
+			finalUrl = finalUrl.replace("http://", "https://");
+		}
+
+		console.log("正在播放 (InnerAudio):", finalUrl);
+
+		try {
+			am.src = finalUrl;
+			setTimeout(() => {
+				musicState.isPlaying = true;
+				am.play();
+			}, 100);
+		} catch (e) {
+			console.error("InnerAudio 播放失败", e);
+			handlePlayNextError();
+		}
+	}
+
+	export function getPlayerDuration() : number {
+		if (musicState.useInnerAudio) {
+			if (_innerAudioContext != null) return _innerAudioContext!.duration;
+		} else {
+			if (_bgAudioManager != null) return _bgAudioManager!.duration;
+		}
+		return 0;
+	}
+
+	export function playerSeek(position : number) {
+		if (musicState.useInnerAudio) {
+			if (_innerAudioContext != null) _innerAudioContext!.seek(position);
+		} else {
+			if (_bgAudioManager != null) _bgAudioManager!.seek(position);
+		}
+	}
+
+	export function getPlayerCurrentTime() : number {
+		if (musicState.useInnerAudio) {
+			if (_innerAudioContext != null) return _innerAudioContext!.currentTime;
+		} else {
+			if (_bgAudioManager != null) return _bgAudioManager!.currentTime;
+		}
+		return 0;
+	}
+
+	export function togglePlay() {
+		if (musicState.useInnerAudio) {
+			const am = getInnerAm();
+			if (musicState.isPlaying) { am.pause(); musicState.isPlaying = false; }
+			else { am.play(); musicState.isPlaying = true; }
+		} else {
+			const am = getBgAm();
+			if (musicState.isPlaying) { am.pause(); musicState.isPlaying = false; }
+			else { am.play(); musicState.isPlaying = true; }
+		}
+	}
+
+	function getSourceById(sourceId : string) : MusicSource | null {
+		if (!_isLoaded) getMusicSources();
+		for (let i = 0; i < _allSources.length; i++) {
+			const s = _allSources[i];
+			if (s.id == sourceId) {
+				return s;
+			}
+		}
+		return null;
+	}
+
+	// 自动切歌逻辑
+	export async function playNext(isAuto : boolean = true) {
+		if (musicState.playlist.length == 0) return;
+
+		let nextIndex = musicState.currentIndex + 1;
+
+		// 模式 1: 随机播放
+		if (musicState.playMode == 1) {
+			nextIndex = Math.floor(Math.random() * musicState.playlist.length);
+			if (musicState.playlist.length > 1 && nextIndex == musicState.currentIndex) {
+				nextIndex = (nextIndex + 1) % musicState.playlist.length;
+			}
+		}
+		// 模式 2: 单曲循环
+		else if (musicState.playMode == 2) {
+			if (isAuto) {
+				nextIndex = musicState.currentIndex;
+			} else {
+				if (nextIndex >= musicState.playlist.length) nextIndex = 0;
+			}
+		}
+		// 模式 0: 列表循环 (默认)
+		else {
+			if (nextIndex >= musicState.playlist.length) nextIndex = 0;
+		}
+
+		const nextSong = musicState.playlist[nextIndex];
+		musicState.currentIndex = nextIndex;
+
+		console.log(`🎵 [Auto] 切歌 (${musicState.playMode == 1 ? '随机' : '顺序'}): ${nextSong.title}`);
+
+		if (nextSong.source == 'local' || (nextSong.playUrl != "" && nextSong.playUrl.startsWith("http"))) {
+			_retryCount = 0;
+			playSong(nextSong);
+			return;
+		}
+
+		try {
+			const res = await autoResolveSongUrl(nextSong);
+			if (res != null && res.url != "" && res.url.startsWith("http")) {
+				_retryCount = 0;
+				nextSong.playUrl = res.url;
+				if (res.sourceId != "") nextSong.source = res.sourceId;
+				playSong(nextSong);
+			} else {
+				console.warn("自动切歌解析失败，尝试跳过");
+				handlePlayNextError();
+			}
+		} catch (e) {
+			console.error("自动切歌异常", e);
+			handlePlayNextError();
+		}
+	}
+
+	export async function playPrev() {
+		if (musicState.playMode == 1) {
+			playNext(false);
+			return;
+		}
+
+		let prevIndex = musicState.currentIndex - 1;
+		if (prevIndex < 0) prevIndex = musicState.playlist.length - 1;
+
+		const prevSong = musicState.playlist[prevIndex];
+		musicState.currentIndex = prevIndex;
+
+		console.log(`🎵 [Auto] 准备播放上一首: ${prevSong.title}`);
+
+		if (prevSong.source == 'local' || (prevSong.playUrl != "" && prevSong.playUrl.startsWith("http"))) {
+			playSong(prevSong);
+			return;
+		}
+
+		try {
+			const res = await autoResolveSongUrl(prevSong);
+			if (res != null && res.url != "") {
+				prevSong.playUrl = res.url;
+				if (res.sourceId != "") prevSong.source = res.sourceId;
+				playSong(prevSong);
+			} else {
+				console.error("上一首解析失败");
+			}
+		} catch (e) {
+			console.error(e);
+		}
+	}
+
+	function handlePlayNextError() {
+		if (_retryCount < 3) {
+			_retryCount++;
+			console.warn(`播放失败，1.5秒后尝试跳到下一首 (${_retryCount}/3)`);
+			setTimeout(() => {
+				playNext();
+			}, 1500);
+		} else {
+			console.error("连续失败过多，停止自动播放");
+			_retryCount = 0;
+			musicState.isPlaying = false;
+			uni.showToast({ title: "连续播放失败，已停止", icon: "none" });
+		}
+	}
+
+	// ========================================================================
+	// 6. 收藏功能
+	// ========================================================================
+	let _favorites : MusicSong[] = [];
+	let _favLoaded = false;
+
+	function loadFavorites() {
+		if (_favLoaded) return;
+		// #ifdef APP-ANDROID
+		const saved = uni.getStorageSync(STORAGE_KEY_FAVORITES);
+		if (Array.isArray(saved)) {
+			const arr = saved as Array<any>;
+			arr.forEach(item => {
+				try {
+					const obj = item as UTSJSONObject;
+					if (obj != null) {
+						const d = obj['duration'];
+						let durationVal = 0;
+						if (d != null) durationVal = parseFloat(`${d}`);
+
+						_favorites.push({
+							source: (obj['source'] ?? "") as string,
+							id: (obj['id'] ?? "") as string,
+							title: (obj['title'] ?? "") as string,
+							singer: (obj['singer'] ?? "") as string,
+							album: (obj['album'] ?? "") as string,
+							coverImage: (obj['coverImage'] ?? "") as string,
+							duration: durationVal,
+							playUrl: (obj['playUrl'] ?? "") as string,
+							lyricUrl: (obj['lyricUrl'] ?? "") as string,
+							httpHeaders: obj['httpHeaders']
+						} as MusicSong);
+					}
+				} catch (e) { }
+			});
+		}
+		// #endif
+		_favLoaded = true;
+	}
+
+	export function getFavorites() : MusicSong[] {
+		loadFavorites();
+		return _favorites;
+	}
+
+	export function isFavorite(id : string) : boolean {
+		loadFavorites();
+		return _favorites.some(s => s.id == id);
+	}
+
+	export function addToFavorites(song : MusicSong) {
+		loadFavorites();
+		if (!isFavorite(song.id)) {
+			_favorites.push(song);
+			uni.setStorageSync(STORAGE_KEY_FAVORITES, _favorites);
+			uni.showToast({ title: "已收藏", icon: "success" });
+		}
+	}
+
+	export function removeFromFavorites(id : string) {
+		loadFavorites();
+		const idx = _favorites.findIndex(s => s.id == id);
+		if (idx >= 0) {
+			_favorites.splice(idx, 1);
+			uni.setStorageSync(STORAGE_KEY_FAVORITES, _favorites);
+			uni.showToast({ title: "已取消收藏", icon: "none" });
+		}
+	}
+
+	export function searchMusicLocal(keyword : string) : MusicSong[] {
+		return [{
+			source: "local",
+			id: "loc_" + Date.now(),
+			title: "测试歌曲 - " + keyword,
+			singer: "本地歌手",
+			album: "Local Album",
+			coverImage: "/static/logo.png",
+			duration: 180,
+			playUrl: "https://web-ext.u-tools.cn/plugin-demo/test.mp3",
+			lyricUrl: "",
+			httpHeaders: new UTSJSONObject()
+		} as MusicSong];
+	}
+
+	export async function fetchLyric(id : string) : Promise<string> {
+		let targetSong : MusicSong | null = null;
+
+		for (let i = 0; i < musicState.playlist.length; i++) {
+			const s = musicState.playlist[i];
+			if (s.id == id) {
+				targetSong = s;
+				break;
+			}
+		}
+
+		if (targetSong == null && musicState.currentSong != null && musicState.currentSong!.id == id) {
+			targetSong = musicState.currentSong;
+		}
+
+		if (targetSong != null) {
+			const song = targetSong as MusicSong;
+
+			// #ifdef APP-ANDROID
+			if (song.lyricUrl != "" && song.lyricUrl.startsWith("http")) {
+				try {
+					const res = await uni.request({ url: song.lyricUrl, method: 'GET' });
+					const resObj = res as UTSJSONObject;
+					const rawData = resObj['data'];
+					if (rawData != null) {
+						const text = rawData.toString();
+						if (!text.trim().startsWith("{") || text.length > 50) {
+							return text;
+						}
+					}
+				} catch (e) { }
+			}
+
+			if (song.source != "local" && song.source != "") {
+				try {
+					const sourceObj = getSourceById(song.source);
+					if (sourceObj != null && sourceObj.script != "") {
+						let command: any;
+						// #ifdef APP-ANDROID
+						const cmdObj = new UTSJSONObject();
+						cmdObj.set('action', 'get_lyric');
+						cmdObj.set('song', song.httpHeaders);
+						cmdObj.set('script', sourceObj.script);
+						command = cmdObj;
+						// #endif
+						// #ifndef APP-ANDROID
+						command = {
+							action: 'get_lyric',
+							song: song.httpHeaders,
+							script: sourceObj.script
+						};
+						// #endif
+
+						const res = await executePluginCommand(command);
+
+						if (res != null) {
+							if (res instanceof UTSJSONObject) {
+								const obj = res as UTSJSONObject;
+								const lrc = obj["lyric"] ?? obj["lrc"] ?? obj["text"] ?? "";
+								return lrc.toString();
+							}
+							else {
+								return res.toString();
+							}
+						}
+					}
+				} catch (e) { }
+			}
+			// #endif
+		}
+
+		return "[00:00.00] 暂无歌词";
+	}
+
+	// ========================================================================
+	// 修复 1: 歌单列表解析 (增强鲁棒性)
+	// ========================================================================
+	export function fetchUserPlaylists(qq : string) : Promise<MusicUserPlaylistsResult> {
+		return new Promise<MusicUserPlaylistsResult>((resolve, reject) => {
+			// #ifdef APP-ANDROID
+			const avatarUrl = `https://q.qlogo.cn/headimg_dl?dst_uin=${qq}&spec=640&img_type=jpg`;
+
+			const findListInObject = (data : UTSJSONObject) : MusicPlaylist[] => {
+				let list : UTSArray<UTSJSONObject> | null = null;
+				const d = data["data"];
+				if (d instanceof UTSJSONObject) {
+					if (d["lists"] != null && Array.isArray(d["lists"])) list = d["lists"] as UTSArray<UTSJSONObject>;
+					else if (d["list"] != null && Array.isArray(d["list"])) list = d["list"] as UTSArray<UTSJSONObject>;
+					else if (d["mydiss"] instanceof UTSJSONObject) {
+						const md = d["mydiss"] as UTSJSONObject;
+						if (md["list"] != null && Array.isArray(md["list"])) list = md["list"] as UTSArray<UTSJSONObject>;
+					}
+				} else if (data["list"] != null && Array.isArray(data["list"])) {
+					list = data["list"] as UTSArray<UTSJSONObject>;
+				} else if (data["sublist"] != null && Array.isArray(data["sublist"])) {
+					list = data["sublist"] as UTSArray<UTSJSONObject>;
+				}
+
+				const results : MusicPlaylist[] = [];
+				if (list != null) {
+					list.forEach((item) => {
+						const dissid = (item["tid"] ?? item["dissid"] ?? item["id"] ?? "").toString();
+						if (dissid != "" && dissid != "0") {
+							let sCount = 0;
+							const c = item["songCount"] ?? item["song_cnt"] ?? item["songnum"] ?? item["song_count"];
+							if (c != null) sCount = parseInt(`${c}`);
+
+							const title = (item["name"] ?? item["diss_name"] ?? item["title"] ?? "未命名歌单").toString();
+
+							let cover = "";
+							const possibleKeys = ["cover", "diss_cover", "picurl", "imgurl", "logo"];
+							for (let i = 0; i < possibleKeys.length; i++) {
+								const val = item[possibleKeys[i]];
+								if (val != null && val != "") {
+									cover = `${val}`;
+									break;
+								}
+							}
+							if (cover == "") cover = `https://p.qpic.cn/music_cover/${dissid}/${dissid}.jpg?max_age=2592000`;
+							if (cover.startsWith("http://")) cover = cover.replace("http://", "https://");
+
+							results.push({
+								id: dissid,
+								title: title,
+								cover: cover,
+								song_count: sCount,
+								creator_name: `QQ:${qq}`,
+								creator_avatar: avatarUrl
+							} as MusicPlaylist);
+						}
+					});
+				}
+				return results;
+			};
+
+			const runPlanB = () => {
+				const url2 = `https://c.y.qq.com/splcloud/fcgi-bin/fcg_get_diss_by_uin.fcg?picmid=1&rnd=${Math.random()}&g_tk=5381&loginUin=0&hostUin=${qq}&format=json&inCharset=utf8&outCharset=utf-8&notice=0&platform=yqq.json&needNewCode=0&categoryId=10000000`;
+
+				const headers = new UTSJSONObject();
+				headers.set("Referer", "https://y.qq.com/");
+				headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36");
+
+				uni.request({
+					url: url2,
+					method: 'GET',
+					header: headers,
+					success: (res) => {
+						try {
+							let data : UTSJSONObject;
+							if (res.data instanceof UTSJSONObject) data = res.data as UTSJSONObject;
+							else {
+								const rawStr = (res.data ?? "").toString().trim();
+								if (rawStr.startsWith("{")) data = JSON.parse(rawStr) as UTSJSONObject;
+								else {
+									const s = rawStr.indexOf("(") + 1;
+									const e = rawStr.lastIndexOf(")");
+									if (e > s) data = JSON.parse(rawStr.substring(s, e)) as UTSJSONObject;
+									else throw new Error("Invalid format");
+								}
+							}
+							const list = findListInObject(data);
+							resolve({ userInfo: { nickname: `QQ用户 ${qq}`, avatar: avatarUrl }, playlists: list } as MusicUserPlaylistsResult);
+						} catch (e) {
+							console.error("Plan B error", e);
+							reject("解析歌单失败");
+						}
+					},
+					fail: () => reject("网络请求失败")
+				});
+			};
+
+			const url1 = `https://api.timelessq.com/music/tencent/cdList?uid=${qq}`;
+			const headers1 = new UTSJSONObject();
+			headers1.set("User-Agent", "Mozilla/5.0");
+			uni.request({
+				url: url1, method: 'GET', header: headers1,
+				success: (res) => {
+					try {
+						let data : UTSJSONObject;
+						if (res.data instanceof UTSJSONObject) data = res.data as UTSJSONObject;
+						else data = JSON.parse(`${res.data}`) as UTSJSONObject;
+
+						const list = findListInObject(data);
+						if (list.length > 0) resolve({ userInfo: { nickname: `QQ用户 ${qq}`, avatar: avatarUrl }, playlists: list } as MusicUserPlaylistsResult);
+						else runPlanB();
+					} catch (e) { runPlanB(); }
+				},
+				fail: () => runPlanB()
+			});
+			// #endif
+			// #ifndef APP-ANDROID
+			reject("仅支持 Android 平台");
+			// #endif
+		});
+	}
+
+	// ========================================================================
+	// 修复 2: 歌单详情解析
+	// ========================================================================
+	// #ifdef APP-ANDROID
+	export function fetchPlaylistDetail(dissid : string) : Promise<MusicSong[]> {
+		return new Promise<MusicSong[]>((resolve, reject) => {
+			const url = `https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg?type=1&json=1&utf8=1&onlysong=0&disstid=${dissid}&g_tk=5381&loginUin=0&hostUin=0&format=json&inCharset=utf8&outCharset=utf-8&notice=0&platform=yqq.json&needNewCode=0`;
+
+			const headers = new UTSJSONObject();
+			headers.set("Referer", "https://y.qq.com/");
+			headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+
+			uni.request({
+				url: url,
+				method: 'GET',
+				header: headers,
+				success: (res) => {
+					try {
+						let data : UTSJSONObject;
+						if (res.data instanceof UTSJSONObject) data = res.data as UTSJSONObject;
+						else {
+							let s = `${res.data}`;
+							if (s.trim().startsWith("Callback")) {
+								const st = s.indexOf("(") + 1;
+								const ed = s.lastIndexOf(")");
+								if (ed > st) s = s.substring(st, ed);
+							}
+							data = JSON.parse(s) as UTSJSONObject;
+						}
+
+						let songListRaw : UTSArray<UTSJSONObject> | null = null;
+						if (data["cdlist"] != null && Array.isArray(data["cdlist"])) {
+							const arr = data["cdlist"] as UTSArray<UTSJSONObject>;
+							if (arr.length > 0) {
+								const item0 = arr[0];
+								if (item0["songlist"] != null && Array.isArray(item0["songlist"])) {
+									songListRaw = item0["songlist"] as UTSArray<UTSJSONObject>;
+								}
+							}
+						}
+
+						const songs : MusicSong[] = [];
+						if (songListRaw != null) {
+							songListRaw.forEach((item) => {
+								const mid = (item["songmid"] ?? "").toString();
+								const idVal = item["songid"];
+								const finalId = mid != "" ? mid : (idVal != null ? `${idVal}` : "");
+
+								const albumId = (item["albummid"] ?? "").toString();
+								let cover = "https://y.gtimg.cn/mediastyle/global/img/cover_like.png";
+								if (albumId != "") cover = `https://y.gtimg.cn/music/photo_new/T002R300x300M000${albumId}.jpg`;
+
+								let singerName = "未知歌手";
+								if (item["singer"] != null && Array.isArray(item["singer"])) {
+									const singers = item["singer"] as UTSArray<UTSJSONObject>;
+									if (singers.length > 0) singerName = (singers[0]["name"] ?? "").toString();
+								}
+
+								let durationVal = 0;
+								const intv = item["interval"];
+								if (intv != null) durationVal = parseInt(`${intv}`);
+
+								if (finalId != "") {
+									songs.push({
+										id: finalId,
+										title: (item["songname"] ?? item["title"] ?? "").toString(),
+										singer: singerName,
+										album: (item["albumname"] ?? item["album"] ?? "").toString(),
+										coverImage: cover,
+										playUrl: "",
+										lyricUrl: "",
+										source: "qq",
+										duration: durationVal,
+										httpHeaders: item
+									} as MusicSong);
+								}
+							});
+						}
+						resolve(songs);
+					} catch (e) {
+						console.error("Detail parse error", e);
+						reject("解析失败");
+					}
+				},
+				fail: () => reject("请求失败")
+			});
+		});
+	}
+	// #endif
+	// #ifndef APP-ANDROID
+	export function fetchPlaylistDetail(dissid : string) : Promise<MusicSong[]> {
+		return new Promise<MusicSong[]>((_, reject) => { reject("仅支持 Android 平台"); });
+	}
+	// #endif
+
+	export function fetchCustomSource(url : string) : Promise<MusicSong[]> {
+		return new Promise((resolve) => { resolve([]); });
+	}
+
+	export function extractQQPlaylistId(input : string) : string {
+		return input;
+	}
+
+	// ========================================================================
+	// 7. 通用工具函数 (供 UI 层复用)
+	// ========================================================================
+
+	export type LyricLine = {
+		time : number
+		text : string
+	}
+
+	export function parseLyric(lrc : string) : LyricLine[] {
+		const result : LyricLine[] = [];
+		if (lrc == "") return result;
+
+		const cleanLrc = lrc.replace(/\\n/g, '\n');
+		const lines = cleanLrc.split('\n');
+		const timeReg = /\[(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?\]/;
+
+		lines.forEach(line => {
+			const matchReg = timeReg.exec(line);
+			if (matchReg != null) {
+				const fullMatch = matchReg[0];
+				if (fullMatch != null) {
+					const min = parseInt(matchReg[1] ?? "0");
+					const sec = parseInt(matchReg[2] ?? "0");
+					let ms = 0;
+					const msStr = matchReg[3] ?? "0";
+
+					if (msStr.length == 2) ms = parseInt(msStr) * 10;
+					else if (msStr.length == 3) ms = parseInt(msStr);
+					else ms = parseInt(msStr);
+
+					const time = min * 60 + sec + ms / 1000.0;
+					const text = line.replace(fullMatch, "").trim();
+
+					if (text.length > 0) {
+						result.push({ time, text } as LyricLine);
+					}
+				}
+			}
+		});
+
+		if (result.length == 0) {
+			result.push({ time: 0, text: "暂无滚动歌词" } as LyricLine);
+		}
+		return result;
+	}
+
+	export function calcCurrentLyricIndex(lines : LyricLine[], currentTime : number) : number {
+		if (lines.length == 0) return -1;
+		for (let i = lines.length - 1; i >= 0; i--) {
+			if (currentTime >= lines[i].time) {
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	export function formatTime(time : number) : string {
+		if (Number.isNaN(time) || time < 0) return '00:00';
+		const t = Math.floor(time);
+		const minutes = Math.floor(t / 60);
+		const seconds = Math.floor(t % 60);
+
+		const minStr = minutes < 10 ? "0" + minutes : minutes.toString();
+		const secStr = seconds < 10 ? "0" + seconds : seconds.toString();
+
+		return `${minStr}:${secStr}`;
+	}
+
+	export function toggleFavoriteState(song : MusicSong) : boolean {
+		if (isFavorite(song.id)) {
+			removeFromFavorites(song.id);
+			uni.showToast({ title: "已取消收藏", icon: "none" });
+			return false;
+		} else {
+			addToFavorites(song);
+			uni.showToast({ title: "已收藏", icon: "success" });
+			return true;
+		}
+	}
+
+	// ========================================================================
+	// 8. 智能播放接口 (核心复用逻辑)
+	// ========================================================================
+
+	export async function smartPlay(song : MusicSong, contextPlaylist ?: MusicSong[]) {
+		console.log(`🚀 [SmartPlay] ${song.title}`);
+
+		if (musicState.currentSong?.id == song.id) {
+			togglePlay();
+			return;
+		}
+
+		if (contextPlaylist != null) {
+			musicState.playlist = [...contextPlaylist];
+			const idx = musicState.playlist.findIndex(s => s.id == song.id);
+			if (idx >= 0) musicState.currentIndex = idx;
+		}
+
+		if (song.coverImage.startsWith('http://')) {
+			song.coverImage = song.coverImage.replace('http://', 'https://');
+		}
+
+		if (song.source == 'local' || (song.playUrl != "" && song.playUrl.startsWith("http"))) {
+			playSong(song);
+			return;
+		}
+
+		uni.showLoading({ title: "极速解析...", mask: true });
+
+		try {
+			const res = await autoResolveSongUrl(song);
+			if (res != null && res.url != "" && res.url.startsWith("http")) {
+				console.log(`✅ 解析成功: ${res.url}`);
+
+				song.playUrl = res.url;
+				if (res.sourceId != "") song.source = res.sourceId;
+
+				playSong(song);
+			} else {
+				throw new Error("解析地址无效");
+			}
+		} catch (e) {
+			console.error("❌ SmartPlay Error:", e);
+			uni.showToast({ title: "暂无播放源", icon: "none" });
+		} finally {
+			uni.hideLoading();
+		}
+	}
+
+	export async function autoResolveSongUrl(song : MusicSong) : Promise<ResolveResult | null> {
+		if (!_isLoaded) getMusicSources();
+
+		const candidates : MusicSource[] = [];
+		const addedIds = new Set<string>();
+
+		// A. 优先尝试 song.source 指定的源
+		if (song.source != "" && song.source != "local") {
+			const s = _allSources.find(src => src.id == song.source);
+			if (s != null) { candidates.push(s); addedIds.add(s.id); }
+			else {
+				const tag = song.source.toLowerCase();
+				const fuzzy = _allSources.find(src => src.name.toLowerCase().includes(tag) && src.script.trim() != "");
+				if (fuzzy != null && !addedIds.has(fuzzy.id)) { candidates.push(fuzzy); addedIds.add(fuzzy.id); }
+			}
+		}
+
+		// B. 尝试所有可用的插件源 (兜底)
+		_allSources.forEach(s => {
+			if (s.type == 'plugin' && !addedIds.has(s.id) && s.script.trim() != "") {
+				candidates.push(s);
+				addedIds.add(s.id);
+			}
+		});
+
+		// C. 逐个尝试
+		for (const source of candidates) {
+			try {
+				let command: any;
+				// #ifdef APP-ANDROID
+				const cmdObj = new UTSJSONObject();
+				cmdObj.set('action', 'get_media');
+				cmdObj.set('song', song.httpHeaders);
+				cmdObj.set('script', source.script);
+				command = cmdObj;
+				// #endif
+				
+				// #ifndef APP-ANDROID
+				command = {
+					action: "get_media",
+					song: song.httpHeaders,
+					script: source.script
+				};
+				// #endif
+				
+				console.log(`⏳ 尝试源: ${source.name} (${source.id})`);
+
+				const res = await executePluginCommand(command);
+
+				if (res != null) {
+					let finalUrl = "";
+					// #ifdef APP-ANDROID
+					if (res instanceof UTSJSONObject) {
+						finalUrl = (res['url'] ?? "").toString();
+					} else {
+						finalUrl = res.toString();
+					}
+					// #endif
+					// #ifndef APP-ANDROID
+					finalUrl = res.toString();
+					// #endif
+
+					if (finalUrl != "" && finalUrl.startsWith("http")) {
+						return { url: finalUrl, sourceId: source.id } as ResolveResult;
+					}
+				}
+			} catch (e) { }
+		}
+		return null;
+	}

@@ -1,0 +1,142 @@
+import { OcrModelService } from './OcrModelService.uts'
+
+export type OcrResult = {
+	ok: boolean
+	text?: string
+	message?: string
+}
+
+type OcrBox = {
+	left: number
+	top: number
+	right: number
+	bottom: number
+}
+
+type OcrItem = {
+	text: string
+	confidence: number
+	box: OcrBox | null
+}
+
+type OcrSuccess = {
+	fullText: string
+	items: OcrItem[]
+}
+
+type OcrFail = {
+	errMsg: string
+}
+
+type RecognizeOptions = {
+	imagePath: string
+	engine: string
+	success: (res: OcrSuccess) => void
+	fail: (err: OcrFail) => void
+}
+
+type ZemoOcrRuntime = {
+	recognize(options: RecognizeOptions): void
+}
+
+export class OcrService {
+	private static zemoOcrRuntimePromise: Promise<ZemoOcrRuntime> | null = null
+
+	static recognizeTextFromImages(imagePaths: string[]): Promise<OcrResult> {
+		return new Promise((resolve) => {
+			void (async () => {
+				if (imagePaths.length == 0) {
+					resolve({ ok: false, message: "No images provided" } as OcrResult)
+					return
+				}
+				const path = imagePaths[0]
+				if (!OcrModelService.isScreenOcrEnabled()) {
+					console.log(`[ZemoOcr][Service] OCR skipped, reason=screen-ocr-disabled, image=${path}`)
+					resolve({ ok: false, message: '屏幕 OCR 已关闭' } as OcrResult)
+					return
+				}
+				let usePpOcrV6 = OcrModelService.isPpOcrV6Enabled()
+				let backend = ''
+				let ready = false
+				let detModelPath = ''
+				let recModelPath = ''
+				let dictPath = ''
+				try {
+					const status = await OcrModelService.getStatus()
+					backend = status.backend
+					ready = status.ready
+					detModelPath = status.detModelPath
+					recModelPath = status.recModelPath
+					dictPath = status.dictPath
+					usePpOcrV6 = status.enabled
+					if (usePpOcrV6) {
+						console.log(`[ZemoOcr][Service] request engine=ppocrv6, ready=${ready}, backend=${backend == '' ? 'unknown' : backend}, det=${detModelPath}, rec=${recModelPath}, dict=${dictPath}, image=${path}`)
+					} else {
+						console.log(`[ZemoOcr][Service] offline OCR not used, reason=switch-disabled, engine=native, image=${path}`)
+					}
+					if (usePpOcrV6 && !ready) {
+						console.warn(`[ZemoOcr][Service] PP-OCRv6 enabled but model not ready: ${status.message}`)
+					}
+				} catch (e) {
+					console.warn(`[ZemoOcr][Service] offline OCR status unavailable, fallback decision from switch=${usePpOcrV6}: ${e}`)
+				}
+
+				let ocr: ZemoOcrRuntime
+				try {
+					ocr = await OcrService.getZemoOcrRuntime()
+				} catch (e2) {
+					const message = `zemo-ocr 加载失败：${e2}`
+					console.warn(`[ZemoOcr][Service] ${message}`)
+					resolve({ ok: false, message } as OcrResult)
+					return
+				}
+
+				ocr.recognize({
+					imagePath: path,
+					engine: usePpOcrV6 ? 'ppocrv6' : 'native',
+					success: (res: OcrSuccess) => {
+						const text = OcrService.formatOcrText(res)
+						console.log(`[ZemoOcr][Service] OCR success engine=${usePpOcrV6 ? 'ppocrv6' : 'native'}, backend=${backend == '' ? 'platform' : backend}, textLength=${text.length}, items=${res.items.length}, modelReady=${ready}`)
+						resolve({ ok: true, text } as OcrResult)
+					},
+					fail: (err: OcrFail) => {
+						console.warn(`[ZemoOcr][Service] OCR failed engine=${usePpOcrV6 ? 'ppocrv6' : 'native'}, backend=${backend == '' ? 'platform' : backend}, message=${err.errMsg}`)
+						resolve({ ok: false, message: err.errMsg } as OcrResult)
+					}
+				})
+			})()
+		});
+	}
+
+	private static async getZemoOcrRuntime(): Promise<ZemoOcrRuntime> {
+		if (OcrService.zemoOcrRuntimePromise == null) {
+			OcrService.zemoOcrRuntimePromise = new Promise<ZemoOcrRuntime>((resolve, reject) => {
+				void import('@/uni_modules/zemo-ocr').then((module: Object): void => {
+					resolve(module as ZemoOcrRuntime)
+				}).catch((e: Error): void => {
+					reject(e)
+				})
+			})
+		}
+		return OcrService.zemoOcrRuntimePromise as Promise<ZemoOcrRuntime>
+	}
+
+	private static formatOcrText(res: OcrSuccess): string {
+		const items = res.items
+		if (items == null || items.length == 0) return res.fullText
+		const lines = [] as string[]
+		for (let i = 0; i < items.length; i++) {
+			const item = items[i] as OcrItem
+			const text = (item.text ?? '').toString().trim()
+			if (text == '') continue
+			const box = item.box
+			const left = box != null ? Math.round(box.left) : 0
+			const top = box != null ? Math.round(box.top) : 0
+			const width = box != null ? Math.round(Math.max(0, box.right - box.left)) : 0
+			const height = box != null ? Math.round(Math.max(0, box.bottom - box.top)) : 0
+			lines.push(`[[ocr:${left},${top},${width},${height}]]${text}`)
+		}
+		if (lines.length == 0) return res.fullText
+		return lines.join('\n')
+	}
+}

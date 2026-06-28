@@ -1,0 +1,10 @@
+{
+  "share_files": {
+    "scopes": [
+      {
+        "path": "/base/files",
+        "permission": "r+w"
+      }
+    ]
+  }
+}

@@ -1,0 +1,439 @@
+import { DeskPetBillCaptureService, DeskPetBillPrefill, BillTextResult } from '@/services/sys/DeskPetBillCaptureService.uts'
+import { ChatTodoExtractionService, ChatTodoCandidate } from '@/services/sys/ChatTodoExtractionService.uts'
+import { ScreenOmniLiteModelService, ScreenOmniLitePrediction } from '@/services/sys/ScreenOmniLiteModelService.uts'
+
+export type ScreenUnderstandingKind = 'bill' | 'investment' | 'chat' | 'activity' | 'general'
+
+export type ScreenUnderstandingAction = {
+	type: string
+	label: string
+	query: string
+}
+
+export type ScreenUnderstandingResult = {
+	ok: boolean
+	kind: ScreenUnderstandingKind
+	source: string
+	title: string
+	summary: string
+	content: string
+	message: string
+	ocrText: string
+	actions: ScreenUnderstandingAction[]
+	billPrefill: DeskPetBillPrefill | null
+}
+
+type ScreenActivitySignal = {
+	matched: boolean
+	category: string
+	title: string
+	action: string
+}
+
+export class ScreenUnderstandingService {
+	static async analyzeCurrentScreen(skipLiveCapture: boolean = false): Promise<ScreenUnderstandingResult> {
+		let imageOmni: ScreenOmniLitePrediction | null = null
+		let imagePath = ''
+		try {
+			const capturedImagePath = await DeskPetBillCaptureService.captureScreenImagePath()
+			imagePath = capturedImagePath == null ? '' : capturedImagePath
+			if (imagePath != '') imageOmni = await ScreenOmniLiteModelService.predictImage(imagePath)
+		} catch (e) {
+			const message = e == null ? '图片意图识别异常' : (e as Error).message
+			console.warn(`[ScreenUnderstanding][Debug] image_intent_failed message=${message}`)
+		}
+		let captured: BillTextResult
+		try {
+			captured = await DeskPetBillCaptureService.captureBillText(skipLiveCapture, false)
+		} catch (e) {
+			const message = e == null ? '屏幕识别异常' : (e as Error).message
+			if (imageOmni != null && imageOmni.modelReady) return ScreenUnderstandingService.buildImageOnlyResult(imageOmni, imagePath, message)
+			return ScreenUnderstandingService.empty(false, 'general', '', message)
+		}
+
+		if (!captured.ok || captured.text.trim() == '') {
+			if (imageOmni != null && imageOmni.modelReady) return ScreenUnderstandingService.buildImageOnlyResult(imageOmni, imagePath, captured.message)
+			return ScreenUnderstandingService.empty(false, 'general', captured.source, captured.message == '' ? '未识别到屏幕文字' : captured.message)
+		}
+
+		const source = captured.source
+		const ocrText = captured.text
+		const plainText = ScreenUnderstandingService.stripOcrMetaFromText(ocrText)
+		const activity = ScreenUnderstandingService.detectActivity(plainText, `${source}\n${imagePath}`)
+		const chatCandidates = ChatTodoExtractionService.extractCandidates(plainText)
+		const likelyChat = ChatTodoExtractionService.looksLikeChatText(plainText)
+		const omni = await ScreenOmniLiteModelService.predict(plainText)
+		const imageLabel = imageOmni == null ? '' : imageOmni.label
+		console.log(`[ScreenUnderstanding][Debug] analyze_current source=${source}, omni=${omni.label}, imageOmni=${imageLabel == '' ? 'none' : imageLabel}, method=${omni.method}, confidence=${omni.confidence}, likelyChat=${likelyChat ? 'true' : 'false'}, chatCandidates=${chatCandidates.length}, textLength=${plainText.length}`)
+		if ((likelyChat || omni.label == 'chat_todo' || imageLabel == 'chat_todo') && chatCandidates.length > 0) {
+			return ScreenUnderstandingService.buildChatResult(ocrText, source)
+		}
+		if (omni.label == 'investment_import' || imageLabel == 'investment_import' || ScreenUnderstandingService.looksLikeInvestmentText(plainText)) {
+			return await ScreenUnderstandingService.buildInvestmentResult(ocrText, source)
+		}
+		if (omni.label == 'bill_record' || imageLabel == 'bill_record' || ScreenUnderstandingService.looksLikeBillText(plainText)) {
+			return await ScreenUnderstandingService.buildBillResult(ocrText, source)
+		}
+		if (activity.matched) return ScreenUnderstandingService.buildActivityResult(ocrText, source, activity)
+		let labelActivity = ScreenUnderstandingService.activityFromIntentLabel(imageLabel)
+		if (!labelActivity.matched) labelActivity = ScreenUnderstandingService.activityFromIntentLabel(omni.label)
+		if (labelActivity.matched) return ScreenUnderstandingService.buildActivityResult(ocrText, source, labelActivity)
+		if (likelyChat || omni.label == 'chat_todo' || imageLabel == 'chat_todo' || chatCandidates.length > 0) {
+			return ScreenUnderstandingService.buildChatResult(ocrText, source)
+		}
+		return ScreenUnderstandingService.buildGeneralResult(ocrText, source)
+	}
+
+	static async analyzeText(text: string, source: string = 'manual'): Promise<ScreenUnderstandingResult> {
+		const value = (text ?? '').toString().trim()
+		if (value == '') return ScreenUnderstandingService.empty(false, 'general', source, '文本为空')
+		const plainText = ScreenUnderstandingService.stripOcrMetaFromText(value)
+		const chatCandidates = ChatTodoExtractionService.extractCandidates(plainText)
+		const likelyChat = ChatTodoExtractionService.looksLikeChatText(plainText)
+		const omni = await ScreenOmniLiteModelService.predict(plainText)
+		console.log(`[ScreenUnderstanding][Debug] analyze_text source=${source}, omni=${omni.label}, method=${omni.method}, confidence=${omni.confidence}, likelyChat=${likelyChat ? 'true' : 'false'}, chatCandidates=${chatCandidates.length}, textLength=${plainText.length}`)
+		if ((likelyChat || omni.label == 'chat_todo') && chatCandidates.length > 0) return ScreenUnderstandingService.buildChatResult(value, source)
+		if (omni.label == 'investment_import' || ScreenUnderstandingService.looksLikeInvestmentText(plainText)) return await ScreenUnderstandingService.buildInvestmentResult(value, source)
+		if (omni.label == 'bill_record' || ScreenUnderstandingService.looksLikeBillText(plainText)) return await ScreenUnderstandingService.buildBillResult(value, source)
+		const activity = ScreenUnderstandingService.detectActivity(plainText, source)
+		if (activity.matched) return ScreenUnderstandingService.buildActivityResult(value, source, activity)
+		const labelActivity = ScreenUnderstandingService.activityFromIntentLabel(omni.label)
+		if (labelActivity.matched) return ScreenUnderstandingService.buildActivityResult(value, source, labelActivity)
+		if (likelyChat || omni.label == 'chat_todo' || chatCandidates.length > 0) return ScreenUnderstandingService.buildChatResult(value, source)
+		return ScreenUnderstandingService.buildGeneralResult(value, source)
+	}
+
+	private static buildImageOnlyResult(omni: ScreenOmniLitePrediction, imagePath: string, message: string): ScreenUnderstandingResult {
+		const activity = ScreenUnderstandingService.detectActivity('', imagePath)
+		if (activity.matched) return ScreenUnderstandingService.buildActivityResult('', imagePath == '' ? 'screen-image' : imagePath, activity, message)
+		const labelActivity = ScreenUnderstandingService.activityFromIntentLabel(omni.label)
+		if (labelActivity.matched) return ScreenUnderstandingService.buildActivityResult('', imagePath == '' ? 'screen-image' : imagePath, labelActivity, message)
+		let kind: ScreenUnderstandingKind = 'general'
+		let title = '屏幕内容'
+		let summary = `图片意图模型识别为 ${omni.label}，置信度 ${omni.confidence}`
+		let billPrefill: DeskPetBillPrefill | null = null
+		const actions = [] as ScreenUnderstandingAction[]
+		if (omni.label == 'bill_record') {
+			kind = 'bill'
+			title = '疑似账单页面'
+			summary = '图片意图模型识别到账单页面；当前没有文本字段，自动记账还需要金额等结构化信息'
+			billPrefill = DeskPetBillCaptureService.parseBillText('')
+			actions.push({ type: 'open_record', label: '打开记账确认', query: DeskPetBillCaptureService.buildRecordQuery(billPrefill) } as ScreenUnderstandingAction)
+		} else if (omni.label == 'chat_todo') {
+			kind = 'chat'
+			title = '疑似聊天页面'
+			summary = '图片意图模型识别到聊天页面；当前没有聊天文字，无法直接创建待办内容'
+		} else if (omni.label == 'investment_import') {
+			kind = 'investment'
+			title = '疑似理财/资产页面'
+			summary = '图片意图模型识别到理财/资产页面；当前没有持仓文字，暂不能自动导入明细'
+		}
+		if (message != '') summary += `；文本来源提示：${message}`
+		return {
+			ok: true,
+			kind,
+			source: imagePath == '' ? 'screen-image' : imagePath,
+			title,
+			summary,
+			content: `image=${imagePath == '' ? 'current-screen' : imagePath}`,
+			message: '',
+			ocrText: '',
+			actions,
+			billPrefill
+		} as ScreenUnderstandingResult
+	}
+
+	private static async buildBillResult(text: string, source: string): Promise<ScreenUnderstandingResult> {
+		let prefill = DeskPetBillCaptureService.parseBillText(text)
+		try {
+			const slmPrefill = await DeskPetBillCaptureService.parseBillTextWithSlmDebug(text, `screen-understanding-${source}`)
+			if (slmPrefill.amount != '' || slmPrefill.note != '' || slmPrefill.sourceApp != '') prefill = slmPrefill
+		} catch (_e0) {}
+		try {
+			prefill = await DeskPetBillCaptureService.resolvePrefillTarget(prefill)
+		} catch (_e1) {}
+
+		const modeText = ScreenUnderstandingService.modeLabel(prefill.activeMode)
+		const amountText = prefill.amount == '' ? '金额未识别' : `${modeText} ¥${prefill.amount}`
+		const title = prefill.amount == '' ? '疑似账单页面' : amountText
+		const summaryParts = [] as string[]
+		summaryParts.push(`识别到${modeText}账单`)
+		if (prefill.amount != '') summaryParts.push(`金额 ${prefill.amount} 元`)
+		if (prefill.note != '') summaryParts.push(`内容 ${prefill.note}`)
+		if (prefill.sourceApp != '') summaryParts.push(`来源 ${prefill.sourceApp}`)
+		if (prefill.payMethod != '') summaryParts.push(`方式 ${prefill.payMethod}`)
+		if (prefill.transactionTime > 0) summaryParts.push(`时间 ${ScreenUnderstandingService.formatTime(prefill.transactionTime)}`)
+
+		const actions = [] as ScreenUnderstandingAction[]
+		if (prefill.amount != '') {
+			actions.push({
+				type: 'open_record',
+				label: '打开记账确认',
+				query: DeskPetBillCaptureService.buildRecordQuery(prefill)
+			} as ScreenUnderstandingAction)
+		}
+
+		return {
+			ok: true,
+			kind: 'bill',
+			source,
+			title,
+			summary: summaryParts.join('，'),
+			content: ScreenUnderstandingService.buildContent(text, 18),
+			message: '',
+			ocrText: text,
+			actions,
+			billPrefill: prefill
+		} as ScreenUnderstandingResult
+	}
+
+	private static async buildInvestmentResult(text: string, source: string): Promise<ScreenUnderstandingResult> {
+		const lines = ScreenUnderstandingService.plainLines(text)
+		const codeText = ScreenUnderstandingService.extractInvestmentCode(lines)
+		const amountText = ScreenUnderstandingService.extractFirstAmount(lines.join('\n'))
+		const parts = [] as string[]
+		if (codeText != '') parts.push(`代码 ${codeText}`)
+		if (amountText != '') parts.push(`金额 ${amountText}`)
+		if (lines.length > 0) parts.push(`主要内容：${ScreenUnderstandingService.limitText(lines.slice(0, 5).join(' / '), 120)}`)
+		const summary = parts.length > 0 ? `识别到理财/资产页面，${parts.join('，')}` : '识别到理财/资产相关页面'
+
+		return {
+			ok: true,
+			kind: 'investment',
+			source,
+			title: codeText != '' ? `理财/资产：${codeText}` : '理财/资产页面',
+			summary,
+			content: ScreenUnderstandingService.buildContent(text, 24),
+			message: '',
+			ocrText: text,
+			actions: [] as ScreenUnderstandingAction[],
+			billPrefill: null
+		} as ScreenUnderstandingResult
+	}
+
+	private static buildGeneralResult(text: string, source: string): ScreenUnderstandingResult {
+		const lines = ScreenUnderstandingService.plainLines(text)
+		const title = lines.length > 0 ? ScreenUnderstandingService.limitText(lines[0], 28) : '屏幕内容'
+		const amount = ScreenUnderstandingService.extractFirstAmount(lines.join('\n'))
+		const summaryParts = [] as string[]
+		summaryParts.push(`识别到 ${lines.length} 行文字`)
+		if (amount != '') summaryParts.push(`包含金额 ${amount}`)
+		if (lines.length > 1) summaryParts.push(`主要内容：${ScreenUnderstandingService.limitText(lines.slice(0, 4).join(' / '), 120)}`)
+		return {
+			ok: true,
+			kind: 'general',
+			source,
+			title,
+			summary: summaryParts.join('，'),
+			content: ScreenUnderstandingService.buildContent(text, 24),
+			message: '',
+			ocrText: text,
+			actions: [] as ScreenUnderstandingAction[],
+			billPrefill: null
+		} as ScreenUnderstandingResult
+	}
+
+	private static buildActivityResult(text: string, source: string, activity: ScreenActivitySignal, message: string = ''): ScreenUnderstandingResult {
+		const lines = ScreenUnderstandingService.plainLines(text)
+		const summaryParts = [] as string[]
+		summaryParts.push(`记录${activity.title}`)
+		if (lines.length > 0) summaryParts.push(`识别到 ${lines.length} 行文字`)
+		if (lines.length > 1) summaryParts.push(`主要内容：${ScreenUnderstandingService.limitText(lines.slice(0, 4).join(' / '), 120)}`)
+		if (message != '') summaryParts.push(message)
+		return {
+			ok: true,
+			kind: 'activity',
+			source,
+			title: activity.title,
+			summary: summaryParts.join('，'),
+			content: lines.length > 0 ? ScreenUnderstandingService.buildContent(text, 18) : `source=${source}`,
+			message: '',
+			ocrText: text,
+			actions: [{ type: activity.action, label: '记录活动', query: activity.category }] as ScreenUnderstandingAction[],
+			billPrefill: null
+		} as ScreenUnderstandingResult
+	}
+
+	private static buildChatResult(text: string, source: string): ScreenUnderstandingResult {
+		const candidates = ChatTodoExtractionService.extractCandidates(text)
+		const lines = ScreenUnderstandingService.plainLines(text)
+		const title = candidates.length > 0 ? '聊天待办识别' : '聊天页面'
+		const summaryParts = [] as string[]
+		summaryParts.push(`识别到聊天内容 ${lines.length} 行`)
+		if (candidates.length > 0) {
+			summaryParts.push(`可创建待办 ${candidates.length} 个`)
+			summaryParts.push(`首个待办：${ScreenUnderstandingService.limitText(candidates[0].title, 36)}`)
+		}
+		const actions = [] as ScreenUnderstandingAction[]
+		if (candidates.length > 0) {
+			actions.push({
+				type: 'create_todos',
+				label: '创建待办',
+				query: ''
+			} as ScreenUnderstandingAction)
+		}
+		return {
+			ok: true,
+			kind: 'chat',
+			source,
+			title,
+			summary: summaryParts.join('，'),
+			content: ScreenUnderstandingService.buildChatContent(text, candidates),
+			message: '',
+			ocrText: text,
+			actions,
+			billPrefill: null
+		} as ScreenUnderstandingResult
+	}
+
+	private static buildChatContent(text: string, candidates: ChatTodoCandidate[]): string {
+		const parts = [] as string[]
+		if (candidates.length > 0) {
+			parts.push('待办候选：')
+			for (let i = 0; i < candidates.length; i++) {
+				parts.push(`${i + 1}. ${candidates[i].title}`)
+			}
+			parts.push('')
+		}
+		parts.push(ScreenUnderstandingService.buildContent(text, 18))
+		return parts.join('\n')
+	}
+
+	private static buildContent(text: string, maxLines: number): string {
+		const lines = ScreenUnderstandingService.plainLines(text)
+		const picked = [] as string[]
+		for (let i = 0; i < lines.length && picked.length < maxLines; i++) {
+			const line = lines[i]
+			if (line == '') continue
+			picked.push(line)
+		}
+		if (lines.length > picked.length) picked.push(`... 还有 ${lines.length - picked.length} 行`)
+		return picked.join('\n')
+	}
+
+	private static plainLines(text: string): string[] {
+		const rawLines = (text ?? '').toString().replace(/\r\n/g, '\n').split('\n')
+		const result = [] as string[]
+		const metaPattern = /^\[\[ocr:([0-9.\-]+),([0-9.\-]+),([0-9.\-]+),([0-9.\-]+)\]\](.*)$/
+		for (let i = 0; i < rawLines.length; i++) {
+			let value = rawLines[i].trim()
+			if (value == '') continue
+			const m = metaPattern.exec(value)
+			if (m != null && m.length >= 6) value = m[5].trim()
+			if (value != '') result.push(value)
+		}
+		return result
+	}
+
+	private static stripOcrMetaFromText(text: string): string {
+		return ScreenUnderstandingService.plainLines(text).join('\n')
+	}
+
+	private static looksLikeBillText(text: string): boolean {
+		if (text.length < 4) return false
+		if (ScreenUnderstandingService.extractFirstAmount(text) == '') return false
+		return ScreenUnderstandingService.containsAny(text, [
+			'账单', '付款', '支付', '收款', '收入', '支出', '交易', '订单', '商户', '商家',
+			'支付宝', '微信', '银联', '银行卡', '退款', '实付', '消费', '转账', '入账',
+			'红包', '零钱通', '付款方式', '支付方式'
+		])
+	}
+
+	private static looksLikeInvestmentText(text: string): boolean {
+		let score = 0
+		if (ScreenUnderstandingService.containsAny(text, ['持仓', '市值', '盈亏', '收益率', '持有收益'])) score += 2
+		if (ScreenUnderstandingService.containsAny(text, ['基金', '股票', 'ETF', '证券', '理财', '资产'])) score += 1
+		if (ScreenUnderstandingService.containsAny(text, ['可用', '份额', '净值', '成本', '代码'])) score += 1
+		return score >= 2
+	}
+
+	private static detectActivity(text: string, source: string): ScreenActivitySignal {
+		const value = `${(text ?? '').toString()}\n${(source ?? '').toString()}`.toLowerCase()
+		if (ScreenUnderstandingService.containsAny(value, ['yylx.danmaku.bili', 'bilibili', '哔哩', '弹幕', 'com.ss.android.ugc.aweme', '抖音', 'com.qiyi.video', '爱奇艺', 'com.tencent.videohm', '腾讯视频', '短剧', '综艺', '电视剧', '电影', '播放', '暂停'])) {
+			return { matched: true, category: 'entertainment_video', title: '视频娱乐', action: 'record_activity' } as ScreenActivitySignal
+		}
+		if (ScreenUnderstandingService.containsAny(value, ['qqmusic', 'luna.hm.music', '音乐', '歌曲', '歌单', '专辑', '播放列表'])) {
+			return { matched: true, category: 'entertainment_music', title: '音乐娱乐', action: 'record_activity' } as ScreenActivitySignal
+		}
+		if (ScreenUnderstandingService.containsAny(value, ['taobao', 'tmall', 'jd.hm.mall', 'jingdong', 'pinduoduo', 'xunmeng', 'idlefish', 'xiaomi.shop', '1688', 'alibaba.wireless', '购物车', '商品', '下单', '订单', '店铺'])) {
+			return { matched: true, category: 'shopping_browse', title: '购物浏览', action: 'record_activity' } as ScreenActivitySignal
+		}
+		if (ScreenUnderstandingService.containsAny(value, ['microsoft.emmx', 'browser', '浏览器', '网页', '搜索', '资讯', '新闻'])) {
+			return { matched: true, category: 'web_browse', title: '网页浏览', action: 'record_activity' } as ScreenActivitySignal
+		}
+		if (ScreenUnderstandingService.containsAny(value, ['miui.gallery', 'baidu.youavideo', '图库', '相册', '照片', '图片'])) {
+			return { matched: true, category: 'media_browse', title: '相册浏览', action: 'record_activity' } as ScreenActivitySignal
+		}
+		if (ScreenUnderstandingService.containsAny(value, ['tantan', '社交', '附近的人'])) {
+			return { matched: true, category: 'social_activity', title: '社交娱乐', action: 'record_activity' } as ScreenActivitySignal
+		}
+		return { matched: false, category: '', title: '', action: '' } as ScreenActivitySignal
+	}
+
+	private static activityFromIntentLabel(label: string): ScreenActivitySignal {
+		if (label == 'shopping_activity') return { matched: true, category: 'shopping_browse', title: '购物浏览', action: 'record_activity' } as ScreenActivitySignal
+		if (label == 'entertainment_activity') return { matched: true, category: 'entertainment', title: '娱乐活动', action: 'record_activity' } as ScreenActivitySignal
+		return { matched: false, category: '', title: '', action: '' } as ScreenActivitySignal
+	}
+
+	private static extractFirstAmount(text: string): string {
+		const reg = /[+\-]?\s*[¥￥]?\s*[0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*(?:元)?/
+		const m = reg.exec(text)
+		if (m == null || m.length == 0) return ''
+		return m[0].replace(/\s+/g, '').trim()
+	}
+
+	private static extractInvestmentCode(lines: string[]): string {
+		const reg = /\b(?:SH|SZ|HK)?[0-9]{5,6}\b/i
+		for (let i = 0; i < lines.length; i++) {
+			const m = reg.exec(lines[i])
+			if (m != null && m.length > 0) return m[0]
+		}
+		return ''
+	}
+
+	private static containsAny(text: string, keywords: string[]): boolean {
+		for (let i = 0; i < keywords.length; i++) {
+			if (text.indexOf(keywords[i]) >= 0) return true
+		}
+		return false
+	}
+
+	private static modeLabel(mode: string): string {
+		if (mode == 'income') return '收入'
+		if (mode == 'transfer') return '转账'
+		if (mode == 'refund') return '退款'
+		return '支出'
+	}
+
+	private static formatTime(ts: number): string {
+		const d = new Date(ts)
+		const y = d.getFullYear()
+		const m = `${d.getMonth() + 1}`.padStart(2, '0')
+		const day = `${d.getDate()}`.padStart(2, '0')
+		const hh = `${d.getHours()}`.padStart(2, '0')
+		const mm = `${d.getMinutes()}`.padStart(2, '0')
+		return `${y}-${m}-${day} ${hh}:${mm}`
+	}
+
+	private static limitText(text: string, maxLen: number): string {
+		const value = (text ?? '').toString().trim()
+		if (value.length <= maxLen) return value
+		return `${value.substring(0, maxLen)}...`
+	}
+
+	private static empty(ok: boolean, kind: ScreenUnderstandingKind, source: string, message: string): ScreenUnderstandingResult {
+		return {
+			ok,
+			kind,
+			source,
+			title: ok ? '屏幕内容' : '屏幕理解失败',
+			summary: '',
+			content: '',
+			message,
+			ocrText: '',
+			actions: [] as ScreenUnderstandingAction[],
+			billPrefill: null
+		} as ScreenUnderstandingResult
+	}
+}

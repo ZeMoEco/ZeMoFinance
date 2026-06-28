@@ -1,0 +1,86 @@
+// #ifdef APP-HARMONY
+import common from '@ohos.app.ability.common'
+// #endif
+
+import { UserBiz } from '@/services/biz/UserBiz.uts'
+import { WebDavIncrementalSyncService } from './WebDavIncrementalSyncService.uts'
+import { configureAppRuntime, AppRuntimeProfile } from '@/utils/app/AppRuntime.uts'
+import { DBInit } from '@/utils/DB/DBInit.uts'
+
+export type EcosystemBootResult = {
+  dbReady: boolean
+  syncReady: boolean
+  syncReason: string | null
+  syncDebugLog?: string | null
+}
+
+export class EcosystemAppBootstrap {
+  static resolveNativeContext(owner: any | null = null): any | null {
+    let context: any | null = null
+    // #ifdef APP-HARMONY
+    try {
+      const rawContext = owner != null ? getContext(owner) : getContext()
+      if (rawContext != null) context = rawContext as common.UIAbilityContext
+    } catch (_e1) {
+      try {
+        const rawContext = getContext()
+        if (rawContext != null) context = rawContext as common.UIAbilityContext
+      } catch (_e2) {}
+    }
+    // #endif
+    return context
+  }
+
+  static async init(profile: AppRuntimeProfile, context: any | null = null, syncSource: string = 'launch'): Promise<EcosystemBootResult> {
+    configureAppRuntime(profile)
+
+    const ok = await DBInit.run(context)
+    if (!ok) {
+      console.error(`[${profile.appId}] Database initialization failed.`)
+      return {
+        dbReady: false,
+        syncReady: false,
+        syncReason: 'db_init_failed',
+        syncDebugLog: null,
+      } as EcosystemBootResult
+    }
+
+    await UserBiz.ensureDeviceId()
+    const syncResult = await WebDavIncrementalSyncService.run(profile, syncSource, context)
+    if (!syncResult.available) {
+      const reason = syncResult.reason ?? 'webdav_sync_unavailable'
+      console.warn(`[${profile.appId}] WebDAV sync unavailable; entering local-only mode: ${reason}`)
+      return {
+        dbReady: true,
+        syncReady: false,
+        syncReason: reason,
+        syncDebugLog: syncResult.debugLog ?? null,
+      } as EcosystemBootResult
+    }
+
+    if (!syncResult.synced && syncResult.reason != null) {
+      console.warn(`[${profile.appId}] WebDAV sync ${syncSource} incomplete: ${syncResult.reason}`)
+    }
+
+    return {
+      dbReady: true,
+      syncReady: true,
+      syncReason: syncResult.synced ? null : syncResult.reason,
+      syncDebugLog: syncResult.debugLog ?? null,
+    } as EcosystemBootResult
+  }
+
+  static async runForegroundSync(profile: AppRuntimeProfile, source: string): Promise<void> {
+    configureAppRuntime(profile)
+    const syncResult = await WebDavIncrementalSyncService.run(profile, source, null)
+    if (!syncResult.available) {
+      console.warn(`[${profile.appId}] WebDAV sync ${source} unavailable: ${syncResult.reason ?? 'unknown'}`)
+      return
+    }
+    if (!syncResult.synced || syncResult.reason != null) {
+      console.warn(
+        `[${profile.appId}] sync ${source}: remote_found=${syncResult.remoteFound},downloaded=${syncResult.downloaded},imported=${syncResult.imported},uploaded=${syncResult.uploaded},synced=${syncResult.synced},reason=${syncResult.reason ?? 'none'}`,
+      )
+    }
+  }
+}

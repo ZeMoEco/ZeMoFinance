@@ -1,0 +1,126 @@
+<template>
+	<view class="week-view">
+		<view class="week-header">
+			<text class="week-day">日</text>
+			<text class="week-day">一</text>
+			<text class="week-day">二</text>
+			<text class="week-day">三</text>
+			<text class="week-day">四</text>
+			<text class="week-day">五</text>
+			<text class="week-day">六</text>
+		</view>
+
+		<view class="week-row" :style="weekSingleRowStyle">
+			<view class="day-cell" v-for="(cell, idx) in typedWeekCells" :key="'wd-'+idx"
+				:id="cellIdBy(cell)" :data-date="cell.dateStr" :style="dayCellStyleBy(cell)" @click="$emit('selectCell', cell)">
+				<text class="day-num" :style="dayNumStyleBy(cell)">{{ cellDayLabelBy(cell) }}</text>
+				<scroll-view class="task-list" scroll-y="true">
+					<text class="task-item task-item-pending" v-for="(t, tIdx) in pendingTasksBy(cell)" :key="'wp-'+idx+'-'+tIdx">{{ t }}</text>
+					<text class="task-item task-item-done" v-for="(t, tIdx) in tasksBy(cell)" :key="'wt-'+idx+'-'+tIdx">{{ t }}</text>
+				</scroll-view>
+			</view>
+		</view>
+
+		<view class="resize-handle" @touchstart="$emit('resizeStart', $event)" @touchmove="$emit('resizeMove', $event)" @touchend="$emit('resizeEnd')" @touchcancel="$emit('resizeEnd')">
+			<view class="resize-bar"></view>
+		</view>
+	</view>
+</template>
+
+<script lang="uts">
+	import type { DateCellLike } from '@/services/biz/CalendarBiz.uts'
+	type PendingTitle = string
+
+	export default {
+		name: 'WeekView',
+		emits: ['selectCell', 'resizeStart', 'resizeMove', 'resizeEnd'],
+		props: {
+			weekCells: { type: Array, default: () => [] },
+			weekSingleRowStyle: { type: String, default: '' },
+			cellId: { type: Function, default: (_cell: DateCellLike): string => '' },
+			dayCellStyle: { type: Function, default: (_cell: DateCellLike): string => '' },
+			dayNumStyle: { type: Function, default: (_cell: DateCellLike): string => '' },
+			cellDayLabel: { type: Function, default: (_cell: DateCellLike): string => '' },
+			pendingTasksForCell: { type: Function, default: (_cell: DateCellLike): PendingTitle[] => [] },
+			tasksForCell: { type: Function, default: (_cell: DateCellLike): string[] => [] },
+		},
+		computed: {
+			typedWeekCells(): DateCellLike[] {
+				return this.weekCells as DateCellLike[]
+			},
+		},
+		methods: {
+			pendingTitleOf(item: any): string {
+				if (item == null) return ''
+				try {
+					const s = item as string
+					if (s != null && s != '') return s
+				} catch (_e) {}
+				try {
+					const obj = item as UTSJSONObject
+					const v = obj.get('title')
+					if (v != null) {
+						const ts = v.toString()
+						if (ts != '') return ts
+					}
+				} catch (_e2) {}
+				try {
+					const m = item as Map<string, any | null>
+					const v = m.get('title')
+					if (v != null) {
+						const vs = v.toString()
+						if (vs != '') return vs
+					}
+				} catch (_e3) {}
+				try {
+					const s2 = item.toString()
+					return (s2 != '[object Object]' ? s2 : '')
+				} catch (_e4) {}
+				return ''
+			},
+
+			cellIdBy(cell: DateCellLike): string {
+				const fn = this.cellId as ((c: DateCellLike) => string)
+				return fn != null ? fn(cell) : ''
+			},
+			dayCellStyleBy(cell: DateCellLike): string {
+				const fn = this.dayCellStyle as ((c: DateCellLike) => string)
+				return fn != null ? fn(cell) : ''
+			},
+			dayNumStyleBy(cell: DateCellLike): string {
+				const fn = this.dayNumStyle as ((c: DateCellLike) => string)
+				return fn != null ? fn(cell) : ''
+			},
+			cellDayLabelBy(cell: DateCellLike): string {
+				const fn = this.cellDayLabel as ((c: DateCellLike) => string)
+				return fn != null ? fn(cell) : ''
+			},
+			pendingTasksBy(cell: DateCellLike): PendingTitle[] {
+				const fn = this.pendingTasksForCell as ((c: DateCellLike) => any[])
+				const raw = fn != null ? fn(cell) : ([] as any[])
+				try {
+					return raw as PendingTitle[]
+				} catch (_e) {}
+				const out: PendingTitle[] = []
+				for (let i = 0; i < raw.length; i++) {
+					const s = this.pendingTitleOf(raw[i])
+					if (s != '') out.push(s)
+				}
+				return out
+			},
+			tasksBy(cell: DateCellLike): string[] {
+				const fn = this.tasksForCell as ((c: DateCellLike) => string[])
+				return fn != null ? fn(cell) : ([] as string[])
+			},
+			noopCell(_c: DateCellLike) {},
+		}
+	}
+</script>
+
+<style>
+	.week-view {
+		flex: 1;
+		flex-direction: column;
+		min-height: 0;
+	}
+</style>

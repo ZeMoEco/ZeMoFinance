@@ -1,0 +1,1294 @@
+<template>
+	<view class="page">
+		<GlobalBackground />
+		<view class="calendar-view">
+			<view class="header">
+				<view class="nav-left">
+					<view class="nav-back" @click="goBack">
+						<text class="back-icon">‹</text>
+					</view>
+					<view class="title-block">
+						<text class="title-text">收支日历</text>
+						<text class="title-sub">{{ currentPeriodTitle }}</text>
+					</view>
+				</view>
+				<view class="header-actions">
+					<view class="header-btn" @click="goToday"><text class="header-btn-text">今</text></view>
+					<view class="header-btn header-btn-primary" @click="openRecord"><text class="header-plus">＋</text></view>
+				</view>
+			</view>
+
+			<view class="view-tabs">
+				<view class="tab" v-for="tab in viewTabs" :key="tab.key" :class="tab.key == viewMode ? 'tab-active' : ''" @click="setView(tab.key)">
+					<text :class="tab.key == viewMode ? 'tab-text-active' : 'tab-text'">{{ tab.label }}</text>
+					<text :class="tab.key == viewMode ? 'tab-sub-active' : 'tab-sub'">{{ tab.sub }}</text>
+				</view>
+			</view>
+
+			<scroll-view class="calendar-scroll" scroll-y="true" :show-scrollbar="false">
+				<view class="summary-card">
+					<view class="period-switch">
+						<view class="switch-btn" @click="prevPeriod"><text class="switch-text">‹</text></view>
+						<view class="period-mid">
+							<text class="period-title">{{ currentPeriodTitle }}</text>
+							<text class="period-caption">{{ summaryScopeLabel }}</text>
+						</view>
+						<view class="switch-btn" @click="nextPeriod"><text class="switch-text">›</text></view>
+					</view>
+
+					<view class="hero-metric">
+						<view class="hero-left">
+							<text class="metric-label">净现金流</text>
+							<text class="net-amount" :class="netTotal >= 0 ? 'income-text' : 'expense-text'">{{ signedMoney(netTotal) }}</text>
+						</view>
+						<view class="cashflow-badge">
+							<text class="cashflow-badge-main">FLOW</text>
+							<text class="cashflow-badge-sub">{{ transactionTotal }} 笔</text>
+						</view>
+					</view>
+
+					<view class="summary-grid">
+						<view class="summary-item">
+							<text class="summary-label">收入</text>
+							<text class="summary-value income-text">{{ money(incomeTotal) }}</text>
+						</view>
+						<view class="summary-item">
+							<text class="summary-label">支出</text>
+							<text class="summary-value expense-text">{{ money(expenseTotal) }}</text>
+						</view>
+						<view class="summary-item">
+							<text class="summary-label">结余率</text>
+							<text class="summary-value">{{ savingsRateText }}</text>
+						</view>
+						<view class="summary-item summary-item-last">
+							<text class="summary-label">{{ averageExpenseLabel }}</text>
+							<text class="summary-value">{{ averageExpenseText }}</text>
+						</view>
+					</view>
+				</view>
+
+				<view class="calendar-card" v-if="viewMode != 'year'">
+					<view class="week-row week-head">
+						<text class="week-label" v-for="item in weekLabels" :key="item">{{ item }}</text>
+					</view>
+					<view class="month-row" v-for="(row, rowIdx) in displayRows" :key="'row-'+rowIdx">
+						<view class="day-cell" v-for="(cell, colIdx) in row" :key="'cell-'+rowIdx+'-'+colIdx" :class="cellClass(cell)" @click="selectCell(cell)">
+							<view class="day-top">
+								<text class="day-text" :class="cell.isToday ? 'day-today-text' : ''">{{ cell.dayText }}</text>
+								<view class="count-dot" v-if="cell.count > 0"></view>
+							</view>
+							<view class="cell-flow" v-if="cell.count > 0">
+								<text class="cell-income" v-if="cell.income > 0">收{{ compactAmount(cell.income) }}</text>
+								<text class="cell-expense" v-if="cell.expense > 0">支{{ compactAmount(cell.expense) }}</text>
+							</view>
+							<text class="cell-net" v-if="cell.count > 0" :class="cell.balance >= 0 ? 'income-text' : 'expense-text'">{{ signedCompact(cell.balance) }}</text>
+						</view>
+					</view>
+				</view>
+
+				<view class="year-card" v-if="viewMode == 'year'">
+					<view class="year-grid">
+						<view class="year-month-card" v-for="item in yearMonths" :key="'ym-'+item.month" @click="openYearMonth(item.month)">
+							<view class="year-month-head">
+								<text class="year-month-title" :class="item.month == currentMonth ? 'year-month-active' : ''">{{ item.month }}月</text>
+								<text class="year-count">{{ item.count }}笔</text>
+							</view>
+							<text class="year-net" :class="item.balance >= 0 ? 'income-text' : 'expense-text'">{{ signedMoney(item.balance) }}</text>
+							<view class="year-flow-row">
+								<text class="year-income">收 {{ compactAmount(item.income) }}</text>
+								<text class="year-expense">支 {{ compactAmount(item.expense) }}</text>
+							</view>
+						</view>
+					</view>
+				</view>
+
+				<view class="detail-card" v-if="viewMode != 'year'">
+					<view class="detail-head">
+						<view>
+							<text class="detail-title">{{ selectedDateTitle }}</text>
+							<text class="detail-sub">{{ selectedDateSub }}</text>
+						</view>
+						<view class="record-pill" @click="openRecord"><text class="record-pill-text">记一笔</text></view>
+					</view>
+
+					<view class="day-summary-row">
+						<view class="day-summary-item">
+							<text class="day-summary-label">收入</text>
+							<text class="day-summary-value income-text">{{ money(selectedIncome) }}</text>
+						</view>
+						<view class="day-summary-item">
+							<text class="day-summary-label">支出</text>
+							<text class="day-summary-value expense-text">{{ money(selectedExpense) }}</text>
+						</view>
+						<view class="day-summary-item">
+							<text class="day-summary-label">净额</text>
+							<text class="day-summary-value" :class="selectedBalance >= 0 ? 'income-text' : 'expense-text'">{{ signedMoney(selectedBalance) }}</text>
+						</view>
+					</view>
+
+					<view class="transaction-list" v-if="dayTransactions.length > 0">
+						<view class="transaction-row" v-for="bill in dayTransactions" :key="bill.id" @click="openTransaction(bill)">
+							<view class="bill-icon-box">
+								<text class="bill-icon">{{ categoryIcon(bill.category, bill.type) }}</text>
+							</view>
+							<view class="bill-info">
+								<text class="bill-category">{{ categoryTitle(bill.category) }}</text>
+								<text class="bill-meta">{{ transactionMeta(bill) }}</text>
+							</view>
+							<view class="bill-right">
+								<text class="bill-amount" :class="transactionAmountClass(bill)">{{ transactionAmountText(bill) }}</text>
+								<text class="bill-flow-flag" v-if="!bill.includeInFlow">不计入</text>
+							</view>
+						</view>
+					</view>
+					<view class="empty-detail" v-if="dayTransactions.length == 0">
+						<text class="empty-title">当天暂无账单</text>
+						<text class="empty-sub">未产生现金流</text>
+					</view>
+				</view>
+
+				<view class="bottom-space"></view>
+			</scroll-view>
+		</view>
+	</view>
+</template>
+
+<script lang="uts">
+	import GlobalBackground from "@/components/GlobalBackground.uvue";
+	import { CalendarBiz, DailyCashflowStat, CalendarTransaction } from "@/services/biz/CalendarBiz.uts";
+	import { AppDialogApi } from "@/components/sys/AppDialogApi.uts";
+
+	type ViewMode = 'month' | 'week' | 'year';
+
+	type ViewTab = {
+		key: ViewMode;
+		label: string;
+		sub: string;
+	};
+
+	type CalendarCashflowCell = {
+		dayText: string;
+		dateStr: string;
+		inMonth: boolean;
+		isToday: boolean;
+		isSelected: boolean;
+		income: number;
+		expense: number;
+		balance: number;
+		count: number;
+	};
+
+	type YearMonthCashflow = {
+		month: number;
+		income: number;
+		expense: number;
+		balance: number;
+		count: number;
+	};
+
+	export default {
+		components: { GlobalBackground },
+		data() {
+			const now = new Date();
+			return {
+				didLoad: false,
+				viewMode: 'month' as ViewMode,
+				viewTabs: [
+					{ key: 'month', label: '月', sub: '账单' },
+					{ key: 'week', label: '周', sub: '现金流' },
+					{ key: 'year', label: '年', sub: '趋势' }
+				] as ViewTab[],
+				currentYear: now.getFullYear(),
+				currentMonth: now.getMonth() + 1,
+				selectedDateStr: '',
+				weekLabels: ['日', '一', '二', '三', '四', '五', '六'] as string[],
+				monthRows: [] as CalendarCashflowCell[][],
+				weekCells: [] as CalendarCashflowCell[],
+				yearMonths: [] as YearMonthCashflow[],
+				cashflowByDate: new Map<string, DailyCashflowStat>(),
+				monthIncomeTotal: 0.0,
+				monthExpenseTotal: 0.0,
+				monthTransactionTotal: 0,
+				dayTransactions: [] as CalendarTransaction[],
+				selectedIncome: 0.0,
+				selectedExpense: 0.0,
+				selectedBalance: 0.0
+			}
+		},
+		computed: {
+			displayRows(): CalendarCashflowCell[][] {
+				if (this.viewMode == 'week') return [this.weekCells] as CalendarCashflowCell[][];
+				return this.monthRows;
+			},
+			currentPeriodTitle(): string {
+				if (this.viewMode == 'year') return `${this.currentYear}年`;
+				if (this.viewMode == 'week') return this.weekPeriodTitle();
+				return `${this.currentYear}年${this.currentMonth}月`;
+			},
+			summaryScopeLabel(): string {
+				if (this.viewMode == 'year') return '年度收支概览';
+				if (this.viewMode == 'week') return '本周现金流';
+				return '本月现金流';
+			},
+			incomeTotal(): number {
+				if (this.viewMode == 'year') {
+					let total = 0.0;
+					for (let i = 0; i < this.yearMonths.length; i++) total += this.yearMonths[i].income;
+					return this.roundMoney(total);
+				}
+				if (this.viewMode == 'week') {
+					let total = 0.0;
+					for (let i = 0; i < this.weekCells.length; i++) total += this.weekCells[i].income;
+					return this.roundMoney(total);
+				}
+				return this.monthIncomeTotal;
+			},
+			expenseTotal(): number {
+				if (this.viewMode == 'year') {
+					let total = 0.0;
+					for (let i = 0; i < this.yearMonths.length; i++) total += this.yearMonths[i].expense;
+					return this.roundMoney(total);
+				}
+				if (this.viewMode == 'week') {
+					let total = 0.0;
+					for (let i = 0; i < this.weekCells.length; i++) total += this.weekCells[i].expense;
+					return this.roundMoney(total);
+				}
+				return this.monthExpenseTotal;
+			},
+			netTotal(): number {
+				return this.roundMoney(this.incomeTotal - this.expenseTotal);
+			},
+			transactionTotal(): number {
+				if (this.viewMode == 'year') {
+					let total = 0;
+					for (let i = 0; i < this.yearMonths.length; i++) total += this.yearMonths[i].count;
+					return total;
+				}
+				if (this.viewMode == 'week') {
+					let total = 0;
+					for (let i = 0; i < this.weekCells.length; i++) total += this.weekCells[i].count;
+					return total;
+				}
+				return this.monthTransactionTotal;
+			},
+			activeExpenseDays(): number {
+				if (this.viewMode == 'year') {
+					let days = 0;
+					for (let i = 0; i < this.yearMonths.length; i++) {
+						if (this.yearMonths[i].expense > 0) days++;
+					}
+					return days;
+				}
+				const rows = this.displayRows;
+				let days = 0;
+				for (let r = 0; r < rows.length; r++) {
+					for (let c = 0; c < rows[r].length; c++) {
+						if (rows[r][c].expense > 0) days++;
+					}
+				}
+				return days;
+			},
+			savingsRateText(): string {
+				if (this.incomeTotal <= 0) return '--';
+				const rate = ((this.incomeTotal - this.expenseTotal) / this.incomeTotal) * 100.0;
+				return `${rate.toFixed(0)}%`;
+			},
+			averageExpenseText(): string {
+				if (this.activeExpenseDays <= 0) return '¥0.00';
+				return this.money(this.expenseTotal / this.activeExpenseDays);
+			},
+			averageExpenseLabel(): string {
+				return this.viewMode == 'year' ? '月均支出' : '日均支出';
+			},
+			selectedDateTitle(): string {
+				if (this.selectedDateStr == '') return '选择日期';
+				const d = this.parseDateStr(this.selectedDateStr);
+				const now = new Date();
+				const today = this.dateKey(now.getFullYear(), now.getMonth() + 1, now.getDate());
+				if (this.selectedDateStr == today) return '今天';
+				return `${this.pad2Text(d.getMonth() + 1)}月${this.pad2Text(d.getDate())}日`;
+			},
+			selectedDateSub(): string {
+				if (this.selectedDateStr == '') return '';
+				const d = this.parseDateStr(this.selectedDateStr);
+				const labels = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'] as string[];
+				return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 · ${labels[d.getDay()]} · ${this.dayTransactions.length} 笔`;
+			}
+		},
+		onLoad() {
+			const now = new Date();
+			this.selectedDateStr = this.dateKey(now.getFullYear(), now.getMonth() + 1, now.getDate());
+			this.didLoad = true;
+			void this.reloadCurrentView();
+		},
+		onShow() {
+			if (this.didLoad) {
+				void this.reloadCurrentView();
+			}
+		},
+		methods: {
+			goBack() {
+				uni.navigateBack();
+			},
+			goToday() {
+				const now = new Date();
+				this.currentYear = now.getFullYear();
+				this.currentMonth = now.getMonth() + 1;
+				this.selectedDateStr = this.dateKey(this.currentYear, this.currentMonth, now.getDate());
+				this.viewMode = 'month';
+				void this.loadMonth();
+			},
+			setView(mode: string) {
+				if (this.viewMode == mode) return;
+				if (mode != 'month' && mode != 'week' && mode != 'year') return;
+				this.viewMode = mode as ViewMode;
+				if (this.viewMode == 'year') {
+					void this.loadYear();
+				} else {
+					void this.loadMonth();
+				}
+			},
+			async reloadCurrentView() {
+				if (this.viewMode == 'year') {
+					await this.loadYear();
+				} else {
+					await this.loadMonth();
+				}
+			},
+			async loadMonth() {
+				this.ensureSelectedInCurrentMonth();
+				const stats = await CalendarBiz.getMonthlyCashflowStats(this.currentYear, this.currentMonth);
+				const map = new Map<string, DailyCashflowStat>();
+				let income = 0.0;
+				let expense = 0.0;
+				let count = 0;
+				for (let i = 0; i < stats.length; i++) {
+					const item = stats[i];
+					map.set(item.date, item);
+					income += item.income;
+					expense += item.expense;
+					count += item.count;
+				}
+				if (this.viewMode == 'week') {
+					await this.mergeWeekStats(map);
+				}
+				this.cashflowByDate = map;
+				this.monthIncomeTotal = this.roundMoney(income);
+				this.monthExpenseTotal = this.roundMoney(expense);
+				this.monthTransactionTotal = count;
+				this.monthRows = this.buildMonthRows(map);
+				this.weekCells = this.buildWeekCells(map);
+				await this.loadSelectedDay();
+			},
+			async loadYear() {
+				const items: YearMonthCashflow[] = [];
+				for (let m = 1; m <= 12; m++) {
+					const stats = await CalendarBiz.getMonthlyCashflowStats(this.currentYear, m);
+					let income = 0.0;
+					let expense = 0.0;
+					let count = 0;
+					for (let i = 0; i < stats.length; i++) {
+						income += stats[i].income;
+						expense += stats[i].expense;
+						count += stats[i].count;
+					}
+					items.push({
+						month: m,
+						income: this.roundMoney(income),
+						expense: this.roundMoney(expense),
+						balance: this.roundMoney(income - expense),
+						count: count
+					} as YearMonthCashflow);
+				}
+				this.yearMonths = items;
+			},
+			async loadSelectedDay() {
+				if (this.selectedDateStr == '') {
+					this.dayTransactions = [] as CalendarTransaction[];
+					this.selectedIncome = 0.0;
+					this.selectedExpense = 0.0;
+					this.selectedBalance = 0.0;
+					return;
+				}
+				const startTs = this.dayStartTs(this.selectedDateStr);
+				const rows = await CalendarBiz.getDayTransactions(startTs, startTs + 86400000 - 1);
+				let income = 0.0;
+				let expense = 0.0;
+				for (let i = 0; i < rows.length; i++) {
+					if (!rows[i].includeInFlow) continue;
+					if (rows[i].type == 'income') income += rows[i].amount;
+					else expense += rows[i].amount;
+				}
+				this.dayTransactions = rows;
+				this.selectedIncome = this.roundMoney(income);
+				this.selectedExpense = this.roundMoney(expense);
+				this.selectedBalance = this.roundMoney(income - expense);
+			},
+			async mergeWeekStats(map: Map<string, DailyCashflowStat>) {
+				const loaded = new Set<string>();
+				loaded.add(`${this.currentYear}_${this.currentMonth}`);
+				const selected = this.selectedDateStr == '' ? new Date() : this.parseDateStr(this.selectedDateStr);
+				const start = new Date(selected);
+				start.setDate(selected.getDate() - selected.getDay());
+				for (let i = 0; i < 7; i++) {
+					const d = new Date(start);
+					d.setDate(start.getDate() + i);
+					const y = d.getFullYear();
+					const m = d.getMonth() + 1;
+					const loadKey = `${y}_${m}`;
+					if (loaded.has(loadKey)) continue;
+					loaded.add(loadKey);
+					const rows = await CalendarBiz.getMonthlyCashflowStats(y, m);
+					for (let r = 0; r < rows.length; r++) {
+						map.set(rows[r].date, rows[r]);
+					}
+				}
+			},
+			prevPeriod() {
+				if (this.viewMode == 'year') {
+					this.currentYear -= 1;
+					void this.loadYear();
+					return;
+				}
+				if (this.viewMode == 'week') {
+					this.shiftSelectedDate(-7);
+					return;
+				}
+				this.shiftMonth(-1);
+			},
+			nextPeriod() {
+				if (this.viewMode == 'year') {
+					this.currentYear += 1;
+					void this.loadYear();
+					return;
+				}
+				if (this.viewMode == 'week') {
+					this.shiftSelectedDate(7);
+					return;
+				}
+				this.shiftMonth(1);
+			},
+			shiftMonth(delta: number) {
+				const currentSelected = this.selectedDateStr == '' ? new Date(this.currentYear, this.currentMonth - 1, 1) : this.parseDateStr(this.selectedDateStr);
+				const target = new Date(this.currentYear, this.currentMonth - 1 + delta, 1);
+				const maxDay = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
+				const day = Math.min(currentSelected.getDate(), maxDay);
+				this.currentYear = target.getFullYear();
+				this.currentMonth = target.getMonth() + 1;
+				this.selectedDateStr = this.dateKey(this.currentYear, this.currentMonth, day);
+				void this.loadMonth();
+			},
+			shiftSelectedDate(deltaDays: number) {
+				const d = this.selectedDateStr == '' ? new Date() : this.parseDateStr(this.selectedDateStr);
+				d.setDate(d.getDate() + deltaDays);
+				this.currentYear = d.getFullYear();
+				this.currentMonth = d.getMonth() + 1;
+				this.selectedDateStr = this.dateKey(this.currentYear, this.currentMonth, d.getDate());
+				void this.loadMonth();
+			},
+			selectCell(cell: CalendarCashflowCell) {
+				if (cell.dateStr == '') return;
+				if (!cell.inMonth) {
+					const d = this.parseDateStr(cell.dateStr);
+					this.currentYear = d.getFullYear();
+					this.currentMonth = d.getMonth() + 1;
+					this.selectedDateStr = cell.dateStr;
+					void this.loadMonth();
+					return;
+				}
+				this.selectedDateStr = cell.dateStr;
+				this.monthRows = this.buildMonthRows(this.cashflowByDate);
+				this.weekCells = this.buildWeekCells(this.cashflowByDate);
+				void this.loadSelectedDay();
+			},
+			openYearMonth(month: number) {
+				this.currentMonth = month;
+				this.viewMode = 'month';
+				const now = new Date();
+				const day = (now.getFullYear() == this.currentYear && now.getMonth() + 1 == month) ? now.getDate() : 1;
+				this.selectedDateStr = this.dateKey(this.currentYear, month, day);
+				void this.loadMonth();
+			},
+			openRecord() {
+				const base = this.selectedDateStr == '' ? Date.now() : (this.dayStartTs(this.selectedDateStr) + 12 * 60 * 60 * 1000);
+				AppDialogApi.openFinanceRecord(`transactionTime=${base.toString()}`);
+			},
+			openTransaction(bill: CalendarTransaction) {
+				if (bill.id == '') return;
+				AppDialogApi.openFinanceRecordForEdit(bill.id);
+			},
+			ensureSelectedInCurrentMonth() {
+				if (this.selectedDateStr != '') {
+					const d = this.parseDateStr(this.selectedDateStr);
+					if (d.getFullYear() == this.currentYear && d.getMonth() + 1 == this.currentMonth) return;
+				}
+				const now = new Date();
+				const day = (now.getFullYear() == this.currentYear && now.getMonth() + 1 == this.currentMonth) ? now.getDate() : 1;
+				this.selectedDateStr = this.dateKey(this.currentYear, this.currentMonth, day);
+			},
+			buildMonthRows(statByDate: Map<string, DailyCashflowStat>): CalendarCashflowCell[][] {
+				const rows = [] as CalendarCashflowCell[][];
+				const firstDay = new Date(this.currentYear, this.currentMonth - 1, 1);
+				const startOffset = firstDay.getDay();
+				const today = new Date();
+				const todayKey = this.dateKey(today.getFullYear(), today.getMonth() + 1, today.getDate());
+				let row = [] as CalendarCashflowCell[];
+				for (let i = 0; i < 42; i++) {
+					const dayOffset = i - startOffset + 1;
+					const d = new Date(this.currentYear, this.currentMonth - 1, dayOffset);
+					const key = this.dateKey(d.getFullYear(), d.getMonth() + 1, d.getDate());
+					const stat = statByDate.get(key);
+					row.push({
+						dayText: d.getDate().toString(),
+						dateStr: key,
+						inMonth: d.getFullYear() == this.currentYear && d.getMonth() + 1 == this.currentMonth,
+						isToday: key == todayKey,
+						isSelected: key == this.selectedDateStr,
+						income: stat != null ? this.roundMoney(stat.income) : 0.0,
+						expense: stat != null ? this.roundMoney(stat.expense) : 0.0,
+						balance: stat != null ? this.roundMoney(stat.balance) : 0.0,
+						count: stat != null ? stat.count : 0
+					} as CalendarCashflowCell);
+					if (row.length == 7) {
+						rows.push(row);
+						row = [] as CalendarCashflowCell[];
+					}
+				}
+				return rows;
+			},
+			buildWeekCells(statByDate: Map<string, DailyCashflowStat>): CalendarCashflowCell[] {
+				const cells = [] as CalendarCashflowCell[];
+				const selected = this.selectedDateStr == '' ? new Date() : this.parseDateStr(this.selectedDateStr);
+				const start = new Date(selected);
+				start.setDate(selected.getDate() - selected.getDay());
+				const today = new Date();
+				const todayKey = this.dateKey(today.getFullYear(), today.getMonth() + 1, today.getDate());
+				for (let i = 0; i < 7; i++) {
+					const d = new Date(start);
+					d.setDate(start.getDate() + i);
+					const key = this.dateKey(d.getFullYear(), d.getMonth() + 1, d.getDate());
+					const stat = statByDate.get(key);
+					cells.push({
+						dayText: d.getDate().toString(),
+						dateStr: key,
+						inMonth: d.getFullYear() == this.currentYear && d.getMonth() + 1 == this.currentMonth,
+						isToday: key == todayKey,
+						isSelected: key == this.selectedDateStr,
+						income: stat != null ? this.roundMoney(stat.income) : 0.0,
+						expense: stat != null ? this.roundMoney(stat.expense) : 0.0,
+						balance: stat != null ? this.roundMoney(stat.balance) : 0.0,
+						count: stat != null ? stat.count : 0
+					} as CalendarCashflowCell);
+				}
+				return cells;
+			},
+			cellClass(cell: CalendarCashflowCell): string {
+				const parts = [] as string[];
+				if (!cell.inMonth) parts.push('day-cell-out');
+				if (cell.isToday) parts.push('day-cell-today');
+				if (cell.isSelected) parts.push('day-cell-selected');
+				if (cell.count > 0) parts.push('day-cell-active');
+				return parts.join(' ');
+			},
+			weekPeriodTitle(): string {
+				const selected = this.selectedDateStr == '' ? new Date() : this.parseDateStr(this.selectedDateStr);
+				const start = new Date(selected);
+				start.setDate(selected.getDate() - selected.getDay());
+				const end = new Date(start);
+				end.setDate(start.getDate() + 6);
+				if (start.getFullYear() == end.getFullYear() && start.getMonth() == end.getMonth()) {
+					return `${start.getFullYear()}年${start.getMonth() + 1}月${start.getDate()}-${end.getDate()}日`;
+				}
+				return `${this.pad2Text(start.getMonth() + 1)}.${this.pad2Text(start.getDate())}-${this.pad2Text(end.getMonth() + 1)}.${this.pad2Text(end.getDate())}`;
+			},
+			transactionMeta(bill: CalendarTransaction): string {
+				const desc = bill.description.trim();
+				const account = bill.account_name.trim() != '' ? bill.account_name : bill.account_id;
+				const base = `${this.formatTime(bill.time)} · ${account}`;
+				if (desc == '') return base;
+				return `${base} · ${desc}`;
+			},
+			transactionAmountText(bill: CalendarTransaction): string {
+				const prefix = bill.includeInFlow ? (bill.type == 'income' ? '+' : '-') : '';
+				return `${prefix}${bill.amount.toFixed(2)}`;
+			},
+			transactionAmountClass(bill: CalendarTransaction): string {
+				if (!bill.includeInFlow) return 'bill-neutral';
+				return bill.type == 'income' ? 'income-text' : 'expense-text';
+			},
+			categoryTitle(category: string): string {
+				const c = category.trim();
+				return c == '' ? '账单' : c;
+			},
+			categoryIcon(category: string, type: string): string {
+				const c = category.trim();
+				if (c.indexOf('餐') >= 0 || c.indexOf('食') >= 0) return '🍜';
+				if (c.indexOf('购') >= 0) return '购';
+				if (c.indexOf('交通') >= 0) return '↗';
+				if (c.indexOf('工资') >= 0 || c.indexOf('薪') >= 0) return '薪';
+				if (c.indexOf('退款') >= 0 || c.indexOf('报销') >= 0) return '回';
+				if (c.indexOf('税') >= 0) return '税';
+				if (c.indexOf('转') >= 0) return '转';
+				return type == 'income' ? '收' : '支';
+			},
+			formatTime(ts: number): string {
+				if (ts <= 0) return '';
+				const d = new Date(ts);
+				return `${this.pad2Text(d.getHours())}:${this.pad2Text(d.getMinutes())}`;
+			},
+			money(value: number): string {
+				return `¥${this.roundMoney(value).toFixed(2)}`;
+			},
+			signedMoney(value: number): string {
+				const v = this.roundMoney(value);
+				if (v == 0) return '¥0.00';
+				return `${v > 0 ? '+' : '-'}¥${Math.abs(v).toFixed(2)}`;
+			},
+			compactAmount(value: number): string {
+				const v = Math.abs(value);
+				if (v >= 10000) return `${(v / 10000.0).toFixed(1)}w`;
+				if (v >= 1000) return Math.round(v).toString();
+				if (v >= 100) return v.toFixed(0);
+				if (v >= 10) return v.toFixed(0);
+				if (v > 0) return v.toFixed(1);
+				return '0';
+			},
+			signedCompact(value: number): string {
+				if (value == 0) return '0';
+				return `${value > 0 ? '+' : '-'}${this.compactAmount(value)}`;
+			},
+			parseDateStr(dateStr: string): Date {
+				const parts = dateStr.split('-');
+				if (parts.length != 3) return new Date();
+				const y = parseInt(parts[0]);
+				const m = parseInt(parts[1]);
+				const d = parseInt(parts[2]);
+				if (isNaN(y) || isNaN(m) || isNaN(d)) return new Date();
+				return new Date(y, m - 1, d);
+			},
+			dayStartTs(dateStr: string): number {
+				const d = this.parseDateStr(dateStr);
+				return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0).getTime();
+			},
+			dateKey(year: number, month: number, day: number): string {
+				return `${year}-${this.pad2Text(month)}-${this.pad2Text(day)}`;
+			},
+			pad2Text(value: number): string {
+				return value < 10 ? `0${value}` : value.toString();
+			},
+			roundMoney(value: number): number {
+				if (isNaN(value)) return 0.0;
+				return Math.round(value * 100.0) / 100.0;
+			}
+		}
+	}
+</script>
+
+<style>
+	.page {
+		flex: 1;
+		flex-direction: column;
+		position: relative;
+		height: 100%;
+		background-color: rgba(245, 247, 250, 0.18);
+	}
+
+	.calendar-view {
+		flex: 1;
+		flex-direction: column;
+		width: 100%;
+		z-index: 1;
+	}
+
+	.header {
+		height: 58px;
+		padding: 13px 16px 8px 16px;
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+	}
+
+	.nav-left,
+	.header-actions,
+	.period-switch,
+	.hero-metric,
+	.summary-grid,
+	.week-row,
+	.month-row,
+	.day-top,
+	.year-month-head,
+	.year-flow-row,
+	.detail-head,
+	.day-summary-row,
+	.transaction-row {
+		flex-direction: row;
+	}
+
+	.nav-left,
+	.header-actions,
+	.period-switch,
+	.day-top,
+	.year-month-head,
+	.detail-head,
+	.transaction-row {
+		align-items: center;
+	}
+
+	.nav-back,
+	.header-btn,
+	.switch-btn {
+		justify-content: center;
+		align-items: center;
+		background-color: rgba(255, 255, 255, 0.58);
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.72);
+		box-shadow: 0 8px 18px rgba(44, 62, 92, 0.10);
+	}
+
+	.nav-back {
+		width: 38px;
+		height: 38px;
+		border-radius: 19px;
+		margin-right: 9px;
+	}
+
+	.back-icon {
+		font-size: 30px;
+		line-height: 32px;
+		color: #243152;
+	}
+
+	.title-block {
+		justify-content: center;
+	}
+
+	.title-text {
+		font-size: 18px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.title-sub {
+		margin-top: 2px;
+		font-size: 12px;
+		color: #748097;
+	}
+
+	.header-btn {
+		width: 36px;
+		height: 36px;
+		border-radius: 18px;
+		margin-left: 8px;
+	}
+
+	.header-btn-primary {
+		background-color: rgba(59, 115, 217, 0.86);
+	}
+
+	.header-btn-text {
+		font-size: 14px;
+		font-weight: bold;
+		color: #33415f;
+	}
+
+	.header-plus {
+		font-size: 24px;
+		line-height: 26px;
+		font-weight: bold;
+		color: #ffffff;
+	}
+
+	.view-tabs {
+		height: 48px;
+		margin: 0 14px 10px 14px;
+		padding: 4px;
+		flex-direction: row;
+		border-radius: 16px;
+		background-color: rgba(255, 255, 255, 0.48);
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.64);
+		box-shadow: 0 10px 24px rgba(44, 62, 92, 0.08);
+	}
+
+	.tab {
+		flex: 1;
+		border-radius: 12px;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.tab-active {
+		background-color: rgba(255, 255, 255, 0.78);
+		box-shadow: 0 7px 16px rgba(44, 62, 92, 0.10);
+	}
+
+	.tab-text,
+	.tab-text-active {
+		font-size: 14px;
+	}
+
+	.tab-text {
+		color: #7a8694;
+	}
+
+	.tab-text-active {
+		color: #3b73d9;
+		font-weight: bold;
+	}
+
+	.tab-sub,
+	.tab-sub-active {
+		margin-top: 1px;
+		font-size: 10px;
+	}
+
+	.tab-sub {
+		color: #9aa6ac;
+	}
+
+	.tab-sub-active {
+		color: #526fa8;
+	}
+
+	.calendar-scroll {
+		flex: 1;
+		width: 100%;
+		padding: 0 14px;
+		box-sizing: border-box;
+	}
+
+	.summary-card,
+	.calendar-card,
+	.detail-card {
+		background-color: rgba(255, 255, 255, 0.64);
+		border-radius: 18px;
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.74);
+		box-shadow: 0 14px 32px rgba(44, 62, 92, 0.12);
+	}
+
+	.summary-card {
+		padding: 15px;
+		margin-bottom: 12px;
+	}
+
+	.period-switch {
+		justify-content: space-between;
+		margin-bottom: 12px;
+	}
+
+	.switch-btn {
+		width: 30px;
+		height: 30px;
+		border-radius: 15px;
+		background-color: rgba(59, 115, 217, 0.10);
+	}
+
+	.switch-text {
+		font-size: 24px;
+		line-height: 26px;
+		color: #3b73d9;
+	}
+
+	.period-mid {
+		align-items: center;
+	}
+
+	.period-title {
+		font-size: 16px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.period-caption {
+		margin-top: 2px;
+		font-size: 11px;
+		color: #8490a3;
+	}
+
+	.hero-metric {
+		justify-content: space-between;
+		align-items: flex-end;
+		margin-bottom: 14px;
+	}
+
+	.metric-label,
+	.summary-label,
+	.day-summary-label {
+		font-size: 12px;
+		color: #748097;
+	}
+
+	.net-amount {
+		margin-top: 5px;
+		font-size: 31px;
+		font-weight: bold;
+	}
+
+	.cashflow-badge {
+		min-width: 72px;
+		padding: 8px 10px;
+		border-radius: 13px;
+		background-color: rgba(59, 115, 217, 0.11);
+		border-width: 1px;
+		border-color: rgba(59, 115, 217, 0.16);
+		align-items: center;
+	}
+
+	.cashflow-badge-main {
+		font-size: 12px;
+		font-weight: bold;
+		color: #3b73d9;
+	}
+
+	.cashflow-badge-sub {
+		margin-top: 2px;
+		font-size: 11px;
+		color: #687782;
+	}
+
+	.summary-grid {
+		flex-wrap: wrap;
+	}
+
+	.summary-item {
+		width: 50%;
+		padding: 10px 10px 10px 0;
+		border-top-width: 1px;
+		border-top-color: rgba(36, 49, 82, 0.06);
+	}
+
+	.summary-value {
+		margin-top: 4px;
+		font-size: 16px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.income-text {
+		color: #13a06f;
+	}
+
+	.expense-text {
+		color: #e85d67;
+	}
+
+	.calendar-card {
+		padding: 11px 7px 13px 7px;
+		margin-bottom: 12px;
+	}
+
+	.week-head {
+		margin-bottom: 6px;
+	}
+
+	.week-label {
+		flex: 1;
+		text-align: center;
+		font-size: 12px;
+		color: #7f8a99;
+	}
+
+	.month-row {
+		width: 100%;
+	}
+
+	.day-cell {
+		flex: 1;
+		min-height: 66px;
+		margin: 2px;
+		padding: 6px 4px 5px 4px;
+		border-radius: 12px;
+		background-color: rgba(255, 255, 255, 0.44);
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.42);
+		overflow: hidden;
+	}
+
+	.day-cell-out {
+		opacity: 0.45;
+		background-color: rgba(255, 255, 255, 0.20);
+	}
+
+	.day-cell-active {
+		background-color: rgba(255, 255, 255, 0.58);
+		border-color: rgba(19, 160, 111, 0.12);
+	}
+
+	.day-cell-today {
+		border-color: rgba(59, 115, 217, 0.24);
+		background-color: rgba(59, 115, 217, 0.09);
+	}
+
+	.day-cell-selected {
+		border-color: rgba(59, 115, 217, 0.42);
+		background-color: rgba(255, 255, 255, 0.78);
+		box-shadow: 0 6px 14px rgba(59, 115, 217, 0.12);
+	}
+
+	.day-top {
+		justify-content: space-between;
+		margin-bottom: 3px;
+	}
+
+	.day-text {
+		font-size: 12px;
+		font-weight: bold;
+		color: #33415f;
+	}
+
+	.day-today-text {
+		color: #3b73d9;
+	}
+
+	.count-dot {
+		width: 5px;
+		height: 5px;
+		border-radius: 3px;
+		background-color: #3b73d9;
+		margin-top: 3px;
+	}
+
+	.cell-flow {
+		min-height: 24px;
+	}
+
+	.cell-income,
+	.cell-expense {
+		font-size: 9px;
+		line-height: 12px;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.cell-income {
+		color: #13a06f;
+	}
+
+	.cell-expense {
+		color: #e85d67;
+	}
+
+	.cell-net {
+		margin-top: 2px;
+		font-size: 10px;
+		font-weight: bold;
+		text-align: right;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.year-card {
+		margin-bottom: 12px;
+	}
+
+	.year-grid {
+		flex-direction: row;
+		flex-wrap: wrap;
+	}
+
+	.year-month-card {
+		width: 48%;
+		min-height: 94px;
+		margin: 1%;
+		padding: 12px;
+		border-radius: 14px;
+		background-color: rgba(255, 255, 255, 0.66);
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.76);
+	}
+
+	.year-month-head {
+		justify-content: space-between;
+		margin-bottom: 10px;
+	}
+
+	.year-month-title {
+		font-size: 15px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.year-month-active {
+		color: #3b73d9;
+	}
+
+	.year-count {
+		font-size: 11px;
+		color: #8a97a0;
+	}
+
+	.year-net {
+		font-size: 17px;
+		font-weight: bold;
+		margin-bottom: 8px;
+	}
+
+	.year-flow-row {
+		justify-content: space-between;
+	}
+
+	.year-income,
+	.year-expense {
+		font-size: 11px;
+	}
+
+	.year-income {
+		color: #13a06f;
+	}
+
+	.year-expense {
+		color: #e85d67;
+	}
+
+	.detail-card {
+		padding: 14px;
+		margin-bottom: 12px;
+	}
+
+	.detail-head {
+		justify-content: space-between;
+		margin-bottom: 12px;
+	}
+
+	.detail-title {
+		font-size: 17px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.detail-sub {
+		margin-top: 3px;
+		font-size: 12px;
+		color: #7f8a99;
+	}
+
+	.record-pill {
+		height: 32px;
+		padding: 0 13px;
+		border-radius: 16px;
+		background-color: rgba(59, 115, 217, 0.12);
+		border-width: 1px;
+		border-color: rgba(59, 115, 217, 0.16);
+		justify-content: center;
+		align-items: center;
+	}
+
+	.record-pill-text {
+		font-size: 13px;
+		font-weight: bold;
+		color: #3b73d9;
+	}
+
+	.day-summary-row {
+		margin-bottom: 10px;
+		padding: 10px;
+		border-radius: 13px;
+		background-color: rgba(245, 248, 251, 0.72);
+	}
+
+	.day-summary-item {
+		flex: 1;
+	}
+
+	.day-summary-value {
+		margin-top: 4px;
+		font-size: 15px;
+		font-weight: bold;
+		color: #1b2846;
+	}
+
+	.transaction-list {
+		border-radius: 14px;
+		overflow: hidden;
+	}
+
+	.transaction-row {
+		min-height: 64px;
+		padding: 9px 0;
+		border-bottom-width: 1px;
+		border-bottom-color: rgba(36, 49, 82, 0.06);
+	}
+
+	.bill-icon-box {
+		width: 36px;
+		height: 36px;
+		border-radius: 18px;
+		background-color: rgba(245, 248, 251, 0.82);
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.78);
+		justify-content: center;
+		align-items: center;
+		margin-right: 10px;
+	}
+
+	.bill-icon {
+		font-size: 15px;
+		font-weight: bold;
+		color: #33415f;
+	}
+
+	.bill-info {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.bill-category {
+		font-size: 15px;
+		font-weight: bold;
+		color: #1b2846;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.bill-meta {
+		margin-top: 4px;
+		font-size: 12px;
+		color: #8d98a6;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.bill-right {
+		min-width: 78px;
+		align-items: flex-end;
+		margin-left: 8px;
+	}
+
+	.bill-amount {
+		font-size: 16px;
+		font-weight: bold;
+	}
+
+	.bill-neutral {
+		color: #8c98a4;
+	}
+
+	.bill-flow-flag {
+		margin-top: 4px;
+		font-size: 11px;
+		color: #8c98a4;
+	}
+
+	.empty-detail {
+		align-items: center;
+		padding: 20px 0 18px 0;
+	}
+
+	.empty-title {
+		font-size: 14px;
+		font-weight: bold;
+		color: #6f7b8d;
+	}
+
+	.empty-sub {
+		margin-top: 5px;
+		font-size: 12px;
+		color: #9aa6ac;
+	}
+
+	.bottom-space {
+		height: 28px;
+	}
+</style>

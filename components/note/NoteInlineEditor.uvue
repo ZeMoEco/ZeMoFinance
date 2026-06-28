@@ -1,0 +1,773 @@
+<template>
+	<view class="note-inline">
+		<!-- Toolbar removed, handled externally via events -->
+
+		<view class="note-head">
+			<input class="note-title" :value="title" placeholder="笔记标题" confirm-type="done" @input="onTitleInput($event)" @blur="scheduleSave" />
+			<text v-if="saving" class="note-status">保存中...</text>
+			<text v-else-if="dirty" class="note-status">未保存</text>
+		</view>
+
+		<view class="block-list" @click="onInputAreaClick">
+			<view v-for="(b, idx) in blocks" :key="idx" class="block-item" :id="'note_block_' + idx">
+				<view v-if="b.editing" class="block-inline-live">
+					<view v-if="hasInlineMirror(b.raw)" class="block-inline-render">
+						<RichTextCompat :nodes="b.raw" :inline="true" style="flex: 1;"></RichTextCompat>
+					</view>
+					<input
+						class="block-input block-input-overlay"
+						:class="hasInlineMirror(b.raw) ? 'block-input-mirrored' : ''"
+						:value="b.raw"
+						:focus="activeBlockIndex == idx"
+						placeholder="输入内容..."
+						confirm-type="next"
+						@click.stop="onBlockClick"
+						@input="onBlockInput(idx, $event)"
+						@confirm="onBlockConfirmInline(idx)"
+						@blur="onBlockBlur(idx, $event)"
+						@focus="onBlockFocus(idx)"
+					></input>
+				</view>
+				<view v-else class="block-render" @click.stop="editBlock(idx)">
+					<image 
+						v-if="getImageSrc(b.raw) != ''" 
+						:src="getImageSrc(b.raw)" 
+						mode="widthFix" 
+						class="block-image-preview"
+						@click.stop="previewImage(getImageSrc(b.raw))"
+					></image>
+					<view v-else style="flex-direction: row; align-items: center; flex-wrap: wrap;">
+						<RichTextCompat :nodes="b.raw" @itemclick="onRichItemClick" style="flex: 1;"></RichTextCompat>
+						<view v-if="b.link != null" @click.stop="openLink(b.link!)" style="margin-left: 8px; background-color: #E3F2FD; padding: 4px 8px; border-radius: 6px; flex-direction: row; align-items: center;">
+							<text style="color: #1976D2; font-size: 12px; font-weight: bold;">打开链接</text>
+						</view>
+					</view>
+				</view>
+			</view>
+			<view style="height: 500px; width: 100%;"></view>
+		</view>
+	</view>
+</template>
+
+<script lang="uts">
+	import { NoteBiz } from "@/services/biz/NoteBiz.uts";
+	import { NoteExportService } from '@/services/sys/export/note-export.uts'
+	import { FileUtil } from '@/utils/file/file.uts'
+	import { RUNTIME_NOTE_DOCS_DIR } from '@/utils/constant.uts'
+	import { formatDateForFile, joinPath } from '@/utils/common/tools.uts'
+	import { AppDialogApi, ZemoPreviewImageOptions } from '@/components/sys/AppDialogApi.uts'
+	import RichTextCompat from '@/components/sys/RichTextCompat.uvue'
+	
+	// #ifdef APP-ANDROID
+	import Intent from 'android.content.Intent'
+	import Uri from 'android.net.Uri'
+	import UTSAndroid from 'io.dcloud.uts.UTSAndroid'
+	// #endif
+	
+	type NoteBlock = {
+		raw: string
+		html: string
+		editing: boolean
+		link: string | null
+	}
+
+	const CONTENT_FILE_PREFIX = '@file:'
+	const ZWSP = '\u200B'
+
+	export default {
+		name: 'NoteInlineEditor',
+		components: { RichTextCompat },
+		props: {
+			noteId: {
+				type: String,
+				required: false,
+				default: ''
+			},
+			taskId: {
+				type: String,
+				required: false,
+				default: ''
+			},
+			initAttributeId: {
+				type: String,
+				required: false,
+				default: ''
+			}
+		},
+		emits: ['saved', 'loaded', 'scroll-to'],
+		data() {
+			return {
+				id: '',
+				title: '',
+				content: '',
+				storedContentRef: null as string | null,
+				relatedTaskId: null as string | null,
+				attributeId: null as string | null,
+				blocks: [] as NoteBlock[],
+				dirty: false,
+				saving: false,
+				saveTimer: 0 as number,
+				activeBlockIndex: -1,  // Track active block
+				isHandlingLinkClick: false 
+			}
+		},
+		watch: {
+			noteId(_v: any) {
+				this.loadNote()
+			}
+		},
+		mounted() {
+			this.loadNote()
+			uni.$on('note-apply-format', this.handleFormatEvent)
+		},
+		destroyed() {
+			uni.$off('note-apply-format', this.handleFormatEvent)
+		},
+		methods: {
+			onBlockClick() {},
+			hasInlineMirror(raw: string): boolean {
+				if (raw == null) return false
+				const s = raw.toString()
+				return s != '' && s != ZWSP
+			},
+			splitBlockByNewline(idx: number, rawValue: string) {
+				if (idx < 0 || idx >= this.blocks.length) return
+				const normalized = rawValue
+					.replace(/\r\n/g, '\n')
+					.replace(/\r/g, '\n')
+				const lines = normalized.split('\n')
+				if (lines.length <= 1) return
+
+				const firstLine = lines[0] != null ? lines[0].toString() : ''
+				this.blocks[idx].raw = firstLine
+				this.finalizeBlock(idx)
+				this.blocks[idx].editing = false
+
+				let insertAt = idx
+				for (let i = 1; i < lines.length; i++) {
+					insertAt = insertAt + 1
+					const line = lines[i] != null ? lines[i].toString() : ''
+					const isLast = i == lines.length - 1
+					this.blocks.splice(insertAt, 0, { raw: line, html: '', editing: isLast, link: null } as NoteBlock)
+
+					if (isLast) {
+						this.renderBlock(insertAt)
+						this.activeBlockIndex = insertAt
+					} else {
+						this.finalizeBlock(insertAt)
+						this.blocks[insertAt].editing = false
+					}
+				}
+
+				this.content = this.getMarkdownText()
+				this.dirty = true
+				this.scheduleSave()
+			},
+			onBlockConfirmInline(idx: number) {
+				if (idx < 0 || idx >= this.blocks.length) return
+				this.finalizeBlock(idx)
+				const insertAt = idx + 1
+				this.blocks.splice(insertAt, 0, { raw: '', html: '', editing: true, link: null } as NoteBlock)
+				for (let i = 0; i < this.blocks.length; i++) {
+					if (i != insertAt) this.blocks[i].editing = false
+				}
+				this.activeBlockIndex = -1
+				this.$nextTick(() => {
+					this.activeBlockIndex = insertAt
+				})
+			},
+			handleFormatEvent(type: any) {
+				const t = type.toString()
+				if (t == 'image') this.insertImage()
+				else if (t == 'video') this.insertVideo()
+				else this.applyFormat(t)
+			},
+			onInputAreaClick(_e: any) {
+				if (this.blocks.length == 0) {
+					this.blocks.push({ raw: '', html: '', editing: true, link: null } as NoteBlock)
+					this.activeBlockIndex = 0
+				} else {
+					const lastIdx = this.blocks.length - 1
+					// Close other blocks first
+					for (let i = 0; i < this.blocks.length; i++) {
+						if (i != lastIdx) this.blocks[i].editing = false
+					}
+					
+					// Always confirm the last block is active and set focus
+					this.blocks[lastIdx].editing = true
+					// Resetting it to -1 and then back to lastIdx forces the watch/focus update in some frameworks,
+					// but here we just set it. If it was already lastIdx, the focus might be lost, 
+					// so we need to ensure the template re-evaluates or the native view grabs focus.
+					// In uni-app x, :focus binding works when value changes or component mounts.
+					// If already true, it might not re-trigger.
+					this.activeBlockIndex = -1
+					this.$nextTick(() => {
+						this.activeBlockIndex = lastIdx
+					})
+				}
+			},
+			// Rich Text Tools
+			applyFormat(type: string) {
+				const idx = this.activeBlockIndex
+				if (idx < 0 || idx >= this.blocks.length) return
+				
+				let text = this.blocks[idx].raw
+				// Simple toggles for block start
+				if (type == 'h1') {
+					if (text.startsWith('# ')) text = text.substring(2)
+					else text = '# ' + text
+				} else if (type == 'h2') {
+					if (text.startsWith('## ')) text = text.substring(3)
+					else text = '## ' + text
+				} else if (type == 'list') {
+					if (text.startsWith('- ')) text = text.substring(2)
+					else text = '- ' + text
+				} else if (type == 'todo') {
+					if (text.startsWith('- [ ] ')) text = text.substring(6)
+					else text = '- [ ] ' + text
+				} else if (type == 'bold') {
+					text = text + '**粗体**'
+				} else if (type == 'italic') {
+					text = text + '*斜体*'
+				}
+				// Link manually removed, handled by auto-detect in finalizeBlock
+				
+				this.blocks[idx].raw = text
+				// Force input update if bound? value binding handles it
+				this.onBlockInput(idx, { detail: { value: text } } as any)
+			},
+			insertImage() {
+				const idx = this.activeBlockIndex
+				if (idx < 0) return
+				uni.chooseImage({
+					count: 1,
+					success: (res) => {
+						const path = res.tempFilePaths[0]
+						// Use standard markdown format, detection logic handles the rest
+						const text = this.blocks[idx].raw + `![Image](${path})`
+						this.blocks[idx].raw = text
+						this.onBlockInput(idx, { detail: { value: text } } as any)
+					}
+				})
+			},
+			insertVideo() {
+				const idx = this.activeBlockIndex
+				if (idx < 0) return
+				uni.chooseVideo({
+					success: (res) => {
+						const path = res.tempFilePath
+						// Standard Markdown doesn't support video well, using custom tag or link
+						const text = this.blocks[idx].raw + `\n<video src="${path}"></video>`
+						this.blocks[idx].raw = text
+						this.onBlockInput(idx, { detail: { value: text } } as any)
+					}
+				})
+			},
+			
+			extractInputValue(e: any, fallback: string): string {
+				let v = fallback
+				// Preferred in uni-app x: UniInputEvent.detail.value
+				try {
+					const ev = e as UniInputEvent
+					if (ev != null) {
+						const dv = ev.detail.value
+						if (dv != null) return dv.toString()
+					}
+				} catch (_e0) {}
+				// Fallback: UTSJSONObject shapes
+				try {
+					const obj = e as UTSJSONObject
+					if (obj == null) return v
+					const detail = obj['detail']
+					if (detail != null) {
+						const d = detail as UTSJSONObject
+						const vv = d['value']
+						if (vv != null) return vv.toString()
+					}
+					const vv2 = obj['value']
+					if (vv2 != null) return vv2.toString()
+					const t0 = obj['target']
+					if (t0 != null) {
+						const t = t0 as UTSJSONObject
+						const tv = t['value']
+						if (tv != null) return tv.toString()
+					}
+					const ct0 = obj['currentTarget']
+					if (ct0 != null) {
+						const ct = ct0 as UTSJSONObject
+						const ctv = ct['value']
+						if (ctv != null) return ctv.toString()
+					}
+				} catch (_e1) {}
+				return v
+			},
+			getMarkdownText(): string {
+				if (this.blocks != null && this.blocks.length > 0) {
+					const lines: string[] = []
+					for (let i = 0; i < this.blocks.length; i++) {
+						let r = this.blocks[i].raw != null ? this.blocks[i].raw.toString() : ''
+						if (r == ZWSP) r = ''
+						lines.push(r)
+					}
+					return lines.join('\n')
+				}
+				return this.content != null ? this.content.toString() : ''
+			},
+			rebuildBlocksFromContent() {
+				const md = this.content != null ? this.content.toString() : ''
+				const lines = md.split(/\r?\n/)
+				const out: NoteBlock[] = []
+				for (let i = 0; i < lines.length; i++) {
+					const raw = lines[i] != null ? lines[i].toString() : ''
+					// Check for link
+					let linkUrl: string | null = null
+					const linkMatch = raw.match(/\[.*?\]\((.*?)\)/)
+					if (linkMatch != null && linkMatch.length > 1) {
+						linkUrl = linkMatch[1]
+					}
+					out.push({ raw, html: NoteExportService.renderHtml(raw), editing: false, link: linkUrl } as NoteBlock)
+				}
+				if (out.length == 0) out.push({ raw: '', html: '', editing: true, link: null } as NoteBlock)
+				let anyEditing = false
+				for (let i = 0; i < out.length; i++) { if (out[i].editing) { anyEditing = true; break } }
+				if (!anyEditing) out[out.length - 1].editing = true
+				this.blocks = out
+			},
+			renderBlock(idx: number) {
+				if (idx < 0 || idx >= this.blocks.length) return
+				const raw = this.blocks[idx].raw != null ? this.blocks[idx].raw.toString() : ''
+				this.blocks[idx].html = NoteExportService.renderHtml(raw)
+				// Extract link if present for quick button
+				const linkMatch = raw.match(/\[.*?\]\((.*?)\)/)
+				if (linkMatch != null && linkMatch.length > 1) {
+					this.blocks[idx].link = linkMatch[1]
+				} else {
+					this.blocks[idx].link = null
+				}
+			},
+			onTitleInput(e: any) {
+				this.title = this.extractInputValue(e, this.title)
+				this.dirty = true
+				this.scheduleSave()
+			},
+			onBlockInput(idx: number, e: any) {
+				if (idx < 0 || idx >= this.blocks.length) return
+				const previousRaw = this.blocks[idx].raw
+				const fallback = this.blocks[idx].raw != null ? this.blocks[idx].raw.toString() : ''
+				let v = this.extractInputValue(e, fallback)
+				
+				// ZWSP Backspace detection
+				if (v == '') {
+					// Value became empty. check if it was ZWSP before?
+					// If previousRaw was ZWSP, user backspaced it -> Delete block
+					// If previousRaw was 'a', user backspaced -> Set ZWSP for next backspace
+					if (previousRaw == ZWSP) {
+						// Delete this block if not the only one
+						if (this.blocks.length > 1) {
+							this.blocks.splice(idx, 1)
+							this.content = this.getMarkdownText()
+							this.dirty = true
+							this.scheduleSave()
+							const prevIdx = idx - 1
+							if (prevIdx >= 0) {
+								this.activeBlockIndex = -1
+								// Force focus previous
+								this.$nextTick(() => {
+									this.blocks[prevIdx].editing = true
+									this.activeBlockIndex = prevIdx
+								})
+							}
+						} else {
+							// Only one block left, just keep it empty (reset ZWSP)
+							this.blocks[idx].raw = ZWSP
+							this.renderBlock(idx)
+							this.content = this.getMarkdownText()
+							this.dirty = true
+							this.scheduleSave()
+						}
+						return
+					} else {
+						// Content deleted, set ZWSP so next backspace triggers delete
+						v = ZWSP
+					}
+				} else {
+					// Normal input, ensure ZWSP is stripped from actual content
+					if (v.startsWith(ZWSP)) {
+						v = v.replace(ZWSP, '')
+					}
+					// If user cleared everything but ZWSP remains? v might be ZWSP.
+					// If v is exactly ZWSP, keep it.
+				}
+				
+				if (v.indexOf('\n') >= 0 || v.indexOf('\r') >= 0) {
+					this.splitBlockByNewline(idx, v)
+					return
+				}
+
+				this.blocks[idx].raw = v
+				this.renderBlock(idx)
+				this.content = this.getMarkdownText()
+				this.dirty = true
+				this.scheduleSave()
+			},
+			onBlockFocus(idx: number) {
+				this.activeBlockIndex = idx
+				// Inject ZWSP if empty to enable backspace-delete
+				if (this.blocks[idx].raw == '') {
+					this.blocks[idx].raw = ZWSP
+				}
+				// Removed scroll-to on focus to avoid fighting with native scroll
+				// this.$emit('scroll-to', 'note_block_' + idx)
+			},
+			getImageSrc(raw: string): string {
+				if (raw == null) return ''
+				const r = raw.trim()
+				// Match markdown image ![...](url)
+				const mdMatch = r.match(/^!\[.*\]\((.*)\)$/)
+				if (mdMatch != null) {
+					const url = mdMatch![1]
+					return url != null ? url : ''
+				}
+				// Match HTML image <img src="url" ... />
+				const htmlMatch = r.match(/<img[^>]+src="([^"]+)"/)
+				if (htmlMatch != null) {
+					const url = htmlMatch![1]
+					return url != null ? url : ''
+				}
+				return ''
+			},
+			previewImage(src: string) {
+				if (src == '') return
+				AppDialogApi.previewImage({
+					urls: [src],
+					current: 0
+				} as ZemoPreviewImageOptions)
+			},
+			openLink(rawUrl: string) {
+				let url = rawUrl
+				if (!url.startsWith('http') && !url.startsWith('https')) {
+					if (url.startsWith('www.') || url.includes('.')) {
+						url = 'https://' + url
+					}
+				}
+				
+				console.log('OpenLink Button Clicked:', url)
+				
+				if (url.startsWith('http')) {
+					// #ifdef APP-ANDROID
+					try {
+						const uri = Uri.parse(url)
+						const intent = new Intent(Intent.ACTION_VIEW, uri)
+						intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+						UTSAndroid.getUniActivity()!.startActivity(intent)
+					} catch (err) {
+						console.error('Intent failed', err)
+						uni.showToast({ title: '无法打开: ' + err, icon: 'none' })
+					}
+					// #endif
+					
+					// #ifdef WEB
+					window.open(url)
+					// #endif
+				}
+			},
+			onRichItemClick(e: any) {
+				// In uni-app x this event is often a UniPointerEvent without rich node detail.
+				// Link/image actions are handled by dedicated UI controls.
+			},
+			fetchUrlTitle(url: string, idx: number) {
+				uni.request({
+					url: url,
+					method: 'GET',
+					timeout: 5000,
+					success: (res) => {
+						const data = res.data
+						if (data != null) {
+							const htmlStr = data.toString()
+							// Simple regex to find title
+							const matches = htmlStr.match(/<title>([^<]*)<\/title>/i)
+							if (matches != null && matches.length > 1) {
+								const titleMatch = matches[1]
+								if (titleMatch != null) {
+									let title = titleMatch.trim()
+									if (title.length > 0) {
+										// Update the block if checking
+										if (idx < this.blocks.length) {
+											const current = this.blocks[idx].raw
+											// [url](url) -> [title](url)
+											const target = `[${url}](${url})`
+											if (current.includes(target)) {
+												this.blocks[idx].raw = current.replace(target, `[${title}](${url})`)
+												this.renderBlock(idx)
+												// Save quietly
+												this.dirty = true
+												this.scheduleSave()
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				})
+			},
+			finalizeBlock(idx: number) {
+				if (idx < 0 || idx >= this.blocks.length) return
+				// Check for raw URL: https://...
+				const raw = this.blocks[idx].raw
+				if (raw.match(/^https?:\/\/[^\s]+$/) != null) {
+					// It's a single URL line. Convert to markdown link. 
+					// Use URL as title initially.
+					// [URL](URL)
+					const url = raw.trim()
+					this.blocks[idx].raw = `[${url}](${url})`
+					// Try to fetch title
+					this.fetchUrlTitle(url, idx)
+				}
+
+				this.renderBlock(idx)
+				this.content = this.getMarkdownText()
+				this.dirty = true
+				this.scheduleSave()
+			},
+			// Removed onBlockConfirm as textarea doesn't fire it reliably for valid text input
+			onBlockBlur(idx: number, e: any) {
+			    // Update one last time
+				this.onBlockInput(idx, e) // Might inject ZWSP if empty
+				
+				// Strip ZWSP before finalizing
+				if (this.blocks[idx].raw == ZWSP) {
+					this.blocks[idx].raw = ''
+					// Check if we should delete empty block on blur?
+					// Optional: if user leaves an empty block, maybe remove it?
+					// But user might want empty lines. Let's keep it empty string.
+				}
+				
+				// Use finalizeBlock to trigger auto-link detection
+				this.finalizeBlock(idx)
+				this.blocks[idx].editing = false
+				// FinalizeBlock already handles render and save, but ensuring state is clean
+			},
+			editBlock(idx: number) {
+				if (this.isHandlingLinkClick) return
+				if (idx < 0 || idx >= this.blocks.length) return
+				for (let i = 0; i < this.blocks.length; i++) {
+					this.blocks[i].editing = false
+				}
+				this.blocks[idx].editing = true
+				this.activeBlockIndex = idx
+			},
+			scheduleSave() {
+				try {
+					if (this.saveTimer > 0) {
+						clearTimeout(this.saveTimer)
+						this.saveTimer = 0
+					}
+				} catch (_e) {}
+				this.saveTimer = setTimeout(() => {
+					this.saveTimer = 0
+					this.saveNow()
+				}, 500) as number
+			},
+			async resolveStoredContent(raw: string): Promise<string> {
+				const s = raw != null ? raw.toString() : ''
+				if (s.startsWith(CONTENT_FILE_PREFIX)) {
+					this.storedContentRef = s
+					const path = s.substring(CONTENT_FILE_PREFIX.length)
+					const text = await FileUtil.readTextFile(path, 'utf8')
+					return text != null ? text : ''
+				}
+				this.storedContentRef = null
+				return s
+			},
+			async persistMarkdownToFile(markdown: string): Promise<string> {
+				await FileUtil.ensureRuntimeDirs()
+				let path = ''
+				if (this.storedContentRef != null && this.storedContentRef.toString().startsWith(CONTENT_FILE_PREFIX)) {
+					path = this.storedContentRef.toString().substring(CONTENT_FILE_PREFIX.length)
+				}
+				if (path == '') {
+					const name = `note_${this.id != '' ? this.id : 'new'}_${formatDateForFile(new Date())}.md`
+					path = joinPath(RUNTIME_NOTE_DOCS_DIR, name)
+				}
+				const ok = await FileUtil.writeTextFile(path, markdown, 'utf8')
+				if (ok) {
+					this.storedContentRef = CONTENT_FILE_PREFIX + path
+					return this.storedContentRef
+				}
+				return markdown
+			},
+			async loadNote() {
+				const v = this.noteId as any
+				const id = v != null ? v.toString() : ''
+				this.id = id
+				if (id == '') {
+					this.title = ''
+					this.content = ''
+					this.storedContentRef = null
+					const taskIdStr = (this.taskId as any).toString()
+					this.relatedTaskId = taskIdStr != '' ? taskIdStr : null
+					const attr = (this.initAttributeId as any).toString()
+					this.attributeId = attr != '' ? attr : null
+					this.blocks = [{ raw: '', html: '', editing: true, link: null } as NoteBlock]
+					this.dirty = false
+					return
+				}
+				try {
+					// Use NoteService (compatibility layer for unified tasks table)
+					const n = await NoteBiz.getNoteAsync(id)
+					if (n != null) {
+						let contentRaw: string | null = null
+						this.title = ''
+						try {
+							const payload = JSON.parse(n.node.content) as UTSJSONObject
+							const t = payload.getString('title')
+							const c = payload.getString('content')
+							if (t != null) this.title = t.toString()
+							if (c != null) contentRaw = c.toString()
+						} catch (_e) {
+							contentRaw = null
+						}
+
+						this.relatedTaskId = n.related_task_id
+						// If attributeId is missing from NoteItem, we'll maintain our state
+						// Perhaps it was removed from the NoteBiz.getNote payload recently.
+
+						const fallbackRaw = n.node.content != null ? n.node.content.toString() : ''
+						const resolvedRaw = contentRaw != null ? contentRaw : fallbackRaw
+						this.content = await this.resolveStoredContent(resolvedRaw)
+						this.rebuildBlocksFromContent()
+						this.dirty = false
+						this.$emit('loaded', n)
+					}
+				} catch (_e) {}
+			},
+			async saveNow() {
+				if (this.saving) return
+				if (!this.dirty) return
+				if (this.id == '') {
+					this.saving = true
+					try {
+						const mdNew = this.getMarkdownText()
+						const storedNew = await this.persistMarkdownToFile(mdNew)
+						const taskIdStr = (this.taskId as any).toString()
+						const relatedTaskId = taskIdStr != '' ? taskIdStr : this.relatedTaskId
+						// Create note using NoteService (compatibility layer)
+						const result = await NoteBiz.saveNoteAndLinkAsync(this.title, storedNew, relatedTaskId)
+						const newId = result != null ? result.node.id : ''
+						if (newId != '') {
+							this.id = newId
+							this.dirty = false
+							this.$emit('saved', newId)
+						}
+					} catch (_eNew) {
+					} finally {
+						this.saving = false
+					}
+					return
+				}
+				this.saving = true
+				try {
+					const md = this.getMarkdownText()
+					const stored = await this.persistMarkdownToFile(md)
+					// Update note using NoteService (compatibility layer)
+					const ok = await NoteBiz.updateNoteContentAsync(this.id, this.title, stored)
+					if (ok) {
+						this.dirty = false
+					}
+				} catch (_e) {
+				} finally {
+					this.saving = false
+				}
+			}
+		}
+	}
+</script>
+
+<style scoped>
+	.note-inline {
+		padding: 12;
+	}
+
+	.note-head {
+		flex-direction: row;
+		align-items: center;
+		margin-bottom: 10;
+	}
+
+	.note-title {
+		flex: 1;
+		font-size: 15;
+		padding: 8;
+	}
+
+	.note-status {
+		font-size: 12;
+		margin-left: 8;
+	}
+
+	.block-list {
+		min-height: 400px;
+		flex: 1;
+	}
+
+	.block-item {
+		margin-bottom: 0;
+	}
+
+	.note-inline {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+	}
+	.block-list {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		min-height: 200px;
+	}
+
+	.block-input {
+		padding: 4px 10px;
+		font-size: 14;
+	}
+
+	.block-inline-live {
+		position: relative;
+		min-height: 30px;
+	}
+
+	.block-inline-render {
+		padding: 4px 10px;
+		pointer-events: none;
+		min-height: 30px;
+	}
+
+	.block-input-overlay {
+		position: absolute;
+		left: 0;
+		top: 0;
+		width: 100%;
+		height: 30px;
+		background-color: transparent;
+		color: #111827;
+		font-size: 14;
+		line-height: 22;
+		padding: 4px 10px;
+		z-index: 2;
+	}
+
+	.block-input-mirrored {
+		color: rgba(31, 41, 55, 0);
+	}
+
+	.block-render {
+		padding: 4px 10px;
+	}
+	
+	.block-image-preview {
+		width: 50%; /* Default 1/4 area roughly */
+		border-radius: 8px;
+		margin: 4px 0;
+	}
+</style>

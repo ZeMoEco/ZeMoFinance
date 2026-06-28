@@ -1,0 +1,95 @@
+<template>
+  <view class="skill-badge" :class="status" @click.stop="onClick">
+    <text class="badge-icon">🤖</text>
+    <text class="badge-label">{{ label }}</text>
+    <view v-if="status == 'running'" class="status-indicator">
+       <view class="spinner"></view>
+    </view>
+    <text v-if="status != 'running'" class="play-icon">▶</text>
+  </view>
+</template>
+
+<script lang="uts">
+export default {
+  emits: ['run'],
+  props: {
+    skillId: {
+      type: String,
+      required: true
+    },
+    status: {
+      type: String, // 'idle' | 'running' | 'done' | 'active'
+      default: 'idle'
+    }
+  },
+  computed: {
+    label(): string {
+        // Simple formatter
+        const parts = this.skillId.split('.');
+        const last = parts[parts.length - 1];
+        // Capitalize
+        return last.charAt(0).toUpperCase() + last.slice(1);
+    }
+  },
+  methods: {
+    onClick() {
+      if (this.status == 'running') return;
+      this.$emit('run', this.skillId);
+    }
+  }
+}
+</script>
+
+<style>
+.skill-badge {
+  flex-direction: row;
+  align-items: center;
+  background-color: #f0f2f5;
+  border-radius: 12px;
+  padding: 2px 8px;
+  margin-left: 8px;
+  border: 1px solid #ddd;
+}
+
+.skill-badge.running {
+  background-color: #e6f7ff;
+  border-color: #91d5ff;
+}
+
+.skill-badge.done {
+  background-color: #f6ffed;
+  border-color: #b7eb8f;
+}
+
+.badge-icon {
+  font-size: 12px;
+  margin-right: 4px;
+}
+
+.badge-label {
+  font-size: 10px;
+  color: #666;
+  margin-right: 4px;
+}
+
+.play-icon {
+  font-size: 10px;
+  color: #1890ff;
+}
+
+.status-indicator {
+    width: 12px;
+    height: 12px;
+    align-items: center;
+    justify-content: center;
+}
+
+/* Spinner simulation with simple dot for now or could be keyframes if supported */
+.spinner {
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background-color: #1890ff;
+    /* Opacity animation not always supported in CSS in Canvas/UTS, but assume basic styles work */
+}
+</style>

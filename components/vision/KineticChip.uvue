@@ -1,0 +1,103 @@
+<template>
+  <view v-if="node != null" class="kinetic-chip" @click="onClick">
+    <view class="port input"></view>
+    <view class="chip-content">
+      <text class="chip-label">{{ label }}</text>
+    </view>
+    <view v-if="isRunning === true" class="status-dot running"></view>
+    <view class="run-btn" @click.stop="toggleRun">
+      <text class="run-icon">{{ isRunning === true ? '⏹' : '▶️' }}</text>
+    </view>
+    <view class="port output" @click.stop="$emit('connect-start')"></view>
+  </view>
+</template>
+
+<script lang="uts">
+export default {
+  emits: ['click', 'connect-start', 'toggle'],
+  props: {
+    node: {
+      type: Object,
+      required: true
+    }
+  },
+  computed: {
+    label(): string {
+      // 核心修正：通过 JSON 序列化彻底“脱壳”，绕过 VisionNodeShim
+      const rawStr = JSON.stringify(this.node);
+      const n = JSON.parse(rawStr) as UTSJSONObject | null;
+      if (n == null) return 'Unknown';
+
+      const subtype = n.getString('subtype') ?? 'unknown';
+      const id = n.getString('id') ?? '';
+      
+      if (subtype == 'agent') return "🤖 Agent";
+      if (subtype == 'skill') return "⚡ Skill";
+      
+      const shortId = id.length > 4 ? id.substring(0, 4) : id;
+      return (subtype.toUpperCase()) + " (" + shortId + ")";
+    },
+    
+    isRunning(): boolean {
+      const rawStr = JSON.stringify(this.node);
+      const n = JSON.parse(rawStr) as UTSJSONObject | null;
+      const data = n?.get('data') as UTSJSONObject | null;
+      if (data == null) return false;
+      
+      const active = data.getBoolean('active') ?? false;
+      const status = data.getString('status');
+      return active || status == 'running';
+    }
+  },
+  methods: {
+    onClick() {
+      this.$emit('click');
+    },
+    toggleRun() {
+      const rawStr = JSON.stringify(this.node);
+      const n = JSON.parse(rawStr) as UTSJSONObject | null;
+      const id = n?.getString('id');
+      if (id != null) {
+        this.$emit('toggle', id);
+      }
+    }
+  }
+}
+</script>
+
+<style>
+/* 保持你原有的样式不变 */
+.kinetic-chip {
+  flex-direction: row;
+  align-items: center;
+  background-color: #333;
+  border-radius: 20px;
+  padding: 4px 12px;
+  position: absolute;
+}
+.chip-label {
+  color: #fff;
+  font-size: 12px;
+}
+.status-dot.running {
+  width: 8px;
+  height: 8px;
+  background-color: #00ff00;
+  border-radius: 4px;
+  margin-left: 5px;
+  /* 可以在这里添加动画 */
+}
+.run-btn {
+  margin-left: 10px;
+  padding: 2px;
+}
+.run-icon {
+  font-size: 14px;
+}
+.port {
+  width: 10px;
+  height: 10px;
+  background-color: #1890ff;
+  border-radius: 5px;
+}
+</style>

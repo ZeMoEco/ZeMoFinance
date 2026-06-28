@@ -1,0 +1,306 @@
+<template>
+	<view class="es-wrap">
+		<!-- Trigger Button -->
+		<view class="es-trigger" :class="{'es-trigger-active': open}" @click.stop="toggleOpen">
+			<text class="es-trigger-text">{{ triggerText }}</text>
+			<text class="es-trigger-icon" :style="{transform: open ? 'rotate(180deg)' : 'rotate(0deg)'}">▼</text>
+		</view>
+		
+		<!-- Mask to close when clicking outside -->
+		<view v-if="open" class="es-mask" @click.stop="toggleOpen"></view>
+
+		<!-- Dropdown Panel -->
+		<!-- Using position: fixed to break out of any parent clipping -->
+		<view
+			v-if="open"
+			class="es-dropdown"
+			:style="fixedStyle"
+		>
+			<scroll-view scroll-y="true" class="es-list">
+				<view v-for="(it, idx) in items" :key="idx" class="es-item" 
+					:class="{'es-item-active': isActive(it)}"
+					@click.stop="pick(it)">
+					<text class="es-item-text" :class="{'es-item-text-active': isActive(it)}">{{ getText(it) }}</text>
+					<text v-if="isActive(it)" class="es-item-check">✓</text>
+				</view>
+				<view v-if="items.length == 0" class="es-empty">
+					<text class="es-empty-text">无选项</text>
+				</view>
+			</scroll-view>
+		</view>
+	</view>
+</template>
+
+<script lang="uts">
+	type SelectorItem = {
+		key: any | null
+		text: string
+	}
+
+	export default {
+		name: 'expand-selector',
+		props: {
+			triggerText: { type: String, required: true },
+			items: { type: Array, required: false, default: () => [] as Array<any> },
+			open: { type: Boolean, required: false, default: false },
+			activeKey: { type: Object, required: false, default: null },
+			align: { type: String, required: false, default: 'left' }
+		},
+		emits: ['update:open', 'select'],
+		data() {
+			return {
+				fixedTop: 0,
+				fixedLeft: 0,
+				dropdownWidth: 200
+			}
+		},
+		computed: {
+			fixedStyle(): string {
+				// Use fixed positioning
+				return `position:fixed; top:${this.fixedTop}px; left:${this.fixedLeft}px; width:${this.dropdownWidth}px;`
+			}
+		},
+		methods: {
+			toggleOpen() {
+				const currentState = this.open 
+				if (!currentState) {
+					// Opening: Calculate position first
+					this.updatePositionAndOpen()
+				} else {
+					this.$emit('update:open', false)
+				}
+			},
+			updatePositionAndOpen() {
+				const query = uni.createSelectorQuery().in(this)
+				query.select('.es-trigger').boundingClientRect((rect) => {
+					if (rect != null) {
+						// Cast to NodeInfo manually if needed, but rect usually has properties directly in UVUE callback if typed correctly
+						const r = rect as NodeInfo
+						// r.top, r.left, r.height, r.bottom are available
+						this.fixedTop = (r.bottom ?? 0) + 4
+						
+						if (this.align == 'right') {
+							// Align right edge of dropdown with right edge of trigger
+							// But since we use Left, left = trigger.right - dropdownWidth
+							this.fixedLeft = (r.right ?? 0) - this.dropdownWidth
+						} else {
+							// Align left
+							this.fixedLeft = r.left ?? 0
+						}
+						
+						// Ensure it doesn't go off screen (simple check)
+						const sys = uni.getSystemInfoSync()
+						if (this.fixedLeft < 10) this.fixedLeft = 10
+						if (this.fixedLeft + this.dropdownWidth > sys.windowWidth - 10) {
+							this.fixedLeft = sys.windowWidth - this.dropdownWidth - 10
+						}
+
+						this.$emit('update:open', true)
+					} else {
+                        // Fallback if query fails
+                        this.$emit('update:open', true)
+                    }
+				})
+                query.exec()
+			},
+			getText(it: any | null): string {
+				if (it == null) return ''
+				
+				// 1. Try casting to typed object (SelectorItem)
+				try {
+					const o = it as SelectorItem
+					if (o.text != null) return o.text
+				} catch (_e) {}
+
+				// 2. Try UTSJSONObject (common for loosely passed objects)
+				try {
+					const obj = it as UTSJSONObject
+					const t = obj.getString('text')
+					if (t != null) return t
+				} catch (_e) {}
+
+				// 3. Try Map
+				try {
+					const m = it as Map<string, any>
+					const t = m.get('text')
+					if (t != null) return t.toString()
+				} catch (_e) {}
+
+				// 4. Fallback: stringify or empty if it's strictly an object without toString
+				if (typeof it === 'string') return it
+				return `${it}`
+			},
+			getKey(it: any | null): any | null {
+				if (it == null) return null
+				
+				try {
+					const o = it as SelectorItem
+					return o.key
+				} catch (_e) {}
+
+				try {
+					const obj = it as UTSJSONObject
+					if (obj.get('key') != null) return obj.get('key')
+					if (obj.get('id') != null) return obj.get('id')
+					if (obj.get('value') != null) return obj.get('value')
+				} catch (_e) {}
+				
+				try {
+					const m = it as Map<string, any>
+					if (m.has('key')) return m.get('key')
+				} catch (_e) {}
+
+				return null
+			},
+			isActive(it: any | null): boolean {
+				if (this.activeKey == null) return false
+				try {
+					const k = this.getKey(it)
+					if (k == null) return false
+					return `${k}` == `${this.activeKey}`
+				} catch (_e0) {}
+				return false
+			},
+			pick(it: any | null) {
+				if (it == null) return
+				this.$emit('select', this.getKey(it))
+				this.$emit('update:open', false)
+			}
+		}
+	}
+</script>
+
+<style>
+	.es-wrap {
+		position: relative;
+		display: flex;
+		flex-direction: column;
+		/* Ensure wrapper doesn't force hidden overflow unexpectedly */
+		overflow: visible; 
+	}
+
+	.es-trigger {
+		flex-direction: row;
+		align-items: center;
+		padding: 4px 8px;
+		background-color: rgba(255, 255, 255, 0.5);
+		border-radius: 12px;
+		border-width: 1px;
+		border-style: solid;
+		border-color: rgba(0,0,0,0.05);
+	}
+
+	.es-trigger:active {
+		background-color: rgba(255, 255, 255, 0.8);
+	}
+	
+	.es-trigger-active {
+		background-color: #fff;
+		border-color: #007aff;
+	}
+
+	.es-trigger-text {
+		font-size: 13px;
+		color: #333;
+		font-weight: bold;
+		margin-right: 4px;
+	}
+
+	.es-trigger-icon {
+		font-size: 10px;
+		color: #555;
+		margin-left: 2px;
+		transition-property: transform;
+		transition-duration: 0.2s;
+	}
+
+	.es-mask {
+		position: fixed;
+		top: 0;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		z-index: 990;
+	}
+
+	.es-dropdown {
+		position: absolute;
+		top: 36px;
+		min-width: 200px; /* Increased width */
+		max-width: 280px;
+		background-color: #ffffff;
+		background-color: rgba(255, 255, 255, 0.98); /* Less transparent */
+		border-radius: 12px;
+		box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2); /* Stronger shadow */
+		z-index: 99999; /* Higher Z-index */
+		padding: 6px 0;
+		border-width: 1px;
+		border-style: solid;
+		border-color: rgba(0, 0, 0, 0.1);
+	}
+
+	.es-align-left {
+		left: 0;
+	}
+
+	.es-align-right {
+		right: 0;
+	}
+
+	.es-list {
+		max-height: 240px;
+	}
+
+	.es-item {
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		padding: 10px 14px;
+		border-bottom-width: 0.5px;
+		border-bottom-style: solid;
+		border-bottom-color: rgba(0, 0, 0, 0.05);
+	}
+	
+	.es-item:last-child {
+		border-bottom-width: 0;
+	}
+
+	.es-item:active {
+		background-color: rgba(0, 0, 0, 0.03);
+	}
+	
+	.es-item-active {
+		background-color: #f0f9ff;
+	}
+
+	.es-item-text {
+		font-size: 13px;
+		color: #333;
+		flex: 1;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+	
+	.es-item-text-active {
+		color: #007aff;
+		font-weight: bold;
+	}
+
+	.es-item-check {
+		font-size: 14px;
+		color: #007aff;
+		margin-left: 8px;
+		font-weight: bold;
+	}
+	
+	.es-empty {
+		padding: 20px 0;
+		align-items: center;
+		justify-content: center;
+	}
+	
+	.es-empty-text {
+		font-size: 13px;
+		color: #999;
+	}
+</style>

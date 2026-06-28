@@ -1,0 +1,1078 @@
+<template>
+	<view class="page">
+<!-- 		<image v-if="backgroundImage" :src="backgroundImage" class="bg-image" mode="aspectFill" />
+		<view v-else class="bg-color"></view> -->
+
+		<view class="content-wrapper" :style="bgStyle">
+			<!-- Header Card -->
+			<view class="header-card" :style="cardStyle" v-if="account != null">
+				<view class="header-action" @click="openFunctionMenu">
+					<text class="header-action-icon">⋮</text>
+				</view>
+				<view class="header-top">
+					<view class="account-icon" :style="iconStyle">
+						<text class="icon-text">{{ getIconForType(account?.type ?? '') }}</text>
+					</view>
+					<view class="account-info">
+						<text class="account-name">{{ account?.name ?? '' }}</text>
+						<text class="account-type">{{ account?.type ?? '' }}</text>
+					</view>
+				</view>
+				<view class="balance-area">
+					<text class="balance-label">{{ balanceLabel }}</text>
+					<text class="balance-value">{{ (account?.balance ?? 0).toFixed(2) }}</text>
+				</view>
+				<view class="credit-action-panel" v-if="isCreditAccount">
+					<view class="credit-plan-info">
+						<text class="credit-plan-title">{{ creditKindText }}</text>
+						<text class="credit-plan-sub">{{ creditPlanText }}</text>
+					</view>
+					<view class="quick-repay-btn" @click="openQuickRepayModal">
+						<text class="quick-repay-text">{{ quickSettleText }}</text>
+					</view>
+				</view>
+			</view>
+
+			<!-- Transactions List -->
+			<view class="section-title-area">
+				<text class="section-title">账单明细</text>
+			</view>
+
+			<scroll-view class="transaction-list" scroll-y="true">
+				<view class="transaction-card" v-for="item in transactions" :key="item.id" :style="cardStyle" @click.stop="openBillEditor(item.id)" @tap.stop="openBillEditor(item.id)">
+					<view class="trans-left">
+						<text class="trans-category">{{ getCategoryText(item.category) }}</text>
+						<text class="trans-time">{{ formatTime(item.transaction_time) }}</text>
+						<text class="trans-desc" v-if="hasDescription(item.description)">{{ item.description }}</text>
+					</view>
+					<view class="trans-right">
+						<text class="trans-amount" :class="getAmountClass(item.type)">
+							{{ item.type == 'income' ? '+' : '-' }}{{ formatTransactionAmount(item.amount) }}
+						</text>
+						<text class="trans-balance">{{ transactionBalanceLabel }}: {{ item.balance_snapshot.toFixed(2) }}</text>
+					</view>
+				</view>
+
+				<view class="empty-tip" v-if="transactions.length == 0">
+					<text class="empty-text">暂无账单记录</text>
+				</view>
+				<view class="list-bottom-spacer"></view>
+			</scroll-view>
+		</view>
+
+		<view class="edit-overlay" v-if="showQuickRepayModal" @click="closeQuickRepayModal">
+			<view class="edit-sheet quick-sheet" @click.stop>
+				<view class="sheet-handle"></view>
+				<text class="sheet-title">{{ quickSettleText }}</text>
+				<view class="field-block">
+					<text class="field-label">金额</text>
+					<view class="amount-input-row">
+						<text class="amount-symbol">¥</text>
+						<input class="field-input amount-input" v-model="quickRepayAmount" type="text" placeholder="0.00" @input="onQuickRepayAmountInput" />
+					</view>
+				</view>
+				<view class="field-block" @click="showQuickRepayAccountPicker">
+					<text class="field-label">{{ quickAccountLabel }}</text>
+					<view class="field-select">
+						<text class="field-select-text">{{ quickRepayAccountName }}</text>
+						<text class="field-select-arrow">⌄</text>
+					</view>
+				</view>
+				<text class="quick-tip">{{ quickSettleTip }}</text>
+				<view class="sheet-footer">
+					<button class="save-btn" @click="submitQuickRepay">{{ quickRepaySubmitting ? '处理中...' : '确认记录' }}</button>
+				</view>
+			</view>
+		</view>
+
+		<view class="edit-overlay" v-if="showEditModal" @click="closeEditModal">
+			<view class="edit-sheet" @click.stop>
+				<view class="sheet-handle"></view>
+				<text class="sheet-title">{{ editSheetTitle }}</text>
+				<view class="field-block">
+					<text class="field-label">账户名称</text>
+					<view class="name-card-row">
+						<input class="field-input name-row-main" v-model="editName" placeholder="账户名称" />
+						<input class="field-input card-no-input" v-if="showEditCardNoInput" v-model="editCardNo" :placeholder="editCardNoPlaceholder" />
+					</view>
+				</view>
+				<view class="field-block">
+					<text class="field-label">{{ editBalanceLabel }}</text>
+					<view class="amount-input-row">
+						<text class="amount-symbol">¥</text>
+						<input class="field-input amount-input" v-model="editBalance" type="text" placeholder="0.00" @input="onEditBalanceInput" />
+					</view>
+					<text class="diff-tip" :class="editDiff >= 0 ? 'diff-income' : 'diff-expense'" v-if="editDiff != 0">
+						{{ editDiffText }}，保存后记录余额调整
+					</text>
+				</view>
+				<view class="field-block">
+					<text class="field-label">{{ editProviderLabel }}</text>
+					<input class="field-input" v-model="editProvider" :placeholder="editProviderPlaceholder" />
+				</view>
+				<view class="field-block" v-if="showEditCreditLimit">
+					<text class="field-label">授信额度</text>
+					<view class="amount-input-row">
+						<text class="amount-symbol">¥</text>
+						<input class="field-input amount-input" v-model="editCreditLimit" type="text" placeholder="0.00" @input="onEditCreditLimitInput" />
+					</view>
+				</view>
+				<view class="toggle-block">
+					<view class="toggle-info">
+						<text class="toggle-title">计入总资产</text>
+						<text class="toggle-desc">{{ editToggleDesc }}</text>
+					</view>
+					<switch :checked="editIncludeInTotal" @change="onEditIncludeChange" color="#0d6e6e" />
+				</view>
+				<view class="sheet-footer">
+					<button class="save-btn" @click="saveAccountEdit">保存修改</button>
+				</view>
+			</view>
+		</view>
+		<!-- 1. 放入背景组件 (一行搞定) -->
+		<GlobalBackground />
+	</view>
+</template>
+
+<script lang="uts">
+	import { FinanceBiz, AccountNode, TransactionMount, AssetAccountPayload, CreateTransactionForNodesPayload } from '@/services/biz/FinanceBiz.uts';
+	import { AppDialogApi } from '@/components/sys/AppDialogApi.uts';
+	import GlobalBackground from "@/components/GlobalBackground.uvue";
+	export default {
+		components: { GlobalBackground },
+		data() {
+			return {
+				accountId: "",
+				account: null as AccountNode | null,
+				transactions: [] as TransactionMount[],
+				accounts: [] as AccountNode[],
+				backgroundImage: "",
+				transparency: 0.3,
+				showEditModal: false,
+				showQuickRepayModal: false,
+				quickRepayAmount: "",
+				quickRepayAccountId: "",
+				quickRepaySubmitting: false,
+				editName: "",
+				editCardNo: "",
+				editBalance: "",
+				editProvider: "",
+				editCreditLimit: "",
+				editIncludeInTotal: true
+			}
+		},
+		onLoad(options : OnLoadOptions) {
+			const idStr = options.get('id');
+			if (idStr != null) {
+				this.accountId = idStr.toString();
+				this.loadData();
+			}
+		},
+		onShow() {
+			this.loadTheme();
+			// Reload data on show in case balance changed
+			if (this.accountId != "") {
+				this.loadData();
+			}
+		},
+		computed: {
+			bgStyle() : string {
+				return `background-color: rgba(245, 245, 245, ${this.transparency})`;
+			},
+			cardStyle() : string {
+				return `background-color: rgba(255, 255, 255, ${Math.min(1.0, this.transparency + 0.1)})`;
+			},
+			iconStyle() : string {
+				return `background-color: rgba(240, 240, 240, 0.5)`;
+			},
+			editDiff() : number {
+				if (this.account == null) return 0.0;
+				const next = parseFloat(this.editBalance);
+				if (isNaN(next)) return 0.0;
+				const acc = this.account as AccountNode;
+				return next - acc.balance;
+			},
+			editDiffText() : string {
+				const diff = this.editDiff;
+				if (diff == 0) return '';
+				return `${diff > 0 ? '增加 ' : '减少 '}${Math.abs(diff).toFixed(2)}`;
+			},
+			isCreditAccount() : boolean {
+				if (this.account == null) return false;
+				const acc = this.account as AccountNode;
+				return acc.category == 'credit';
+			},
+			isReceivableCredit() : boolean {
+				if (this.account == null) return false;
+				return FinanceBiz.isReceivableCreditAccount(this.account as AccountNode);
+			},
+			editCreditKind() : string {
+				if (this.account == null) return '';
+				const acc = this.account as AccountNode;
+				return FinanceBiz.normalizeCreditKind(acc.credit_kind, acc.sub_type);
+			},
+			showEditCardNoInput() : boolean {
+				if (this.account == null) return false;
+				const acc = this.account as AccountNode;
+				if (acc.category == 'credit') return this.editCreditKind == 'credit_card';
+				if (acc.category == 'heavy') return false;
+				return acc.category != 'investment';
+			},
+			editCardNoPlaceholder() : string {
+				return this.isCreditAccount ? '卡尾号' : '账号/尾号';
+			},
+			editBalanceLabel() : string {
+				if (!this.isCreditAccount) return '当前余额';
+				if (this.editCreditKind == 'lent') return '待收金额';
+				if (this.editCreditKind == 'credit_card') return '当前账单欠款';
+				return '当前欠款';
+			},
+			showEditCreditLimit() : boolean {
+				return this.isCreditAccount && this.editCreditKind == 'credit_card';
+			},
+			editProviderLabel() : string {
+				if (!this.isCreditAccount) return '发卡机构/提供商';
+				if (this.editCreditKind == 'lent') return '借款人';
+				if (this.editCreditKind == 'borrowed') return '债权人/平台';
+				if (this.editCreditKind == 'other') return '机构/对象';
+				return '发卡银行/平台';
+			},
+			editProviderPlaceholder() : string {
+				if (!this.isCreditAccount) return '例如：招商银行';
+				if (this.editCreditKind == 'lent') return '例如：张三';
+				if (this.editCreditKind == 'borrowed') return '例如：李四 / 借呗';
+				if (this.editCreditKind == 'other') return '例如：银行 / 亲友 / 平台';
+				return '例如：招商银行';
+			},
+			editToggleDesc() : string {
+				if (this.isCreditAccount && this.isReceivableCredit) return '该应收款将计入净资产';
+				if (this.isCreditAccount) return '该负债将从净资产中扣除';
+				return '该账户余额将计算在净资产内';
+			},
+			balanceLabel() : string {
+				if (!this.isCreditAccount) return '当前余额';
+				return this.isReceivableCredit ? '当前应收' : '当前欠款';
+			},
+			transactionBalanceLabel() : string {
+				if (!this.isCreditAccount) return '余额';
+				return this.isReceivableCredit ? '应收' : '欠款';
+			},
+			creditKindText() : string {
+				if (this.account == null) return '信贷';
+				const acc = this.account as AccountNode;
+				const kind = FinanceBiz.normalizeCreditKind(acc.credit_kind, acc.sub_type);
+				if (kind == 'borrowed') return '我欠别人';
+				if (kind == 'lent') return '别人欠我';
+				if (kind == 'other') return '其他信贷';
+				return '信用卡';
+			},
+			installmentRemainingPeriods() : number {
+				if (this.account == null) return 0;
+				const acc = this.account as AccountNode;
+				if (!FinanceBiz.isInstallmentCreditAccount(acc)) return 0;
+				const remain = acc.installment_count - acc.installment_paid;
+				return remain > 0 ? remain : 0;
+			},
+			installmentAmount() : number {
+				if (this.account == null) return 0.0;
+				const acc = this.account as AccountNode;
+				const remain = this.installmentRemainingPeriods;
+				if (remain <= 0) return acc.balance;
+				return Math.round((acc.balance / remain) * 100.0) / 100.0;
+			},
+			creditPlanText() : string {
+				if (this.account == null) return '';
+				const acc = this.account as AccountNode;
+				if (FinanceBiz.isInstallmentCreditAccount(acc)) {
+					const remain = this.installmentRemainingPeriods;
+					if (remain <= 0) return '分期已还清';
+					const dueText = acc.installment_next_due_at > 0 ? this.formatDate(acc.installment_next_due_at) : '未设还款日';
+					return `剩余 ${remain} 期 · 本期约 ${this.installmentAmount.toFixed(2)} · ${dueText}`;
+				}
+				if (this.isReceivableCredit) return '记录收款后会同步减少应收金额';
+				return '记录还款后会同步减少欠款金额';
+			},
+			quickSettleText() : string {
+				return this.isReceivableCredit ? '记录收款' : '快速还款';
+			},
+			quickAccountLabel() : string {
+				return this.isReceivableCredit ? '收款账户' : '还款账户';
+			},
+			quickSettleTip() : string {
+				if (this.isReceivableCredit) return '会增加收款账户余额，并减少当前应收款';
+				return '会扣减还款账户余额，并减少当前欠款';
+			},
+			quickRepayAccountName() : string {
+				if (this.quickRepayAccountId == '') return '请选择账户';
+				const acc = this.accounts.find((a : AccountNode) : boolean => a.id == this.quickRepayAccountId);
+				if (acc == null) return '请选择账户';
+				return acc.name;
+			},
+			editSheetTitle() : string {
+				if (this.isCreditAccount) return `编辑${this.creditKindText}`;
+				return '编辑资金账户';
+			}
+		},
+		methods: {
+			loadTheme() {
+				const bg = uni.getStorageSync('theme_background_image');
+				if (bg != null) {
+					this.backgroundImage = bg.toString();
+				}
+
+				const t = uni.getStorageSync('theme_transparency');
+				if (t != null) {
+					const str = t.toString();
+					if (str != '') {
+						const val = parseFloat(str);
+						if (!isNaN(val)) {
+							this.transparency = val;
+						}
+					}
+				}
+			},
+			async loadData() {
+				this.account = await FinanceBiz.getAccountNode(this.accountId);
+				this.accounts = await FinanceBiz.listAccountNodes(null);
+				if (this.account != null) {
+					uni.setNavigationBarTitle({ title: this.account?.name ?? '' });
+				}
+				this.transactions = await FinanceBiz.listTransactionMountsByAccount(this.accountId);
+			},
+			openFunctionMenu() {
+				uni.showActionSheet({
+					itemList: ['编辑账户', '删除账户'],
+					success: (res) => {
+						if (res.tapIndex == 0) this.openEditModal();
+						if (res.tapIndex == 1) this.confirmDeleteAccount();
+					}
+				});
+			},
+			openEditModal() {
+				if (this.account == null) return;
+				const acc = this.account as AccountNode;
+				this.editName = acc.name;
+				this.editCardNo = acc.card_no;
+				this.editBalance = acc.balance.toFixed(2);
+				this.editProvider = acc.provider;
+				this.editCreditLimit = acc.credit_limit > 0 ? acc.credit_limit.toFixed(2) : "";
+				this.editIncludeInTotal = acc.include_in_total;
+				this.showEditModal = true;
+			},
+			closeEditModal() {
+				this.showEditModal = false;
+			},
+			sanitizeAmount(raw : string) : string {
+				let val = raw.replace(/[^0-9.]/g, "");
+				const dots = val.split('.').length - 1;
+				if (dots > 1) {
+					const firstDotIndex = val.indexOf('.');
+					val = val.substring(0, firstDotIndex + 1) + val.substring(firstDotIndex + 1).replace(/\./g, '');
+				}
+				if (val.includes('.')) {
+					const parts = val.split('.');
+					if (parts[1].length > 2) val = parts[0] + '.' + parts[1].substring(0, 2);
+				}
+				return val;
+			},
+			onEditBalanceInput(e : InputEvent) {
+				const val = this.sanitizeAmount(e.detail.value);
+				setTimeout(() => { this.editBalance = val; }, 0);
+			},
+			onEditCreditLimitInput(e : InputEvent) {
+				const val = this.sanitizeAmount(e.detail.value);
+				setTimeout(() => { this.editCreditLimit = val; }, 0);
+			},
+			onEditIncludeChange(e : UniSwitchChangeEvent) {
+				this.editIncludeInTotal = e.detail.value;
+			},
+			cashAccountCandidates() : AccountNode[] {
+				return this.accounts.filter((acc : AccountNode) : boolean => acc.category == 'cash' && acc.id != this.accountId);
+			},
+			openQuickRepayModal() {
+				if (this.account == null) return;
+				const candidates = this.cashAccountCandidates();
+				if (candidates.length == 0) {
+					uni.showToast({ title: '请先创建资金账户', icon: 'none' });
+					return;
+				}
+				const acc = this.account as AccountNode;
+				let amount = acc.balance;
+				if (FinanceBiz.isInstallmentCreditAccount(acc) && this.installmentAmount > 0) {
+					amount = this.installmentAmount;
+				}
+				if (amount > acc.balance) amount = acc.balance;
+				this.quickRepayAmount = amount <= 0 ? '' : amount.toFixed(2);
+				if (this.quickRepayAccountId == '' || candidates.find((a : AccountNode) : boolean => a.id == this.quickRepayAccountId) == null) {
+					this.quickRepayAccountId = candidates[0].id;
+				}
+				this.showQuickRepayModal = true;
+			},
+			closeQuickRepayModal() {
+				if (this.quickRepaySubmitting) return;
+				this.showQuickRepayModal = false;
+			},
+			onQuickRepayAmountInput(e : InputEvent) {
+				const val = this.sanitizeAmount(e.detail.value);
+				setTimeout(() => { this.quickRepayAmount = val; }, 0);
+			},
+			showQuickRepayAccountPicker() {
+				const candidates = this.cashAccountCandidates();
+				if (candidates.length == 0) {
+					uni.showToast({ title: '请先创建资金账户', icon: 'none' });
+					return;
+				}
+				const itemList = candidates.map((a : AccountNode) : string => a.name);
+				uni.showActionSheet({
+					itemList: itemList,
+					success: (res) => {
+						if (res.tapIndex >= 0 && res.tapIndex < candidates.length) {
+							this.quickRepayAccountId = candidates[res.tapIndex].id;
+						}
+					}
+				});
+			},
+			nextInstallmentDueAt(currentDueAt : number, dueDay : number) : number {
+				let safeDay = dueDay;
+				if (safeDay < 1) safeDay = 1;
+				if (safeDay > 28) safeDay = 28;
+				const base = currentDueAt > 0 ? new Date(currentDueAt) : new Date();
+				return new Date(base.getFullYear(), base.getMonth() + 1, safeDay, 9, 0, 0, 0).getTime();
+			},
+			async advanceInstallmentIfNeeded(settleAmount : number) {
+				const latest = await FinanceBiz.getAccountNode(this.accountId);
+				if (latest == null) return;
+				if (!FinanceBiz.isInstallmentCreditAccount(latest)) return;
+				const remain = latest.installment_count - latest.installment_paid;
+				if (remain <= 0) return;
+				const beforeBalance = latest.balance + settleAmount;
+				const expected = remain > 0 ? Math.round((beforeBalance / remain) * 100.0) / 100.0 : settleAmount;
+				if (settleAmount + 0.01 < expected) return;
+				let nextPaid = latest.balance <= 0.01 ? latest.installment_count : latest.installment_paid + 1;
+				if (nextPaid > latest.installment_count) nextPaid = latest.installment_count;
+				const nextDueAt = nextPaid >= latest.installment_count || latest.balance <= 0.01 ? 0 : this.nextInstallmentDueAt(latest.installment_next_due_at, latest.installment_due_day);
+				await FinanceBiz.updateAssetAccount(latest.id, {
+					name: latest.name,
+					category: latest.category,
+					balance: latest.balance,
+					book_id: latest.book_id,
+					provider: latest.provider,
+					card_no: latest.card_no,
+					include_in_total: latest.include_in_total,
+					code: latest.code,
+					sub_type: latest.sub_type,
+					profit_rate: latest.profit_rate,
+					profit_amount: latest.profit_amount,
+					market_value: latest.market_value,
+					units: latest.units,
+					latest_nav: latest.latest_nav,
+					estimate_nav: latest.estimate_nav,
+					quote_time: latest.quote_time,
+					data_source: latest.data_source,
+					credit_limit: latest.credit_limit,
+					credit_kind: latest.credit_kind,
+					installment_total: latest.installment_total,
+					installment_count: latest.installment_count,
+					installment_paid: nextPaid,
+					installment_due_day: latest.installment_due_day,
+					installment_next_due_at: nextDueAt
+				} as AssetAccountPayload);
+			},
+			async submitQuickRepay() {
+				if (this.quickRepaySubmitting || this.account == null) return;
+				const val = parseFloat(this.quickRepayAmount);
+				if (isNaN(val) || val <= 0) {
+					uni.showToast({ title: '请输入有效金额', icon: 'none' });
+					return;
+				}
+				const acc = this.account as AccountNode;
+				if (val - acc.balance > 0.01) {
+					uni.showToast({ title: `金额不能超过${this.balanceLabel}`, icon: 'none' });
+					return;
+				}
+				if (this.quickRepayAccountId == '') {
+					uni.showToast({ title: `请选择${this.quickAccountLabel}`, icon: 'none' });
+					return;
+				}
+				const fund = this.accounts.find((a : AccountNode) : boolean => a.id == this.quickRepayAccountId);
+				if (!this.isReceivableCredit && fund != null && fund.balance + 0.01 < val) {
+					uni.showToast({ title: '还款账户余额不足', icon: 'none' });
+					return;
+				}
+				this.quickRepaySubmitting = true;
+				const ok = await FinanceBiz.settleCreditAccount(
+					acc.id,
+					this.quickRepayAccountId,
+					val,
+					`${this.quickSettleText} ${acc.name}`,
+					this.isReceivableCredit
+				);
+				if (ok) {
+					await this.advanceInstallmentIfNeeded(val);
+					uni.showToast({ title: '已记录', icon: 'success' });
+					this.showQuickRepayModal = false;
+					await this.loadData();
+				} else {
+					uni.showToast({ title: '记录失败', icon: 'none' });
+				}
+				this.quickRepaySubmitting = false;
+			},
+			async saveAccountEdit() {
+				if (this.account == null) return;
+				const acc = this.account as AccountNode;
+				const name = this.editName.trim();
+				if (name == '') {
+					uni.showToast({ title: '请输入账户名称', icon: 'none' });
+					return;
+				}
+				const nextBalance = parseFloat(this.editBalance);
+				if (isNaN(nextBalance)) {
+					uni.showToast({ title: '请输入有效余额', icon: 'none' });
+					return;
+				}
+				const diff = nextBalance - acc.balance;
+				const nextCreditLimit = parseFloat(this.editCreditLimit);
+				const nextCardNo = this.showEditCardNoInput ? this.editCardNo.trim() : '';
+				if (Math.abs(diff) >= 0.01) {
+					const adjustmentType = acc.category == 'credit'
+						? (diff > 0 ? 'expense' : 'income')
+						: (diff > 0 ? 'income' : 'expense');
+					const txId = await FinanceBiz.createTransactionForNodes({
+						account_id: acc.id,
+						amount: Math.abs(diff),
+						type: adjustmentType,
+						category: '余额调整',
+						description: `编辑账户余额：${acc.balance.toFixed(2)} -> ${nextBalance.toFixed(2)}`,
+						properties: JSON.stringify({ source: 'account_edit_adjustment', old_balance: acc.balance, new_balance: nextBalance })
+					} as CreateTransactionForNodesPayload);
+					if (txId == null || txId == '') {
+						uni.showToast({ title: '余额调整记录失败', icon: 'none' });
+						return;
+					}
+				}
+				const payload = {
+					name: name,
+					category: acc.category,
+					balance: nextBalance,
+					book_id: acc.book_id,
+					provider: this.editProvider.trim(),
+					card_no: nextCardNo,
+					include_in_total: this.editIncludeInTotal,
+					code: acc.code,
+					sub_type: acc.sub_type,
+					profit_rate: acc.profit_rate,
+					profit_amount: acc.profit_amount,
+					market_value: acc.category == 'investment' ? nextBalance : acc.market_value,
+					units: acc.units,
+					latest_nav: acc.latest_nav,
+					estimate_nav: acc.estimate_nav,
+					quote_time: acc.quote_time,
+					data_source: acc.data_source,
+					credit_limit: this.showEditCreditLimit && !isNaN(nextCreditLimit) ? nextCreditLimit : 0.0,
+					credit_kind: acc.credit_kind,
+					installment_total: acc.installment_total,
+					installment_count: acc.installment_count,
+					installment_paid: acc.installment_paid,
+					installment_due_day: acc.installment_due_day,
+					installment_next_due_at: acc.installment_next_due_at
+				} as AssetAccountPayload;
+				const ok = await FinanceBiz.updateAssetAccount(acc.id, payload);
+				if (ok) {
+					uni.showToast({ title: '已保存', icon: 'success' });
+					this.closeEditModal();
+					this.loadData();
+				} else {
+					uni.showToast({ title: '保存失败', icon: 'none' });
+				}
+			},
+			confirmDeleteAccount() {
+				if (this.account == null) return;
+				const acc = this.account as AccountNode;
+				const name = acc.name;
+				const txCount = this.transactions.length;
+				uni.showModal({
+					title: '确认删除账户',
+					content: txCount > 0 ? `确定删除「${name}」吗？该账户将不再显示，历史账单记录保留。` : `确定删除「${name}」吗？`,
+					success: (res) => {
+						if (!res.confirm) return;
+						FinanceBiz.deleteAccountNode(this.accountId).then((ok : boolean) => {
+							if (ok) {
+								uni.showToast({ title: '已删除', icon: 'success' });
+								setTimeout(() => {
+									uni.navigateBack();
+								}, 250);
+							} else {
+								uni.showToast({ title: '删除失败', icon: 'none' });
+							}
+						});
+					}
+				});
+			},
+			getIconForType(type : string) : string {
+				if (type.includes("微信")) return "💬";
+				if (type.includes("支付宝")) return "🅰️";
+				if (type.includes("银行") || type.includes("卡")) return "💳";
+				if (type.includes("现金")) return "💵";
+				return "💰";
+			},
+			formatDate(ts : number) : string {
+				if (ts <= 0) return '未设日期';
+				const date = new Date(ts);
+				const m = (date.getMonth() + 1).toString().padStart(2, '0');
+				const d = date.getDate().toString().padStart(2, '0');
+				return `${m}-${d}到期`;
+			},
+			formatTime(ts : number) : string {
+				const date = new Date(ts);
+				const m = (date.getMonth() + 1).toString().padStart(2, '0');
+				const d = date.getDate().toString().padStart(2, '0');
+				const h = date.getHours().toString().padStart(2, '0');
+				const min = date.getMinutes().toString().padStart(2, '0');
+				return `${m}-${d} ${h}:${min}`;
+			},
+			formatTransactionAmount(amount : number) : string {
+				return Math.abs(amount).toFixed(2);
+			},
+			getAmountClass(type : string) : string {
+				return type == 'income' ? 'amount-income' : 'amount-expense';
+			},
+			getCategoryText(c : string | null) : string {
+				if (c == null || c == "") {
+					return "未分类";
+				}
+				return c;
+			},
+			hasDescription(d : string | null) : boolean {
+				return d != null && d != "";
+			},
+			openBillEditor(transactionId : string) {
+				if (transactionId == '') return;
+				AppDialogApi.openFinanceRecordForEdit(transactionId);
+			}
+		}
+	}
+</script>
+
+<style>
+	.page {
+		flex: 1;
+		position: relative;
+		background-color: rgba(245, 247, 250, 0.2);
+	}
+
+	.bg-image {
+		position: absolute;
+		top: 0;
+		left: 0;
+		width: 100%;
+		height: 100%;
+		z-index: 0;
+	}
+
+	.bg-color {
+		position: absolute;
+		top: 0;
+		left: 0;
+		width: 100%;
+		height: 100%;
+		/* background-color: #f5f5f5; */
+		z-index: 0;
+	}
+
+	.content-wrapper {
+		flex: 1;
+		flex-direction: column;
+		z-index: 1;
+		height: 100%;
+	}
+
+	.header-card {
+		margin: 15px;
+		padding: 20px;
+		border-radius: 16px;
+		box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+		position: relative;
+	}
+
+	.header-action {
+		position: absolute;
+		top: 12px;
+		right: 12px;
+		width: 32px;
+		height: 32px;
+		border-radius: 16px;
+		background-color: rgba(0, 0, 0, 0.06);
+		justify-content: center;
+		align-items: center;
+		z-index: 2;
+	}
+
+	.header-action-icon {
+		font-size: 22px;
+		color: #5f6875;
+		font-weight: bold;
+	}
+
+	.header-top {
+		flex-direction: row;
+		align-items: center;
+		margin-bottom: 20px;
+	}
+
+	.account-icon {
+		width: 50px;
+		height: 50px;
+		border-radius: 25px;
+		justify-content: center;
+		align-items: center;
+		margin-right: 15px;
+	}
+
+	.icon-text {
+		font-size: 24px;
+	}
+
+	.account-info {
+		flex: 1;
+	}
+
+	.account-name {
+		font-size: 18px;
+		font-weight: bold;
+		color: #333;
+		margin-bottom: 4px;
+	}
+
+	.account-type {
+		font-size: 13px;
+		color: #888;
+	}
+
+	.balance-area {
+		align-items: center;
+		border-top-width: 1px;
+		border-top-color: rgba(0, 0, 0, 0.05);
+		padding-top: 15px;
+	}
+
+	.balance-label {
+		font-size: 14px;
+		color: #666;
+		margin-bottom: 5px;
+	}
+
+	.balance-value {
+		font-size: 32px;
+		font-weight: bold;
+		color: #333;
+	}
+
+	.credit-action-panel {
+		margin-top: 14px;
+		padding-top: 12px;
+		border-top-width: 1px;
+		border-top-color: rgba(0, 0, 0, 0.05);
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+	}
+
+	.credit-plan-info {
+		flex: 1;
+		min-width: 0;
+		margin-right: 10px;
+	}
+
+	.credit-plan-title {
+		font-size: 13px;
+		font-weight: bold;
+		color: #1f2d3d;
+	}
+
+	.credit-plan-sub {
+		margin-top: 4px;
+		font-size: 12px;
+		color: #667281;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.quick-repay-btn {
+		height: 36px;
+		border-radius: 18px;
+		padding: 0 14px;
+		background-color: #0d6e6e;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.quick-repay-text {
+		font-size: 13px;
+		color: #ffffff;
+		font-weight: bold;
+	}
+
+	.section-title-area {
+		padding: 0 20px 10px 20px;
+	}
+
+	.section-title {
+		font-size: 16px;
+		font-weight: bold;
+		color: #555;
+	}
+
+	.transaction-list {
+		flex: 1;
+		padding: 0 15px;
+	}
+
+	.transaction-card {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+		padding: 15px;
+		margin-bottom: 10px;
+		border-radius: 12px;
+		box-shadow: 0 2px 6px rgba(0, 0, 0, 0.02);
+	}
+
+	.trans-left {
+		flex: 1;
+	}
+
+	.trans-category {
+		font-size: 16px;
+		font-weight: bold;
+		color: #333;
+		margin-bottom: 4px;
+	}
+
+	.trans-time {
+		font-size: 12px;
+		color: #999;
+		margin-bottom: 2px;
+	}
+
+	.trans-desc {
+		font-size: 13px;
+		color: #666;
+	}
+
+	.trans-right {
+		align-items: flex-end;
+	}
+
+	.trans-amount {
+		font-size: 18px;
+		font-weight: bold;
+	}
+
+	.amount-income {
+		color: #4caf50;
+	}
+
+	.amount-expense {
+		color: #f44336;
+	}
+
+	.trans-balance {
+		font-size: 12px;
+		color: #999;
+		margin-top: 4px;
+	}
+
+	.empty-tip {
+		align-items: center;
+		margin-top: 50px;
+	}
+
+	.empty-text {
+		color: #999;
+		font-size: 14px;
+	}
+
+	.list-bottom-spacer {
+		height: 30px;
+	}
+
+	.edit-overlay {
+		position: fixed;
+		left: 0;
+		right: 0;
+		top: 0;
+		bottom: 0;
+		background-color: rgba(0, 0, 0, 0.28);
+		justify-content: flex-end;
+		z-index: 20;
+	}
+
+	.edit-sheet {
+		background-color: #f7f9fb;
+		border-top-left-radius: 22px;
+		border-top-right-radius: 22px;
+		padding: 14px 18px 20px 18px;
+	}
+
+	.quick-sheet {
+		padding-bottom: 24px;
+	}
+
+	.sheet-handle {
+		width: 38px;
+		height: 4px;
+		border-radius: 2px;
+		background-color: #d4dbe3;
+		align-self: center;
+		margin-bottom: 12px;
+	}
+
+	.sheet-title {
+		font-size: 18px;
+		font-weight: bold;
+		color: #1f2d3d;
+		margin-bottom: 14px;
+	}
+
+	.field-block {
+		margin-bottom: 14px;
+	}
+
+	.field-label {
+		font-size: 13px;
+		color: #6b7785;
+		margin-bottom: 6px;
+	}
+
+	.name-card-row {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.name-row-main {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.card-no-input {
+		width: 118px;
+		margin-left: 8px;
+	}
+
+	.field-input {
+		height: 46px;
+		border-radius: 12px;
+		background-color: #ffffff;
+		padding: 0 14px;
+		font-size: 15px;
+		color: #1f2d3d;
+	}
+
+	.field-select {
+		height: 46px;
+		border-radius: 12px;
+		background-color: #ffffff;
+		padding: 0 14px;
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+	}
+
+	.field-select-text {
+		flex: 1;
+		min-width: 0;
+		font-size: 15px;
+		color: #1f2d3d;
+		font-weight: bold;
+		lines: 1;
+		text-overflow: ellipsis;
+	}
+
+	.field-select-arrow {
+		font-size: 16px;
+		color: #9aa4b0;
+	}
+
+	.amount-input-row {
+		flex-direction: row;
+		align-items: center;
+		height: 46px;
+		border-radius: 12px;
+		background-color: #ffffff;
+		padding: 0 14px;
+	}
+
+	.amount-symbol {
+		font-size: 18px;
+		color: #0d6e6e;
+		font-weight: bold;
+		margin-right: 8px;
+	}
+
+	.amount-input {
+		flex: 1;
+		height: 46px;
+		background-color: transparent;
+		padding: 0;
+		font-size: 18px;
+		font-weight: bold;
+	}
+
+	.diff-tip {
+		font-size: 12px;
+		margin-top: 6px;
+	}
+
+	.quick-tip {
+		font-size: 12px;
+		color: #6b7785;
+		margin-bottom: 12px;
+	}
+
+	.diff-income {
+		color: #16a34a;
+	}
+
+	.diff-expense {
+		color: #f44336;
+	}
+
+	.toggle-block {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+		background-color: #ffffff;
+		border-radius: 12px;
+		padding: 12px 14px;
+		margin-bottom: 16px;
+	}
+
+	.toggle-info {
+		flex: 1;
+	}
+
+	.toggle-title {
+		font-size: 15px;
+		font-weight: bold;
+		color: #1f2d3d;
+	}
+
+	.toggle-desc {
+		font-size: 12px;
+		color: #7a8694;
+		margin-top: 4px;
+	}
+
+	.sheet-footer {
+		margin-top: 2px;
+	}
+
+	.save-btn {
+		background-color: #0d6e6e;
+		color: #ffffff;
+		border-radius: 14px;
+		height: 48px;
+		font-size: 16px;
+		font-weight: bold;
+	}
+</style>

@@ -1,0 +1,263 @@
+<template>
+<view v-if="visible" class="modal-mask" @click="onClose">
+<view class="modal-content" @click.stop>
+<text class="modal-title">{{ isAbandon ? '放弃任务' : '完成任务' }}</text>
+
+<view class="setting-item" @click="toggleLoop" style="justify-content: flex-start;">
+<view :style="'width: 20px; height: 20px; border-radius: 10px; border: 2px solid ' + (isLoop ? themeColor : '#ccc') + '; display: flex; justify-content: center; align-items: center;'">
+<view v-if="isLoop" :style="'width: 10px; height: 10px; border-radius: 5px; background-color: ' + themeColor + ';'"></view>
+</view>
+<text class="setting-label" style="margin-left: 10px;">是否循环重启任务</text>
+</view>
+
+<view v-if="isLoop" class="setting-item" style="flex-direction: row; flex-wrap: wrap; justify-content: flex-start; align-items: center; gap: 10px; padding: 12px 0;">
+<view style="display: flex; flex-direction: row; align-items: center;">
+<text class="setting-label" style="margin-right: 8px;">下次</text>
+<view class="picker-trigger" @click="openNativeDate" style="background-color: #f5f5f5; padding: 4px 8px; border-radius: 6px; margin-right: 10px;">
+<text class="picker-text" style="margin-right: 0;">{{ displayDate }}</text>
+</view>
+<view class="picker-trigger" @click="openNativeTime" style="background-color: #f5f5f5; padding: 4px 8px; border-radius: 6px; margin-right: 10px;">
+<text class="picker-text" style="margin-right: 0;">{{ selectedTime }}</text>
+</view>
+<view class="picker-trigger" @click="openTypeSheet" style="background-color: #f5f5f5; padding: 4px 8px; border-radius: 6px;">
+<text class="picker-text" style="margin-right: 0;">{{ repeatTypes[selectedTypeIndex] }}</text>
+<text class="picker-arrow" style="margin-left: 4px;">›</text>
+</view>
+</view>
+</view>
+
+<view class="setting-item" @click="toggleArchiveProgress" style="justify-content: flex-start; margin-top: 10px;">
+<view :style="'width: 20px; height: 20px; border-radius: 10px; border: 2px solid ' + (archiveProgress ? themeColor : '#ccc') + '; display: flex; justify-content: center; align-items: center;'">
+<view v-if="archiveProgress" :style="'width: 10px; height: 10px; border-radius: 5px; background-color: ' + themeColor + ';'"></view>
+</view>
+<text class="setting-label" style="margin-left: 10px;">归档本次进展记录 (从头开始)</text>
+</view>
+
+<view class="modal-actions">
+<button class="modal-btn cancel-btn" @click="onClose">取消</button>
+<button class="modal-btn confirm-btn" :style="'background-color: ' + themeColor + ';'" @click="onConfirm">{{ isAbandon ? '确认放弃' : '确认完成' }}</button>
+</view>
+</view>
+</view>
+</template>
+
+<script lang="uts">
+// #ifdef APP-ANDROID
+import UTSAndroid from "io.dcloud.uts.UTSAndroid";
+import DatePickerDialog from "android.app.DatePickerDialog";
+import TimePickerDialog from "android.app.TimePickerDialog";
+import Calendar from "java.util.Calendar";
+import Context from "android.content.Context";
+// #endif
+
+export type CompleteTaskOptions = {
+isLoop: boolean;
+nextDate: string;
+nextTime: string;
+typeIndex: number;
+archiveProgress: boolean;
+}
+
+export default {
+name: "task-complete-modal",
+emits: ["close", "confirm"],
+props: {
+visible: { type: Boolean, default: false },
+actionType: { type: String, default: "complete" }, // 'complete' | 'abandon'
+initialIsLoop: { type: Boolean, default: false },
+initialTime: { type: String, default: "09:00" },
+initialTypeIndex: { type: Number, default: 0 }
+},
+data() {
+return {
+isLoop: false,
+archiveProgress: true,
+repeatTypes: ["单次重启(不重复)", "每天", "每周", "每月"],
+selectedTypeIndex: 1,
+selectedTime: "09:00",
+selectedDate: ""
+}
+},
+computed: {
+isAbandon(): boolean {
+return this.actionType == 'abandon';
+},
+themeColor(): string {
+return this.isAbandon ? '#ff3b30' : '#007AFF';
+},
+displayDate(): string {
+if (this.selectedDate == "") return "";
+const parts = this.selectedDate.split("-");
+if (parts.length == 3) {
+return `${parts[1]}-${parts[2]}`;
+}
+return this.selectedDate;
+}
+},
+watch: {
+visible(v: boolean) {
+if(v) {
+if (this.initialIsLoop) {
+this.isLoop = true;
+this.selectedTypeIndex = this.initialTypeIndex > 0 ? this.initialTypeIndex : 1; 
+this.selectedTime = (this.initialTime != null && this.initialTime != "") ? this.initialTime : "09:00";
+} else {
+this.isLoop = false;
+this.selectedTypeIndex = 1;
+this.selectedTime = "09:00";
+}
+
+const now = new Date();
+if (this.isLoop && this.selectedTypeIndex > 0) {
+if (this.selectedTypeIndex == 1) {
+now.setDate(now.getDate() + 1);
+} else if (this.selectedTypeIndex == 2) {
+now.setDate(now.getDate() + 7);
+} else if (this.selectedTypeIndex == 3) {
+now.setMonth(now.getMonth() + 1);
+}
+} else {
+now.setDate(now.getDate() + 1);
+}
+
+const y = now.getFullYear();
+const m = (now.getMonth() + 1).toString().padStart(2, "0");
+const d = now.getDate().toString().padStart(2, "0");
+this.selectedDate = `${y}-${m}-${d}`;
+}
+}
+},
+methods: {
+onClose() { this.$emit("close"); },
+toggleLoop() { this.isLoop = !this.isLoop; },
+toggleArchiveProgress() { this.archiveProgress = !this.archiveProgress; },
+onConfirm() {
+this.$emit("confirm", {
+isLoop: this.isLoop,
+nextDate: this.selectedDate,
+nextTime: this.selectedTime,
+typeIndex: this.selectedTypeIndex,
+archiveProgress: this.archiveProgress
+} as CompleteTaskOptions);
+},
+openTypeSheet() {
+uni.showActionSheet({
+itemList: this.repeatTypes,
+success: (res) => { this.selectedTypeIndex = res.tapIndex; }
+});
+},
+openNativeDate() {
+// #ifdef APP-ANDROID
+const context = UTSAndroid.getUniActivity();
+if (context == null) return;
+const cal = Calendar.getInstance();
+const parts = this.selectedDate.split("-");
+if(parts.length == 3) {
+cal.set(Calendar.YEAR, parseInt(parts[0]) as Int);
+cal.set(Calendar.MONTH, (parseInt(parts[1]) - 1) as Int);
+cal.set(Calendar.DAY_OF_MONTH, parseInt(parts[2]) as Int);
+}
+const dialog = new DatePickerDialog(context,
+new DatePickerDialog.OnDateSetListener((_, y, m, d) => {
+this.selectedDate = `${y}-${(m + 1).toString().padStart(2, "0")}-${d.toString().padStart(2, "0")}`;      
+}),
+cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)
+);
+dialog.show();
+// #endif
+},
+openNativeTime() {
+// #ifdef APP-ANDROID
+const context = UTSAndroid.getUniActivity();
+if (context == null) return;
+const cal = Calendar.getInstance();
+const parts = this.selectedTime.split(":");
+if(parts.length == 2) {
+cal.set(Calendar.HOUR_OF_DAY, parseInt(parts[0]) as Int);
+cal.set(Calendar.MINUTE, parseInt(parts[1]) as Int);
+}
+const dialog = new TimePickerDialog(context,
+new TimePickerDialog.OnTimeSetListener((_, h, m) => {
+this.selectedTime = `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}`;
+}),
+cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE), true
+);
+dialog.show();
+// #endif
+}
+}
+}
+</script>
+<style scoped>
+.modal-mask {
+position: fixed;
+top: 0; left: 0; right: 0; bottom: 0;
+background-color: rgba(0, 0, 0, 0.5);
+display: flex;
+justify-content: center;
+align-items: center;
+z-index: 1000;
+}
+.modal-content {
+width: 300px;
+background-color: #fff;
+border-radius: 12px;
+padding: 20px;
+display: flex;
+flex-direction: column;
+}
+.modal-title {
+font-size: 18px;
+font-weight: bold;
+text-align: center;
+margin-bottom: 20px;
+color: #333;
+}
+.setting-item {
+display: flex;
+flex-direction: row;
+align-items: center;
+justify-content: space-between;
+padding: 12px 0;
+border-bottom: 1px solid #eee;
+}
+.setting-label {
+font-size: 16px;
+color: #333;
+}
+.picker-trigger {
+display: flex;
+flex-direction: row;
+align-items: center;
+}
+.picker-text {
+font-size: 16px;
+color: #666;
+margin-right: 8px;
+}
+.picker-arrow {
+font-size: 16px;
+color: #aaa;
+}
+.modal-actions {
+display: flex;
+flex-direction: row;
+margin-top: 24px;
+}
+.modal-btn {
+flex: 1;
+height: 40px;
+line-height: 40px;
+text-align: center;
+border-radius: 20px;
+font-size: 16px;
+}
+.cancel-btn {
+background-color: #f0f0f0;
+color: #666;
+margin-right: 12px;
+}
+.confirm-btn {
+color: #fff;
+}
+</style>

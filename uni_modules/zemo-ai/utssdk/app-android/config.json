@@ -1,0 +1,25 @@
+{
+	"dependencies": [
+
+		{
+			"id": "com.google.ai.edge.litert:litert:2.1.0+litertlm",
+			"source": "implementation fileTree(include: ['*.jar', '*.aar'], dir: './libs')"
+		},
+		{
+			"id": "com.google.guava:guava:33.5.0-android",
+			"source": "implementation 'com.google.guava:guava:33.5.0-android'"
+		},
+		{
+			"id": "org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.10.2",
+			"source": "implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.10.2'"
+		},
+		{
+			"id": "androidx.lifecycle:lifecycle-runtime:2.8.7",
+			"source": "implementation 'androidx.lifecycle:lifecycle-runtime:2.8.7'"
+		}
+	],
+	"minSdkVersion": 24,
+	"permissions": [
+		"android.permission.INTERNET"
+	]
+}

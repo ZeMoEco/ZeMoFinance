@@ -1,0 +1,1267 @@
+import { FileUtil } from '@/utils/file/file.uts'
+import { RUNTIME_ASSETS_DIR } from '@/utils/constant.uts'
+
+// #ifdef APP-HARMONY
+import fs from '@ohos.file.fs'
+import common from '@ohos.app.ability.common'
+declare function getContext(component?: Object | null): Object | null
+// #endif
+
+export type ScreenOmniLiteTop = {
+	label: string
+	score: number
+}
+
+export type ScreenOmniLitePrediction = {
+	ok: boolean
+	label: string
+	kind: string
+	action: string
+	method: string
+	message: string
+	modelReady: boolean
+	confidence: number
+	top3: ScreenOmniLiteTop[]
+}
+
+export type ScreenOmniModelFiles = {
+	modelPath: string
+	labelsPath: string
+}
+
+export type ScreenOmniModelStatus = {
+	ready: boolean
+	modelPath: string
+	labelsPath: string
+	nativeModelPath: string
+	nativeLabelsPath: string
+	version: string
+	updatedAt: string
+	message: string
+}
+
+export type ScreenOmniModelInstallResult = {
+	ok: boolean
+	message: string
+	status: ScreenOmniModelStatus
+}
+
+type ScreenOmniMsRuntime = {
+	ready: boolean
+	modelPath: string
+	labelsPath: string
+	nativeModelPath: string
+	nativeLabelsPath: string
+	message: string
+}
+
+type ScreenOmniMsPrediction = {
+	ok: boolean
+	label: string
+	confidence: number
+	top3: ScreenOmniLiteTop[]
+	message: string
+	method: string
+}
+
+type ZemoAskRuntime = {
+	classifyScreenIntent(text: string, modelPath: string, labelsPath: string): Promise<string>
+	classifyScreenImageIntent(imagePath: string, modelPath: string, labelsPath: string): Promise<string>
+}
+
+type ScreenOmniLegacyPrediction = {
+	ok: boolean
+	label: string
+	confidence: number
+	top3: ScreenOmniLiteTop[]
+	message: string
+}
+
+type ScreenOmniLegacyScore = {
+	label: string
+	score: number
+	hits: number
+}
+
+export class ScreenOmniLiteModelService {
+	static readonly MODEL_ASSET_PATH = '/static/models/screen_omni_lite/screen_omni_model.min.json'
+	static readonly MS_MODEL_ASSET_PATH = '/static/models/screen_omni_ms/screen_omni_intent.ms'
+	static readonly MS_LABELS_ASSET_PATH = '/static/models/screen_omni_ms/label_map.json'
+	static readonly VISION_MODEL_ASSET_PATH = '/static/models/screen_omni_vision_ms/screen_omni_vision_intent.ms'
+	static readonly VISION_LABELS_ASSET_PATH = '/static/models/screen_omni_vision_ms/label_map.json'
+	static readonly MS_RUNTIME_DIR = `${RUNTIME_ASSETS_DIR}/ai/screen_omni_intent`
+	static readonly MS_MODEL_RUNTIME_PATH = `${ScreenOmniLiteModelService.MS_RUNTIME_DIR}/screen_omni_intent.ms`
+	static readonly MS_LABELS_RUNTIME_PATH = `${ScreenOmniLiteModelService.MS_RUNTIME_DIR}/label_map.json`
+	static readonly MS_MANIFEST_PATH = `${ScreenOmniLiteModelService.MS_RUNTIME_DIR}/manifest.json`
+	static readonly VISION_RUNTIME_DIR = `${RUNTIME_ASSETS_DIR}/ai/screen_omni_vision_intent`
+	static readonly VISION_MODEL_RUNTIME_PATH = `${ScreenOmniLiteModelService.VISION_RUNTIME_DIR}/screen_omni_vision_intent.ms`
+	static readonly VISION_LABELS_RUNTIME_PATH = `${ScreenOmniLiteModelService.VISION_RUNTIME_DIR}/label_map.json`
+	static readonly VERSION_KEY = 'screen_omni_intent_model_version'
+	static readonly UPDATED_AT_KEY = 'screen_omni_intent_model_updated_at'
+	static readonly MODEL_PATH_KEY = 'screen_omni_intent_model_path'
+	static readonly LABELS_PATH_KEY = 'screen_omni_intent_labels_path'
+	static readonly NATIVE_MODEL_PATH_KEY = 'screen_omni_intent_native_model_path'
+	static readonly NATIVE_LABELS_PATH_KEY = 'screen_omni_intent_native_labels_path'
+	private static legacyReadyCache: boolean | null = null
+	private static legacyModelCache: any | null = null
+	private static msRuntimeCache: ScreenOmniMsRuntime | null = null
+	private static visionRuntimeCache: ScreenOmniMsRuntime | null = null
+	private static zemoAskRuntimePromise: Promise<ZemoAskRuntime> | null = null
+
+	static async predict(text: string): Promise<ScreenOmniLitePrediction> {
+		const raw = (text ?? '').toString()
+		const value = ScreenOmniLiteModelService.normalizeText(raw)
+		const rule = ScreenOmniLiteModelService.ruleLabel(value, raw)
+		const ms = await ScreenOmniLiteModelService.predictWithMindSpore(value)
+		const legacy = ms.ok ? ScreenOmniLiteModelService.emptyLegacyPrediction('mindspore_ok') : await ScreenOmniLiteModelService.predictWithLegacyJson(value)
+		const modelReady = ms.ok || legacy.ok
+		const top3 = ms.ok ? ms.top3 : legacy.top3
+		let output: ScreenOmniLitePrediction
+		if (rule != '') {
+			const msMethod = ScreenOmniLiteModelService.screenTextMsMethod(ms.method)
+			output = ScreenOmniLiteModelService.result(
+				rule,
+				ms.ok ? `business_priority_rules+${msMethod}` : (legacy.ok ? 'business_priority_rules+screen_omni_lite_json' : 'business_priority_rules'),
+				modelReady,
+				ms.ok && ms.label == rule ? ms.confidence : (legacy.ok && legacy.label == rule ? legacy.confidence : 1.0),
+				top3
+			)
+		} else if (ms.ok && ms.label != '' && ms.confidence >= 0.35) {
+			output = ScreenOmniLiteModelService.result(ms.label, ScreenOmniLiteModelService.screenTextMsMethod(ms.method), true, ms.confidence, ms.top3)
+		} else if (legacy.ok && legacy.label != '' && legacy.confidence >= 0.25) {
+			output = ScreenOmniLiteModelService.result(legacy.label, 'screen_omni_lite_json', true, legacy.confidence, legacy.top3)
+		} else {
+			output = ScreenOmniLiteModelService.result('screen_summary', modelReady ? 'model_default' : 'built_in_default', modelReady, ms.ok ? ms.confidence : legacy.confidence, top3)
+		}
+		console.log(`[屏幕意图] 文本：标签=${output.label}，类型=${output.kind}，方法=${output.method}，模型=${output.modelReady ? '可用' : '不可用'}，置信度=${output.confidence}，规则=${rule == '' ? '无' : rule}，MS=${ms.ok ? '成功' : '失败'}，旧JSON=${legacy.ok ? '启用' : '关闭'}，预览=${ScreenOmniLiteModelService.safeJson(ScreenOmniLiteModelService.limitText(raw, 180))}`)
+		return output
+	}
+
+	static async predictImage(imagePath: string): Promise<ScreenOmniLitePrediction> {
+		const value = FileUtil.normalizePath((imagePath ?? '').toString())
+		if (value == '') return ScreenOmniLiteModelService.result('screen_summary', 'vision_empty_image', false, 0.0, [] as ScreenOmniLiteTop[])
+		const ms = await ScreenOmniLiteModelService.predictImageWithMindSpore(value)
+		const modelReady = ms.ok
+		let output: ScreenOmniLitePrediction
+		if (ms.ok && ms.label != '' && ms.confidence >= 0.25) {
+			output = ScreenOmniLiteModelService.result(ms.label, ScreenOmniLiteModelService.screenVisionMsMethod(ms.method), true, ms.confidence, ms.top3)
+		} else {
+			output = ScreenOmniLiteModelService.result('screen_summary', modelReady ? 'vision_model_default' : 'vision_unavailable_default', modelReady, ms.confidence, ms.top3)
+		}
+		console.log(`[屏幕意图] 图片：标签=${output.label}，类型=${output.kind}，方法=${output.method}，模型=${output.modelReady ? '可用' : '不可用'}，置信度=${output.confidence}，MS=${ms.ok ? '成功' : '失败'}，图片=${value}`)
+		return output
+	}
+
+	static async getStatus(): Promise<string> {
+		const status = await ScreenOmniLiteModelService.getModelStatus()
+		const vision = await ScreenOmniLiteModelService.ensureVisionRuntime()
+		if (status.ready) return `${status.message}；vision=${vision.ready ? 'ready' : vision.message}`
+		const legacy = await ScreenOmniLiteModelService.isLegacyJsonReady()
+		if (legacy) return `json_ready: ${ScreenOmniLiteModelService.MODEL_ASSET_PATH}; ms=${status.message}；vision=${vision.ready ? 'ready' : vision.message}`
+		return `not_readable: built-in rules only; ms=${status.message}；vision=${vision.ready ? 'ready' : vision.message}`
+	}
+
+	static async getModelStatus(): Promise<ScreenOmniModelStatus> {
+		const runtime = await ScreenOmniLiteModelService.ensureMindSporeRuntime()
+		const version = ScreenOmniLiteModelService.readStorageText(ScreenOmniLiteModelService.VERSION_KEY)
+		const updatedAt = ScreenOmniLiteModelService.readStorageText(ScreenOmniLiteModelService.UPDATED_AT_KEY)
+		let message = runtime.message
+		if (runtime.ready) {
+			message = `屏幕意图 MS 模型已就绪${updatedAt != '' ? `，更新时间 ${updatedAt}` : ''}；model=${runtime.modelPath}`
+		} else if (message == '') {
+			message = 'screen_omni_intent.ms 未导入'
+		}
+		const vision = await ScreenOmniLiteModelService.ensureVisionRuntime()
+		message += `；图片意图模型=${vision.ready ? '已就绪' : vision.message}`
+		return {
+			ready: runtime.ready,
+			modelPath: runtime.modelPath,
+			labelsPath: runtime.labelsPath,
+			nativeModelPath: runtime.nativeModelPath,
+			nativeLabelsPath: runtime.nativeLabelsPath,
+			version,
+			updatedAt,
+			message
+		} as ScreenOmniModelStatus
+	}
+
+	static async installModelFiles(files: ScreenOmniModelFiles): Promise<ScreenOmniModelInstallResult> {
+		const modelPath = FileUtil.normalizePath(files.modelPath)
+		const labelsPath = FileUtil.normalizePath(files.labelsPath)
+		if (modelPath == '') return await ScreenOmniLiteModelService.installResult(false, 'screen_omni_intent.ms 路径为空')
+		if (labelsPath == '') return await ScreenOmniLiteModelService.installResult(false, '屏幕意图模型需要同时导入 label_map.json')
+		if (!ScreenOmniLiteModelService.looksLikeScreenIntentModelPath(modelPath)) return await ScreenOmniLiteModelService.installResult(false, '请选择 screen_omni_intent.ms')
+		if (!await ScreenOmniLiteModelService.looksLikeScreenIntentLabelsPath(labelsPath) && !ScreenOmniLiteModelService.looksLikeLabelMapName(labelsPath)) return await ScreenOmniLiteModelService.installResult(false, '请选择屏幕意图模型的 label_map.json')
+
+		const modelData = await FileUtil.readBinaryFile(modelPath)
+		if (modelData == null || modelData.byteLength <= 0) return await ScreenOmniLiteModelService.installResult(false, 'screen_omni_intent.ms 读取失败')
+		if (!ScreenOmniLiteModelService.isScreenIntentModelBinary(modelData)) return await ScreenOmniLiteModelService.installResult(false, '请选择文本屏幕意图模型 screen_omni_intent.ms，不能选择 screen_omni_vision_intent.ms')
+		const labelsText = await ScreenOmniLiteModelService.readLabelMapText(labelsPath)
+		if (labelsText == null || labelsText == '') return await ScreenOmniLiteModelService.installResult(false, 'label_map.json 读取失败')
+		if (!ScreenOmniLiteModelService.isScreenIntentLabelMapText(labelsText)) return await ScreenOmniLiteModelService.installResult(false, 'label_map.json 不是屏幕意图模型标签文件，请选择 model/screen_omni_ms/label_map.json')
+
+		try {
+			await FileUtil.removeDir(ScreenOmniLiteModelService.MS_RUNTIME_DIR)
+			await FileUtil.ensureDir(ScreenOmniLiteModelService.MS_RUNTIME_DIR)
+			const modelOk = await FileUtil.writeBinaryFile(ScreenOmniLiteModelService.MS_MODEL_RUNTIME_PATH, modelData)
+			const labelsOk = await ScreenOmniLiteModelService.writeTextRuntimeFile(ScreenOmniLiteModelService.MS_LABELS_RUNTIME_PATH, labelsText)
+			if (!modelOk) return await ScreenOmniLiteModelService.installResult(false, `模型复制失败：model=fail, labels=${labelsOk ? 'ok' : 'pending_native'}`)
+
+			let nativeModelPath = ''
+			let nativeLabelsPath = ''
+			// #ifdef APP-HARMONY
+			nativeModelPath = ScreenOmniLiteModelService.prepareHarmonyNativeBinary('screen_omni_intent.ms', modelData)
+			nativeLabelsPath = ScreenOmniLiteModelService.prepareHarmonyNativeText('label_map.json', labelsText)
+			if (nativeModelPath == '' || nativeLabelsPath == '') return await ScreenOmniLiteModelService.installResult(false, `原生路径准备失败：model=${nativeModelPath == '' ? 'missing' : 'ok'}, labels=${nativeLabelsPath == '' ? 'missing' : 'ok'}`)
+			// #endif
+			if (!labelsOk && nativeLabelsPath == '') return await ScreenOmniLiteModelService.installResult(false, 'label_map.json 写入失败')
+			const storedLabelsPath = labelsOk ? ScreenOmniLiteModelService.MS_LABELS_RUNTIME_PATH : nativeLabelsPath
+
+			const updatedAt = ScreenOmniLiteModelService.formatNow()
+			uni.setStorageSync(ScreenOmniLiteModelService.VERSION_KEY, 'screen_omni_intent.ms')
+			uni.setStorageSync(ScreenOmniLiteModelService.UPDATED_AT_KEY, updatedAt)
+			uni.setStorageSync(ScreenOmniLiteModelService.MODEL_PATH_KEY, ScreenOmniLiteModelService.MS_MODEL_RUNTIME_PATH)
+			uni.setStorageSync(ScreenOmniLiteModelService.LABELS_PATH_KEY, storedLabelsPath)
+			uni.setStorageSync(ScreenOmniLiteModelService.NATIVE_MODEL_PATH_KEY, nativeModelPath)
+			uni.setStorageSync(ScreenOmniLiteModelService.NATIVE_LABELS_PATH_KEY, nativeLabelsPath)
+			await FileUtil.writeTextFile(ScreenOmniLiteModelService.MS_MANIFEST_PATH, JSON.stringify({
+				version: 'screen_omni_intent.ms',
+				updatedAt,
+				model: ScreenOmniLiteModelService.basename(modelPath),
+				labels: ScreenOmniLiteModelService.basename(labelsPath),
+				labelsPath: storedLabelsPath,
+				nativeModelPath,
+				nativeLabelsPath
+			}))
+			ScreenOmniLiteModelService.msRuntimeCache = {
+				ready: true,
+				modelPath: ScreenOmniLiteModelService.MS_MODEL_RUNTIME_PATH,
+				labelsPath: storedLabelsPath,
+				nativeModelPath,
+				nativeLabelsPath,
+				message: ''
+			} as ScreenOmniMsRuntime
+			console.log(`[屏幕意图] 导入文本模型：model=${modelPath}，labels=${labelsPath}，native=${nativeModelPath}`)
+			return await ScreenOmniLiteModelService.installResult(true, '屏幕意图 MS 模型已导入')
+		} catch (e) {
+			const message = e == null ? '屏幕意图模型导入异常' : (e as Error).message
+			return await ScreenOmniLiteModelService.installResult(false, message)
+		}
+	}
+
+	static looksLikeScreenIntentModelPath(path: string): boolean {
+		const lower = FileUtil.normalizePath(path).toLowerCase()
+		if (!lower.endsWith('.ms')) return false
+		if (lower.indexOf('vision') >= 0 || lower.indexOf('image') >= 0) return false
+		const name = ScreenOmniLiteModelService.basename(lower)
+		return name == 'screen_omni_intent.ms'
+			|| lower.indexOf('screen_intent') >= 0
+			|| lower.indexOf('omni_intent') >= 0
+			|| lower.indexOf('screen_omni') >= 0
+	}
+
+	static async looksLikeScreenIntentLabelsPath(path: string): Promise<boolean> {
+		const lower = FileUtil.normalizePath(path).toLowerCase()
+		if (!lower.endsWith('.json')) return false
+		if (lower.indexOf('vision') >= 0 || lower.indexOf('image') >= 0) return false
+		if (lower.indexOf('screen_omni') >= 0 || lower.indexOf('screen_intent') >= 0 || lower.indexOf('omni_intent') >= 0) return true
+		if (!ScreenOmniLiteModelService.looksLikeLabelMapName(path)) return false
+		try {
+			const text = await ScreenOmniLiteModelService.readTextWithBinaryFallback(path)
+			if (text == null || text == '') return false
+			return ScreenOmniLiteModelService.isScreenIntentLabelMapText(text)
+		} catch (_e) {}
+		return false
+	}
+
+	static looksLikeLabelMapName(path: string): boolean {
+		const name = ScreenOmniLiteModelService.basename(FileUtil.normalizePath(path).toLowerCase())
+		return name == 'label_map.json' || name.endsWith('_label_map.json')
+	}
+
+	static isScreenIntentLabelMapText(text: string): boolean {
+		const value = (text ?? '').toString()
+		if (value.indexOf('zemo_screen_omni_vision') >= 0) return false
+		if (value.indexOf('image_feature_dim') >= 0 || value.indexOf('image_grid') >= 0 || value.indexOf('image_features') >= 0) return false
+		return value.indexOf('zemo_screen_omni_intent_ms_v1') >= 0
+			|| (value.indexOf('hash_feature_dim') >= 0 && value.indexOf('chat_todo') >= 0 && value.indexOf('bill_record') >= 0 && value.indexOf('investment_import') >= 0)
+	}
+
+	private static async readTextWithBinaryFallback(path: string): Promise<string> {
+		const text = await FileUtil.readTextFile(path)
+		if (text != null && text != '') return text
+		const data = await ScreenOmniLiteModelService.readBundledBinary(path)
+		if (data == null || data.byteLength <= 0) {
+			console.warn(`[屏幕意图] 读取文本失败：${path}`)
+			return ''
+		}
+		const decoded = ScreenOmniLiteModelService.decodeUtf8(data)
+		if (decoded == '') console.warn(`[屏幕意图] 文本解码失败：${path}，字节=${data.byteLength}`)
+		return decoded
+	}
+
+	private static async readLabelMapText(path: string): Promise<string> {
+		const selected = await ScreenOmniLiteModelService.readTextWithBinaryFallback(path)
+		if (selected != '') return selected
+		if (!ScreenOmniLiteModelService.looksLikeLabelMapName(path)) return ''
+		console.warn(`[屏幕意图] 选中的标签文件不可读，改用内置：${path}`)
+		const bundled = await ScreenOmniLiteModelService.readFirstText([
+			ScreenOmniLiteModelService.MS_LABELS_ASSET_PATH,
+			'static/models/screen_omni_ms/label_map.json'
+		] as string[])
+		return bundled
+	}
+
+	private static async writeTextRuntimeFile(path: string, text: string): Promise<boolean> {
+		const textOk = await FileUtil.writeTextFile(path, text)
+		if (textOk && await FileUtil.exists(path)) return true
+		const data = ScreenOmniLiteModelService.encodeUtf8(text)
+		const binaryOk = await FileUtil.writeBinaryFile(path, data)
+		if (binaryOk && await FileUtil.exists(path)) return true
+		console.warn(`[屏幕意图] 写入运行时标签失败：${path}，字符=${(text ?? '').toString().length}，字节=${data.byteLength}`)
+		return false
+	}
+
+	private static encodeUtf8(text: string): ArrayBuffer {
+		const bytes = [] as number[]
+		const value = (text ?? '').toString()
+		for (let i = 0; i < value.length; i++) {
+			let code = value.charCodeAt(i)
+			if (code >= 0xD800 && code <= 0xDBFF && i + 1 < value.length) {
+				const next = value.charCodeAt(i + 1)
+				if (next >= 0xDC00 && next <= 0xDFFF) {
+					code = 0x10000 + ((code - 0xD800) << 10) + (next - 0xDC00)
+					i += 1
+				}
+			}
+			if (code < 0x80) {
+				bytes.push(code)
+			} else if (code < 0x800) {
+				bytes.push(0xC0 | (code >> 6))
+				bytes.push(0x80 | (code & 0x3F))
+			} else if (code < 0x10000) {
+				bytes.push(0xE0 | (code >> 12))
+				bytes.push(0x80 | ((code >> 6) & 0x3F))
+				bytes.push(0x80 | (code & 0x3F))
+			} else {
+				bytes.push(0xF0 | (code >> 18))
+				bytes.push(0x80 | ((code >> 12) & 0x3F))
+				bytes.push(0x80 | ((code >> 6) & 0x3F))
+				bytes.push(0x80 | (code & 0x3F))
+			}
+		}
+		const out = new Uint8Array(bytes.length)
+		for (let i = 0; i < bytes.length; i++) out[i] = bytes[i]
+		return out.buffer
+	}
+
+	private static decodeUtf8(data: ArrayBuffer): string {
+		const bytes = new Uint8Array(data)
+		let out = ''
+		let i = 0
+		while (i < bytes.length) {
+			const b0 = bytes[i]
+			if (b0 < 0x80) {
+				out += String.fromCharCode(b0)
+				i += 1
+				continue
+			}
+			if (b0 >= 0xC0 && b0 < 0xE0 && i + 1 < bytes.length) {
+				const code = ((b0 & 0x1F) << 6) | (bytes[i + 1] & 0x3F)
+				out += String.fromCharCode(code)
+				i += 2
+				continue
+			}
+			if (b0 >= 0xE0 && b0 < 0xF0 && i + 2 < bytes.length) {
+				const code = ((b0 & 0x0F) << 12) | ((bytes[i + 1] & 0x3F) << 6) | (bytes[i + 2] & 0x3F)
+				out += String.fromCharCode(code)
+				i += 3
+				continue
+			}
+			if (b0 >= 0xF0 && b0 < 0xF8 && i + 3 < bytes.length) {
+				let code = ((b0 & 0x07) << 18) | ((bytes[i + 1] & 0x3F) << 12) | ((bytes[i + 2] & 0x3F) << 6) | (bytes[i + 3] & 0x3F)
+				code -= 0x10000
+				out += String.fromCharCode(0xD800 + ((code >> 10) & 0x3FF))
+				out += String.fromCharCode(0xDC00 + (code & 0x3FF))
+				i += 4
+				continue
+			}
+			i += 1
+		}
+		if (out.length > 0 && out.charCodeAt(0) == 0xFEFF) return out.substring(1)
+		return out
+	}
+
+	private static async predictWithMindSpore(text: string): Promise<ScreenOmniMsPrediction> {
+		const top = [] as ScreenOmniLiteTop[]
+		const runtime = await ScreenOmniLiteModelService.ensureMindSporeRuntime()
+		if (!runtime.ready) return { ok: false, label: '', confidence: 0.0, top3: top, message: runtime.message, method: '' } as ScreenOmniMsPrediction
+		try {
+			const modelPath = runtime.nativeModelPath != '' ? runtime.nativeModelPath : runtime.modelPath
+			const labelsPath = runtime.nativeLabelsPath != '' ? runtime.nativeLabelsPath : runtime.labelsPath
+			const ask = await ScreenOmniLiteModelService.getZemoAskRuntime()
+			const rawResult = await ask.classifyScreenIntent(text, modelPath, labelsPath)
+			const parsed = JSON.parse((rawResult ?? '').toString()) as any
+			const ok = parsed.ok === true
+			if (!ok) {
+				const message = parsed.message == null ? 'mindspore predict failed' : parsed.message.toString()
+				return { ok: false, label: '', confidence: 0.0, top3: top, message, method: '' } as ScreenOmniMsPrediction
+			}
+			const parsedTop = parsed.top3 as any[]
+			if (parsedTop != null) {
+				for (let i = 0; i < parsedTop.length && i < 3; i++) {
+					const item = parsedTop[i]
+					if (item == null) continue
+					const label = item.label == null ? '' : item.label.toString()
+					const score = item.score == null ? 0.0 : parseFloat(item.score.toString())
+					if (label != '') top.push({ label, score: isNaN(score) ? 0.0 : score } as ScreenOmniLiteTop)
+				}
+			}
+			const label = parsed.label == null ? '' : parsed.label.toString()
+			const confidence = parsed.confidence == null ? 0.0 : parseFloat(parsed.confidence.toString())
+			const method = parsed.method == null ? 'mindspore_lite_ms' : parsed.method.toString()
+			const fallbackMessage = parsed.fallbackMessage == null ? '' : parsed.fallbackMessage.toString()
+			return {
+				ok: label != '',
+				label,
+				confidence: isNaN(confidence) ? 0.0 : confidence,
+				top3: top,
+				message: fallbackMessage,
+				method
+			} as ScreenOmniMsPrediction
+		} catch (e) {
+			const message = e == null ? 'mindspore predict exception' : (e as Error).message
+			console.warn(`[屏幕意图] 文本 MS 推理失败：${message}`)
+			return { ok: false, label: '', confidence: 0.0, top3: top, message, method: '' } as ScreenOmniMsPrediction
+		}
+	}
+
+	private static emptyLegacyPrediction(message: string): ScreenOmniLegacyPrediction {
+		return { ok: false, label: '', confidence: 0.0, top3: [] as ScreenOmniLiteTop[], message } as ScreenOmniLegacyPrediction
+	}
+
+	private static async predictWithLegacyJson(text: string): Promise<ScreenOmniLegacyPrediction> {
+		const model = await ScreenOmniLiteModelService.ensureLegacyJsonModel()
+		if (model == null) return ScreenOmniLiteModelService.emptyLegacyPrediction('screen_omni_lite json not_readable')
+		try {
+			const labels = ScreenOmniLiteModelService.legacyLabels()
+			const labelCounts = ScreenOmniLiteModelService.jsonObject(model, 'label_counts')
+			const tokenCounts = ScreenOmniLiteModelService.jsonObject(model, 'token_counts')
+			const vocabSize = Math.max(1, Math.floor(ScreenOmniLiteModelService.jsonNumber(model, 'vocab_size')))
+			let total = 0.0
+			for (let i = 0; i < labels.length; i++) total += ScreenOmniLiteModelService.jsonNumber(labelCounts, labels[i])
+			const tokens = ScreenOmniLiteModelService.legacyTokens(text)
+			const scores = [] as ScreenOmniLegacyScore[]
+			for (let i = 0; i < labels.length; i++) {
+				const label = labels[i]
+				const labelCount = ScreenOmniLiteModelService.jsonNumber(labelCounts, label)
+				const counts = ScreenOmniLiteModelService.jsonObject(tokenCounts, label)
+				const denom = Math.max(1.0, ScreenOmniLiteModelService.legacyTokenTotal(counts) + vocabSize)
+				let score = Math.log((labelCount + 1.0) / (total + labels.length))
+				const limit = Math.min(tokens.length, 800)
+				let hits = 0
+				for (let j = 0; j < limit; j++) {
+					const count = ScreenOmniLiteModelService.jsonNumber(counts, tokens[j])
+					if (count > 0) hits += 1
+					score += Math.log((count + 1.0) / denom)
+				}
+				scores.push({ label, score, hits } as ScreenOmniLegacyScore)
+			}
+			scores.sort((a: ScreenOmniLegacyScore, b: ScreenOmniLegacyScore): number => b.score - a.score)
+			if (scores.length == 0 || scores[0].label == '') return ScreenOmniLiteModelService.emptyLegacyPrediction('screen_omni_lite empty_scores')
+			let sumExp = 0.0
+			const maxScore = scores[0].score
+			for (let i = 0; i < scores.length; i++) sumExp += Math.exp(scores[i].score - maxScore)
+			const top = [] as ScreenOmniLiteTop[]
+			for (let i = 0; i < scores.length && i < 3; i++) {
+				const confidence = sumExp > 0 ? Math.exp(scores[i].score - maxScore) / sumExp : 0.0
+				top.push({ label: scores[i].label, score: confidence } as ScreenOmniLiteTop)
+			}
+			if (scores[0].label != 'screen_summary' && scores[0].hits <= 0) {
+				return {
+					ok: true,
+					label: 'screen_summary',
+					confidence: 0.5,
+					top3: [{ label: 'screen_summary', score: 0.5 } as ScreenOmniLiteTop],
+					message: 'legacy_low_signal_default'
+				} as ScreenOmniLegacyPrediction
+			}
+			return { ok: true, label: top[0].label, confidence: top[0].score, top3: top, message: '' } as ScreenOmniLegacyPrediction
+		} catch (e) {
+			const message = e == null ? 'screen_omni_lite predict exception' : (e as Error).message
+			return { ok: false, label: '', confidence: 0.0, top3: [] as ScreenOmniLiteTop[], message } as ScreenOmniLegacyPrediction
+		}
+	}
+
+	private static async ensureLegacyJsonModel(): Promise<any | null> {
+		// Harmony uni runtime may throw "Cannot assign to read only property" while converting
+		// large JSON objects. The MindSpore screen intent model is the supported runtime path.
+		ScreenOmniLiteModelService.legacyReadyCache = false
+		return null
+	}
+
+	private static legacyLabels(): string[] {
+		return ['chat_todo', 'bill_record', 'investment_import', 'phone_action', 'screen_summary'] as string[]
+	}
+
+	private static jsonObject(parent: any, key: string): any {
+		if (parent == null) return null
+		try {
+			const value = parent[key]
+			return value == null ? null : value
+		} catch (_e) {}
+		return null
+	}
+
+	private static jsonNumber(parent: any, key: string): number {
+		const value = ScreenOmniLiteModelService.jsonObject(parent, key)
+		if (value == null) return 0.0
+		if (typeof value == 'number') return value
+		const num = parseFloat(value.toString())
+		return isNaN(num) ? 0.0 : num
+	}
+
+	private static safeNumber(value: any): number {
+		if (value == null) return 0.0
+		if (typeof value == 'number') return value
+		const num = parseFloat(value.toString())
+		return isNaN(num) ? 0.0 : num
+	}
+
+	private static legacyTokenTotal(counts: any): number {
+		if (counts == null) return 0.0
+		let total = 0.0
+		try {
+			const keys = Object.keys(counts)
+			for (let i = 0; i < keys.length; i++) total += ScreenOmniLiteModelService.jsonNumber(counts, keys[i])
+		} catch (_e) {}
+		return total
+	}
+
+	private static legacyTokens(text: string): string[] {
+		const value = ScreenOmniLiteModelService.normalizeText(text)
+		const tokens = [] as string[]
+		const chinese = [] as string[]
+		let word = ''
+		let number = ''
+		for (let i = 0; i < value.length; i++) {
+			const ch = value.charAt(i)
+			if (ScreenOmniLiteModelService.isAsciiWordChar(ch)) {
+				if (number != '') {
+					tokens.push(number)
+					number = ''
+				}
+				word += ch
+			} else if (ScreenOmniLiteModelService.isNumberChar(ch)) {
+				if (word != '') {
+					tokens.push(word)
+					word = ''
+				}
+				number += ch
+			} else {
+				if (word != '') {
+					tokens.push(word)
+					word = ''
+				}
+				if (number != '') {
+					tokens.push(number)
+					number = ''
+				}
+				if (ScreenOmniLiteModelService.isChineseChar(ch)) {
+					tokens.push(ch)
+					chinese.push(ch)
+				}
+			}
+		}
+		if (word != '') tokens.push(word)
+		if (number != '') tokens.push(number)
+		for (let i = 0; i + 1 < chinese.length; i++) tokens.push(chinese[i] + chinese[i + 1])
+		return tokens
+	}
+
+	private static isAsciiWordChar(ch: string): boolean {
+		if (ch.length == 0) return false
+		const code = ch.charCodeAt(0)
+		return (code >= 97 && code <= 122) || code == 95
+	}
+
+	private static isNumberChar(ch: string): boolean {
+		if (ch.length == 0) return false
+		const code = ch.charCodeAt(0)
+		return (code >= 48 && code <= 57) || code == 46
+	}
+
+	private static isChineseChar(ch: string): boolean {
+		if (ch.length == 0) return false
+		const code = ch.charCodeAt(0)
+		return code >= 0x4e00 && code <= 0x9fff
+	}
+
+	private static async predictImageWithMindSpore(imagePath: string): Promise<ScreenOmniMsPrediction> {
+		const top = [] as ScreenOmniLiteTop[]
+		const runtime = await ScreenOmniLiteModelService.ensureVisionRuntime()
+		if (!runtime.ready) return { ok: false, label: '', confidence: 0.0, top3: top, message: runtime.message, method: '' } as ScreenOmniMsPrediction
+		try {
+			const modelPath = runtime.nativeModelPath != '' ? runtime.nativeModelPath : runtime.modelPath
+			const labelsPath = runtime.nativeLabelsPath != '' ? runtime.nativeLabelsPath : runtime.labelsPath
+			const ask = await ScreenOmniLiteModelService.getZemoAskRuntime()
+			const rawResult = await ask.classifyScreenImageIntent(imagePath, modelPath, labelsPath)
+			const parsed = JSON.parse((rawResult ?? '').toString()) as any
+			const ok = parsed.ok == true
+			if (!ok) {
+				const message = parsed.message == null ? 'mindspore vision predict failed' : parsed.message.toString()
+				return { ok: false, label: '', confidence: 0.0, top3: top, message, method: '' } as ScreenOmniMsPrediction
+			}
+			const label = parsed.label == null ? '' : parsed.label.toString()
+			const confidence = ScreenOmniLiteModelService.safeNumber(parsed.confidence)
+			const parsedTop = parsed.top3 as any[]
+			if (parsedTop != null) {
+				for (let i = 0; i < parsedTop.length && i < 3; i++) {
+					const item = parsedTop[i]
+					if (item == null) continue
+					const topLabel = item.label == null ? '' : item.label.toString()
+					if (topLabel == '') continue
+					top.push({ label: topLabel, score: ScreenOmniLiteModelService.safeNumber(item.score) } as ScreenOmniLiteTop)
+				}
+			}
+			const method = parsed.method == null ? 'mindspore_lite_vision_ms' : parsed.method.toString()
+			const fallbackMessage = parsed.fallbackMessage == null ? '' : parsed.fallbackMessage.toString()
+			return { ok: label != '', label, confidence, top3: top, message: fallbackMessage, method } as ScreenOmniMsPrediction
+		} catch (e) {
+			const message = e == null ? 'mindspore vision predict exception' : (e as Error).message
+			console.warn(`[屏幕意图] 图片 MS 推理失败：${message}`)
+			return { ok: false, label: '', confidence: 0.0, top3: top, message, method: '' } as ScreenOmniMsPrediction
+		}
+	}
+
+	private static async getZemoAskRuntime(): Promise<ZemoAskRuntime> {
+		if (ScreenOmniLiteModelService.zemoAskRuntimePromise == null) {
+			ScreenOmniLiteModelService.zemoAskRuntimePromise = new Promise<ZemoAskRuntime>((resolve, reject) => {
+				void import('@/uni_modules/zemo-ask').then((module: Object): void => {
+					resolve(module as ZemoAskRuntime)
+				}).catch((e: Error): void => {
+					reject(e)
+				})
+			})
+		}
+		return ScreenOmniLiteModelService.zemoAskRuntimePromise as Promise<ZemoAskRuntime>
+	}
+
+	private static async ensureMindSporeRuntime(): Promise<ScreenOmniMsRuntime> {
+		const cached = ScreenOmniLiteModelService.msRuntimeCache
+		if (cached != null) return cached
+		const stored = await ScreenOmniLiteModelService.resolveStoredRuntime()
+		if (stored.ready) {
+			ScreenOmniLiteModelService.msRuntimeCache = stored
+			return stored
+		}
+
+		const modelData = await ScreenOmniLiteModelService.readFirstBinary([
+			ScreenOmniLiteModelService.MS_MODEL_ASSET_PATH,
+			'static/models/screen_omni_ms/screen_omni_intent.ms'
+		] as string[])
+		if (modelData == null) return ScreenOmniLiteModelService.failedMsRuntime('screen_omni_intent.ms not_readable')
+
+		const labelsText = await ScreenOmniLiteModelService.readFirstText([
+			ScreenOmniLiteModelService.MS_LABELS_ASSET_PATH,
+			'static/models/screen_omni_ms/label_map.json'
+		] as string[])
+		if (labelsText == '') return ScreenOmniLiteModelService.failedMsRuntime('label_map.json not_readable')
+
+		try {
+			await FileUtil.ensureDir(ScreenOmniLiteModelService.MS_RUNTIME_DIR)
+			const modelOk = await FileUtil.writeBinaryFile(ScreenOmniLiteModelService.MS_MODEL_RUNTIME_PATH, modelData)
+			const labelsOk = await ScreenOmniLiteModelService.writeTextRuntimeFile(ScreenOmniLiteModelService.MS_LABELS_RUNTIME_PATH, labelsText)
+			if (!modelOk) return ScreenOmniLiteModelService.failedMsRuntime(`runtime copy failed: model=fail, labels=${labelsOk ? 'ok' : 'pending_native'}`)
+			let nativeModelPath = ''
+			let nativeLabelsPath = ''
+			// #ifdef APP-HARMONY
+			nativeModelPath = ScreenOmniLiteModelService.prepareHarmonyNativeBinary('screen_omni_intent.ms', modelData)
+			nativeLabelsPath = ScreenOmniLiteModelService.prepareHarmonyNativeText('label_map.json', labelsText)
+			if (nativeModelPath == '' || nativeLabelsPath == '') {
+				return ScreenOmniLiteModelService.failedMsRuntime(`native copy failed: model=${nativeModelPath == '' ? 'missing' : 'ok'}, labels=${nativeLabelsPath == '' ? 'missing' : 'ok'}`)
+			}
+			// #endif
+			if (!labelsOk && nativeLabelsPath == '') return ScreenOmniLiteModelService.failedMsRuntime('runtime labels copy failed')
+			const storedLabelsPath = labelsOk ? ScreenOmniLiteModelService.MS_LABELS_RUNTIME_PATH : nativeLabelsPath
+			const result = {
+				ready: true,
+				modelPath: ScreenOmniLiteModelService.MS_MODEL_RUNTIME_PATH,
+				labelsPath: storedLabelsPath,
+				nativeModelPath,
+				nativeLabelsPath,
+				message: ''
+			} as ScreenOmniMsRuntime
+			ScreenOmniLiteModelService.msRuntimeCache = result
+			console.log(`[屏幕意图] 文本模型就绪：model=${result.modelPath}，native=${nativeModelPath == '' ? 'runtime' : nativeModelPath}`)
+			return result
+		} catch (e) {
+			const message = e == null ? 'mindspore runtime exception' : (e as Error).message
+			return ScreenOmniLiteModelService.failedMsRuntime(message)
+		}
+	}
+
+	private static async ensureVisionRuntime(): Promise<ScreenOmniMsRuntime> {
+		const cached = ScreenOmniLiteModelService.visionRuntimeCache
+		if (cached != null && cached.ready) return cached
+		const modelData = await ScreenOmniLiteModelService.readFirstBinary([
+			ScreenOmniLiteModelService.VISION_MODEL_ASSET_PATH,
+			'static/models/screen_omni_vision_ms/screen_omni_vision_intent.ms'
+		] as string[])
+		if (modelData == null) return ScreenOmniLiteModelService.failedVisionRuntime('screen_omni_vision_intent.ms not_readable')
+
+		const labelsText = await ScreenOmniLiteModelService.readFirstText([
+			ScreenOmniLiteModelService.VISION_LABELS_ASSET_PATH,
+			'static/models/screen_omni_vision_ms/label_map.json'
+		] as string[])
+		if (labelsText == '') return ScreenOmniLiteModelService.failedVisionRuntime('vision label_map.json not_readable')
+
+		try {
+			await FileUtil.ensureDir(ScreenOmniLiteModelService.VISION_RUNTIME_DIR)
+			const modelOk = await FileUtil.writeBinaryFile(ScreenOmniLiteModelService.VISION_MODEL_RUNTIME_PATH, modelData)
+			const labelsOk = await ScreenOmniLiteModelService.writeTextRuntimeFile(ScreenOmniLiteModelService.VISION_LABELS_RUNTIME_PATH, labelsText)
+			if (!modelOk) return ScreenOmniLiteModelService.failedVisionRuntime(`vision runtime copy failed: model=fail, labels=${labelsOk ? 'ok' : 'pending_native'}`)
+			let nativeModelPath = ''
+			let nativeLabelsPath = ''
+			// #ifdef APP-HARMONY
+			nativeModelPath = ScreenOmniLiteModelService.prepareHarmonyNativeBinary('screen_omni_vision_intent.ms', modelData)
+			nativeLabelsPath = ScreenOmniLiteModelService.prepareHarmonyNativeText('screen_omni_vision_label_map.json', labelsText)
+			if (nativeModelPath == '' || nativeLabelsPath == '') {
+				return ScreenOmniLiteModelService.failedVisionRuntime(`vision native copy failed: model=${nativeModelPath == '' ? 'missing' : 'ok'}, labels=${nativeLabelsPath == '' ? 'missing' : 'ok'}`)
+			}
+			// #endif
+			if (!labelsOk && nativeLabelsPath == '') return ScreenOmniLiteModelService.failedVisionRuntime('vision runtime labels copy failed')
+			const storedLabelsPath = labelsOk ? ScreenOmniLiteModelService.VISION_LABELS_RUNTIME_PATH : nativeLabelsPath
+			const result = {
+				ready: true,
+				modelPath: ScreenOmniLiteModelService.VISION_MODEL_RUNTIME_PATH,
+				labelsPath: storedLabelsPath,
+				nativeModelPath,
+				nativeLabelsPath,
+				message: ''
+			} as ScreenOmniMsRuntime
+			ScreenOmniLiteModelService.visionRuntimeCache = result
+			console.log(`[屏幕意图] 图片模型就绪：model=${result.modelPath}，native=${nativeModelPath == '' ? 'runtime' : nativeModelPath}`)
+			return result
+		} catch (e) {
+			const message = e == null ? 'vision runtime error' : (e as Error).message
+			return ScreenOmniLiteModelService.failedVisionRuntime(message)
+		}
+	}
+
+	private static failedVisionRuntime(message: string): ScreenOmniMsRuntime {
+		const result = { ready: false, modelPath: '', labelsPath: '', nativeModelPath: '', nativeLabelsPath: '', message } as ScreenOmniMsRuntime
+		ScreenOmniLiteModelService.visionRuntimeCache = result
+		return result
+	}
+
+	private static failedMsRuntime(message: string): ScreenOmniMsRuntime {
+		const result = { ready: false, modelPath: '', labelsPath: '', nativeModelPath: '', nativeLabelsPath: '', message } as ScreenOmniMsRuntime
+		ScreenOmniLiteModelService.msRuntimeCache = result
+		return result
+	}
+
+	private static async installResult(ok: boolean, message: string): Promise<ScreenOmniModelInstallResult> {
+		const status = await ScreenOmniLiteModelService.getModelStatus()
+		return { ok, message, status } as ScreenOmniModelInstallResult
+	}
+
+	private static async resolveStoredRuntime(): Promise<ScreenOmniMsRuntime> {
+		const modelPath = ScreenOmniLiteModelService.readStorageText(ScreenOmniLiteModelService.MODEL_PATH_KEY)
+		const labelsPath = ScreenOmniLiteModelService.readStorageText(ScreenOmniLiteModelService.LABELS_PATH_KEY)
+		if (modelPath == '' || labelsPath == '') return { ready: false, modelPath: '', labelsPath: '', nativeModelPath: '', nativeLabelsPath: '', message: 'no stored screen omni model' } as ScreenOmniMsRuntime
+		if (!ScreenOmniLiteModelService.looksLikeScreenIntentModelPath(modelPath)) {
+			ScreenOmniLiteModelService.clearStoredRuntimeKeys()
+			return { ready: false, modelPath: '', labelsPath: '', nativeModelPath: '', nativeLabelsPath: '', message: `stored screen model rejected: ${modelPath}` } as ScreenOmniMsRuntime
+		}
+		const modelReady = await FileUtil.exists(modelPath)
+		const labelsReady = await FileUtil.exists(labelsPath)
+		if (!modelReady || !labelsReady) return { ready: false, modelPath: '', labelsPath: '', nativeModelPath: '', nativeLabelsPath: '', message: `stored model missing: model=${modelReady ? 'ok' : 'missing'}, labels=${labelsReady ? 'ok' : 'missing'}` } as ScreenOmniMsRuntime
+		const modelData = await FileUtil.readBinaryFile(modelPath)
+		if (modelData == null || !ScreenOmniLiteModelService.isScreenIntentModelBinary(modelData)) {
+			ScreenOmniLiteModelService.clearStoredRuntimeKeys()
+			return { ready: false, modelPath: '', labelsPath: '', nativeModelPath: '', nativeLabelsPath: '', message: 'stored screen model rejected: model binary is not text intent model' } as ScreenOmniMsRuntime
+		}
+		const labelsText = await ScreenOmniLiteModelService.readTextWithBinaryFallback(labelsPath)
+		if (!ScreenOmniLiteModelService.isScreenIntentLabelMapText(labelsText)) {
+			ScreenOmniLiteModelService.clearStoredRuntimeKeys()
+			return { ready: false, modelPath: '', labelsPath: '', nativeModelPath: '', nativeLabelsPath: '', message: 'stored screen model rejected: label_map is not text intent model' } as ScreenOmniMsRuntime
+		}
+		let nativeModelPath = ScreenOmniLiteModelService.readStorageText(ScreenOmniLiteModelService.NATIVE_MODEL_PATH_KEY)
+		let nativeLabelsPath = ScreenOmniLiteModelService.readStorageText(ScreenOmniLiteModelService.NATIVE_LABELS_PATH_KEY)
+		// #ifdef APP-HARMONY
+		if (nativeModelPath == '' || !ScreenOmniLiteModelService.harmonyPathExists(nativeModelPath)) {
+			const data = await FileUtil.readBinaryFile(modelPath)
+			if (data != null) nativeModelPath = ScreenOmniLiteModelService.prepareHarmonyNativeBinary('screen_omni_intent.ms', data)
+		}
+		if (nativeLabelsPath == '' || !ScreenOmniLiteModelService.harmonyPathExists(nativeLabelsPath)) {
+			const text = await FileUtil.readTextFile(labelsPath)
+			if (text != null && text != '') nativeLabelsPath = ScreenOmniLiteModelService.prepareHarmonyNativeText('label_map.json', text)
+		}
+		if (nativeModelPath == '' || nativeLabelsPath == '') return { ready: false, modelPath, labelsPath, nativeModelPath, nativeLabelsPath, message: 'stored model native path not ready' } as ScreenOmniMsRuntime
+		// #endif
+		return { ready: true, modelPath, labelsPath, nativeModelPath, nativeLabelsPath, message: '' } as ScreenOmniMsRuntime
+	}
+
+	private static clearStoredRuntimeKeys(): void {
+		try { uni.removeStorageSync(ScreenOmniLiteModelService.MODEL_PATH_KEY) } catch (_e0) {}
+		try { uni.removeStorageSync(ScreenOmniLiteModelService.LABELS_PATH_KEY) } catch (_e1) {}
+		try { uni.removeStorageSync(ScreenOmniLiteModelService.NATIVE_MODEL_PATH_KEY) } catch (_e2) {}
+		try { uni.removeStorageSync(ScreenOmniLiteModelService.NATIVE_LABELS_PATH_KEY) } catch (_e3) {}
+	}
+
+	private static isScreenIntentModelBinary(data: ArrayBuffer): boolean {
+		if (data.byteLength <= 0) return false
+		if (ScreenOmniLiteModelService.binaryContainsAscii(data, 'image_features')) return false
+		return ScreenOmniLiteModelService.binaryContainsAscii(data, 'features')
+	}
+
+	private static binaryContainsAscii(data: ArrayBuffer, needle: string): boolean {
+		const bytes = new Uint8Array(data)
+		const value = (needle ?? '').toString()
+		if (value == '' || bytes.length < value.length) return false
+		const target = [] as number[]
+		for (let i = 0; i < value.length; i++) target.push(value.charCodeAt(i))
+		const last = bytes.length - target.length
+		for (let i = 0; i <= last; i++) {
+			let ok = true
+			for (let j = 0; j < target.length; j++) {
+				if (bytes[i + j] != target[j]) {
+					ok = false
+					break
+				}
+			}
+			if (ok) return true
+		}
+		return false
+	}
+
+	private static async isLegacyJsonReady(): Promise<boolean> {
+		if (ScreenOmniLiteModelService.legacyReadyCache != null) return ScreenOmniLiteModelService.legacyReadyCache == true
+		const model = await ScreenOmniLiteModelService.ensureLegacyJsonModel()
+		return model != null
+	}
+
+	private static async readFirstBinary(paths: string[]): Promise<ArrayBuffer | null> {
+		for (let i = 0; i < paths.length; i++) {
+			try {
+				const data = await ScreenOmniLiteModelService.readBundledBinary(paths[i])
+				if (data != null && data.byteLength > 0) return data
+			} catch (_e) {}
+		}
+		return null
+	}
+
+	private static async readFirstText(paths: string[]): Promise<string> {
+		for (let i = 0; i < paths.length; i++) {
+			try {
+				const text = await ScreenOmniLiteModelService.readTextWithBinaryFallback(paths[i])
+				if (text != null && text != '') return text
+			} catch (_e) {}
+		}
+		return ''
+	}
+
+	private static async readBundledBinary(path: string): Promise<ArrayBuffer | null> {
+		// #ifdef APP-HARMONY
+		const raw = ScreenOmniLiteModelService.readHarmonyRawFileBinary(path)
+		if (raw != null && raw.byteLength > 0) return raw
+		const physical = ScreenOmniLiteModelService.readHarmonyPhysicalBinary(path)
+		if (physical != null && physical.byteLength > 0) return physical
+		// #endif
+
+		return await FileUtil.readBinaryFile(path)
+	}
+
+	private static readHarmonyRawFileBinary(path: string): ArrayBuffer | null {
+		// #ifdef APP-HARMONY
+		try {
+			const ctx = getContext() as common.UIAbilityContext
+			const rm = (ctx as any).resourceManager
+			if (rm == null) return null
+			const candidates = ScreenOmniLiteModelService.buildRawFileCandidates(path)
+			for (let i = 0; i < candidates.length; i++) {
+				try {
+					const data = rm.getRawFileContentSync(candidates[i])
+					const out = ScreenOmniLiteModelService.toArrayBuffer(data)
+					if (out != null && out.byteLength > 0) {
+						console.log(`[屏幕意图] 读取内置资源成功：${candidates[i]}，字节=${out.byteLength}`)
+						return out
+					}
+				} catch (_e0) {}
+			}
+		} catch (_e1) {}
+		// #endif
+
+		return null
+	}
+
+	private static readHarmonyPhysicalBinary(path: string): ArrayBuffer | null {
+		// #ifdef APP-HARMONY
+		const candidates = ScreenOmniLiteModelService.buildHarmonyPhysicalCandidates(path)
+		for (let i = 0; i < candidates.length; i++) {
+			let file: fs.File | null = null
+			try {
+				file = fs.openSync(candidates[i], fs.OpenMode.READ_ONLY)
+				const stat = fs.statSync(file.fd)
+				const size = parseInt(stat.size.toString())
+				if (size <= 0) continue
+				const out = new ArrayBuffer(size)
+				fs.readSync(file.fd, out)
+				console.log(`[屏幕意图] 读取物理资源成功：${candidates[i]}，字节=${size}`)
+				return out
+			} catch (_e0) {
+			} finally {
+				try {
+					if (file != null) fs.closeSync(file)
+				} catch (_e1) {}
+			}
+		}
+		console.warn(`[屏幕意图] 未找到内置资源：${path}`)
+		// #endif
+
+		return null
+	}
+
+	private static buildRawFileCandidates(path: string): string[] {
+		const normalized = FileUtil.normalizePath(path).replace(/^\/+/, '')
+		const result = [] as string[]
+		ScreenOmniLiteModelService.pushUnique(result, normalized)
+		ScreenOmniLiteModelService.pushUnique(result, `resources/rawfile/${normalized}`)
+		if (normalized.indexOf('static/') == 0) {
+			ScreenOmniLiteModelService.pushUnique(result, normalized.substring('static/'.length))
+			ScreenOmniLiteModelService.pushUnique(result, `resources/rawfile/${normalized.substring('static/'.length)}`)
+		}
+		return result
+	}
+
+	private static buildHarmonyPhysicalCandidates(path: string): string[] {
+		const normalized = FileUtil.normalizePath(path)
+		const rel = normalized.replace(/^\/+/, '')
+		const result = [] as string[]
+		ScreenOmniLiteModelService.pushUnique(result, normalized)
+		ScreenOmniLiteModelService.pushUnique(result, rel)
+		// #ifdef APP-HARMONY
+		let filesDir = ''
+		let resourceDir = ''
+		let bundleCodeDir = ''
+		try {
+			const ctx = getContext() as common.UIAbilityContext
+			const ctxAny = ctx as any
+			filesDir = ((ctxAny.filesDir ?? '') as string).toString().replace(/\\/g, '/').replace(/\/+$/, '')
+			resourceDir = ((ctxAny.resourceDir ?? '') as string).toString().replace(/\\/g, '/').replace(/\/+$/, '')
+			bundleCodeDir = ((ctxAny.bundleCodeDir ?? '') as string).toString().replace(/\\/g, '/').replace(/\/+$/, '')
+		} catch (_e0) {}
+		if (filesDir != '') ScreenOmniLiteModelService.pushUnique(result, `${filesDir}/${rel}`)
+		if (resourceDir != '') {
+			ScreenOmniLiteModelService.pushUnique(result, `${resourceDir}/${rel}`)
+			ScreenOmniLiteModelService.pushUnique(result, `${resourceDir}/rawfile/${rel}`)
+			ScreenOmniLiteModelService.pushUnique(result, `${resourceDir}/resfile/${rel}`)
+		}
+		if (bundleCodeDir != '') {
+			ScreenOmniLiteModelService.pushUnique(result, `${bundleCodeDir}/${rel}`)
+			ScreenOmniLiteModelService.pushUnique(result, `${bundleCodeDir}/entry/resources/rawfile/${rel}`)
+			ScreenOmniLiteModelService.pushUnique(result, `${bundleCodeDir}/entry/resources/resfile/${rel}`)
+		}
+		ScreenOmniLiteModelService.pushUnique(result, `/data/storage/el2/base/haps/entry/files/${rel}`)
+		ScreenOmniLiteModelService.pushUnique(result, `/data/storage/el1/bundle/entry/resources/rawfile/${rel}`)
+		ScreenOmniLiteModelService.pushUnique(result, `/data/storage/el1/bundle/entry/resources/resfile/${rel}`)
+		// #endif
+		return result
+	}
+
+	private static toArrayBuffer(value: any): ArrayBuffer | null {
+		if (value == null) return null
+		try {
+			const bytes = value as Uint8Array
+			if (bytes.length > 0) {
+				const out = new Uint8Array(bytes.length)
+				for (let i = 0; i < bytes.length; i++) out[i] = bytes[i]
+				return out.buffer
+			}
+		} catch (_e0) {}
+		try {
+			const buffer = value as ArrayBuffer
+			const check = new Uint8Array(buffer)
+			if (check.length > 0) return buffer
+		} catch (_e1) {}
+		return null
+	}
+
+	private static pushUnique(list: string[], value: string): void {
+		const text = (value ?? '').toString().trim()
+		if (text == '') return
+		for (let i = 0; i < list.length; i++) {
+			if (list[i] == text) return
+		}
+		list.push(text)
+	}
+
+	private static prepareHarmonyNativeBinary(fileName: string, data: ArrayBuffer): string {
+		// #ifdef APP-HARMONY
+		const root = ScreenOmniLiteModelService.getHarmonyNativeRoot()
+		if (root == '') return ''
+		const path = `${root}/${fileName}`
+		return ScreenOmniLiteModelService.writeHarmonyBinaryFile(path, data) ? path : ''
+		// #endif
+
+		return ''
+	}
+
+	private static prepareHarmonyNativeText(fileName: string, text: string): string {
+		// #ifdef APP-HARMONY
+		const root = ScreenOmniLiteModelService.getHarmonyNativeRoot()
+		if (root == '') return ''
+		const path = `${root}/${fileName}`
+		return ScreenOmniLiteModelService.writeHarmonyTextFile(path, text) ? path : ''
+		// #endif
+
+		return ''
+	}
+
+	private static getHarmonyNativeRoot(): string {
+		// #ifdef APP-HARMONY
+		let baseDir = ''
+		try {
+			const ctx = getContext() as common.UIAbilityContext
+			baseDir = ((ctx.filesDir ?? '') as string).toString().replace(/\\/g, '/').replace(/\/+$/, '')
+		} catch (_e0) {}
+		if (baseDir == '') baseDir = '/data/storage/el2/base/haps/entry/files'
+		const root = `${baseDir}/zemo/assets/ai/screen_omni_intent_native`
+		return ScreenOmniLiteModelService.ensureHarmonyDir(root) ? root : ''
+		// #endif
+
+		return ''
+	}
+
+	private static writeHarmonyBinaryFile(filePath: string, data: ArrayBuffer): boolean {
+		// #ifdef APP-HARMONY
+		let file: fs.File | null = null
+		try {
+			const slash = filePath.lastIndexOf('/')
+			if (slash > 0 && !ScreenOmniLiteModelService.ensureHarmonyDir(filePath.substring(0, slash))) return false
+			file = fs.openSync(filePath, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC)
+			fs.writeSync(file.fd, data)
+			try { fs.fsyncSync(file.fd) } catch (_e1) {}
+			return ScreenOmniLiteModelService.harmonyPathExists(filePath)
+		} catch (_e0) {
+			console.warn(`[屏幕意图] 写入原生模型失败：${filePath}，原因=${_e0}`)
+			return false
+		} finally {
+			try {
+				if (file != null) fs.closeSync(file)
+			} catch (_e1) {}
+		}
+		// #endif
+
+		return false
+	}
+
+	private static writeHarmonyTextFile(filePath: string, text: string): boolean {
+		// #ifdef APP-HARMONY
+		let file: fs.File | null = null
+		try {
+			const slash = filePath.lastIndexOf('/')
+			if (slash > 0 && !ScreenOmniLiteModelService.ensureHarmonyDir(filePath.substring(0, slash))) return false
+			file = fs.openSync(filePath, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC)
+			fs.writeSync(file.fd, text, { encoding: 'utf-8' })
+			try { fs.fsyncSync(file.fd) } catch (_e1) {}
+			return ScreenOmniLiteModelService.harmonyPathExists(filePath)
+		} catch (_e0) {
+			console.warn(`[屏幕意图] 写入原生标签失败：${filePath}，原因=${_e0}`)
+			return false
+		} finally {
+			try {
+				if (file != null) fs.closeSync(file)
+			} catch (_e1) {}
+		}
+		// #endif
+
+		return false
+	}
+
+	private static ensureHarmonyDir(dirPath: string): boolean {
+		// #ifdef APP-HARMONY
+		try {
+			const stat = fs.statSync(dirPath)
+			if (stat != null && stat.isDirectory()) return true
+			try { fs.unlinkSync(dirPath) } catch (_e0) {}
+		} catch (_e1) {}
+		try {
+			fs.mkdirSync(dirPath, true)
+			const stat = fs.statSync(dirPath)
+			return stat != null && stat.isDirectory()
+		} catch (_e2) {
+			try {
+				const stat = fs.statSync(dirPath)
+				return stat != null && stat.isDirectory()
+			} catch (_e3) {
+				return false
+			}
+		}
+		// #endif
+
+		return false
+	}
+
+	private static harmonyPathExists(filePath: string): boolean {
+		// #ifdef APP-HARMONY
+		try {
+			const stat = fs.statSync(filePath)
+			if (stat == null) return false
+			if (stat.isDirectory()) return false
+			return true
+		} catch (_e0) {
+			return false
+		}
+		// #endif
+
+		return false
+	}
+
+	private static ruleLabel(value: string, raw: string): string {
+		if (ScreenOmniLiteModelService.investmentScore(value) >= 2) return 'investment_import'
+		if (ScreenOmniLiteModelService.looksLikeBill(value)) return 'bill_record'
+		if (ScreenOmniLiteModelService.looksLikeTodo(value, raw)) return 'chat_todo'
+		const activity = ScreenOmniLiteModelService.activityLabel(value)
+		if (activity != '') return activity
+		return ''
+	}
+
+	private static looksLikeBill(value: string): boolean {
+		if (!/[+\-]?\s*[¥￥]?\s*[0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*(?:元)?/.test(value)) return false
+		return ScreenOmniLiteModelService.containsAny(value, [
+			'收入', '收款', '入账', '退款', '到账',
+			'支出', '付款', '支付', '消费', '实付', '扣款',
+			'微信', '支付宝', '云闪付', '银行卡', '招商银行', '工商银行'
+		])
+	}
+
+	private static investmentScore(value: string): number {
+		let score = 0
+		const keywords = ['基金', '持仓', '市值', '收益率', '盈亏', '净值', '份额', '证券', 'ETF', 'etf']
+		for (let i = 0; i < keywords.length; i++) {
+			if (value.indexOf(keywords[i].toLowerCase()) >= 0) score += 1
+		}
+		return score
+	}
+
+	private static looksLikeTodo(value: string, raw: string): boolean {
+		if (!ScreenOmniLiteModelService.containsAny(value, [
+			'记得', '提醒', '待办', '安排', '开会', '提交', '确认', '处理', '跟进', '报销', '付款', '还款'
+		])) return false
+		const hasTime = /(今天|明天|后天|今晚|下周[一二三四五六日天]?|周[一二三四五六日天]|\d{1,2}[:：]\d{2}|\d{1,2}[月\/\-]\d{1,2})/.test(value)
+		const hasSpeaker = /(^|\n).{1,12}[:：]\s*.{2,}/.test(raw)
+		const hasChatHint = ScreenOmniLiteModelService.containsAny(value, ['群聊', '聊天', '微信', '收到', '回复'])
+		return hasTime || hasSpeaker || hasChatHint
+	}
+
+	private static activityLabel(value: string): string {
+		if (ScreenOmniLiteModelService.containsAny(value, [
+			'淘宝', '天猫', '京东', '拼多多', '闲鱼', '小米商城', '1688', '购物车',
+			'商品', '下单', '店铺', '优惠券', '加入购物车', '客服'
+		])) return 'shopping_activity'
+		if (ScreenOmniLiteModelService.containsAny(value, [
+			'哔哩', 'bilibili', '抖音', '腾讯视频', '爱奇艺', 'qq音乐', '网易云音乐',
+			'播放', '暂停', '倍速', '弹幕', '电影', '电视剧', '综艺', '短视频', '歌单', '歌词'
+		])) return 'entertainment_activity'
+		return ''
+	}
+
+	private static normalizeText(text: string): string {
+		return (text ?? '').toString()
+			.replace(/\[\[ocr:[^\]]+\]\]/g, ' ')
+			.replace(/\s+/g, ' ')
+			.trim()
+			.toLowerCase()
+	}
+
+	private static containsAny(text: string, keywords: string[]): boolean {
+		for (let i = 0; i < keywords.length; i++) {
+			if (text.indexOf(keywords[i].toLowerCase()) >= 0) return true
+		}
+		return false
+	}
+
+	private static screenTextMsMethod(method: string): string {
+		return 'mindspore_lite_ms'
+	}
+
+	private static screenVisionMsMethod(method: string): string {
+		return 'mindspore_lite_vision_ms'
+	}
+
+	private static result(label: string, method: string, modelReady: boolean, confidence: number, top3: ScreenOmniLiteTop[]): ScreenOmniLitePrediction {
+		let kind = 'general'
+		let action = 'summarize_screen'
+		if (label == 'chat_todo') {
+			kind = 'chat'
+			action = 'create_todos'
+		} else if (label == 'bill_record') {
+			kind = 'bill'
+			action = 'create_transaction'
+		} else if (label == 'investment_import') {
+			kind = 'investment'
+			action = 'import_investment'
+		} else if (label == 'shopping_activity' || label == 'entertainment_activity') {
+			kind = 'activity'
+			action = 'record_activity'
+		} else if (label == 'phone_action') {
+			kind = 'phone_action'
+			action = 'suggest_phone_action'
+		}
+		return {
+			ok: true,
+			label,
+			kind,
+			action,
+			method,
+			message: '',
+			modelReady,
+			confidence,
+			top3
+		} as ScreenOmniLitePrediction
+	}
+
+	private static safeJson(value: any): string {
+		try {
+			return JSON.stringify(value)
+		} catch (_e) {
+			try {
+				return value == null ? 'null' : value.toString()
+			} catch (_e2) {}
+		}
+		return '[unserializable]'
+	}
+
+	private static limitText(text: string, limit: number): string {
+		const value = (text ?? '').toString()
+		if (value.length <= limit) return value
+		return `${value.substring(0, limit)}...(len=${value.length})`
+	}
+
+	private static readStorageText(key: string): string {
+		try {
+			const value = uni.getStorageSync(key)
+			return value == null ? '' : value.toString()
+		} catch (_e) {}
+		return ''
+	}
+
+	private static basename(path: string): string {
+		const normalized = FileUtil.normalizePath(path)
+		const idx = normalized.lastIndexOf('/')
+		return idx >= 0 ? normalized.substring(idx + 1) : normalized
+	}
+
+	private static formatNow(): string {
+		const d = new Date()
+		const y = d.getFullYear()
+		const m = `${d.getMonth() + 1}`.padStart(2, '0')
+		const day = `${d.getDate()}`.padStart(2, '0')
+		const hh = `${d.getHours()}`.padStart(2, '0')
+		const mm = `${d.getMinutes()}`.padStart(2, '0')
+		const ss = `${d.getSeconds()}`.padStart(2, '0')
+		return `${y}-${m}-${day} ${hh}:${mm}:${ss}`
+	}
+}

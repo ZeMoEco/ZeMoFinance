@@ -1,0 +1,1425 @@
+<template>
+	<view class="modal-mask" @click="closeModal">
+		<view class="glass-modal" @click.stop>
+			<view class="modal-head">
+				<view class="modal-head-left">
+					<text class="modal-head-title">{{ title }}</text>
+					<text v-if="isQuickMode" class="modal-head-sub">快速任务创建</text>
+				</view>
+				<text class="modal-close-icon" @click="closeModal">×</text>
+			</view>
+
+			<view v-if="isListMode" class="list-mode-wrap">
+				<view class="search-wrap">
+					<input class="search-input" v-model="keyword" placeholder="搜索..." placeholder-style="color: rgba(255,255,255,0.4)" />
+				</view>
+				<scroll-view class="scroll-list" scroll-y="true">
+					<view class="row-item" v-for="item in filteredList" :key="item.id" @click="onSelectItem(item)">
+						<text class="row-item-text">{{ item.title }}</text>
+					</view>
+					<view v-if="filteredList.length == 0" class="empty-box">
+						<text class="empty-text">未找到匹配项</text>
+					</view>
+				</scroll-view>
+			</view>
+
+			<view v-else class="quick-mode-wrap">
+				<view class="scene-tabs">
+					<view class="scene-tab" :style="activeScene == 'recipe' ? 'background-color: rgba(70, 180, 255, 0.22); border: 1px solid rgba(90, 190, 255, 0.55);' : ''" @click="switchScene('recipe')">
+						<text class="scene-tab-text" :style="activeScene == 'recipe' ? 'color: #d4f1ff; font-weight: 600;' : ''">食谱导入</text>
+					</view>
+					<view class="scene-tab" :style="activeScene == 'courier' ? 'background-color: rgba(70, 180, 255, 0.22); border: 1px solid rgba(90, 190, 255, 0.55);' : ''" @click="switchScene('courier')">
+						<text class="scene-tab-text" :style="activeScene == 'courier' ? 'color: #d4f1ff; font-weight: 600;' : ''">日常</text>
+					</view>
+					<view class="scene-tab" :style="activeScene == 'storage' ? 'background-color: rgba(70, 180, 255, 0.22); border: 1px solid rgba(90, 190, 255, 0.55);' : ''" @click="switchScene('storage')">
+						<text class="scene-tab-text" :style="activeScene == 'storage' ? 'color: #d4f1ff; font-weight: 600;' : ''">物品储存</text>
+					</view>
+				</view>
+
+				<scroll-view class="quick-scroll" scroll-y="true">
+					<view v-if="activeScene == 'recipe'" class="scene-panel">
+						<text class="field-label">食谱标题</text>
+						<input class="field-input" v-model="recipeTitle" placeholder="例如：番茄牛腩煲" />
+						<text class="field-label">网页食谱内容（复制粘贴）</text>
+						<textarea class="field-textarea" v-model="recipeRaw" placeholder="粘贴网页中的食材/步骤内容" auto-height></textarea>
+						<text class="field-label">下次时间与频率</text>
+						<view class="schedule-row">
+							<view class="picker-box schedule-box" @click="openSceneDatePicker('recipe')">
+								<text class="picker-text">{{ displayDate(recipeDateStr) }}</text>
+							</view>
+							<view class="picker-box schedule-box" @click="openSceneTimePicker('recipe')">
+								<text class="picker-text">{{ recipeTimeStr }}</text>
+							</view>
+							<view class="picker-box schedule-box schedule-box-last" @click="openSceneRepeatActionSheet('recipe')">
+								<text class="picker-text">{{ repeatRuleLabel(recipeRepeatTypeIndex) }}</text>
+								<text class="picker-arrow">›</text>
+							</view>
+						</view>
+						<text class="field-tip">确认后只创建未开始任务，不会直接进入待办执行。</text>
+					</view>
+
+					<view v-if="activeScene == 'courier'" class="scene-panel">
+						<text class="field-label">日常任务名称</text>
+						<view class="picker-row courier-task-row">
+							<input class="field-input courier-task-input" :style="courierCanEditName ? '' : 'opacity: 0.74;'" v-model="courierTaskName" :disabled="!courierCanEditName" placeholder="选择已有日常，或切换新增后输入名称" />
+							<view class="courier-picker-btn" @click="openDailyTaskPicker">
+								<text class="picker-arrow courier-picker-arrow">›</text>
+							</view>
+						</view>
+						<text class="field-tip">{{ courierCanEditName ? '新增模式：输入名称后，确认可保存为未启动任务。' : '已选择已有任务：确认后将快速重启该任务。' }}</text>
+						<text class="field-label">任务描述（可选）</text>
+						<textarea class="field-textarea" v-model="courierDescription" placeholder="输入任务描述，例如：到菜鸟驿站取件并核对包裹" auto-height></textarea>
+						
+						<view class="picker-row" style="margin-top: 12px; margin-bottom: 12px;" @click="courierNeedStore = !courierNeedStore">
+							<text :style="courierNeedStore ? 'color: #2f88ff; font-size: 18px; margin-right: 6px;' : 'color: rgba(255,255,255,0.5); font-size: 18px; margin-right: 6px;'">{{ courierNeedStore ? '☑' : '☐' }}</text>
+							<text style="font-size: 14px; color: #fff;">完成后将物品放入对应储物箱</text>
+						</view>
+						<view v-if="courierNeedStore" style="margin-bottom: 12px;">
+							<text class="field-label">目标储物箱</text>
+							<view class="picker-row">
+								<view class="picker-box" :style="courierStorageTargetId != '' ? 'border: 1px solid rgba(90, 190, 255, 0.55); background-color: rgba(70, 180, 255, 0.16);' : ''" @click="chooseDailyStorageTarget">
+									<text class="picker-text">{{ courierStorageTargetName == '' ? '选择储物箱' : courierStorageTargetName }}</text>
+								</view>
+							</view>
+							<text v-if="courierStorageTargetId != ''" class="selected-hint">已选择储物箱：{{ courierStorageTargetName }}</text>
+						</view>
+
+						<text class="field-label">下次时间与频率</text>
+						<view class="schedule-row">
+							<view class="picker-box schedule-box" @click="openSceneDatePicker('courier')">
+								<text class="picker-text">{{ displayDate(courierDateStr) }}</text>
+							</view>
+							<view class="picker-box schedule-box" @click="openSceneTimePicker('courier')">
+								<text class="picker-text">{{ courierTimeStr }}</text>
+							</view>
+							<view class="picker-box schedule-box schedule-box-last" @click="openSceneRepeatActionSheet('courier')">
+								<text class="picker-text">{{ repeatRuleLabel(courierRepeatTypeIndex) }}</text>
+								<text class="picker-arrow">›</text>
+							</view>
+						</view>
+						<text class="field-tip">点击右侧箭头可随时切换“选择已有任务”与“新增日常任务”。</text>
+					</view>
+
+					<view v-if="activeScene == 'storage'" class="scene-panel">
+						<text class="field-label">物品名称</text>
+						<input class="field-input" v-model="storageItemName" placeholder="例如：黑胡椒研磨器" />
+						<text class="field-label">储物箱名称</text>
+						<view class="picker-row courier-task-row">
+							<input class="field-input courier-task-input" :style="storageCanEditBoxName ? '' : 'opacity: 0.74;'" v-model="storageTargetName" :disabled="!storageCanEditBoxName" placeholder="选择已有储物箱，或切换新增后输入名称" />
+							<view class="courier-picker-btn" @click="openStorageBoxPicker">
+								<text class="picker-arrow courier-picker-arrow">›</text>
+							</view>
+						</view>
+						<text class="field-tip">{{ storageCanEditBoxName ? '新增模式：输入名称并补充定位与详细地点。' : '已选择已有储物箱：名称不可编辑。' }}</text>
+						<text class="field-label">定位</text>
+						<view class="picker-row">
+							<input class="field-input" :style="storageCanEditBoxName ? 'flex: 1;' : 'flex: 1; opacity: 0.74;'" v-model="storageBoxLocation" :disabled="!storageCanEditBoxName" placeholder="例如：Loc: 23.1234, 113.1234" />
+							<view class="courier-picker-btn" @click="quickStorageBoxLocation">
+								<text class="picker-arrow courier-picker-arrow">⌖</text>
+							</view>
+						</view>
+						<text class="field-label">详细地点</text>
+						<textarea class="field-textarea" :style="storageCanEditBoxName ? '' : 'opacity: 0.74;'" v-model="storageBoxDetail" :disabled="!storageCanEditBoxName" placeholder="例如：1楼玄关，鞋柜最右侧第二格" auto-height></textarea>
+						<text v-if="storageTargetId != ''" class="selected-hint">已选择储存箱：{{ storageTargetName }}</text>
+						<text class="field-label">金额（可选）</text>
+						<input class="field-input" v-model="storageAmount" placeholder="例如：39.90" />
+						<text class="field-label">保质期（可选）</text>
+						<input class="field-input" v-model="storageExpiryDate" placeholder="YYYY-MM-DD" />
+						<text class="field-label">拍照存档</text>
+						<view class="photo-row">
+							<view class="photo-btn" @click="takeStoragePhoto">
+								<text class="photo-btn-text">拍照</text>
+							</view>
+						</view>
+						<scroll-view v-if="storagePhotos.length > 0" class="photo-preview-scroll" direction="horizontal">
+							<view class="photo-preview-wrap">
+								<view class="photo-preview-item" v-for="(p, idx) in storagePhotos" :key="'sp_' + idx">
+									<image class="photo-preview" :src="p" mode="aspectFill" />
+									<view class="photo-remove" @click="removeStoragePhoto(idx)">
+										<text class="photo-remove-text">×</text>
+									</view>
+								</view>
+							</view>
+						</scroll-view>
+						<text class="field-label">下次时间与频率</text>
+						<view class="schedule-row">
+							<view class="picker-box schedule-box" @click="openSceneDatePicker('storage')">
+								<text class="picker-text">{{ displayDate(storageDateStr) }}</text>
+							</view>
+							<view class="picker-box schedule-box" @click="openSceneTimePicker('storage')">
+								<text class="picker-text">{{ storageTimeStr }}</text>
+							</view>
+							<view class="picker-box schedule-box schedule-box-last" @click="openSceneRepeatActionSheet('storage')">
+								<text class="picker-text">{{ repeatRuleLabel(storageRepeatTypeIndex) }}</text>
+								<text class="picker-arrow">›</text>
+							</view>
+						</view>
+						<text class="field-tip">保存后会创建未开始的物品储存任务，并关联到所选储存箱。</text>
+					</view>
+				</scroll-view>
+
+				<view class="quick-footer">
+					<view class="btn btn-cancel" @click="closeModal">
+						<text class="btn-text">取消</text>
+					</view>
+					<view class="btn btn-confirm" @click="submitQuickCreate">
+						<text class="btn-text">{{ submitting ? '处理中...' : '创建任务' }}</text>
+					</view>
+				</view>
+			</view>
+		</view>
+	</view>
+</template>
+
+<script lang="uts">
+	// #ifdef APP-ANDROID
+	import UTSAndroid from 'io.dcloud.uts.UTSAndroid';
+	import DatePickerDialog from 'android.app.DatePickerDialog';
+	import TimePickerDialog from 'android.app.TimePickerDialog';
+	import Calendar from 'java.util.Calendar';
+	// #endif
+	import { AppDialogApi, SelectionItem, SelectionSubmitResult } from '@/components/sys/AppDialogApi.uts';
+	import { CreateStorageItemPayload, CreateTaskPayload, Task, TaskBiz, UpdateTaskPayload } from '@/services/biz/TaskBiz.uts';
+	import { NoteBiz } from '@/services/biz/NoteBiz.uts';
+	import { GraphRelationType } from '@/utils/types/index.uts';
+
+	type JsonObject = any;
+
+	function createJsonObject(data: JsonObject): JsonObject {
+		return data;
+	}
+
+	function isCourierTaskCandidate(task: Task): boolean {
+		const category = TaskBiz.getTaskCategory(task);
+		if (category == '快递') return true;
+
+		for (let i = 0; i < task.tags.length; i++) {
+			const tag = (task.tags[i] ?? '').toString().trim().toLowerCase();
+			if (tag == 'scene:daily' || tag == 'scene:pickup') return true;
+		}
+
+		const title = (task.title ?? '').toString().trim();
+		return title.indexOf('日常:') == 0;
+	}
+
+	function getCourierTaskDisplayName(task: Task): string {
+		let name = (task.title ?? '').toString().replace(/\s+/g, ' ').trim();
+		if (name.indexOf('日常:') == 0) {
+			name = name.substring(3).replace(/\s+/g, ' ').trim();
+		}
+		return name;
+	}
+
+	async function buildCourierPickerItems() {
+		const all = await TaskBiz.getAllTasks();
+		const items = [] as string[];
+		for (let i = 0; i < all.length; i++) {
+			const task = all[i];
+			if (!isCourierTaskCandidate(task)) continue;
+			const id = (task.id ?? '').toString();
+			if (id == '') continue;
+			const display = getCourierTaskDisplayName(task);
+			if (display == '') continue;
+			items.push(`${id}\t${display}`);
+		}
+		return items;
+	}
+
+	export default {
+		data() {
+			return {
+				keyword: '',
+				title: '请选择',
+				items: [] as SelectionItem[],
+				mode: 'list',
+				activeScene: 'recipe' as string,
+				submitting: false,
+
+				recipeTitle: '',
+				recipeRaw: '',
+				recipeDateStr: '',
+				recipeTimeStr: '',
+				recipeRepeatTypeIndex: 0,
+
+				courierTaskName: '',
+				courierDescription: '',
+				dailyTaskPresets: [] as string[],
+				dailyTaskPresetsLoaded: false,
+				courierSelectedTaskId: '',
+				courierDateStr: '',
+				courierTimeStr: '',
+				courierRepeatTypeIndex: 0,
+				courierNeedStore: false,
+				courierStorageTargetId: '',
+				courierStorageTargetName: '',
+
+				repeatOptions: ['单次重启(不重复)', '每天', '每周', '每月'],
+
+				storageItemName: '',
+				storageBoxLocation: '',
+				storageBoxDetail: '',
+				storageAmount: '',
+				storageExpiryDate: '',
+				storageDateStr: '',
+				storageTimeStr: '',
+				storageRepeatTypeIndex: 0,
+				storageTargetId: '',
+				storageTargetName: '',
+				storageCandidates: [] as Task[],
+				storagePhotos: [] as string[],
+				storageCandidatesLoaded: false
+			}
+		},
+		computed: {
+			isListMode(): boolean {
+				return this.mode == 'list';
+			},
+			isQuickMode(): boolean {
+				return this.mode != 'list';
+			},
+			courierCanEditName(): boolean {
+				return this.courierSelectedTaskId == '';
+			},
+			storageCanEditBoxName(): boolean {
+				return this.storageTargetId == '';
+			},
+			filteredList(): SelectionItem[] {
+				const kw = this.keyword.trim().toLowerCase();
+				if (kw == '') return this.items;
+				return this.items.filter((it: SelectionItem): boolean => it.title.toLowerCase().includes(kw));
+			}
+		},
+		mounted() {
+			this.initDefaultDateTime();
+			if (AppDialogApi.currentSelectionOptions != null) {
+				const opts = AppDialogApi.currentSelectionOptions!;
+				this.title = opts.title;
+				const modeRaw = (opts.mode ?? 'list').toString().trim().toLowerCase();
+				let defaultScene = 'recipe';
+				if (modeRaw == 'quick-create' || modeRaw == 'recipe-import' || modeRaw == 'courier-pickup' || modeRaw == 'storage-item') {
+					this.mode = 'quick-create';
+				} else {
+					this.mode = 'list';
+				}
+				if (modeRaw == 'courier-pickup') defaultScene = 'courier';
+				else if (modeRaw == 'storage-item') defaultScene = 'storage';
+
+				if (this.mode == 'quick-create') {
+					const sceneRaw = (opts.initialScene ?? defaultScene).toString();
+					if (sceneRaw == 'courier') this.activeScene = 'courier';
+					else if (sceneRaw == 'storage') this.activeScene = 'storage';
+					else this.activeScene = 'recipe';
+				}
+				this.items = opts.items ?? ([] as SelectionItem[]);
+			}
+			if (this.isQuickMode && this.activeScene == 'storage') {
+				this.ensureStorageCandidates();
+			} else if (this.isQuickMode && this.activeScene == 'courier') {
+				this.ensureDailyTaskDefaults();
+				this.ensureStorageCandidates();
+			}
+			this.loadStorageTargetPreset();
+		},
+		methods: {
+			dailyTaskPresetStorageKey(): string {
+				return 'selection_modal_daily_task_presets_v1';
+			},
+			dailyTaskLastStorageKey(): string {
+				return 'selection_modal_daily_task_last_v1';
+			},
+			storageLastTargetStorageKey(): string {
+				return 'selection_modal_storage_last_target_v1';
+			},
+			toSafeNumber(value: any, fallback: number = 0): number {
+				if (value == null) return fallback;
+				const n = parseInt(value.toString());
+				return isNaN(n) ? fallback : n;
+			},
+			normalizeDailyTaskName(value: string): string {
+				return value.toString().replace(/\s+/g, ' ').trim();
+			},
+			loadDailyTaskPresets() {
+				if (this.dailyTaskPresetsLoaded) return;
+				this.dailyTaskPresets.splice(0, this.dailyTaskPresets.length);
+
+				const raw = uni.getStorageSync(this.dailyTaskPresetStorageKey());
+				if (raw != null && raw.toString().trim() != '') {
+					try {
+						const lines = raw.toString().split('\n');
+						for (let i = 0; i < lines.length; i++) {
+							const name = this.normalizeDailyTaskName(lines[i]);
+							if (name != '' && this.dailyTaskPresets.indexOf(name) < 0) this.dailyTaskPresets.push(name);
+						}
+					} catch (_e) {}
+				}
+
+				if (this.dailyTaskPresets.indexOf('取快递') < 0) this.dailyTaskPresets.push('取快递');
+				if (this.dailyTaskPresets.indexOf('寄快递') < 0) this.dailyTaskPresets.push('寄快递');
+				if (this.dailyTaskPresets.indexOf('取外卖') < 0) this.dailyTaskPresets.push('取外卖');
+				if (this.dailyTaskPresets.indexOf('倒垃圾') < 0) this.dailyTaskPresets.push('倒垃圾');
+
+				this.dailyTaskPresetsLoaded = true;
+			},
+			ensureDailyTaskDefaults() {
+				this.loadDailyTaskPresets();
+				if (this.courierTaskName.trim() != '') return;
+
+				if (this.dailyTaskPresets.length > 0) {
+					this.courierSelectedTaskId = '';
+					this.courierTaskName = this.dailyTaskPresets[0];
+				}
+			},
+			openDailyTaskPicker() {
+				this.loadDailyTaskPresets();
+				buildCourierPickerItems().then((rawItems) => {
+					if (rawItems.length == 0) {
+						uni.showToast({ title: '暂无可选任务，可切换新增模式', icon: 'none' });
+						return;
+					}
+
+					const candidateIds = [] as string[];
+					const candidateNames = [] as string[];
+					const itemList = [] as string[];
+					for (let i = 0; i < rawItems.length; i++) {
+						const parts = rawItems[i].split('\t');
+						if (parts.length < 2) continue;
+						const id = parts[0];
+						const name = parts.slice(1).join('\t');
+						candidateIds.push(id);
+						candidateNames.push(name);
+						itemList.push(id == this.courierSelectedTaskId ? `✓ ${name}` : name);
+					}
+					itemList.push('手动新增日常任务');
+
+					uni.showActionSheet({
+						itemList: itemList,
+						success: (res) => {
+							let idx = -1;
+							try {
+								idx = this.toSafeNumber(res.tapIndex, -1);
+							} catch (_e) {
+								idx = -1;
+							}
+							if (idx < 0) {
+								uni.showToast({ title: '未识别到选择项，请重试', icon: 'none' });
+								return;
+							}
+							if (idx >= 0 && idx < candidateIds.length) {
+								this.courierSelectedTaskId = candidateIds[idx];
+								this.courierTaskName = this.normalizeDailyTaskName(candidateNames[idx]);
+								this.courierRepeatTypeIndex = 1;
+								uni.showToast({ title: `已选择: ${this.courierTaskName}`, icon: 'none' });
+								try {
+									uni.setStorageSync(this.dailyTaskLastStorageKey(), `${candidateIds[idx]}\n${this.courierTaskName}`);
+								} catch (_e) {}
+								return;
+							}
+							if (idx != candidateIds.length) {
+								uni.showToast({ title: '请选择有效任务项', icon: 'none' });
+								return;
+							}
+
+							const keep = this.normalizeDailyTaskName(this.courierTaskName);
+							if (keep == '' && this.dailyTaskPresets.length > 0) {
+								this.courierSelectedTaskId = '';
+								this.courierTaskName = this.normalizeDailyTaskName(this.dailyTaskPresets[0]);
+							} else {
+								this.courierSelectedTaskId = '';
+								if (keep != '') this.courierTaskName = this.normalizeDailyTaskName(keep);
+							}
+							uni.showToast({ title: '已切换为新增模式', icon: 'none' });
+						},
+						fail: () => {
+							uni.showToast({ title: '已取消选择', icon: 'none' });
+						}
+					});
+				});
+			},
+			loadStorageTargetPreset() {
+				const raw = uni.getStorageSync(this.storageLastTargetStorageKey());
+				if (raw == null || raw.toString().trim() == '') return;
+				const text = raw.toString();
+				const parts = text.split('\n');
+				if (parts.length < 2) return;
+				const id = parts[0].trim();
+				const name = parts.slice(1).join('\n').trim();
+				if (id == '' || name == '') return;
+				this.storageTargetId = id;
+				this.storageTargetName = name;
+				this.courierStorageTargetId = id;
+				this.courierStorageTargetName = name;
+			},
+			saveStorageTargetPreset(id: string, name: string) {
+				if (id == '' || name == '') return;
+				try {
+					uni.setStorageSync(this.storageLastTargetStorageKey(), `${id}\n${name}`);
+				} catch (_e) {}
+			},
+			displayDate(dateStr: string): string {
+				if (dateStr == null || dateStr.trim() == '') return '选择日期';
+				const parts = dateStr.split('-');
+				if (parts.length == 3) return `${parts[1]}-${parts[2]}`;
+				return dateStr;
+			},
+			repeatRuleLabel(index: number): string {
+				if (index < 0 || index >= this.repeatOptions.length) return this.repeatOptions[0];
+				return this.repeatOptions[index];
+			},
+			repeatRuleFromIndex(index: number): string | null {
+				if (index == 1) return 'daily';
+				if (index == 2) return 'weekly';
+				if (index == 3) return 'monthly';
+				return null;
+			},
+			openSceneRepeatActionSheet(scene: string) {
+				uni.showActionSheet({
+					itemList: this.repeatOptions,
+					success: (res) => {
+						const idx = this.toSafeNumber(res.tapIndex, -1);
+						if (idx < 0 || idx >= this.repeatOptions.length) return;
+
+						if (scene == 'recipe') this.recipeRepeatTypeIndex = idx;
+						else if (scene == 'courier') this.courierRepeatTypeIndex = idx;
+						else this.storageRepeatTypeIndex = idx;
+					}
+				});
+			},
+			openSceneDatePicker(scene: string) {
+				// #ifdef APP-ANDROID
+				const context = UTSAndroid.getUniActivity();
+				if (context == null) return;
+				const cal = Calendar.getInstance();
+				const currentDate = scene == 'recipe' ? this.recipeDateStr : (scene == 'courier' ? this.courierDateStr : this.storageDateStr);
+				const parts = currentDate.split('-');
+				if (parts.length == 3) {
+					cal.set(Calendar.YEAR, parseInt(parts[0]) as Int);
+					cal.set(Calendar.MONTH, (parseInt(parts[1]) - 1) as Int);
+					cal.set(Calendar.DAY_OF_MONTH, parseInt(parts[2]) as Int);
+				}
+
+				const dialog = new DatePickerDialog(context,
+					new DatePickerDialog.OnDateSetListener((_, y, m, d) => {
+						const nextDate = `${y}-${(m + 1).toString().padStart(2, '0')}-${d.toString().padStart(2, '0')}`;
+						if (scene == 'recipe') this.recipeDateStr = nextDate;
+						else if (scene == 'courier') this.courierDateStr = nextDate;
+						else this.storageDateStr = nextDate;
+					}),
+					cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)
+				);
+				dialog.show();
+				// #endif
+			},
+			openSceneTimePicker(scene: string) {
+				// #ifdef APP-ANDROID
+				const context = UTSAndroid.getUniActivity();
+				if (context == null) return;
+				const cal = Calendar.getInstance();
+				const currentTime = scene == 'recipe' ? this.recipeTimeStr : (scene == 'courier' ? this.courierTimeStr : this.storageTimeStr);
+				const parts = currentTime.split(':');
+				if (parts.length == 2) {
+					cal.set(Calendar.HOUR_OF_DAY, parseInt(parts[0]) as Int);
+					cal.set(Calendar.MINUTE, parseInt(parts[1]) as Int);
+				}
+
+				const dialog = new TimePickerDialog(context,
+					new TimePickerDialog.OnTimeSetListener((_, h, m) => {
+						const nextTime = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+						if (scene == 'recipe') this.recipeTimeStr = nextTime;
+						else if (scene == 'courier') this.courierTimeStr = nextTime;
+						else this.storageTimeStr = nextTime;
+					}),
+					cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE), true
+				);
+				dialog.show();
+				// #endif
+			},
+			initDefaultDateTime() {
+				const now = new Date(Date.now() + 30 * 60 * 1000);
+				const m = (now.getMonth() + 1).toString().padStart(2, '0');
+				const d = now.getDate().toString().padStart(2, '0');
+				const hh = now.getHours().toString().padStart(2, '0');
+				const mm = now.getMinutes().toString().padStart(2, '0');
+				const dateStr = `${now.getFullYear()}-${m}-${d}`;
+				const timeStr = `${hh}:${mm}`;
+
+				this.recipeDateStr = dateStr;
+				this.recipeTimeStr = timeStr;
+				this.courierDateStr = dateStr;
+				this.courierTimeStr = timeStr;
+				this.storageDateStr = dateStr;
+				this.storageTimeStr = timeStr;
+			},
+			closeModal() {
+				if (this.submitting) return;
+				AppDialogApi.tryCloseDialog();
+			},
+			onSelectItem(item: SelectionItem) {
+				AppDialogApi.handleSelectionConfirm(item);
+			},
+			switchScene(scene: string) {
+				this.activeScene = scene;
+				if (scene == 'storage') {
+					this.ensureStorageCandidates();
+				} else if (scene == 'courier') {
+					this.ensureDailyTaskDefaults();
+					this.ensureStorageCandidates();
+				}
+			},
+			async ensureStorageCandidates() {
+				if (this.storageCandidatesLoaded) return;
+				const all = await TaskBiz.getAllTasks();
+				const candidates = [] as Task[];
+				for (let i = 0; i < all.length; i++) {
+					const t = all[i];
+					const category = TaskBiz.getTaskCategory(t);
+					const organizing = category == '收纳' || category == '整理';
+					const s = (t.status ?? '').toString().trim().toLowerCase();
+					const active = s != 'done' && s != 'completed' && s != 'archived' && s != 'abandoned' && s != '2' && s != '3';
+					if (organizing && active) {
+						candidates.push(t);
+					}
+				}
+				this.storageCandidates = candidates;
+				if (this.storageTargetId != '') {
+					for (let i = 0; i < candidates.length; i++) {
+						if (candidates[i].id == this.storageTargetId) {
+							if (this.storageTargetName == '') this.storageTargetName = candidates[i].title;
+							this.applyStorageBoxDetailsFromTask(candidates[i]);
+							break;
+						}
+					}
+				}
+				this.storageCandidatesLoaded = true;
+			},
+			applyStorageBoxDetailsFromTask(task: Task) {
+				let loadedLocation = '';
+				let loadedDetail = '';
+				try {
+					const raw = (task.metadata ?? '').toString().trim();
+					if (raw != '') {
+						const md = JSON.parse(raw) as JsonObject;
+						const locVal = md['box_location'];
+						const detailVal = md['box_detail'];
+						if (locVal != null) loadedLocation = locVal.toString();
+						if (detailVal != null) loadedDetail = detailVal.toString();
+					}
+				} catch (_e) {}
+
+				if (loadedLocation == '' || loadedDetail == '') {
+					const desc = (task.description ?? '').toString();
+					if (desc != '') {
+						const lines = desc.split('\n');
+						for (let i = 0; i < lines.length; i++) {
+							const line = lines[i].trim();
+							if (loadedLocation == '' && line.indexOf('定位:') == 0) loadedLocation = line.substring(3).trim();
+							if (loadedDetail == '' && line.indexOf('详细地点:') == 0) loadedDetail = line.substring(5).trim();
+						}
+					}
+				}
+
+				this.storageBoxLocation = loadedLocation;
+				this.storageBoxDetail = loadedDetail;
+			},
+			openStorageBoxPicker() {
+				const itemList = [] as string[];
+				for (let i = 0; i < this.storageCandidates.length; i++) {
+					const t = this.storageCandidates[i];
+					itemList.push(t.id == this.storageTargetId ? `✓ ${t.title}` : t.title);
+				}
+				itemList.push('手动新增储物箱');
+				uni.showActionSheet({
+					itemList: itemList,
+					success: (res) => {
+						const idx = this.toSafeNumber(res.tapIndex, -1);
+						if (idx >= 0 && idx < this.storageCandidates.length) {
+							const target = this.storageCandidates[idx];
+							this.storageTargetId = target.id;
+							this.storageTargetName = target.title;
+							this.applyStorageBoxDetailsFromTask(target);
+							this.saveStorageTargetPreset(target.id, target.title);
+							uni.showToast({ title: `已选择: ${target.title}`, icon: 'none' });
+							return;
+						}
+						if (idx == this.storageCandidates.length) {
+							this.storageTargetId = '';
+							if (this.storageTargetName.trim() == '' && this.storageItemName.trim() != '') {
+								this.storageTargetName = `${this.storageItemName}储物箱`;
+							}
+							if (this.storageTargetName.trim() == '') this.storageTargetName = '新储物箱';
+							this.storageBoxLocation = '';
+							this.storageBoxDetail = '';
+							uni.showToast({ title: '已切换为新增储物箱', icon: 'none' });
+						}
+					}
+				});
+			},
+			quickStorageBoxLocation() {
+				if (!this.storageCanEditBoxName) return;
+				uni.getLocation({
+					type: 'wgs84',
+					success: (res) => {
+						this.storageBoxLocation = `Loc: ${res.latitude.toFixed(4)}, ${res.longitude.toFixed(4)}`;
+					},
+					fail: () => {
+						uni.showToast({ title: '定位失败，请手动输入', icon: 'none' });
+					}
+				});
+			},
+			chooseDailyStorageTarget() {
+				if (this.storageCandidates.length == 0) {
+					uni.showToast({ title: '暂无可选储存箱任务', icon: 'none' });
+					return;
+				}
+				const itemList = this.storageCandidates.map((t: Task): string => t.id == this.courierStorageTargetId ? `✓ ${t.title}` : t.title);
+				uni.showActionSheet({
+					itemList: itemList,
+					success: (res) => {
+						const idx = this.toSafeNumber(res.tapIndex, -1);
+						if (idx >= 0 && idx < this.storageCandidates.length) {
+							const target = this.storageCandidates[idx];
+							this.courierStorageTargetId = target.id;
+							this.courierStorageTargetName = target.title;
+							this.saveStorageTargetPreset(target.id, target.title);
+							uni.showToast({ title: `已选择: ${target.title}`, icon: 'none' });
+						}
+					}
+				});
+			},
+			takeStoragePhoto() {
+				uni.chooseImage({
+					count: 3,
+					sourceType: ['camera'],
+					success: (res) => {
+						for (let i = 0; i < res.tempFilePaths.length; i++) {
+							this.storagePhotos.push(res.tempFilePaths[i]);
+						}
+					}
+				});
+			},
+			removeStoragePhoto(index: number) {
+				if (index < 0 || index >= this.storagePhotos.length) return;
+				this.storagePhotos.splice(index, 1);
+			},
+			parseDateTime(dateStr: string, timeStr: string, fallback: number): number {
+				try {
+					const parsed = new Date(`${dateStr} ${timeStr}:00`).getTime();
+					if (!isNaN(parsed) && parsed > 0) return parsed;
+				} catch (_e) {}
+				return fallback;
+			},
+			async submitQuickCreate(): Promise<void> {
+				if (this.submitting) return;
+				this.submitting = true;
+				try {
+					if (this.activeScene == 'recipe') {
+						await this.createRecipeTask();
+					} else if (this.activeScene == 'courier') {
+						await this.createCourierTask();
+					} else if (this.activeScene == 'storage') {
+						await this.createStorageTask();
+					}
+				} finally {
+					this.submitting = false;
+				}
+			},
+			async createRecipeTask(): Promise<boolean> {
+				const raw = this.recipeRaw.trim();
+				if (raw == '') {
+					uni.showToast({ title: '请粘贴食谱内容', icon: 'none' });
+					return false;
+				}
+
+				let title = this.recipeTitle.trim();
+				if (title == '') {
+					let guessed = raw.trim();
+					const nPos = guessed.indexOf('\n');
+					if (nPos >= 0) {
+						guessed = guessed.substring(0, nPos).trim();
+					} else {
+						const rPos = guessed.indexOf('\r');
+						if (rPos >= 0) guessed = guessed.substring(0, rPos).trim();
+					}
+					if (guessed.length > 30) guessed = guessed.substring(0, 30);
+					title = guessed;
+				}
+				if (title == '') title = '网页食谱导入';
+
+				const desc = raw.length > 4000 ? raw.substring(0, 4000) : raw;
+				const startAt = this.parseDateTime(this.recipeDateStr, this.recipeTimeStr, Date.now() + 30 * 60 * 1000);
+				const repeatRule = this.repeatRuleFromIndex(this.recipeRepeatTypeIndex);
+				const metadataObj = createJsonObject({
+					source: 'web_recipe_paste',
+					raw_length: raw.length,
+					schedule_date: this.recipeDateStr,
+					schedule_time: this.recipeTimeStr,
+					repeat_rule: repeatRule
+				});
+				const metadata = JSON.stringify(metadataObj);
+				const taskId = await TaskBiz.createTask({
+					title: title,
+					description: desc,
+					status: 'pending',
+					start_at: startAt,
+					end_at: startAt + 2 * 60 * 60 * 1000,
+					repeat_rule: repeatRule,
+					tags: ['category:烹饪', 'scene:recipe_import', 'source:web_recipe'],
+					metadata: metadata
+				} as CreateTaskPayload);
+
+				if (taskId == null || taskId == '') {
+					uni.showToast({ title: '食谱任务创建失败', icon: 'none' });
+					return false;
+				}
+
+				await TaskBiz.addTaskContextLog(taskId, GraphRelationType.ContextCooking, 'recipe_import', '根据食谱网页快速导入', [] as string[]);
+				await TaskBiz.addTaskLog(taskId, 'recipe', `已创建未开始的食谱任务\n标题: ${title}\n开始时间: ${this.recipeDateStr} ${this.recipeTimeStr}\n提醒频率: ${this.repeatRuleLabel(this.recipeRepeatTypeIndex)}`, [] as string[]);
+				
+				// 将完整的食谱内容存入笔记，使得它可以在相关笔记里查看
+				let recipeNoteLinked = false;
+				const createdRecipeNote = await NoteBiz.saveNoteAndLinkAsync(title, raw, taskId);
+				if (createdRecipeNote != null && createdRecipeNote.related_task_id != null && createdRecipeNote.related_task_id != '') {
+					recipeNoteLinked = true;
+				} else if (createdRecipeNote != null) {
+					const retryEdgeId = await NoteBiz.referenceNoteToNode(taskId, createdRecipeNote.node.id);
+					recipeNoteLinked = retryEdgeId != null && retryEdgeId != '';
+				}
+				if (!recipeNoteLinked) {
+					await TaskBiz.addTaskLog(taskId, 'recipe_note_repair', '食谱正文已保存，但笔记关联异常。系统将在任务详情中自动修复。', [] as string[]);
+				}
+				
+				uni.showToast({ title: '已创建未开始的食谱任务', icon: 'none' });
+
+				AppDialogApi.handleSelectionSubmit(createJsonObject({
+					scene: 'recipe',
+					taskId: taskId,
+					title: title,
+					metadata: metadata,
+					extra: createJsonObject({
+						start_at: startAt,
+						repeat_rule: repeatRule
+					})
+				}) as SelectionSubmitResult);
+				return true;
+			},
+			async createCourierTask(): Promise<boolean> {
+				const taskName = this.normalizeDailyTaskName(this.courierTaskName);
+				if (taskName == '') {
+					uni.showToast({ title: '请输入日常任务名称', icon: 'none' });
+					return false;
+				}
+				const description = this.courierDescription.trim();
+				const startAt = this.parseDateTime(this.courierDateStr, this.courierTimeStr, Date.now() + 30 * 60 * 1000);
+				const endAt = startAt + 2 * 60 * 60 * 1000;
+				const repeatRule = this.repeatRuleFromIndex(this.courierRepeatTypeIndex);
+
+				let selectedTask: Task | null = null;
+				if (this.courierSelectedTaskId != '') {
+					selectedTask = await TaskBiz.getTask(this.courierSelectedTaskId);
+					if (selectedTask == null) {
+						uni.showToast({ title: '所选任务已失效，请重新选择', icon: 'none' });
+						return false;
+					}
+				}
+
+				if (selectedTask != null) {
+					let skipArchive = false;
+					try {
+						if (selectedTask.metadata != null && selectedTask.metadata!.trim() != '') {
+							const metadataObj = JSON.parse(selectedTask.metadata!) as JsonObject;
+							if (metadataObj['skip_archive_on_restart'] == true) {
+								skipArchive = true;
+							}
+						}
+					} catch (_e) {}
+
+					await TaskBiz.setTaskTime(selectedTask.id, startAt, endAt, repeatRule);
+					const restarted = await TaskBiz.restartTask(selectedTask.id, null);
+					if (!restarted) {
+						uni.showToast({ title: '日常任务重启失败', icon: 'none' });
+						return false;
+					}
+
+					let displayName = this.normalizeDailyTaskName((selectedTask.title ?? '').toString());
+					if (displayName.indexOf('日常:') == 0) displayName = this.normalizeDailyTaskName(displayName.substring(3));
+					if (displayName == '') displayName = taskName;
+					const logLines = [] as string[];
+					logLines.push(`快速重启: ${displayName}`);
+					if (description != '') logLines.push(`任务描述: ${description}`);
+					logLines.push(`开始时间: ${this.courierDateStr} ${this.courierTimeStr}`);
+					logLines.push(`提醒频率: ${this.repeatRuleLabel(this.courierRepeatTypeIndex)}`);
+					await TaskBiz.addTaskLog(selectedTask.id, skipArchive ? 'daily' : 'restart', logLines.join('\n'), [] as string[]);
+					this.loadDailyTaskPresets();
+					this.dailyTaskPresets = [displayName].concat(this.dailyTaskPresets);
+					try {
+						uni.setStorageSync(this.dailyTaskPresetStorageKey(), this.dailyTaskPresets.join('\n'));
+					} catch (_e) {}
+					try {
+						uni.setStorageSync(this.dailyTaskLastStorageKey(), `${selectedTask.id}\n${displayName}`);
+					} catch (_e) {}
+
+					let newMetadataObj = createJsonObject({});
+					try {
+						if (selectedTask.metadata != null && selectedTask.metadata!.trim() != '') {
+							newMetadataObj = JSON.parse(selectedTask.metadata!) as JsonObject;
+						}
+					} catch (_e) {}
+					
+					newMetadataObj['source'] = 'daily_task_restart';
+					newMetadataObj['mode'] = 'restart';
+					newMetadataObj['task_id'] = selectedTask.id;
+					newMetadataObj['daily_name'] = displayName;
+					newMetadataObj['description_length'] = description.length;
+					newMetadataObj['schedule_date'] = this.courierDateStr;
+					newMetadataObj['schedule_time'] = this.courierTimeStr;
+					newMetadataObj['repeat_rule'] = repeatRule;
+
+					if (this.courierNeedStore && this.courierStorageTargetId != '') {
+						newMetadataObj['store_to_target_id'] = this.courierStorageTargetId;
+						newMetadataObj['store_to_target_name'] = this.courierStorageTargetName;
+					} else {
+						newMetadataObj['store_to_target_id'] = null;
+						newMetadataObj['store_to_target_name'] = null;
+					}
+
+					const metadata = JSON.stringify(newMetadataObj);
+					await TaskBiz.updateTask(selectedTask.id, { metadata: metadata } as UpdateTaskPayload);
+
+					uni.showToast({ title: '已快速重启日常任务', icon: 'none' });
+
+					AppDialogApi.handleSelectionSubmit(createJsonObject({
+						scene: 'courier',
+						taskId: selectedTask.id,
+						title: selectedTask.title,
+						metadata: metadata,
+						extra: createJsonObject({
+							mode: 'restart',
+							start_at: startAt,
+							repeat_rule: repeatRule,
+							restarted_task_id: selectedTask.id
+						})
+					}) as SelectionSubmitResult);
+					return true;
+				}
+
+				if (this.courierSelectedTaskId != '') {
+					this.courierSelectedTaskId = '';
+				}
+
+				const title = `日常: ${taskName}`;
+				const taskDesc = description == '' ? taskName : description;
+				const metadataObj = createJsonObject({
+					source: 'daily_task',
+					mode: 'create',
+					daily_name: taskName,
+					description_length: description.length,
+					schedule_date: this.courierDateStr,
+					schedule_time: this.courierTimeStr,
+					repeat_rule: repeatRule
+				});
+
+				if (this.courierNeedStore && this.courierStorageTargetId != '') {
+					metadataObj['store_to_target_id'] = this.courierStorageTargetId;
+					metadataObj['store_to_target_name'] = this.courierStorageTargetName;
+				}
+
+				const metadata = JSON.stringify(metadataObj);
+
+				const taskId = await TaskBiz.createTask({
+					title: title,
+					description: taskDesc,
+					status: 'pending',
+					start_at: startAt,
+					end_at: endAt,
+					repeat_rule: repeatRule,
+					tags: ['category:快递', 'scene:daily'],
+					metadata: metadata
+				} as CreateTaskPayload);
+
+				if (taskId == null || taskId == '') {
+					uni.showToast({ title: '日常任务创建失败', icon: 'none' });
+					return false;
+				}
+
+				const logLines = [] as string[];
+				logLines.push(`日常任务: ${taskName}`);
+				if (description != '') logLines.push(`任务描述: ${description}`);
+				logLines.push(`开始时间: ${this.courierDateStr} ${this.courierTimeStr}`);
+				logLines.push(`提醒频率: ${this.repeatRuleLabel(this.courierRepeatTypeIndex)}`);
+				await TaskBiz.addTaskLog(taskId, 'daily', logLines.join('\n'), [] as string[]);
+				this.loadDailyTaskPresets();
+				this.dailyTaskPresets = [taskName].concat(this.dailyTaskPresets);
+				try {
+					uni.setStorageSync(this.dailyTaskPresetStorageKey(), this.dailyTaskPresets.join('\n'));
+				} catch (_e) {}
+				try {
+					uni.setStorageSync(this.dailyTaskLastStorageKey(), `${taskId}\n${taskName}`);
+				} catch (_e) {}
+				uni.showToast({ title: '已创建未开始的日常任务', icon: 'none' });
+
+				AppDialogApi.handleSelectionSubmit(createJsonObject({
+					scene: 'courier',
+					taskId: taskId,
+					title: title,
+					metadata: metadata,
+					extra: createJsonObject({
+						start_at: startAt,
+						repeat_rule: repeatRule
+					})
+				}) as SelectionSubmitResult);
+				return true;
+			},
+			async createStorageTask(): Promise<boolean> {
+				if (this.storageCanEditBoxName) {
+					const boxName = this.normalizeDailyTaskName(this.storageTargetName);
+					const boxLocation = this.storageBoxLocation.trim();
+					const boxDetail = this.storageBoxDetail.trim();
+					if (boxName == '') {
+						uni.showToast({ title: '请填写储物箱名称', icon: 'none' });
+						return false;
+					}
+					if (boxLocation == '') {
+						uni.showToast({ title: '请填写或获取定位', icon: 'none' });
+						return false;
+					}
+					if (boxDetail == '') {
+						uni.showToast({ title: '请填写详细地点', icon: 'none' });
+						return false;
+					}
+
+					const boxDescriptionLines = [] as string[];
+					boxDescriptionLines.push(`定位: ${boxLocation}`);
+					boxDescriptionLines.push(`详细地点: ${boxDetail}`);
+					const boxMetadata = createJsonObject({
+						source: 'storage_box_create',
+						box_name: boxName,
+						box_location: boxLocation,
+						box_detail: boxDetail
+					});
+					const boxTaskId = await TaskBiz.createTask({
+						title: `储物箱: ${boxName}`,
+						description: boxDescriptionLines.join('\n'),
+						status: 'pending',
+						start_at: Date.now(),
+						end_at: Date.now() + 24 * 60 * 60 * 1000,
+						tags: ['category:收纳', 'scene:storage_box'],
+						metadata: JSON.stringify(boxMetadata)
+					} as CreateTaskPayload);
+					if (boxTaskId == null || boxTaskId == '') {
+						uni.showToast({ title: '储物箱创建失败', icon: 'none' });
+						return false;
+					}
+					await TaskBiz.addTaskLog(boxTaskId, 'storage_box', boxDescriptionLines.join('\n'), [] as string[]);
+					this.storageTargetId = boxTaskId;
+					this.storageTargetName = `储物箱: ${boxName}`;
+					this.saveStorageTargetPreset(boxTaskId, this.storageTargetName);
+					this.storageCandidatesLoaded = false;
+					await this.ensureStorageCandidates();
+					uni.showToast({ title: '已创建储物箱', icon: 'none' });
+				} else if (this.storageTargetId == '' || this.storageTargetName == '') {
+					uni.showToast({ title: '请选择储存箱', icon: 'none' });
+					return false;
+				}
+
+				const itemName = this.storageItemName.trim();
+				if (itemName == '') {
+					uni.showToast({ title: '请填写物品名称', icon: 'none' });
+					return false;
+				}
+
+				const amountText = this.storageAmount.trim();
+				const expiryText = this.storageExpiryDate.trim();
+				const amountVal = amountText == '' ? null : parseFloat(amountText);
+				const startAt = this.parseDateTime(this.storageDateStr, this.storageTimeStr, Date.now() + 30 * 60 * 1000);
+				const repeatRule = this.repeatRuleFromIndex(this.storageRepeatTypeIndex);
+				const lines = [] as string[];
+				lines.push(`物品名称: ${itemName}`);
+				lines.push(`储存箱: ${this.storageTargetName}`);
+				if (amountText != '' && !isNaN(amountVal!)) lines.push(`金额: ${amountText}`);
+				if (expiryText != '') lines.push(`保质期: ${expiryText}`);
+				lines.push(`开始时间: ${this.storageDateStr} ${this.storageTimeStr}`);
+				lines.push(`提醒频率: ${this.repeatRuleLabel(this.storageRepeatTypeIndex)}`);
+				const description = lines.join('\n');
+
+				const metadataObj = createJsonObject({
+					source: 'storage_entry_direct',
+					item_name: itemName,
+					amount: (amountText != '' && !isNaN(amountVal!)) ? amountVal : null,
+					expiry_date: expiryText == '' ? null : expiryText,
+					schedule_date: this.storageDateStr,
+					schedule_time: this.storageTimeStr,
+					repeat_rule: repeatRule,
+					storage_target_id: this.storageTargetId,
+					storage_target_name: this.storageTargetName
+				});
+				const metadata = JSON.stringify(metadataObj);
+
+				const itemId = await TaskBiz.createStorageItem(this.storageTargetId, {
+					item_name: itemName,
+					note: description,
+					amount: (amountText != '' && !isNaN(amountVal!)) ? amountVal : null,
+					expiry_date: expiryText == '' ? null : expiryText,
+					attachments: this.storagePhotos,
+					source_task_title: this.storageTargetName
+				} as CreateStorageItemPayload);
+
+				if (itemId == null || itemId == '') {
+					uni.showToast({ title: '物品录入失败', icon: 'none' });
+					return false;
+				}
+				uni.showToast({ title: '已录入物品到储物箱', icon: 'none' });
+
+				AppDialogApi.handleSelectionSubmit(createJsonObject({
+					scene: 'storage',
+					taskId: this.storageTargetId,
+					title: this.storageTargetName,
+					metadata: metadata,
+					extra: createJsonObject({
+						start_at: startAt,
+						repeat_rule: repeatRule,
+						item_name: itemName,
+						item_id: itemId,
+						storage_target_id: this.storageTargetId,
+						storage_target_name: this.storageTargetName
+					})
+				}) as SelectionSubmitResult);
+				return true;
+			}
+		}
+	}
+</script>
+
+<style scoped>
+	.modal-mask {
+		position: fixed;
+		top: 0;
+		left: 0;
+		right: 0;
+		bottom: 0;
+		background-color: rgba(0, 0, 0, 0.6);
+		z-index: 999;
+		display: flex;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.glass-modal {
+		width: 88%;
+		height: 78%;
+		background-color: rgba(22, 22, 26, 0.94);
+		border-radius: 20px;
+		border: 1px solid rgba(255, 255, 255, 0.1);
+		display: flex;
+		flex-direction: column;
+		overflow: hidden;
+	}
+
+	.modal-head {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+		padding: 16px 18px;
+		border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+	}
+
+	.modal-head-left {
+		display: flex;
+		flex-direction: column;
+	}
+
+	.modal-head-title {
+		color: #ffffff;
+		font-size: 18px;
+		font-weight: bold;
+	}
+
+	.modal-head-sub {
+		color: rgba(255, 255, 255, 0.55);
+		font-size: 12px;
+		margin-top: 4px;
+	}
+
+	.modal-close-icon {
+		color: rgba(255, 255, 255, 0.65);
+		font-size: 24px;
+		padding: 5px 10px;
+	}
+
+	.list-mode-wrap {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+	}
+
+	.search-wrap {
+		padding: 10px 16px;
+		border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+	}
+
+	.search-input {
+		background-color: rgba(255, 255, 255, 0.1);
+		border-radius: 8px;
+		height: 36px;
+		padding: 0 10px;
+		color: #fff;
+		font-size: 14px;
+	}
+
+	.scroll-list {
+		flex: 1;
+		padding: 8px 0;
+	}
+
+	.row-item {
+		padding: 14px 16px;
+		border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+	}
+
+	.row-item-text {
+		color: rgba(255, 255, 255, 0.85);
+		font-size: 16px;
+	}
+
+	.empty-box {
+		padding: 30px;
+		align-items: center;
+	}
+
+	.empty-text {
+		color: rgba(255, 255, 255, 0.45);
+		font-size: 14px;
+	}
+
+	.quick-mode-wrap {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+	}
+
+	.scene-tabs {
+		display: flex;
+		flex-direction: row;
+		padding: 10px 12px 8px;
+		border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+	}
+
+	.scene-tab {
+		flex: 1;
+		height: 34px;
+		border-radius: 10px;
+		display: flex;
+		justify-content: center;
+		align-items: center;
+		margin: 0 4px;
+		background-color: rgba(255, 255, 255, 0.05);
+	}
+
+	.scene-tab-text {
+		font-size: 13px;
+		color: rgba(255, 255, 255, 0.7);
+	}
+
+	.quick-scroll {
+		flex: 1;
+		padding: 12px 14px;
+	}
+
+	.scene-panel {
+		padding-bottom: 24px;
+	}
+
+	.field-label {
+		font-size: 13px;
+		color: rgba(255, 255, 255, 0.72);
+		margin-top: 10px;
+		margin-bottom: 6px;
+	}
+
+	.field-input {
+		height: 38px;
+		border-radius: 10px;
+		background-color: rgba(255, 255, 255, 0.09);
+		color: #ffffff;
+		font-size: 14px;
+		padding: 0 10px;
+	}
+
+	.field-textarea {
+		min-height: 120px;
+		border-radius: 10px;
+		background-color: rgba(255, 255, 255, 0.09);
+		color: #ffffff;
+		font-size: 14px;
+		padding: 10px;
+	}
+
+	.field-tip {
+		font-size: 12px;
+		line-height: 18px;
+		color: rgba(255, 255, 255, 0.5);
+		margin-top: 8px;
+	}
+
+	.selected-hint {
+		font-size: 12px;
+		line-height: 16px;
+		color: #9ed6ff;
+		margin-top: 6px;
+	}
+
+	.picker-row {
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.courier-task-row {
+		align-items: center;
+	}
+
+	.courier-task-input {
+		flex: 1;
+	}
+
+	.courier-picker-btn {
+		width: 38px;
+		height: 38px;
+		margin-left: 8px;
+		border-radius: 10px;
+		background-color: rgba(255, 255, 255, 0.12);
+		display: flex;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.courier-picker-arrow {
+		margin-left: 0;
+	}
+
+	.schedule-row {
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+	}
+
+	.picker-box {
+		flex: 1;
+		height: 38px;
+		border-radius: 10px;
+		background-color: rgba(255, 255, 255, 0.09);
+		display: flex;
+		align-items: center;
+		padding: 0 10px;
+	}
+
+	.picker-text {
+		font-size: 14px;
+		color: #ffffff;
+	}
+
+	.schedule-box {
+		justify-content: space-between;
+		margin-right: 8px;
+	}
+
+	.schedule-box-last {
+		margin-right: 0;
+	}
+
+	.picker-arrow {
+		font-size: 15px;
+		color: rgba(255, 255, 255, 0.58);
+		margin-left: 6px;
+	}
+
+	.photo-row {
+		flex-direction: row;
+		margin-top: 4px;
+	}
+
+	.photo-btn {
+		height: 34px;
+		padding: 0 14px;
+		border-radius: 9px;
+		background-color: rgba(255, 255, 255, 0.12);
+		display: flex;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.photo-btn-text {
+		color: #ffffff;
+		font-size: 13px;
+	}
+
+	.photo-preview-scroll {
+		height: 84px;
+		margin-top: 10px;
+	}
+
+	.photo-preview-wrap {
+		display: flex;
+		flex-direction: row;
+	}
+
+	.photo-preview-item {
+		position: relative;
+		margin-right: 10px;
+	}
+
+	.photo-preview {
+		width: 80px;
+		height: 80px;
+		border-radius: 10px;
+	}
+
+	.photo-remove {
+		position: absolute;
+		top: -6px;
+		right: -6px;
+		width: 18px;
+		height: 18px;
+		border-radius: 9px;
+		background-color: rgba(0, 0, 0, 0.75);
+		display: flex;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.photo-remove-text {
+		font-size: 12px;
+		color: #ffffff;
+	}
+
+	.quick-footer {
+		height: 58px;
+		padding: 10px 12px;
+		border-top: 1px solid rgba(255, 255, 255, 0.08);
+		display: flex;
+		flex-direction: row;
+	}
+
+	.btn {
+		flex: 1;
+		border-radius: 10px;
+		display: flex;
+		justify-content: center;
+		align-items: center;
+	}
+
+	.btn-cancel {
+		background-color: rgba(255, 255, 255, 0.08);
+		margin-right: 8px;
+	}
+
+	.btn-confirm {
+		background-color: #2f88ff;
+		margin-left: 8px;
+	}
+
+	.btn-text {
+		color: #ffffff;
+		font-size: 14px;
+		font-weight: 600;
+	}
+</style>

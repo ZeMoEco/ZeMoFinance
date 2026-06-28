@@ -1,0 +1,1446 @@
+import { OcrModelConfig } from '@/uni_modules/zemo-ocr/utssdk/common/OcrModelConfig.uts'
+import { FileUtil } from '@/utils/file/file.uts'
+import { ZipUtil } from '@/utils/zip/zip.uts'
+import { ScreenOmniLiteModelService } from '@/services/sys/ScreenOmniLiteModelService.uts'
+
+// #ifdef APP-HARMONY
+import fs from '@ohos.file.fs'
+import common from '@ohos.app.ability.common'
+declare function getContext(component?: Object | null): Object | null
+// #endif
+
+export type OcrModelStatus = {
+	enabled: boolean
+	screenOcrEnabled: boolean
+	ready: boolean
+	backend: string
+	modelRoot: string
+	detModelPath: string
+	recModelPath: string
+	dictPath: string
+	screenOmniModelReady: boolean
+	screenOmniModelPath: string
+	screenOmniModelMessage: string
+	miniMindOModelReady: boolean
+	miniMindOModelPath: string
+	miniMindOModelMessage: string
+	version: string
+	updatedAt: string
+	message: string
+}
+
+export type OcrModelInstallResult = {
+	ok: boolean
+	message: string
+	status: OcrModelStatus
+}
+
+type OcrModelDiscovery = {
+	detNbPath: string
+	recNbPath: string
+	detOnnxPath: string
+	recOnnxPath: string
+	detMsPath: string
+	recMsPath: string
+	screenMsPath: string
+	screenLabelsPath: string
+	dictPath: string
+}
+
+type OcrNativeModelPaths = {
+	detPath: string
+	recPath: string
+	dictPath: string
+}
+
+type DirectScreenIntentFiles = {
+	modelPath: string
+	labelsPath: string
+}
+
+export class OcrModelService {
+	static readonly ENABLED_KEY: string = 'ocr_ppocrv6_enabled'
+	static readonly SCREEN_OCR_ENABLED_KEY: string = 'screen_ocr_enabled'
+	static readonly VERSION_KEY: string = 'ocr_ppocrv6_model_version'
+	static readonly UPDATED_AT_KEY: string = 'ocr_ppocrv6_model_updated_at'
+	static readonly BACKEND_KEY: string = 'ocr_ppocrv6_model_backend'
+	static readonly DET_PATH_KEY: string = 'ocr_ppocrv6_det_model_path'
+	static readonly REC_PATH_KEY: string = 'ocr_ppocrv6_rec_model_path'
+	static readonly DICT_PATH_KEY: string = 'ocr_ppocrv6_dict_path'
+	static readonly MINIMIND_O_MODEL_PATH_KEY: string = 'minimind_o_ms_model_path'
+	static readonly MINIMIND_O_UPDATED_AT_KEY: string = 'minimind_o_ms_updated_at'
+	static readonly MINIMIND_O_FULL_MODEL_FILE_NAME: string = 'zemo_screen_minimind_o_prefill_s192.ms'
+	static readonly MINIMIND_O_TEXT_MODEL_FILE_NAME: string = 'zemo_screen_minimind_o_text_s192.ms'
+	static readonly MINIMIND_O_COPY_CHUNK_BYTES: number = 4 * 1024 * 1024
+	static readonly MINIMIND_O_FULL_MODEL_SIZE: number = 632571520
+	static readonly MINIMIND_O_TEXT_MODEL_SIZE: number = 354510208
+	static readonly MINIMIND_O_BAD_GATHERND_MODEL_SIZE: number = 632719456
+
+	static isPpOcrV6Enabled(): boolean {
+		try {
+			const raw = uni.getStorageSync(OcrModelService.ENABLED_KEY)
+			return raw != null && raw.toString() == '1'
+		} catch (_e0) {
+			return false
+		}
+	}
+
+	static setPpOcrV6Enabled(enabled: boolean): void {
+		uni.setStorageSync(OcrModelService.ENABLED_KEY, enabled ? '1' : '0')
+	}
+
+	static isScreenOcrEnabled(): boolean {
+		try {
+			const raw = uni.getStorageSync(OcrModelService.SCREEN_OCR_ENABLED_KEY)
+			if (raw == null || raw.toString() == '') return true
+			return raw.toString() == '1'
+		} catch (_e0) {
+			return true
+		}
+	}
+
+	static setScreenOcrEnabled(enabled: boolean): void {
+		uni.setStorageSync(OcrModelService.SCREEN_OCR_ENABLED_KEY, enabled ? '1' : '0')
+	}
+
+	static async getStatus(): Promise<OcrModelStatus> {
+		const screenStatus = await ScreenOmniLiteModelService.getModelStatus()
+		const detNbPath = `${OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR}/model.nb`
+		const recNbPath = `${OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR}/model.nb`
+		const detOnnxPath = `${OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR}/model.onnx`
+		const recOnnxPath = `${OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR}/model.onnx`
+		const detMsPath = `${OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR}/model.ms`
+		const recMsPath = `${OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR}/model.ms`
+		const dictTxtPath = OcrModelConfig.PPOCRV6_DICT_RUNTIME_PATH
+		const dictYamlPath = OcrModelConfig.PPOCRV6_DICT_YAML_RUNTIME_PATH
+		const detNbReady = await FileUtil.exists(detNbPath)
+		const recNbReady = await FileUtil.exists(recNbPath)
+		const detOnnxReady = await FileUtil.exists(detOnnxPath)
+		const recOnnxReady = await FileUtil.exists(recOnnxPath)
+		const detMsReady = await FileUtil.exists(detMsPath)
+		const recMsReady = await FileUtil.exists(recMsPath)
+		const dictYamlReady = await FileUtil.exists(dictYamlPath)
+		const dictTxtReady = await FileUtil.exists(dictTxtPath)
+		let dictPath = dictTxtPath
+		let dictReady = dictTxtReady
+		// #ifdef APP-HARMONY
+		dictPath = dictYamlPath
+		dictReady = dictYamlReady
+		// #endif
+		let version = ''
+		let updatedAt = ''
+		let backend = ''
+		let nativeDetPath = ''
+		let nativeRecPath = ''
+		let nativeDictPath = ''
+		version = OcrModelService.readStorageText(OcrModelService.VERSION_KEY)
+		updatedAt = OcrModelService.readStorageText(OcrModelService.UPDATED_AT_KEY)
+		backend = OcrModelService.readStorageText(OcrModelService.BACKEND_KEY)
+		nativeDetPath = OcrModelService.readStorageText(OcrModelService.DET_PATH_KEY)
+		nativeRecPath = OcrModelService.readStorageText(OcrModelService.REC_PATH_KEY)
+		nativeDictPath = OcrModelService.readStorageText(OcrModelService.DICT_PATH_KEY)
+		const storedMiniMindPath = OcrModelService.readStorageText(OcrModelService.MINIMIND_O_MODEL_PATH_KEY)
+		let miniMindPath = storedMiniMindPath
+		let miniMindSize = 0
+		let miniMindReady = false
+		let miniMindMessage = 'MiniMind-O 模型未配置'
+		// #ifdef APP-HARMONY
+		if (storedMiniMindPath != '') {
+			if (!OcrModelService.isHarmonyPhysicalPath(storedMiniMindPath)) {
+				miniMindPath = ''
+				miniMindMessage = 'MiniMind-O 仍是外部授权路径，请重新导入到应用沙箱'
+			} else {
+				miniMindSize = OcrModelService.harmonyFileSize(storedMiniMindPath)
+				miniMindReady = miniMindSize > 0 && !OcrModelService.isKnownBadMiniMindOModelSize(miniMindSize)
+				const miniMindKind = OcrModelService.miniMindOModelKindBySize(miniMindSize)
+				miniMindMessage = miniMindSize <= 0
+					? 'MiniMind-O 沙箱模型文件丢失，请重新导入'
+					: (miniMindReady
+						? `MiniMind-O ${miniMindKind}模型已导入沙箱，大小 ${OcrModelService.formatBytes(miniMindSize)}`
+						: 'MiniMind-O 是旧转换产物，请重新导入 model/minimind_o_ms/zemo_screen_minimind_o_prefill_s192.ms')
+				if (!miniMindReady) miniMindPath = ''
+			}
+		}
+		// #endif
+		// #ifndef APP-HARMONY
+		if (storedMiniMindPath != '') {
+			miniMindSize = await FileUtil.getFileSize(storedMiniMindPath)
+			miniMindReady = miniMindSize > 0 && !OcrModelService.isKnownBadMiniMindOModelSize(miniMindSize)
+			const miniMindKind = OcrModelService.miniMindOModelKindBySize(miniMindSize)
+			miniMindMessage = miniMindSize <= 0
+				? 'MiniMind-O 模型文件不可读，请重新导入'
+				: (miniMindReady
+					? `MiniMind-O ${miniMindKind}模型已配置，大小 ${OcrModelService.formatBytes(miniMindSize)}`
+					: 'MiniMind-O 是旧转换产物，请重新导入 model/minimind_o_ms/zemo_screen_minimind_o_prefill_s192.ms')
+			if (!miniMindReady) miniMindPath = ''
+		}
+		// #endif
+		const onnxReady = detOnnxReady && recOnnxReady
+		const paddleReady = detNbReady && recNbReady
+		const mindSporeReady = detMsReady && recMsReady
+		if (backend == 'onnx' && !onnxReady) backend = ''
+		if (backend == 'paddle-lite' && !paddleReady) backend = ''
+		if (backend == 'mindspore-lite' && !mindSporeReady) backend = ''
+		// #ifdef APP-ANDROID
+		if (backend == 'mindspore-lite') backend = ''
+		if (backend == '') backend = onnxReady ? 'onnx' : (paddleReady ? 'paddle-lite' : '')
+		// #endif
+		// #ifdef APP-HARMONY
+		if (backend == 'onnx' || backend == 'paddle-lite') backend = ''
+		if (backend == '') backend = mindSporeReady ? 'mindspore-lite' : ''
+		// #endif
+		// #ifndef APP-ANDROID || APP-HARMONY
+		if (backend == '') backend = mindSporeReady ? 'mindspore-lite' : (onnxReady ? 'onnx' : (paddleReady ? 'paddle-lite' : ''))
+		// #endif
+		let detModelPath = backend == '' ? '' : (backend == 'mindspore-lite' ? detMsPath : (backend == 'onnx' ? detOnnxPath : detNbPath))
+		let recModelPath = backend == '' ? '' : (backend == 'mindspore-lite' ? recMsPath : (backend == 'onnx' ? recOnnxPath : recNbPath))
+		let effectiveDictPath = dictPath
+		let nativeReady = true
+		// #ifdef APP-HARMONY
+		if (backend == 'mindspore-lite') {
+			let nativeDetReady = false
+			let nativeRecReady = false
+			let nativeDictReady = false
+			if (nativeDetPath != '') nativeDetReady = OcrModelService.harmonyPathExists(nativeDetPath)
+			if (nativeRecPath != '') nativeRecReady = OcrModelService.harmonyPathExists(nativeRecPath)
+			if (nativeDictPath != '') nativeDictReady = OcrModelService.harmonyPathExists(nativeDictPath)
+			nativeReady = nativeDetReady && nativeRecReady && nativeDictReady
+			if (nativeReady) {
+				detModelPath = nativeDetPath
+				recModelPath = nativeRecPath
+				effectiveDictPath = nativeDictPath
+			}
+		}
+		// #endif
+		const ready = backend != '' && dictReady && nativeReady
+		let message = 'PP-OCRv6 模型未导入'
+		if (ready) {
+			message = `PP-OCRv6 模型已就绪（${backend}）${updatedAt != '' ? `，更新时间 ${updatedAt}` : ''}`
+		} else if (backend == 'mindspore-lite' && !nativeReady) {
+			message = 'PP-OCRv6 原生模型路径未就绪，请重新导入模型'
+		} else if (backend == '' && (mindSporeReady || onnxReady || paddleReady) && dictReady) {
+			message = 'PP-OCRv6 模型格式与当前平台不匹配'
+		} else if (detMsReady || recMsReady || detNbReady || recNbReady || detOnnxReady || recOnnxReady || dictReady) {
+			message = `PP-OCRv6 模型不完整：msDet=${detMsReady ? 'ok' : 'missing'}, msRec=${recMsReady ? 'ok' : 'missing'}, onnxDet=${detOnnxReady ? 'ok' : 'missing'}, onnxRec=${recOnnxReady ? 'ok' : 'missing'}, nbDet=${detNbReady ? 'ok' : 'missing'}, nbRec=${recNbReady ? 'ok' : 'missing'}, dict=${dictReady ? 'ok' : 'missing'}`
+		}
+		return {
+			enabled: OcrModelService.isPpOcrV6Enabled(),
+			screenOcrEnabled: OcrModelService.isScreenOcrEnabled(),
+			ready,
+			backend,
+			modelRoot: OcrModelConfig.PPOCRV6_RUNTIME_ROOT_DIR,
+			detModelPath,
+			recModelPath,
+			dictPath: effectiveDictPath,
+			screenOmniModelReady: screenStatus.ready,
+			screenOmniModelPath: screenStatus.nativeModelPath != '' ? screenStatus.nativeModelPath : screenStatus.modelPath,
+			screenOmniModelMessage: `${screenStatus.message}；${miniMindMessage}`,
+			miniMindOModelReady: miniMindReady,
+			miniMindOModelPath: miniMindPath,
+			miniMindOModelMessage: miniMindMessage,
+			version,
+			updatedAt,
+			message,
+		} as OcrModelStatus
+	}
+
+	static async installPpOcrV6ModelPackage(sourcePath: string): Promise<OcrModelInstallResult> {
+		const normalizedSource = FileUtil.normalizePath(sourcePath)
+		if (normalizedSource == '') {
+			return await OcrModelService.result(false, '模型路径为空')
+		}
+
+		let sourceRoot = normalizedSource
+		let tempRoot = ''
+		try {
+			const sourceIsDir = await FileUtil.isDir(normalizedSource)
+			if (!sourceIsDir) {
+				const lower = normalizedSource.toLowerCase()
+				if (OcrModelService.looksLikeRemovedFinanceFieldModelPath(lower)) {
+					return await OcrModelService.result(false, '金融字段 SLM 已移除，请改用屏幕视觉模型；这里只导入 OCR 或屏幕意图模型')
+				}
+				if (OcrModelService.looksLikeMiniMindOModelPath(lower)) {
+					return await OcrModelService.installMiniMindOModelPath(normalizedSource)
+				}
+				if (ScreenOmniLiteModelService.looksLikeScreenIntentModelPath(lower)) {
+					return await OcrModelService.result(false, '屏幕意图模型需要同时选择 screen_omni_intent.ms 和 label_map.json')
+				}
+				if (lower.endsWith('.ms') || lower.endsWith('.onnx') || lower.endsWith('.nb')) {
+					return await OcrModelService.result(false, 'OCR 至少需要同时选择 det 和 rec 两个模型文件')
+				}
+				if (OcrModelService.isDictionaryCandidatePath(lower)) {
+					return await OcrModelService.result(false, 'inference.yml/字典文件只能作为字典来源，仍需同时选择 det 和 rec 模型文件')
+				}
+				tempRoot = `${uni.env.USER_DATA_PATH.replace(/\/+$/, '')}/zemo/tmp/ppocrv6_import_${Date.now()}`
+				await FileUtil.ensureDir(tempRoot)
+				const zipPath = await OcrModelService.materializeZipSource(normalizedSource, tempRoot)
+				if (zipPath == '') {
+					return await OcrModelService.result(false, '无法读取模型 zip 文件')
+				}
+				const unzipOk = await ZipUtil.unzipFile(zipPath, tempRoot)
+				if (!unzipOk) {
+					return await OcrModelService.result(false, '模型 zip 解压失败')
+				}
+				sourceRoot = tempRoot
+			}
+
+			const discovery = await OcrModelService.discoverModelFiles(sourceRoot)
+			const hasOcrPair = discovery.detMsPath != '' || discovery.recMsPath != '' || discovery.detOnnxPath != '' || discovery.recOnnxPath != '' || discovery.detNbPath != '' || discovery.recNbPath != ''
+			if (!hasOcrPair && discovery.screenMsPath != '') {
+				const screenOnlyResult = await ScreenOmniLiteModelService.installModelFiles({
+					modelPath: discovery.screenMsPath,
+					labelsPath: discovery.screenLabelsPath
+				})
+				return await OcrModelService.result(screenOnlyResult.ok, screenOnlyResult.ok ? `${screenOnlyResult.message}；OCR 模型未更新` : screenOnlyResult.message)
+			}
+			let useMindSporeLite = false
+			let useOnnx = false
+			let usePaddleLite = false
+			// #ifdef APP-HARMONY
+			useMindSporeLite = discovery.detMsPath != '' && discovery.recMsPath != ''
+			// #endif
+			// #ifdef APP-ANDROID
+			useOnnx = discovery.detOnnxPath != '' && discovery.recOnnxPath != ''
+			usePaddleLite = !useOnnx && discovery.detNbPath != '' && discovery.recNbPath != ''
+			// #endif
+			// #ifndef APP-ANDROID || APP-HARMONY
+			useMindSporeLite = discovery.detMsPath != '' && discovery.recMsPath != ''
+			useOnnx = !useMindSporeLite && discovery.detOnnxPath != '' && discovery.recOnnxPath != ''
+			usePaddleLite = !useMindSporeLite && !useOnnx && discovery.detNbPath != '' && discovery.recNbPath != ''
+			// #endif
+			// #ifdef APP-HARMONY
+			if (!useMindSporeLite) {
+				return await OcrModelService.result(false, '鸿蒙 PP-OCRv6 请同时选择 .ms 模型和 inference.yml；两个 .ms 的文件名或目录需包含 ocrv6_det 和 ocrv6_rec')
+			}
+			// #endif
+			if (!useMindSporeLite && !useOnnx && !usePaddleLite) {
+				return await OcrModelService.result(false, '模型包缺少 det/rec 成套模型，请提供鸿蒙 .ms、Android .onnx 或 Paddle Lite .nb')
+			}
+
+			let discoveryDictIsYaml = false
+			if (discovery.dictPath != '') discoveryDictIsYaml = await OcrModelService.isYamlDictionarySource(discovery.dictPath)
+			if (useMindSporeLite && !discoveryDictIsYaml) {
+				return await OcrModelService.result(false, '鸿蒙 PP-OCRv6 请使用官方 inference.yml 作为字典，并确保包含 PostProcess.character_dict')
+			}
+
+			OcrModelService.clearNativeModelPathStorage()
+			await FileUtil.removeDir(OcrModelConfig.PPOCRV6_RUNTIME_ROOT_DIR)
+			await FileUtil.ensureDir(OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR)
+			await FileUtil.ensureDir(OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR)
+
+			const backend = useMindSporeLite ? 'mindspore-lite' : (useOnnx ? 'onnx' : 'paddle-lite')
+			if (useMindSporeLite) {
+				await OcrModelService.installMindSporeModelFile(discovery.detMsPath, OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR)
+				await OcrModelService.installMindSporeModelFile(discovery.recMsPath, OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR)
+			} else if (useOnnx) {
+				await OcrModelService.installOnnxModelFile(discovery.detOnnxPath, OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR)
+				await OcrModelService.installOnnxModelFile(discovery.recOnnxPath, OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR)
+			} else {
+				await OcrModelService.installPaddleLiteModelFile(discovery.detNbPath, OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR)
+				await OcrModelService.installPaddleLiteModelFile(discovery.recNbPath, OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR)
+			}
+
+			const installedDetPath = useMindSporeLite
+				? `${OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR}/model.ms`
+				: (useOnnx ? `${OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR}/model.onnx` : `${OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR}/model.nb`)
+			const installedRecPath = useMindSporeLite
+				? `${OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR}/model.ms`
+				: (useOnnx ? `${OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR}/model.onnx` : `${OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR}/model.nb`)
+			const installedDetReady = await FileUtil.exists(installedDetPath)
+			const installedRecReady = await FileUtil.exists(installedRecPath)
+			if (!installedDetReady || !installedRecReady) {
+				return await OcrModelService.result(false, `模型文件复制失败：det=${installedDetReady ? 'ok' : 'missing'}, rec=${installedRecReady ? 'ok' : 'missing'}`)
+			}
+
+			const installedDictPath = useMindSporeLite
+				? OcrModelConfig.PPOCRV6_DICT_YAML_RUNTIME_PATH
+				: OcrModelConfig.PPOCRV6_DICT_RUNTIME_PATH
+			console.log(`[ZemoOcr][Model] discovered det=${discovery.detMsPath}, rec=${discovery.recMsPath}, dict=${discovery.dictPath}, installDict=${installedDictPath}`)
+			let dictOk = false
+			if (discovery.dictPath != '') {
+				dictOk = await OcrModelService.installDictFile(discovery.dictPath, installedDictPath)
+			} else {
+				dictOk = await OcrModelService.installDictFile(OcrModelConfig.DICT_ASSET_PATH, installedDictPath)
+			}
+			if (!dictOk) {
+				return await OcrModelService.result(false, useMindSporeLite
+					? '官方 inference.yml 导入失败，请确认包含 PostProcess.character_dict'
+					: (discovery.dictPath != '' ? '字典文件导入失败，请提供 ppocr_keys_v1.txt 或带 character_dict 的 inference.yml' : '内置字典复制失败，请提供 ppocr_keys_v1.txt'))
+			}
+			const nativePaths = await OcrModelService.prepareNativeModelPaths(backend, {
+				detPath: installedDetPath,
+				recPath: installedRecPath,
+				dictPath: installedDictPath,
+			} as OcrNativeModelPaths)
+			console.log(`[ZemoOcr][Model] native paths det=${nativePaths.detPath}, rec=${nativePaths.recPath}, dict=${nativePaths.dictPath}`)
+			if (nativePaths.detPath == '' || nativePaths.recPath == '' || nativePaths.dictPath == '') {
+				return await OcrModelService.result(false, '原生模型文件准备失败，请重新导入模型')
+			}
+
+			let extraMessage = ''
+			if (discovery.screenMsPath != '') {
+				const screenResult = await ScreenOmniLiteModelService.installModelFiles({
+					modelPath: discovery.screenMsPath,
+					labelsPath: discovery.screenLabelsPath
+				})
+				if (!screenResult.ok) {
+					return await OcrModelService.result(false, `OCR 模型已导入，屏幕意图模型导入失败：${screenResult.message}`)
+				}
+				extraMessage += `；${screenResult.message}`
+			}
+
+			const updatedAt = OcrModelService.formatNow()
+			uni.setStorageSync(OcrModelService.VERSION_KEY, 'PP-OCRv6')
+			uni.setStorageSync(OcrModelService.UPDATED_AT_KEY, updatedAt)
+			uni.setStorageSync(OcrModelService.BACKEND_KEY, backend)
+			uni.setStorageSync(OcrModelService.DET_PATH_KEY, nativePaths.detPath)
+			uni.setStorageSync(OcrModelService.REC_PATH_KEY, nativePaths.recPath)
+			uni.setStorageSync(OcrModelService.DICT_PATH_KEY, nativePaths.dictPath)
+			await FileUtil.writeTextFile(
+				OcrModelConfig.PPOCRV6_MANIFEST_PATH,
+				JSON.stringify({
+					version: 'PP-OCRv6',
+					backend,
+					updatedAt,
+					source: OcrModelService.basename(normalizedSource),
+					detModel: useMindSporeLite ? OcrModelService.basename(discovery.detMsPath) : (useOnnx ? OcrModelService.basename(discovery.detOnnxPath) : OcrModelService.basename(discovery.detNbPath)),
+					recModel: useMindSporeLite ? OcrModelService.basename(discovery.recMsPath) : (useOnnx ? OcrModelService.basename(discovery.recOnnxPath) : OcrModelService.basename(discovery.recNbPath)),
+					dict: discovery.dictPath == '' ? 'bundled-ppocr_keys_v1.txt' : OcrModelService.basename(discovery.dictPath),
+					screenOmniModel: discovery.screenMsPath == '' ? '' : OcrModelService.basename(discovery.screenMsPath),
+				})
+			)
+			return await OcrModelService.result(true, `PP-OCRv6 模型已导入${extraMessage}`)
+		} catch (e) {
+			const message = e == null ? '模型导入异常' : (e as Error).message
+			return await OcrModelService.result(false, message)
+		} finally {
+			if (tempRoot != '') {
+				await FileUtil.removeDir(tempRoot)
+			}
+		}
+	}
+
+	static async installPpOcrV6ModelFiles(sourcePaths: string[]): Promise<OcrModelInstallResult> {
+		const paths = [] as string[]
+		for (let i = 0; i < sourcePaths.length; i++) {
+			const path = FileUtil.normalizePath(sourcePaths[i])
+			if (path != '') paths.push(path)
+		}
+		if (paths.length == 0) {
+			return await OcrModelService.result(false, '模型路径为空')
+		}
+		if (paths.length == 1) {
+			const lower = paths[0].toLowerCase()
+			if (OcrModelService.looksLikeMiniMindOModelPath(lower)) {
+				return await OcrModelService.installMiniMindOModelPath(paths[0])
+			}
+			if (ScreenOmniLiteModelService.looksLikeScreenIntentModelPath(lower)) {
+				return await OcrModelService.result(false, '屏幕意图模型需要同时选择 screen_omni_intent.ms 和 label_map.json')
+			}
+			if (OcrModelService.looksLikeRemovedFinanceFieldModelPath(lower)) {
+				return await OcrModelService.result(false, '金融字段 SLM 已移除，请改用屏幕视觉模型；这里只导入 OCR 或屏幕意图模型')
+			}
+			if (lower.endsWith('.ms') || lower.endsWith('.onnx') || lower.endsWith('.nb')) {
+				return await OcrModelService.result(false, 'OCR 至少需要同时选择 det 和 rec 两个模型文件')
+			}
+			if (OcrModelService.isDictionaryCandidatePath(lower)) {
+				return await OcrModelService.result(false, 'inference.yml/字典文件只能作为字典来源，仍需同时选择 det 和 rec 模型文件')
+			}
+			return await OcrModelService.installPpOcrV6ModelPackage(paths[0])
+		}
+
+		let workingPaths = paths
+		let miniMindMessage = ''
+		const miniMindPath = OcrModelService.findMiniMindOModelPath(workingPaths)
+		if (miniMindPath != '') {
+			miniMindMessage = await OcrModelService.saveMiniMindOModelPath(miniMindPath)
+			if (miniMindMessage == '') {
+				return await OcrModelService.result(false, 'MiniMind-O 模型文件不可读，请重新选择 zemo_screen_minimind_o_prefill_s192.ms 或 zemo_screen_minimind_o_text_s192.ms')
+			}
+			workingPaths = OcrModelService.filterMiniMindOImportFiles(workingPaths, miniMindPath)
+			if (workingPaths.length == 0) {
+				return await OcrModelService.result(true, `${miniMindMessage}；OCR 模型未更新`)
+			}
+		}
+
+		const directScreenFiles = await OcrModelService.findDirectScreenIntentFiles(workingPaths)
+		if (directScreenFiles.modelPath != '' && directScreenFiles.labelsPath != '' && !OcrModelService.hasOtherImportFiles(workingPaths, directScreenFiles)) {
+			const screenResult = await ScreenOmniLiteModelService.installModelFiles({
+				modelPath: directScreenFiles.modelPath,
+				labelsPath: directScreenFiles.labelsPath
+			})
+			const okMessage = miniMindMessage == '' ? `${screenResult.message}；OCR 模型未更新` : `${screenResult.message}；${miniMindMessage}；OCR 模型未更新`
+			return await OcrModelService.result(screenResult.ok, screenResult.ok ? okMessage : screenResult.message)
+		}
+		if (directScreenFiles.modelPath != '' && directScreenFiles.labelsPath == '') {
+			return await OcrModelService.result(false, `已选择 ${OcrModelService.basename(directScreenFiles.modelPath)}，但没有识别到对应 label_map.json。请同时选择 model/screen_omni_ms/label_map.json`)
+		}
+
+		const tempRoot = `${uni.env.USER_DATA_PATH.replace(/\/+$/, '')}/zemo/tmp/ppocrv6_files_${Date.now()}`
+		try {
+			await FileUtil.ensureDir(tempRoot)
+			for (let i = 0; i < workingPaths.length; i++) {
+				const path = workingPaths[i]
+				if (OcrModelService.shouldIgnoreRemovedFinanceFieldImportFile(path)) continue
+				const isDir = await FileUtil.isDir(path)
+				if (isDir) continue
+				const name = OcrModelService.importTempName(path, i)
+				const dest = `${tempRoot}/${i}_${name}`
+				const data = await FileUtil.readBinaryFile(path)
+				if (data != null) {
+					const ok = await FileUtil.writeBinaryFile(dest, data)
+					if (!ok) return await OcrModelService.result(false, `复制模型文件失败：${name}`)
+				} else {
+					await FileUtil.copyFile(path, dest, { overwrite: true })
+				}
+			}
+			const result = await OcrModelService.installPpOcrV6ModelPackage(tempRoot)
+			if (result.ok && miniMindMessage != '') {
+				return await OcrModelService.result(true, `${result.message}；${miniMindMessage}`)
+			}
+			return result
+		} finally {
+			await FileUtil.removeDir(tempRoot)
+		}
+	}
+
+	private static async installMiniMindOModelPath(sourcePath: string): Promise<OcrModelInstallResult> {
+		const message = await OcrModelService.saveMiniMindOModelPath(sourcePath)
+		if (message == '') return await OcrModelService.result(false, 'MiniMind-O 模型文件不可读，请选择 zemo_screen_minimind_o_prefill_s192.ms 或 zemo_screen_minimind_o_text_s192.ms')
+		return await OcrModelService.result(true, `${message}；OCR 模型未更新`)
+	}
+
+	private static async saveMiniMindOModelPath(sourcePath: string): Promise<string> {
+		const path = FileUtil.normalizePath(sourcePath)
+		if (path == '') return ''
+		// #ifdef APP-HARMONY
+		const nativePath = await OcrModelService.installMiniMindOModelToSandbox(path)
+		if (nativePath == '') return ''
+		const nativeSize = OcrModelService.harmonyFileSize(nativePath)
+		if (nativeSize <= 0) return ''
+		uni.setStorageSync(OcrModelService.MINIMIND_O_MODEL_PATH_KEY, nativePath)
+		uni.setStorageSync(OcrModelService.MINIMIND_O_UPDATED_AT_KEY, OcrModelService.formatNow())
+		return `MiniMind-O ${OcrModelService.miniMindOModelKindBySize(nativeSize)}模型已导入沙箱，大小 ${OcrModelService.formatBytes(nativeSize)}`
+		// #endif
+
+		await FileUtil.activatePersistedUriPermission(path)
+		const size = await FileUtil.getFileSize(path)
+		uni.setStorageSync(OcrModelService.MINIMIND_O_MODEL_PATH_KEY, path)
+		uni.setStorageSync(OcrModelService.MINIMIND_O_UPDATED_AT_KEY, OcrModelService.formatNow())
+		return size > 0
+			? `MiniMind-O ${OcrModelService.miniMindOModelKindBySize(size)}模型已配置，大小 ${OcrModelService.formatBytes(size)}`
+			: 'MiniMind-O 模型路径已保存，等待运行时校验文件'
+	}
+
+	private static async findDirectScreenIntentFiles(paths: string[]): Promise<DirectScreenIntentFiles> {
+		let modelPath = ''
+		let labelsPath = ''
+		for (let i = 0; i < paths.length; i++) {
+			const path = FileUtil.normalizePath(paths[i])
+			const lower = path.toLowerCase()
+			if (modelPath == '' && ScreenOmniLiteModelService.looksLikeScreenIntentModelPath(lower)) {
+				modelPath = path
+				continue
+			}
+		}
+		for (let i = 0; i < paths.length; i++) {
+			const path = FileUtil.normalizePath(paths[i])
+			if (path == '' || path == modelPath) continue
+			if (labelsPath == '' && await ScreenOmniLiteModelService.looksLikeScreenIntentLabelsPath(path)) {
+				labelsPath = path
+				continue
+			}
+		}
+		if (modelPath != '' && labelsPath == '') {
+			for (let i = 0; i < paths.length; i++) {
+				const path = FileUtil.normalizePath(paths[i])
+				if (path == '' || path == modelPath) continue
+				const lower = path.toLowerCase()
+				const name = OcrModelService.basename(lower)
+				if (lower.endsWith('.json') && (name == 'label_map.json' || name.endsWith('_label_map.json'))) {
+					labelsPath = path
+					break
+				}
+			}
+		}
+		return { modelPath, labelsPath } as DirectScreenIntentFiles
+	}
+
+	private static hasOtherImportFiles(paths: string[], screenFiles: DirectScreenIntentFiles): boolean {
+		for (let i = 0; i < paths.length; i++) {
+			const path = FileUtil.normalizePath(paths[i])
+			if (path == '' || path == screenFiles.modelPath || path == screenFiles.labelsPath) continue
+			const lower = path.toLowerCase()
+			const name = OcrModelService.basename(lower)
+			if (name == 'model_config.json' || name == 'train_report.json' || name == 'model_training_summary.md' || name == 'readme.md') continue
+			if (lower.indexOf('screen_omni') >= 0 || lower.indexOf('screen_intent') >= 0 || lower.indexOf('omni_intent') >= 0) continue
+			if (OcrModelService.shouldIgnoreRemovedFinanceFieldImportFile(path)) continue
+			return true
+		}
+		return false
+	}
+
+	private static findMiniMindOModelPath(paths: string[]): string {
+		for (let i = 0; i < paths.length; i++) {
+			const path = FileUtil.normalizePath(paths[i])
+			const name = OcrModelService.basename(path.toLowerCase())
+			if (name == OcrModelService.MINIMIND_O_FULL_MODEL_FILE_NAME) return path
+		}
+		for (let j = 0; j < paths.length; j++) {
+			const path = FileUtil.normalizePath(paths[j])
+			const name = OcrModelService.basename(path.toLowerCase())
+			if (name == OcrModelService.MINIMIND_O_TEXT_MODEL_FILE_NAME) return path
+		}
+		for (let i = 0; i < paths.length; i++) {
+			const path = FileUtil.normalizePath(paths[i])
+			if (OcrModelService.looksLikeMiniMindOModelPath(path)) return path
+		}
+		return ''
+	}
+
+	private static filterMiniMindOImportFiles(paths: string[], miniMindPath: string): string[] {
+		const result = [] as string[]
+		for (let i = 0; i < paths.length; i++) {
+			const path = FileUtil.normalizePath(paths[i])
+			if (path == '' || path == miniMindPath) continue
+			if (OcrModelService.isMiniMindOSidecarFile(path)) continue
+			result.push(path)
+		}
+		return result
+	}
+
+	private static looksLikeMiniMindOModelPath(path: string): boolean {
+		const lower = FileUtil.normalizePath(path).toLowerCase()
+		if (!lower.endsWith('.ms')) return false
+		const name = OcrModelService.basename(lower)
+		return name == OcrModelService.MINIMIND_O_FULL_MODEL_FILE_NAME
+			|| name == OcrModelService.MINIMIND_O_TEXT_MODEL_FILE_NAME
+			|| name.indexOf('minimind') >= 0
+			|| lower.indexOf('minimind_o_ms') >= 0
+	}
+
+	private static isMiniMindOSidecarFile(path: string): boolean {
+		const lower = FileUtil.normalizePath(path).toLowerCase()
+		const name = OcrModelService.basename(lower)
+		if (name == 'manifest.json' || name == 'id_to_token.json' || name == 'tokenizer.json') {
+			return lower.indexOf('minimind') >= 0 || lower.indexOf('mindspore_lite') >= 0 || lower.indexOf('zemo_screen') >= 0
+		}
+		if (name.endsWith('.manifest.json') && name.indexOf('zemo_screen_minimind_o') >= 0) return true
+		return name == 'zemo_screen_minimind_o_prefill_s192.manifest.json'
+			|| name == 'zemo_screen_minimind_o_prefill_s192.onnx'
+			|| name == 'zemo_screen_minimind_o_text_s192.manifest.json'
+			|| name == 'zemo_screen_minimind_o_text_s192.onnx'
+	}
+
+	private static looksLikeRemovedFinanceFieldModelPath(path: string): boolean {
+		const lower = FileUtil.normalizePath(path).toLowerCase()
+		if (!lower.endsWith('.ms')) return false
+		const name = OcrModelService.basename(lower)
+		return name == 'finance_layout_field_cls.ms'
+			|| name == 'finance_field_cls.ms'
+			|| name.indexOf('finance_layout_field_cls') >= 0
+			|| name.indexOf('finance_field_cls') >= 0
+			|| name.indexOf('layout_field_cls') >= 0
+			|| name.indexOf('layout_field_encoder') >= 0
+			|| name.indexOf('field_cls') >= 0
+	}
+
+	private static shouldIgnoreRemovedFinanceFieldImportFile(path: string): boolean {
+		const lower = FileUtil.normalizePath(path).toLowerCase()
+		const name = OcrModelService.basename(lower)
+		if (OcrModelService.looksLikeRemovedFinanceFieldModelPath(lower)) return true
+		if (name == 'model_config.json' || name.endsWith('_model_config.json')) return true
+		if ((name == 'vocab.txt' || name.endsWith('_vocab.txt')) && (lower.indexOf('finance') >= 0 || lower.indexOf('field') >= 0 || lower.indexOf('layout') >= 0)) return true
+		return false
+	}
+
+	private static async result(ok: boolean, message: string): Promise<OcrModelInstallResult> {
+		const status = await OcrModelService.getStatus()
+		return { ok, message, status } as OcrModelInstallResult
+	}
+
+	private static clearNativeModelPathStorage(): void {
+		try { uni.setStorageSync(OcrModelService.DET_PATH_KEY, '') } catch (_e0) {}
+		try { uni.setStorageSync(OcrModelService.REC_PATH_KEY, '') } catch (_e1) {}
+		try { uni.setStorageSync(OcrModelService.DICT_PATH_KEY, '') } catch (_e2) {}
+	}
+
+	private static async materializeZipSource(sourcePath: string, tempRoot: string): Promise<string> {
+		const normalizedSource = FileUtil.normalizePath(sourcePath)
+		if (normalizedSource.indexOf('://') <= 0 || normalizedSource.indexOf('unifile://') == 0) {
+			return normalizedSource
+		}
+		const data = await FileUtil.readBinaryFile(normalizedSource)
+		if (data == null) return ''
+		const zipPath = `${tempRoot}/model.zip`
+		const ok = await FileUtil.writeBinaryFile(zipPath, data)
+		return ok ? zipPath : ''
+	}
+
+	private static async discoverModelFiles(root: string): Promise<OcrModelDiscovery> {
+		const files = await FileUtil.listDirRecursive(root)
+		console.log(`[ZemoOcr][Model] discover files root=${root}, count=${files.length}`)
+		let detNbPath = ''
+		let recNbPath = ''
+		let detOnnxPath = ''
+		let recOnnxPath = ''
+		let detMsPath = ''
+		let recMsPath = ''
+		let screenMsPath = ''
+		let screenLabelsPath = ''
+		let dictPath = ''
+		let allowTxtDictionary = true
+		// #ifdef APP-HARMONY
+		allowTxtDictionary = false
+		// #endif
+		for (let i = 0; i < files.length; i++) {
+			const path = FileUtil.normalizePath(files[i])
+			const lower = path.toLowerCase()
+			if (await ScreenOmniLiteModelService.looksLikeScreenIntentLabelsPath(path)) {
+				if (screenLabelsPath == '') screenLabelsPath = path
+				continue
+			}
+			if (OcrModelService.shouldIgnoreRemovedFinanceFieldImportFile(path)) {
+				continue
+			}
+			if (allowTxtDictionary && lower.endsWith('.txt') && (lower.indexOf('dict') >= 0 || lower.indexOf('keys') >= 0 || lower.indexOf('vocab') >= 0)) {
+				if (dictPath == '') dictPath = path
+				continue
+			}
+			if (OcrModelService.isYamlPath(lower)) {
+				const dictText = allowTxtDictionary
+					? await OcrModelService.extractDictTextFromYaml(path)
+					: OcrModelService.extractInlineCharacterDict(await OcrModelService.readDictionarySourceText(path))
+				if (dictText != '') dictPath = path
+				continue
+			}
+			const isModelFile = lower.endsWith('.ms') || lower.endsWith('.nb') || lower.endsWith('.onnx')
+			if (!isModelFile) {
+				continue
+			}
+			if (ScreenOmniLiteModelService.looksLikeScreenIntentModelPath(lower)) {
+				if (screenMsPath == '') screenMsPath = path
+				continue
+			}
+			if (lower.endsWith('.ms') && detMsPath == '' && OcrModelService.looksLikeDetPath(lower)) {
+				detMsPath = path
+				continue
+			}
+			if (lower.endsWith('.ms') && recMsPath == '' && OcrModelService.looksLikeRecPath(lower)) {
+				recMsPath = path
+				continue
+			}
+			if (lower.endsWith('.onnx') && detOnnxPath == '' && OcrModelService.looksLikeDetPath(lower)) {
+				detOnnxPath = path
+				continue
+			}
+			if (lower.endsWith('.onnx') && recOnnxPath == '' && OcrModelService.looksLikeRecPath(lower)) {
+				recOnnxPath = path
+				continue
+			}
+			if (lower.endsWith('.nb') && detNbPath == '' && OcrModelService.looksLikeDetPath(lower)) {
+				detNbPath = path
+				continue
+			}
+			if (lower.endsWith('.nb') && recNbPath == '' && OcrModelService.looksLikeRecPath(lower)) {
+				recNbPath = path
+				continue
+			}
+		}
+		let allowMsFallback = true
+		// #ifdef APP-HARMONY
+		allowMsFallback = false
+		// #endif
+		if (allowMsFallback && (detMsPath == '' || recMsPath == '')) {
+			const pair = OcrModelService.pickFallbackPair(files, '.ms')
+			if (detMsPath == '') detMsPath = pair[0] != recMsPath ? pair[0] : pair[1]
+			if (recMsPath == '') recMsPath = pair[0] != detMsPath ? pair[0] : pair[1]
+			if (detMsPath == recMsPath) recMsPath = ''
+		}
+		if (detOnnxPath == '' || recOnnxPath == '') {
+			const pair = OcrModelService.pickFallbackPair(files, '.onnx')
+			if (detOnnxPath == '') detOnnxPath = pair[0] != recOnnxPath ? pair[0] : pair[1]
+			if (recOnnxPath == '') recOnnxPath = pair[0] != detOnnxPath ? pair[0] : pair[1]
+			if (detOnnxPath == recOnnxPath) recOnnxPath = ''
+		}
+		if (detNbPath == '' || recNbPath == '') {
+			const pair = OcrModelService.pickFallbackPair(files, '.nb')
+			if (detNbPath == '') detNbPath = pair[0] != recNbPath ? pair[0] : pair[1]
+			if (recNbPath == '') recNbPath = pair[0] != detNbPath ? pair[0] : pair[1]
+			if (detNbPath == recNbPath) recNbPath = ''
+		}
+		return { detNbPath, recNbPath, detOnnxPath, recOnnxPath, detMsPath, recMsPath, screenMsPath, screenLabelsPath, dictPath } as OcrModelDiscovery
+	}
+
+	private static pickFallbackPair(files: string[], ext: string): string[] {
+		let first = ''
+		let second = ''
+		for (let i = 0; i < files.length; i++) {
+			const path = FileUtil.normalizePath(files[i])
+			const lower = path.toLowerCase()
+			if (!lower.endsWith(ext)) continue
+			if (ext == '.ms' && ScreenOmniLiteModelService.looksLikeScreenIntentModelPath(lower)) continue
+			if (ext == '.ms' && OcrModelService.looksLikeRemovedFinanceFieldModelPath(lower)) continue
+			if (first == '') {
+				first = path
+				continue
+			}
+			if (second == '' && path != first) {
+				second = path
+				break
+			}
+		}
+		return [first, second]
+	}
+
+	private static importTempName(path: string, index: number): string {
+		let name = OcrModelService.basename(path)
+		if (name == '') name = `model_${index}`
+		const lowerName = name.toLowerCase()
+		const lowerPath = FileUtil.normalizePath(path).toLowerCase()
+		if (lowerName.endsWith('.ms') || lowerName.endsWith('.onnx') || lowerName.endsWith('.nb')) {
+			if (ScreenOmniLiteModelService.looksLikeScreenIntentModelPath(lowerPath)) return `screen_omni_intent_${name}`
+			if (OcrModelService.looksLikeDetPath(lowerPath)) return `det_${name}`
+			if (OcrModelService.looksLikeRecPath(lowerPath)) return `rec_${name}`
+		}
+		return name
+	}
+
+	private static looksLikeDetPath(lower: string): boolean {
+		const hint = OcrModelService.normalizeModelHint(lower)
+		return hint.indexOf('ocrv6_det') >= 0
+			|| hint.indexOf('ppocrv6_det') >= 0
+			|| hint.indexOf('pp_ocrv6_det') >= 0
+			|| hint.indexOf('pp_ocr_v6_det') >= 0
+			|| lower.indexOf('/det') >= 0
+			|| lower.indexOf('_det') >= 0
+			|| lower.indexOf('detection') >= 0
+	}
+
+	private static looksLikeRecPath(lower: string): boolean {
+		const hint = OcrModelService.normalizeModelHint(lower)
+		return hint.indexOf('ocrv6_rec') >= 0
+			|| hint.indexOf('ppocrv6_rec') >= 0
+			|| hint.indexOf('pp_ocrv6_rec') >= 0
+			|| hint.indexOf('pp_ocr_v6_rec') >= 0
+			|| lower.indexOf('/rec') >= 0
+			|| lower.indexOf('_rec') >= 0
+			|| lower.indexOf('recognition') >= 0
+	}
+
+	private static normalizeModelHint(value: string): string {
+		return (value ?? '').toString().toLowerCase().replace(/[^a-z0-9]+/g, '_')
+	}
+
+	private static async installDictFile(sourcePath: string, targetPath: string): Promise<boolean> {
+		const lower = FileUtil.normalizePath(sourcePath).toLowerCase()
+		if (OcrModelService.isYamlPath(lower)) {
+			const dictText = await OcrModelService.extractDictTextFromYaml(sourcePath)
+			if (dictText == '') return false
+			if (!OcrModelService.isYamlPath(FileUtil.normalizePath(targetPath).toLowerCase())) {
+				const ok = await FileUtil.writeTextFile(targetPath, dictText)
+				return ok && await FileUtil.exists(targetPath)
+			}
+			await FileUtil.copyFile(sourcePath, targetPath, { overwrite: true })
+			return await FileUtil.exists(targetPath)
+		}
+
+		await FileUtil.copyFile(sourcePath, targetPath, { overwrite: true })
+		return await FileUtil.exists(targetPath)
+	}
+
+	private static async prepareNativeModelPaths(backend: string, installedPaths: OcrNativeModelPaths): Promise<OcrNativeModelPaths> {
+		// #ifdef APP-HARMONY
+		if (backend != 'mindspore-lite') return installedPaths
+		const root = OcrModelService.getHarmonyNativePpOcrV6Root()
+		if (root == '') {
+			console.warn('[ZemoOcr][Model] prepare native model failed: empty native root')
+			return { detPath: '', recPath: '', dictPath: '' } as OcrNativeModelPaths
+		}
+		const rootReady = OcrModelService.ensureHarmonyDir(root)
+		const detDirReady = OcrModelService.ensureHarmonyDir(`${root}/det`)
+		const recDirReady = OcrModelService.ensureHarmonyDir(`${root}/rec`)
+		if (!rootReady || !detDirReady || !recDirReady) {
+			console.warn(`[ZemoOcr][Model] prepare native model failed: mkdir root=${root}, rootReady=${rootReady}, detDirReady=${detDirReady}, recDirReady=${recDirReady}`)
+			return { detPath: '', recPath: '', dictPath: '' } as OcrNativeModelPaths
+		}
+
+		const detSource = installedPaths.detPath
+		const recSource = installedPaths.recPath
+		const detPath = `${root}/det/model.ms`
+		const recPath = `${root}/rec/model.ms`
+		const dictSource = installedPaths.dictPath
+		const dictPath = `${root}/inference.yml`
+		const detOk = await OcrModelService.copyBinaryFileForNative(detSource, detPath)
+		const recOk = await OcrModelService.copyBinaryFileForNative(recSource, recPath)
+		if (!detOk || !recOk) {
+			console.warn(`[ZemoOcr][Model] prepare native model failed: copy model det=${detOk}, rec=${recOk}, detSource=${detSource}, recSource=${recSource}`)
+			return { detPath: '', recPath: '', dictPath: '' } as OcrNativeModelPaths
+		}
+
+		const dictOk = await OcrModelService.installNativeDictFile(dictSource, dictPath)
+		if (!dictOk) {
+			console.warn(`[ZemoOcr][Model] prepare native model failed: copy dict source=${dictSource}`)
+			return { detPath: '', recPath: '', dictPath: '' } as OcrNativeModelPaths
+		}
+
+		const detReady = OcrModelService.harmonyPathExists(detPath)
+		const recReady = OcrModelService.harmonyPathExists(recPath)
+		const dictReady = OcrModelService.harmonyPathExists(dictPath)
+		if (!detReady || !recReady || !dictReady) {
+			console.warn(`[ZemoOcr][Model] prepare native model failed: exists det=${detReady}, rec=${recReady}, dict=${dictReady}, root=${root}`)
+			return { detPath: '', recPath: '', dictPath: '' } as OcrNativeModelPaths
+		}
+		console.log(`[ZemoOcr][Model] Harmony native model root=${root}`)
+		return { detPath, recPath, dictPath } as OcrNativeModelPaths
+		// #endif
+
+		return installedPaths
+	}
+
+	private static async installNativeDictFile(sourcePath: string, targetPath: string): Promise<boolean> {
+		// #ifdef APP-HARMONY
+		const lower = FileUtil.normalizePath(sourcePath).toLowerCase()
+		if (!OcrModelService.isYamlPath(lower)) return false
+		const dictText = await OcrModelService.extractDictTextFromYaml(sourcePath)
+		if (dictText == '') return false
+		return await OcrModelService.copyBinaryFileForNative(sourcePath, targetPath)
+		// #endif
+
+		return false
+	}
+
+	private static async copyBinaryFileForNative(sourcePath: string, targetPath: string): Promise<boolean> {
+		// #ifdef APP-HARMONY
+		const data = await FileUtil.readBinaryFile(sourcePath)
+		if (data == null) {
+			console.warn(`[ZemoOcr][Model] read native source failed: ${sourcePath}`)
+			return false
+		}
+		return OcrModelService.writeHarmonyBinaryFile(targetPath, data)
+		// #endif
+
+		return false
+	}
+
+	private static getHarmonyNativePpOcrV6Root(): string {
+		// #ifdef APP-HARMONY
+		let baseDir = ''
+		try {
+			const ctx = getContext() as common.UIAbilityContext
+			baseDir = ((ctx.filesDir ?? '') as string).toString().replace(/\\/g, '/').replace(/\/+$/, '')
+		} catch (_e0) {}
+		if (baseDir == '') baseDir = '/data/storage/el2/base/haps/entry/files'
+		return `${baseDir}/zemo/assets/ai/ppocrv6_native`
+		// #endif
+
+		return ''
+	}
+
+	private static writeHarmonyBinaryFile(filePath: string, data: ArrayBuffer): boolean {
+		// #ifdef APP-HARMONY
+		let file: fs.File | null = null
+		try {
+			const slash = filePath.lastIndexOf('/')
+			if (slash > 0 && !OcrModelService.ensureHarmonyDir(filePath.substring(0, slash))) return false
+			file = fs.openSync(filePath, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC)
+			fs.writeSync(file.fd, data)
+			try { fs.fsyncSync(file.fd) } catch (_e1) {}
+			return OcrModelService.harmonyPathExists(filePath)
+		} catch (_e0) {
+			console.warn(`[ZemoOcr][Model] write native binary failed: ${filePath}, err=${_e0}`)
+			return false
+		} finally {
+			try {
+				if (file != null) fs.closeSync(file)
+			} catch (_e1) {}
+		}
+		// #endif
+
+		return false
+	}
+
+	private static ensureHarmonyDir(dirPath: string): boolean {
+		// #ifdef APP-HARMONY
+		try {
+			const stat = fs.statSync(dirPath)
+			if (stat != null && stat.isDirectory()) return true
+			try { fs.unlinkSync(dirPath) } catch (_e0) {}
+		} catch (_e1) {}
+		try {
+			fs.mkdirSync(dirPath, true)
+			const stat = fs.statSync(dirPath)
+			return stat != null && stat.isDirectory()
+		} catch (_e2) {
+			try {
+				const stat = fs.statSync(dirPath)
+				return stat != null && stat.isDirectory()
+			} catch (_e3) {
+				console.warn(`[ZemoOcr][Model] ensure dir failed: ${dirPath}, err=${_e2}`)
+				return false
+			}
+		}
+		// #endif
+
+		return false
+	}
+
+	private static harmonyPathExists(filePath: string): boolean {
+		// #ifdef APP-HARMONY
+		try {
+			const stat = fs.statSync(filePath)
+			if (stat == null) return false
+			if (stat.isDirectory()) return false
+			return true
+		} catch (_e0) {
+			return false
+		}
+		// #endif
+
+		return false
+	}
+
+	private static isYamlPath(lower: string): boolean {
+		return lower.endsWith('.yml') || lower.endsWith('.yaml')
+	}
+
+	private static async isYamlDictionarySource(path: string): Promise<boolean> {
+		const lower = FileUtil.normalizePath(path).toLowerCase()
+		if (!OcrModelService.isYamlPath(lower)) return false
+		const text = await OcrModelService.readDictionarySourceText(path)
+		return OcrModelService.extractInlineCharacterDict(text) != ''
+	}
+
+	private static isDictionaryCandidatePath(lower: string): boolean {
+		return OcrModelService.isYamlPath(lower)
+			|| lower.endsWith('.txt')
+	}
+
+	private static async extractDictTextFromYaml(yamlPath: string): Promise<string> {
+		const text = await OcrModelService.readDictionarySourceText(yamlPath)
+		if (text == '') return ''
+
+		const inlineDict = OcrModelService.extractInlineCharacterDict(text)
+		if (inlineDict != '') return inlineDict
+
+		const dictPath = OcrModelService.extractCharacterDictPath(text, yamlPath)
+		if (dictPath == '') return ''
+		const dictText = await OcrModelService.readDictionarySourceText(dictPath)
+		return dictText
+	}
+
+	private static async readDictionarySourceText(path: string): Promise<string> {
+		const text = await FileUtil.readTextFile(path)
+		if (text != null && text != '') return text
+		const data = await FileUtil.readBinaryFile(path)
+		if (data == null) return ''
+		return OcrModelService.decodeUtf8(data)
+	}
+
+	private static decodeUtf8(data: ArrayBuffer): string {
+		const bytes = new Uint8Array(data)
+		let out = ''
+		let i = 0
+		while (i < bytes.length) {
+			const b0 = bytes[i]
+			if (b0 < 0x80) {
+				out += String.fromCharCode(b0)
+				i += 1
+				continue
+			}
+			if (b0 >= 0xC0 && b0 < 0xE0 && i + 1 < bytes.length) {
+				const code = ((b0 & 0x1F) << 6) | (bytes[i + 1] & 0x3F)
+				out += String.fromCharCode(code)
+				i += 2
+				continue
+			}
+			if (b0 >= 0xE0 && b0 < 0xF0 && i + 2 < bytes.length) {
+				const code = ((b0 & 0x0F) << 12) | ((bytes[i + 1] & 0x3F) << 6) | (bytes[i + 2] & 0x3F)
+				out += String.fromCharCode(code)
+				i += 3
+				continue
+			}
+			if (b0 >= 0xF0 && b0 < 0xF8 && i + 3 < bytes.length) {
+				let code = ((b0 & 0x07) << 18) | ((bytes[i + 1] & 0x3F) << 12) | ((bytes[i + 2] & 0x3F) << 6) | (bytes[i + 3] & 0x3F)
+				code -= 0x10000
+				out += String.fromCharCode(0xD800 + ((code >> 10) & 0x3FF))
+				out += String.fromCharCode(0xDC00 + (code & 0x3FF))
+				i += 4
+				continue
+			}
+			i += 1
+		}
+		if (out.length > 0 && out.charCodeAt(0) == 0xFEFF) return out.substring(1)
+		return out
+	}
+
+	private static extractInlineCharacterDict(text: string): string {
+		const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n')
+		const chars = [] as string[]
+		let inDict = false
+		let dictIndent = -1
+		for (let i = 0; i < lines.length; i++) {
+			const rawLine = lines[i]
+			const line = OcrModelService.trimYamlSyntax(rawLine)
+			if (!inDict) {
+				if (line == 'character_dict:') {
+					inDict = true
+					dictIndent = OcrModelService.countLeadingSpaces(rawLine)
+				}
+				continue
+			}
+
+			if (line == '' || line.startsWith('#')) continue
+			if (OcrModelService.isYamlListItem(line)) {
+				const value = OcrModelService.cleanYamlScalar(OcrModelService.yamlListItemValue(line))
+				if (value != '') chars.push(value)
+				continue
+			}
+
+			const indent = OcrModelService.countLeadingSpaces(rawLine)
+			if (indent <= dictIndent) break
+		}
+		return chars.length > 0 ? chars.join('\n') : ''
+	}
+
+	private static extractCharacterDictPath(text: string, yamlPath: string): string {
+		const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n')
+		for (let i = 0; i < lines.length; i++) {
+			const line = OcrModelService.trimYamlSyntax(lines[i])
+			if (!line.startsWith('character_dict_path:')) continue
+			let value = OcrModelService.trimYamlSyntax(line.substring('character_dict_path:'.length))
+			const commentIdx = value.indexOf(' #')
+			if (commentIdx >= 0) value = OcrModelService.trimYamlSyntax(value.substring(0, commentIdx))
+			value = OcrModelService.cleanYamlScalar(value)
+			if (value == '' || value.toLowerCase() == 'none' || value.toLowerCase() == 'null') return ''
+			const normalized = FileUtil.normalizePath(value)
+			if (normalized.indexOf('://') > 0 || normalized.indexOf('/') == 0) return normalized
+			const dir = OcrModelService.dirname(yamlPath)
+			return dir == '' ? normalized : `${dir}/${normalized}`
+		}
+		return ''
+	}
+
+	private static cleanYamlScalar(value: string): string {
+		let result = OcrModelService.trimYamlSyntax((value ?? '').toString())
+		if (result.length >= 2 && result.startsWith("'") && result.endsWith("'")) {
+			result = result.substring(1, result.length - 1)
+			while (result.indexOf("''") >= 0) {
+				result = result.replace("''", "'")
+			}
+			return result
+		}
+		if (result.length >= 2 && result.startsWith('"') && result.endsWith('"')) {
+			result = result.substring(1, result.length - 1)
+			result = result.replace('\\"', '"')
+			result = result.replace('\\\\', '\\')
+			return result
+		}
+		return result
+	}
+
+	private static isYamlListItem(line: string): boolean {
+		return line.length > 0 && line.substring(0, 1) == '-'
+	}
+
+	private static yamlListItemValue(line: string): string {
+		let value = line.length > 1 ? line.substring(1) : ''
+		if (value.startsWith(' ') || value.startsWith('\t')) value = value.substring(1)
+		return OcrModelService.trimYamlSyntax(value)
+	}
+
+	private static trimYamlSyntax(value: string): string {
+		let start = 0
+		let end = value.length
+		while (start < end) {
+			const c = value.substring(start, start + 1)
+			if (c != ' ' && c != '\t') break
+			start += 1
+		}
+		while (end > start) {
+			const c = value.substring(end - 1, end)
+			if (c != ' ' && c != '\t') break
+			end -= 1
+		}
+		return value.substring(start, end)
+	}
+
+	private static countLeadingSpaces(value: string): number {
+		let count = 0
+		for (let i = 0; i < value.length; i++) {
+			if (value.substring(i, i + 1) != ' ') break
+			count += 1
+		}
+		return count
+	}
+
+	private static async installPaddleLiteModelFile(modelPath: string, targetDir: string): Promise<void> {
+		await FileUtil.ensureDir(targetDir)
+		if (OcrModelService.basename(modelPath).toLowerCase() == 'model.nb') {
+			const parent = OcrModelService.dirname(modelPath)
+			await FileUtil.copyDir(parent, targetDir, { overwrite: true })
+			return
+		}
+		await OcrModelService.installSingleModelFile(modelPath, targetDir, 'model.nb')
+	}
+
+	private static async installOnnxModelFile(modelPath: string, targetDir: string): Promise<void> {
+		await OcrModelService.installSingleModelFile(modelPath, targetDir, 'model.onnx')
+	}
+
+	private static async installMindSporeModelFile(modelPath: string, targetDir: string): Promise<void> {
+		await OcrModelService.installSingleModelFile(modelPath, targetDir, 'model.ms')
+	}
+
+	private static async installSingleModelFile(modelPath: string, targetDir: string, targetName: string): Promise<void> {
+		await FileUtil.ensureDir(targetDir)
+		const targetPath = `${targetDir}/${targetName}`
+		const sourcePath = FileUtil.normalizePath(modelPath)
+		if (sourcePath == FileUtil.normalizePath(targetPath)) return
+
+		const data = await FileUtil.readBinaryFile(sourcePath)
+		if (data != null) {
+			const ok = await FileUtil.writeBinaryFile(targetPath, data)
+			if (ok && await FileUtil.exists(targetPath)) return
+		}
+
+		await FileUtil.copyFile(sourcePath, targetPath, { overwrite: true })
+		const copied = await FileUtil.exists(targetPath)
+		if (!copied) {
+			throw new Error(`模型文件复制失败：${OcrModelService.basename(sourcePath)}`)
+		}
+	}
+
+	private static async installMiniMindOModelToSandbox(sourcePath: string): Promise<string> {
+		// #ifdef APP-HARMONY
+		const normalizedSource = FileUtil.normalizePath(sourcePath)
+		if (normalizedSource == '') return ''
+		await FileUtil.activatePersistedUriPermission(normalizedSource)
+		const root = OcrModelService.getHarmonyNativeMiniMindORoot()
+		if (root == '' || !OcrModelService.ensureHarmonyDir(root)) return ''
+		const targetName = OcrModelService.miniMindOTargetFileName(normalizedSource)
+		const targetPath = `${root}/${targetName}`
+		if (FileUtil.normalizePath(targetPath) == normalizedSource && OcrModelService.harmonyFileSize(targetPath) > 0) return targetPath
+		const copied = OcrModelService.copyHarmonyFileToSandbox(normalizedSource, targetPath)
+		if (!copied) {
+			console.warn(`[MiniMind-O] 导入沙箱失败：source=${normalizedSource}, target=${targetPath}`)
+			return ''
+		}
+		const size = OcrModelService.harmonyFileSize(targetPath)
+		if (size <= 0) return ''
+		console.log(`[MiniMind-O] 已导入沙箱：${targetPath}，大小=${size}`)
+		return targetPath
+		// #endif
+
+		return FileUtil.normalizePath(sourcePath)
+	}
+
+	private static miniMindOTargetFileName(sourcePath: string): string {
+		const name = OcrModelService.basename(FileUtil.normalizePath(sourcePath).toLowerCase())
+		if (name == OcrModelService.MINIMIND_O_TEXT_MODEL_FILE_NAME) return OcrModelService.MINIMIND_O_TEXT_MODEL_FILE_NAME
+		if (name == OcrModelService.MINIMIND_O_FULL_MODEL_FILE_NAME) return OcrModelService.MINIMIND_O_FULL_MODEL_FILE_NAME
+		if (name.endsWith('.ms') && name.indexOf('/') < 0 && name.indexOf('\\') < 0) return name
+		return OcrModelService.MINIMIND_O_FULL_MODEL_FILE_NAME
+	}
+
+	private static miniMindOModelKindBySize(size: number): string {
+		if (size == OcrModelService.MINIMIND_O_TEXT_MODEL_SIZE) return 'text-only smoke '
+		if (size == OcrModelService.MINIMIND_O_FULL_MODEL_SIZE) return '全模态'
+		return ''
+	}
+
+	private static getHarmonyNativeMiniMindORoot(): string {
+		// #ifdef APP-HARMONY
+		let baseDir = ''
+		try {
+			const ctx = getContext() as common.UIAbilityContext
+			baseDir = ((ctx.filesDir ?? '') as string).toString().replace(/\\/g, '/').replace(/\/+$/, '')
+		} catch (_e0) {}
+		if (baseDir == '') baseDir = '/data/storage/el2/base/haps/entry/files'
+		return `${baseDir}/zemo/assets/ai/minimind_o_ms`
+		// #endif
+
+		return ''
+	}
+
+	private static copyHarmonyFileToSandbox(sourcePath: string, targetPath: string): boolean {
+		// #ifdef APP-HARMONY
+		const slash = targetPath.lastIndexOf('/')
+		if (slash > 0 && !OcrModelService.ensureHarmonyDir(targetPath.substring(0, slash))) return false
+		const candidates = OcrModelService.buildHarmonyOpenCandidates(sourcePath)
+		for (let i = 0; i < candidates.length; i++) {
+			try {
+				fs.copyFileSync(candidates[i], targetPath)
+				if (OcrModelService.harmonyFileSize(targetPath) > 0) return true
+			} catch (_e0) {}
+		}
+		for (let j = 0; j < candidates.length; j++) {
+			if (OcrModelService.copyHarmonyFileChunked(candidates[j], targetPath)) return true
+		}
+		return false
+		// #endif
+
+		return false
+	}
+
+	private static copyHarmonyFileChunked(sourcePath: string, targetPath: string): boolean {
+		// #ifdef APP-HARMONY
+		let sourceFile: fs.File | null = null
+		let targetFile: fs.File | null = null
+		try {
+			sourceFile = fs.openSync(sourcePath, fs.OpenMode.READ_ONLY)
+			const stat = fs.statSync(sourceFile.fd)
+			const total = parseInt(stat.size.toString())
+			if (total <= 0) return false
+			targetFile = fs.openSync(targetPath, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC)
+			let copied = 0
+			while (copied < total) {
+				const left = total - copied
+				const chunkSize = left > OcrModelService.MINIMIND_O_COPY_CHUNK_BYTES ? OcrModelService.MINIMIND_O_COPY_CHUNK_BYTES : left
+				const buffer = new ArrayBuffer(chunkSize)
+				const readLen = fs.readSync(sourceFile.fd, buffer)
+				if (readLen <= 0) break
+				if (readLen == chunkSize) {
+					fs.writeSync(targetFile.fd, buffer)
+				} else {
+					fs.writeSync(targetFile.fd, buffer.slice(0, readLen))
+				}
+				copied += readLen
+			}
+			try { fs.fsyncSync(targetFile.fd) } catch (_e1) {}
+			const copiedSize = OcrModelService.harmonyFileSize(targetPath)
+			return copied == total && copiedSize == total
+		} catch (_e0) {
+			return false
+		} finally {
+			try {
+				if (sourceFile != null) fs.closeSync(sourceFile)
+			} catch (_e1) {}
+			try {
+				if (targetFile != null) fs.closeSync(targetFile)
+			} catch (_e2) {}
+		}
+		// #endif
+
+		return false
+	}
+
+	private static buildHarmonyOpenCandidates(path: string): string[] {
+		// #ifdef APP-HARMONY
+		const result = [] as string[]
+		const normalized = FileUtil.normalizePath(path)
+		OcrModelService.pushUniquePath(result, normalized)
+		try {
+			OcrModelService.pushUniquePath(result, decodeURIComponent(normalized))
+		} catch (_e0) {}
+		const count = result.length
+		for (let i = 0; i < count; i++) {
+			const physical = OcrModelService.uriToPhysicalPath(result[i])
+			if (physical != '') OcrModelService.pushUniquePath(result, physical)
+		}
+		return result
+		// #endif
+
+		return [FileUtil.normalizePath(path)]
+	}
+
+	private static pushUniquePath(list: string[], path: string): void {
+		const value = (path ?? '').toString().trim()
+		if (value == '') return
+		for (let i = 0; i < list.length; i++) {
+			if (list[i] == value) return
+		}
+		list.push(value)
+	}
+
+	private static uriToPhysicalPath(path: string): string {
+		const marker = '://'
+		const schemeIdx = path.indexOf(marker)
+		if (schemeIdx < 0) return ''
+		const rest = path.substring(schemeIdx + marker.length)
+		const slashIdx = rest.indexOf('/')
+		if (slashIdx < 0 || slashIdx >= rest.length - 1) return ''
+		const physical = rest.substring(slashIdx)
+		return physical.indexOf('/') == 0 ? physical : ''
+	}
+
+	private static isHarmonyPhysicalPath(path: string): boolean {
+		const normalized = FileUtil.normalizePath(path)
+		if (normalized.indexOf('://') > 0) return false
+		return normalized.indexOf('/') == 0
+	}
+
+	private static harmonyFileSize(path: string): number {
+		// #ifdef APP-HARMONY
+		const candidates = OcrModelService.buildHarmonyOpenCandidates(path)
+		for (let i = 0; i < candidates.length; i++) {
+			let file: fs.File | null = null
+			try {
+				file = fs.openSync(candidates[i], fs.OpenMode.READ_ONLY)
+				const stat = fs.statSync(file.fd)
+				const size = parseInt(stat.size.toString())
+				if (size > 0) return size
+			} catch (_e0) {
+			} finally {
+				try {
+					if (file != null) fs.closeSync(file)
+				} catch (_e1) {}
+			}
+		}
+		return 0
+		// #endif
+
+		return 0
+	}
+
+	private static dirname(path: string): string {
+		const normalized = FileUtil.normalizePath(path)
+		const idx = normalized.lastIndexOf('/')
+		return idx > 0 ? normalized.substring(0, idx) : ''
+	}
+
+	private static basename(path: string): string {
+		const normalized = FileUtil.normalizePath(path)
+		const idx = normalized.lastIndexOf('/')
+		return idx >= 0 ? normalized.substring(idx + 1) : normalized
+	}
+
+	private static readStorageText(key: string): string {
+		try {
+			const value = uni.getStorageSync(key)
+			return value == null ? '' : value.toString()
+		} catch (_e0) {
+			return ''
+		}
+	}
+
+	private static isKnownBadMiniMindOModelSize(size: number): boolean {
+		return size == OcrModelService.MINIMIND_O_BAD_GATHERND_MODEL_SIZE
+	}
+
+	private static formatBytes(size: number): string {
+		if (size >= 1073741824) {
+			const gb10 = Math.round(size * 10 / 1073741824)
+			return `${Math.floor(gb10 / 10)}.${gb10 % 10}GB`
+		}
+		if (size >= 1048576) {
+			const mb = Math.round(size / 1048576)
+			return `${mb}MB`
+		}
+		if (size >= 1024) {
+			const kb = Math.round(size / 1024)
+			return `${kb}KB`
+		}
+		return `${size}B`
+	}
+
+	private static formatNow(): string {
+		const d = new Date()
+		const y = d.getFullYear()
+		const m = `${d.getMonth() + 1}`.padStart(2, '0')
+		const day = `${d.getDate()}`.padStart(2, '0')
+		const hh = `${d.getHours()}`.padStart(2, '0')
+		const mm = `${d.getMinutes()}`.padStart(2, '0')
+		return `${y}-${m}-${day} ${hh}:${mm}`
+	}
+}

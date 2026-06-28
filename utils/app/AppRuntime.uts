@@ -1,0 +1,45 @@
+export type AppRuntimeProfile = {
+  appId: string
+  dbName: string
+  displayName: string
+  domainKey: string
+}
+
+const DEFAULT_APP_PROFILE = {
+  appId: 'zemo.main',
+  dbName: 'ZeMo.db',
+  displayName: '泽墨办',
+  domainKey: 'main',
+} as AppRuntimeProfile
+
+let currentAppProfile = cloneAppRuntimeProfile(DEFAULT_APP_PROFILE)
+
+function cloneAppRuntimeProfile(profile: AppRuntimeProfile): AppRuntimeProfile {
+  return {
+    appId: profile.appId,
+    dbName: profile.dbName,
+    displayName: profile.displayName,
+    domainKey: profile.domainKey,
+  } as AppRuntimeProfile
+}
+
+export function configureAppRuntime(profile: AppRuntimeProfile): AppRuntimeProfile {
+  currentAppProfile = cloneAppRuntimeProfile(profile)
+  return getCurrentAppProfile()
+}
+
+export function getCurrentAppProfile(): AppRuntimeProfile {
+  return cloneAppRuntimeProfile(currentAppProfile)
+}
+
+export function getCurrentAppId(): string {
+  return currentAppProfile.appId
+}
+
+export function getCurrentDbName(): string {
+  return currentAppProfile.dbName
+}
+
+export function resetAppRuntime(): void {
+  currentAppProfile = cloneAppRuntimeProfile(DEFAULT_APP_PROFILE)
+}

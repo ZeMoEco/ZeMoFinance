@@ -1,0 +1,269 @@
+import { Recognize, RecognizeOptions, OcrFail, OcrItem } from "../interface.uts"
+import { OcrModelConfig } from "../common/OcrModelConfig.uts"
+import { screenshot } from '@kit.ArkUI'
+import { textRecognition } from '@kit.CoreVisionKit'
+import { image } from '@kit.ImageKit'
+import { fileIo } from '@kit.CoreFileKit'
+import fs from '@ohos.file.fs'
+import { recognizePpOcrV6MindSpore } from './src/ZemoOcrMindSpore.ets'
+
+const CURRENT_SCREEN_IMAGE_PATH = "zemo://current-screen"
+const OCR_PPOCRV6_DET_PATH_KEY = "ocr_ppocrv6_det_model_path"
+const OCR_PPOCRV6_REC_PATH_KEY = "ocr_ppocrv6_rec_model_path"
+const OCR_PPOCRV6_DICT_PATH_KEY = "ocr_ppocrv6_dict_path"
+
+type HarmonyPpOcrBoxJson = {
+    left?: string | number | null
+    top?: string | number | null
+    right?: string | number | null
+    bottom?: string | number | null
+}
+
+type HarmonyPpOcrItemJson = {
+    text?: string | number | null
+    confidence?: string | number | null
+    box?: HarmonyPpOcrBoxJson | null
+}
+
+type HarmonyPpOcrLineJson = {
+    t?: string | number | null
+    c?: string | number | null
+    b?: any[] | null
+}
+
+type HarmonyPpOcrJson = {
+    fullText?: string | number | null
+    items?: HarmonyPpOcrItemJson[] | null
+    lines?: HarmonyPpOcrLineJson[] | null
+}
+
+function fail(options: RecognizeOptions, code: number, message: string): void {
+    const err = new UniError("zemo-ocs", code, message) as OcrFail
+    options.fail?.(err)
+    options.complete?.(err)
+}
+
+function normalizeResultText(data: textRecognition.TextRecognitionResult): string {
+    if (data == null) return ""
+    const value = data.value
+    if (value != null) return value.toString()
+    return data.toString()
+}
+
+function fileExists(path: string): boolean {
+    try {
+        let value = (path ?? '').toString().replace(/\\/g, '/')
+        if (value.startsWith('file://')) value = value.substring(7)
+        const stat = fs.statSync(value)
+        return stat != null && !stat.isDirectory()
+    } catch (_e) {}
+    return false
+}
+
+function readStoredPath(key: string, fallback: string): string {
+    try {
+        const value = uni.getStorageSync(key)
+        const text = value != null ? value.toString().trim() : ''
+        if (text != '') return text
+    } catch (_e) {}
+    return fallback
+}
+
+function parseHarmonyPpOcrJson(payload: string): HarmonyPpOcrJson | null {
+    try {
+        return JSON.parse(payload) as HarmonyPpOcrJson
+    } catch (_e) {
+        return null
+    }
+}
+
+function errorText(value: Object | null): string {
+    if (value == null) return 'null'
+    try {
+        const err = value as Error
+        const name = err.name != null ? err.name.toString() : ''
+        const message = err.message != null ? err.message.toString() : ''
+        if (name != '' || message != '') return name == '' ? message : (message == '' ? name : `${name}: ${message}`)
+    } catch (_e0) {}
+    try {
+        const json = JSON.stringify(value)
+        if (json != '{}') return json
+    } catch (_e1) {}
+    try {
+        return value.toString()
+    } catch (_e2) {}
+    return '[unknown error]'
+}
+
+async function loadPixelMapFromPath(path: string): Promise<image.PixelMap | null> {
+    let fileSource: fileIo.File | null = null
+    let imageSource: image.ImageSource | null = null
+    try {
+        let filePath = path
+        if (filePath.startsWith("file://")) filePath = filePath.substring(7)
+        fileSource = await fileIo.open(filePath, fileIo.OpenMode.READ_ONLY)
+        imageSource = image.createImageSource(fileSource.fd)
+        return await imageSource.createPixelMap()
+    } finally {
+        if (imageSource != null) {
+            try { imageSource.release() } catch (_e) {}
+        }
+        if (fileSource != null) {
+            try { fileIo.close(fileSource.fd) } catch (_e) {}
+        }
+    }
+}
+
+async function captureCurrentScreenPixelMap(): Promise<image.PixelMap> {
+    return await screenshot.capture()
+}
+
+export const recognize: Recognize = function(options: RecognizeOptions) {
+    void (async () => {
+        let pixelMap: image.PixelMap | null = null
+        try {
+            if (options.imagePath == CURRENT_SCREEN_IMAGE_PATH) {
+                pixelMap = await captureCurrentScreenPixelMap()
+            } else {
+                pixelMap = await loadPixelMapFromPath(options.imagePath)
+            }
+
+            if (pixelMap == null) {
+                fail(options, 900002, "无法读取待识别图片")
+                return
+            }
+
+            const visionInfo: textRecognition.VisionInfo = { pixelMap: pixelMap }
+            const configuration: textRecognition.TextRecognitionConfiguration = {
+                isDirectionDetectionSupported: true
+            }
+            console.log(`[ZemoOcr][Harmony] using native CoreVisionKit OCR, image=${options.imagePath}`)
+            const result = await textRecognition.recognizeText(visionInfo, configuration)
+            const fullText = normalizeResultText(result)
+            const success = {
+                items: [],
+                fullText: fullText
+            }
+            options.success?.(success)
+            options.complete?.(success)
+        } catch (e) {
+            fail(options, 900002, `Harmony OCR 失败: ${e}`)
+        } finally {
+            if (pixelMap != null) {
+                try { pixelMap.release() } catch (_e) {}
+            }
+        }
+    })()
+}
+
+export const recognizePpOcrV6: Recognize = function(options: RecognizeOptions) {
+    void (async () => {
+        let pixelMap: image.PixelMap | null = null
+        try {
+            const detPath = readStoredPath(OCR_PPOCRV6_DET_PATH_KEY, `${OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR}/model.ms`)
+            const recPath = readStoredPath(OCR_PPOCRV6_REC_PATH_KEY, `${OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR}/model.ms`)
+            const dictPath = readStoredPath(OCR_PPOCRV6_DICT_PATH_KEY, OcrModelConfig.PPOCRV6_DICT_YAML_RUNTIME_PATH)
+            if (!fileExists(detPath) || !fileExists(recPath) || !fileExists(dictPath)) {
+                console.warn(`[ZemoOcr][Harmony] PP-OCRv6 MindSpore Lite model missing, det=${detPath}, rec=${recPath}, dict=${dictPath}`)
+                fail(options, 900002, "Harmony PP-OCRv6 需要先导入 det.ms、rec.ms 和官方 inference.yml")
+                return
+            }
+
+            if (options.imagePath == CURRENT_SCREEN_IMAGE_PATH) {
+                pixelMap = await captureCurrentScreenPixelMap()
+            } else {
+                pixelMap = await loadPixelMapFromPath(options.imagePath)
+            }
+            if (pixelMap == null) {
+                fail(options, 900002, "无法读取待识别图片")
+                return
+            }
+
+            console.log(`[ZemoOcr][Harmony] using PP-OCRv6 MindSpore Lite, det=${detPath}, rec=${recPath}, dict=${dictPath}, image=${options.imagePath}`)
+            let payload = ''
+            try {
+                payload = await recognizePpOcrV6MindSpore(pixelMap, detPath, recPath, dictPath)
+            } catch (firstErr) {
+                const firstError = errorText(firstErr as Object)
+                const dynamicShapeError = firstError.indexOf("动态 shape") >= 0 || firstError.indexOf("ArkTS MindSpore Lite 不支持动态 shape") >= 0
+                const modelContractError = firstError.indexOf("字典与模型不匹配") >= 0 || firstError.indexOf("outputClasses=") >= 0 || firstError.indexOf("dictSize=") >= 0
+                console.warn(`[ZemoOcr][Harmony] PP-OCRv6 failed: ${firstError}`)
+                if (detPath == recPath || dynamicShapeError || modelContractError) throw new Error(firstError)
+                try {
+                    console.log(`[ZemoOcr][Harmony] retry PP-OCRv6 with swapped det/rec, det=${recPath}, rec=${detPath}`)
+                    payload = await recognizePpOcrV6MindSpore(pixelMap, recPath, detPath, dictPath)
+                    try {
+                        uni.setStorageSync(OCR_PPOCRV6_DET_PATH_KEY, recPath)
+                        uni.setStorageSync(OCR_PPOCRV6_REC_PATH_KEY, detPath)
+                    } catch (_storeSwapErr) {}
+                } catch (swapErr) {
+                    throw new Error(`PP-OCRv6 failed=${firstError}, swapped=${errorText(swapErr as Object)}`)
+                }
+            }
+            const parsed = parseHarmonyPpOcrJson(payload)
+            if (parsed == null) {
+                fail(options, 900002, "Harmony PP-OCRv6 返回结果解析失败")
+                return
+            }
+            let fullText = parsed.fullText != null ? parsed.fullText.toString() : ''
+            const items: OcrItem[] = []
+            try {
+                const sourceLines = parsed.lines
+                if (sourceLines != null) {
+                    for (let i = 0; i < sourceLines.length; i++) {
+                        const raw = sourceLines[i]
+                        const rawBox = raw.b
+                        const left = rawBox != null && rawBox.length > 0 && rawBox[0] != null ? parseFloat(rawBox[0].toString()) : 0
+                        const top = rawBox != null && rawBox.length > 1 && rawBox[1] != null ? parseFloat(rawBox[1].toString()) : 0
+                        const width = rawBox != null && rawBox.length > 2 && rawBox[2] != null ? parseFloat(rawBox[2].toString()) : 0
+                        const height = rawBox != null && rawBox.length > 3 && rawBox[3] != null ? parseFloat(rawBox[3].toString()) : 0
+                        items.push({
+                            text: raw.t != null ? raw.t.toString() : '',
+                            confidence: raw.c != null ? parseFloat(raw.c.toString()) : 0,
+                            box: {
+                                left,
+                                top,
+                                right: left + Math.max(0, width),
+                                bottom: top + Math.max(0, height)
+                            }
+                        } as OcrItem)
+                    }
+                }
+                const sourceItems = parsed.items
+                if (items.length == 0 && sourceItems != null) {
+                    for (let i = 0; i < sourceItems.length; i++) {
+                        const raw = sourceItems[i]
+                        const box = raw.box
+                        items.push({
+                            text: raw.text != null ? raw.text.toString() : '',
+                            confidence: raw.confidence != null ? parseFloat(raw.confidence.toString()) : 0,
+                            box: {
+                                left: box != null && box.left != null ? parseFloat(box.left.toString()) : 0,
+                                top: box != null && box.top != null ? parseFloat(box.top.toString()) : 0,
+                                right: box != null && box.right != null ? parseFloat(box.right.toString()) : 0,
+                                bottom: box != null && box.bottom != null ? parseFloat(box.bottom.toString()) : 0
+                            }
+                        } as OcrItem)
+                    }
+                }
+            } catch (_e0) {}
+            if (fullText == '' && items.length > 0) {
+                const texts = [] as string[]
+                for (let i = 0; i < items.length; i++) {
+                    const value = (items[i].text ?? '').toString()
+                    if (value != '') texts.push(value)
+                }
+                fullText = texts.join('\n')
+            }
+            const success = { items, fullText }
+            options.success?.(success)
+            options.complete?.(success)
+        } catch (e) {
+            fail(options, 900002, `Harmony PP-OCRv6 失败: ${e}`)
+        } finally {
+            if (pixelMap != null) {
+                try { pixelMap.release() } catch (_e) {}
+            }
+        }
+    })()
+}

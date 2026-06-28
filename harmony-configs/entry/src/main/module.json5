@@ -1,0 +1,111 @@
+{
+  "module": {
+    "name": "entry",
+    "type": "entry",
+    "description": "$string:module_desc",
+    "mainElement": "EntryAbility",
+    "deviceTypes": [
+      "phone",
+      "tablet",
+      "2in1"
+    ],
+    "deliveryWithInstall": true,
+    "installationFree": false,
+    "shareFiles": "$profile:share_files",
+    "pages": "$profile:main_pages",
+    "abilities": [
+      {
+        "name": "EntryAbility",
+        "srcEntry": "./ets/entryability/EntryAbility.ets",
+        "description": "$string:EntryAbility_desc",
+        "icon": "$media:layered_image",
+        "label": "$string:EntryAbility_label",
+        "startWindowIcon": "$media:startIcon",
+        "startWindowBackground": "$color:start_window_background",
+        "exported": true,
+        "skills": [
+          {
+            "entities": [
+              "entity.system.home"
+            ],
+            "actions": [
+              "action.system.home"
+            ]
+          },
+          {
+            "actions": [
+              "ohos.want.action.viewData"
+            ],
+            "uris": [
+              {
+                "scheme": "zemo",
+                "host": "finance"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "requestPermissions": [
+      {
+        "name": "ohos.permission.INTERNET"
+      },
+      {
+        "name": "ohos.permission.PUBLISH_AGENT_REMINDER"
+      },
+      {
+        "name": "ohos.permission.VIBRATE"
+      },
+      {
+        "name": "ohos.permission.CUSTOM_SCREEN_CAPTURE",
+        "reason": "$string:module_desc",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
+      },
+		 {
+		        "name": "ohos.permission.USE_FLOAT_BALL",
+		        "reason": "$string:module_desc",
+		        "usedScene": {
+		          "abilities": [
+		            "EntryAbility"
+		          ],
+		          "when": "inuse"
+		        }
+			      },
+      {
+        "name": "ohos.permission.AUTO_RESTORE_MAIN_WINDOW"
+      },
+      {
+        "name": "ohos.permission.FILE_ACCESS_PERSIST"
+      },
+      {
+        "name": "ohos.permission.READ_MEDIA",
+        "reason": "$string:module_desc",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
+      },
+      {
+        "name": "ohos.permission.WRITE_MEDIA",
+        "reason": "$string:module_desc",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
+      }
+    ]
+  }
+}
+// 申请权限：ohos.permission.SYSTEM_FLOAT_WINDOW
+// 申请原因：因为需要实现桌宠，所以需要悬浮窗权限。
+// 2026/06/02
+// 智能助手 03:27

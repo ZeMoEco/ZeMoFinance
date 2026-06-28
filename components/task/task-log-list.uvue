@@ -1,0 +1,419 @@
+﻿<template>
+  <view class="log-list-container">
+    <view v-if="localLogs.length == 0" class="empty-state">
+      <text class="empty-text">暂无进展，写点什么吧...</text>
+    </view>
+
+    <view v-for="(node, index) in localLogs" :key="index">
+      <view class="log-card" :id="'log_' + getLog(node).id" @touchstart="captureTouch" @longpress="onLongPress(getLog(node))">
+        <view class="log-header-row">
+          <text class="log-time">{{ getNodeTimeStr(node) }}</text>
+          <view class="log-actions">
+            <!-- 快速拍照按钮 -->
+            <view class="log-action-btn" @click.stop="$emit('add-photo', getLog(node))">
+              <text class="small-icon">📷</text>
+            </view>
+            <view class="log-action-btn" @click="$emit('reply', getLog(node))">
+              <text class="small-icon">↩</text>
+            </view>
+            <view class="log-action-btn" @click="$emit('edit', getLog(node))">
+              <text class="small-icon">✎</text>
+            </view>
+          </view>
+        </view>
+
+        <view v-if="isSyncRef(node)" class="sync-ref-card">
+          <view class="sync-ref-header">
+            <text class="sync-ref-tag">同步块引用</text>
+            <text class="sync-ref-time">源日志 {{ getSyncSourceTime(node) }}</text>
+          </view>
+          <text v-if="isSourceDeleted(node)" class="sync-ref-deleted">源已删除</text>
+          <text class="sync-ref-content" v-if="hasContent(node)">{{ getNodeContent(node) }}</text>
+        </view>
+        <text class="log-text-content" v-else-if="hasContent(node)">{{ getNodeContent(node) }}</text>
+
+        <view class="log-images" v-if="hasMedia(node)">
+          <template v-for="(path, imgIndex) in getNodeMedia(node)" :key="imgIndex">
+            <image v-if="isImage(path)" :src="path" mode="aspectFill" class="log-image" 
+                  @click.stop="onImageClick(path, getNodeMedia(node))"></image>
+              <view v-else class="log-file" @click.stop="openFile(path)">
+              <text class="log-file-icon">📄</text>
+              <text class="log-file-name">{{ getFileName(path) }}</text>
+            </view>
+          </template>
+        </view>
+
+        <view class="log-footer" v-if="node.children.length > 0">
+          <view class="collapse-btn" @click="toggleNode(node)">
+            <text class="collapse-text">{{ node.expanded ? '收起' : '展开 ' + node.children.length + ' 条补充' }}</text>
+            <text class="collapse-icon">{{ node.expanded ? '▼' : '▶' }}</text>
+          </view>
+        </view>
+      </view>
+
+      <view v-if="node.expanded" class="children-container">
+        <view class="log-card log-supplement" v-for="(childNode, childIndex) in node.children" :key="childIndex" :id="'log_' + getLog(childNode).id" @touchstart="captureTouch" @longpress="onLongPress(getLog(childNode))">
+          <view class="log-header-row">
+            <text class="log-time">{{ getNodeTimeStr(childNode) }}</text>
+            <view class="log-actions">
+              <!-- 快速拍照按钮 -->
+              <view class="log-action-btn" @click.stop="$emit('add-photo', getLog(childNode))">
+                <text class="small-icon">📷</text>
+              </view>
+              <view class="log-action-btn" @click="$emit('reply', getLog(childNode))">
+                <text class="small-icon">↩</text>
+              </view>
+              <view class="log-action-btn" @click="$emit('edit', getLog(childNode))">
+                <text class="small-icon">✎</text>
+              </view>
+            </view>
+          </view>
+
+          <view v-if="isSyncRef(childNode)" class="sync-ref-card">
+            <view class="sync-ref-header">
+              <text class="sync-ref-tag">同步块引用</text>
+              <text class="sync-ref-time">源日志 {{ getSyncSourceTime(childNode) }}</text>
+            </view>
+            <text v-if="isSourceDeleted(childNode)" class="sync-ref-deleted">源已删除</text>
+            <text class="sync-ref-content" v-if="hasContent(childNode)">{{ getNodeContent(childNode) }}</text>
+          </view>
+          <text class="log-text-content" v-else-if="hasContent(childNode)">{{ getNodeContent(childNode) }}</text>
+
+          <view class="log-images" v-if="hasMedia(childNode)">
+            <template v-for="(cPath, cIdx) in getNodeMedia(childNode)" :key="cIdx">
+              <image v-if="isImage(cPath)" :src="cPath" mode="aspectFill" class="log-image" 
+                  @click.stop="onImageClick(cPath, getNodeMedia(childNode))"></image>
+                <view v-else class="log-file" @click.stop="openFile(cPath)">
+                <text class="log-file-icon">📄</text>
+                <text class="log-file-name">{{ getFileName(cPath) }}</text>
+              </view>
+            </template>
+          </view>
+        </view>
+      </view>
+    </view>
+    
+    <view style="height: 120px;"></view>
+    
+  </view>
+</template>
+
+<script lang="uts">
+  import { PropType } from 'vue';
+  import { AppDialogApi, ZemoPreviewImageOptions } from '@/components/sys/AppDialogApi.uts';
+  import { TaskLog } from '@/services/biz/TaskBiz.uts';
+  import { UserBiz } from '@/services/biz/UserBiz.uts';
+  // #ifdef APP-ANDROID
+  import UTSAndroid from 'io.dcloud.uts.UTSAndroid';
+  // #endif
+
+  export type LogNode = { 
+    log : TaskLog; 
+    children : LogNode[]; 
+    expanded : boolean;
+  }
+
+  export type ContextMenuData = {
+      log: TaskLog
+      x: number
+      y: number
+  }
+
+  export default {
+    emits: ['reply', 'edit', 'delete', 'copy', 'import', 'contextmenu', 'add-photo'],
+    props: {
+      logs: {
+        type: Array as PropType<LogNode[]>,
+        default: () => [] as LogNode[]
+      },
+      taskId: {
+        type: String,
+        default: ''
+      },
+	  forceExpandId: { type: String, default: '' }
+    },
+    data() {
+        return {
+            localLogs: [] as LogNode[],
+            expandedIds: [] as string[],
+            expandedLoadedKey: '',
+            lastTouchX: 0,
+            lastTouchY: 0
+        }
+    },
+    watch: {
+	
+		forceExpandId(newId: string) {
+		    if (newId != '' && !this.expandedIds.includes(newId)) {
+		        this.expandedIds.push(newId);
+		    }
+		},
+      taskId(_v: string) {
+        // When switching tasks, reload persisted expanded state.
+        this.ensureExpandedLoaded();
+      },
+        logs: {
+            handler(newVal: LogNode[]) {
+                this.ensureExpandedLoaded();
+            },
+            immediate: true
+        }
+    },
+    methods: {
+      getExpandedStorageKey(): string {
+        const tid = this.taskId != null ? this.taskId.toString() : '';
+        return (tid != '' && tid != '0') ? ('zemo_task_log_expand_' + tid) : 'zemo_task_log_expand_global';
+      },
+      getExpandedUserKey(): string {
+        const tid = this.taskId != null ? this.taskId.toString() : '';
+        return (tid != '' && tid != '0') ? ('task_log_expand_' + tid) : 'task_log_expand_global';
+      },
+      ensureExpandedLoaded() {
+        const key = this.getExpandedStorageKey();
+
+        const keyChanged = (key != this.expandedLoadedKey);
+        if (keyChanged) {
+          this.expandedLoadedKey = key;
+
+          // 1) Sync load from local storage for instant UI.
+          this.expandedIds = this.loadExpandedFromLocal(key);
+
+          // 2) Async load from per-user DB KV; override local if present.
+          this.loadExpandedFromUserKV();
+        }
+
+        // Always refresh localLogs when logs change (logs are loaded async by parent).
+        this.localLogs = this.restoreExpandedState(this.logs as LogNode[]);
+      },
+      loadExpandedFromLocal(key: string): string[] {
+        const ids: string[] = [];
+        try {
+          const rawAny = uni.getStorageSync(key);
+          if (rawAny == null) return ids;
+          const raw = rawAny.toString().trim();
+          if (raw == '') return ids;
+          const parts = raw.split(',');
+          for (let i = 0; i < parts.length; i++) {
+            const p = parts[i].trim();
+            if (p == '') continue;
+            ids.push(p);
+            
+          }
+        } catch (_e) {}
+        return ids;
+      },
+      async loadExpandedFromUserKV() {
+        const userKey = this.getExpandedUserKey();
+        try {
+          const raw = await UserBiz.getString(userKey);
+          if (raw == null) return;
+          const ids = UserBiz.parseIdCsv(raw);
+          // If DB has value, it becomes the source of truth.
+          this.expandedIds = ids;
+          this.persistExpandedState();
+          this.localLogs = this.restoreExpandedState(this.logs as LogNode[]);
+        } catch (_e) {}
+      },
+      persistExpandedState() {
+        const key = this.getExpandedStorageKey();
+        try {
+          const csv = UserBiz.toIdCsv(this.expandedIds);
+          uni.setStorageSync(key, csv);
+        } catch (_e) {}
+
+        // Best-effort: persist to per-user DB as well.
+        const userKey = this.getExpandedUserKey();
+        const userCsv = UserBiz.toIdCsv(this.expandedIds);
+        UserBiz.setString(userKey, userCsv);
+      },
+      restoreExpandedState(nodes: LogNode[]): LogNode[] {
+        // Keep it cheap: walk the tree once (no recursion / no nested arrow; avoids UTS compiler bugs).
+        const stack: LogNode[] = [];
+        for (let i = 0; i < nodes.length; i++) stack.push(nodes[i]);
+        while (stack.length > 0) {
+          const n = stack.pop() as LogNode;
+          const id = n.log.id;
+          if (id != null) {
+            try {
+              const idStr = id.toString();
+              n.expanded = (this.expandedIds.indexOf(idStr) >= 0);
+            } catch (_e) {}
+          }
+          if (n.children != null && n.children.length > 0) {
+            for (let j = 0; j < n.children.length; j++) stack.push(n.children[j]);
+          }
+        }
+        return nodes;
+      },
+      getLog(node: LogNode): TaskLog {
+          return node.log;
+      },
+      getNodeContent(node: LogNode): string {
+          return node.log.content ?? "";
+      },
+      hasContent(node: LogNode): boolean {
+          return node.log.content != null && node.log.content != "";
+      },
+        isSyncRef(node: LogNode): boolean {
+          return node.log.type == 'SYNC_BLOCK_REF' || (node.log.sync_block_id != null && node.log.sync_block_id != '');
+        },
+        isSourceDeleted(node: LogNode): boolean {
+          return node.log.source_deleted == true;
+        },
+        getSyncSourceTime(node: LogNode): string {
+          const ts = node.log.source_log_created_at != null
+          ? node.log.source_log_created_at
+          : node.log.created_at;
+          return this.formatTime(ts);
+        },
+      getNodeMedia(node: LogNode): string[] {
+          return node.log.media_paths;
+      },
+      hasMedia(node: LogNode): boolean {
+          return node.log.media_paths.length > 0;
+      },
+      getNodeTimeStr(node: LogNode): string {
+          return this.formatTime(node.log.created_at);
+      },
+      formatTime(ts : number) : string { 
+        const d = new Date(ts); 
+        return `${d.getMonth() + 1}-${d.getDate()} ${d.getHours()}:${d.getMinutes().toString().padStart(2,'0')}`; 
+      },
+      isImage(path : string) : boolean { 
+        const l = path.toLowerCase(); 
+        return l.endsWith('.jpg') || l.endsWith('.png') || l.endsWith('.jpeg') || l.endsWith('.gif') || l.endsWith('.webp'); 
+      },
+      getFileName(path : string) : string { 
+        const parts = path.split('/'); 
+        return parts[parts.length - 1]; 
+      },
+      openFile(path : string) { 
+        if (path.startsWith('http://') || path.startsWith('https://')) {
+          uni.showLoading({ title: '加载中...' });
+            uni.downloadFile({
+                url: path,
+                success: (res) => {
+                    uni.hideLoading();
+                    if (res.statusCode === 200) {
+                        uni.openDocument({ 
+                            filePath: res.tempFilePath,
+                            fail: function(e) {
+                    console.log('打开文档失败', e);
+                    uni.showToast({ title: '无法打开该文件', icon: 'none' });
+                            }
+                        }); 
+                    } else {
+                uni.showToast({ title: '下载失败', icon: 'none' });
+                    }
+                },
+                fail: (err) => {
+                    uni.hideLoading();
+              uni.showToast({ title: '下载失败', icon: 'none' });
+                }
+            });
+        } else {
+            uni.openDocument({ 
+                filePath: path,
+                success: function () {
+              console.log('打开文档成功');
+                },
+                fail: function(e) {
+              console.log('打开文档失败', e);
+                    uni.showToast({
+                title: '无法打开该文件',
+                        icon: 'none'
+                    });
+                }
+            }); 
+        }
+      },
+      onImageClick(clickedPath: string, allPaths: string[]) {
+        const pics = [] as string[];
+        let currentIndex = 0;
+        
+        for (let i = 0; i < allPaths.length; i++) {
+            let originPath = allPaths[i];
+            if (this.isImage(originPath)) {
+                pics.push(originPath);
+                if (originPath == clickedPath) {
+                    currentIndex = pics.length - 1;
+                }
+            }
+        }
+        
+        if (pics.length > 0) {
+          console.log('==== 触发组件级图像预览 ====');
+          // 像原生 API 一样优雅调用
+            AppDialogApi.previewImage({
+                urls: pics,
+                current: currentIndex
+            } as ZemoPreviewImageOptions);
+        }
+      },
+      toggleNode(node : LogNode) { 
+        node.expanded = !node.expanded;
+        const id = node.log.id;
+        if (id != null) {
+            try {
+              const idStr = id.toString();
+              const idx = this.expandedIds.indexOf(idStr);
+              if (node.expanded) {
+                if (idx < 0) this.expandedIds.push(idStr);
+              } else {
+                if (idx >= 0) this.expandedIds.splice(idx, 1);
+              }
+              this.persistExpandedState();
+            } catch (_e2) {}
+        }
+      },
+      captureTouch(e: TouchEvent) {
+          const touches = e.touches
+          if (touches.length > 0) {
+             const t = touches[0]
+             this.lastTouchX = t.clientX
+             this.lastTouchY = t.clientY
+          }
+      },
+      onLongPress(log: TaskLog) {
+          const payload : ContextMenuData = { 
+              log: log, 
+              x: this.lastTouchX, 
+              y: this.lastTouchY 
+          }
+          this.$emit('contextmenu', payload)
+      }
+    }
+  }
+</script>
+
+<style scoped>
+  /* 样式保持不变 */
+  .log-list-container { padding: 0 16px; }
+  .empty-state { align-items: center; padding: 40px 0; }
+  .empty-text { color: #aaa; font-size: 14px; }
+  .log-card { background-color: #fff; border-radius: 12px; padding: 12px; margin-bottom: 12px; box-shadow: 0 1px 4px rgba(0,0,0,0.02); }
+  .log-header-row { flex-direction: row; justify-content: space-between; margin-bottom: 6px; }
+  .log-time { font-size: 12px; color: #999; }
+  .log-actions { flex-direction: row; }
+  .log-action-btn { padding: 4px 8px; margin-left: 4px; background-color: #f5f7fa; border-radius: 4px; }
+  .small-icon { font-size: 12px; color: #666; }
+  .log-text-content { font-size: 15px; color: #333; line-height: 1.5; margin-bottom: 8px; }
+  .log-images { flex-direction: row; flex-wrap: wrap; margin-top: 4px; }
+  .log-image { width: 80px; height: 80px; border-radius: 6px; margin-right: 6px; margin-bottom: 6px; background-color: #eee; }
+  .log-file { width: 110px; height: 40px; background-color: #f5f7fa; border-radius: 6px; flex-direction: row; align-items: center; padding: 0 8px; margin-right: 6px; margin-bottom: 6px; border: 1px solid #eee; }
+  .log-file-icon { font-size: 16px; margin-right: 6px; }
+  .log-file-name { font-size: 11px; color: #333; flex: 1; lines: 1; text-overflow: ellipsis; }
+  .sync-ref-card { background: #f4f8ff; border: 1px solid #d7e6ff; border-radius: 10px; padding: 10px; margin-bottom: 8px; }
+  .sync-ref-header { flex-direction: row; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+  .sync-ref-tag { font-size: 11px; color: #2f6fd6; font-weight: 600; }
+  .sync-ref-time { font-size: 11px; color: #6a7ba3; }
+  .sync-ref-deleted { font-size: 11px; color: #d9534f; margin-bottom: 4px; }
+  .sync-ref-content { font-size: 14px; color: #1f2d3d; line-height: 1.5; }
+  .log-supplement { background-color: #F9FAFC; margin-bottom: 8px; border-left: 3px solid #E4E7ED; margin-left: 20px; }
+  .children-container { margin-top: 8px; }
+  .log-footer { border-top: 1px solid #f5f5f5; padding-top: 6px; margin-top: 6px; }
+  .collapse-btn { flex-direction: row; justify-content: center; align-items: center; }
+  .collapse-text { font-size: 11px; color: #007AFF; }
+  .collapse-icon { font-size: 10px; color: #007AFF; margin-left: 4px; }
+</style>
+

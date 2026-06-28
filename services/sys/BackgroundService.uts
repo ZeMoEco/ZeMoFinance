@@ -1,0 +1,170 @@
+import { reactive } from 'vue';
+
+// 定义状态类型
+type BgState = {
+  bgImage: string;    // 当前显示的壁纸路径
+  bgStyle: string;    // 当前风格 (anime, scenery...)
+  lastUpdateTime: number; // 上次更新时间戳
+}
+
+export class BackgroundService {
+  // 【修复 1】必须初始化为 null，否则编译报错 "Property must be initialized"
+  private static instance: BackgroundService | null = null;
+   
+  // 对外暴露的响应式状态
+  public state: BgState;
+
+  private constructor() {
+    // 初始化响应式状态
+    this.state = reactive({
+      bgImage: "",
+      bgStyle: "anime",
+      lastUpdateTime: 0
+    } as BgState);
+  }
+
+  public static getInstance(): BackgroundService {
+    if (BackgroundService.instance == null) {
+      BackgroundService.instance = new BackgroundService();
+    }
+    // 非空断言返回
+    return BackgroundService.instance as BackgroundService;
+  }
+
+  /**
+   * 初始化：App启动或页面加载时调用
+   */
+  public init() {
+    // 1. 恢复风格
+    const savedStyle = uni.getStorageSync('theme_background_style');
+    if (savedStyle != null && (savedStyle as string).length > 0) {
+      this.state.bgStyle = savedStyle as string;
+    }
+
+    // 2. 恢复壁纸 (优先用固定壁纸)
+    const manualBg = uni.getStorageSync('theme_background_image');
+    if (manualBg != null && (manualBg as string).length > 0) {
+      this.state.bgImage = manualBg as string;
+    }
+    
+    // 3. 如果没有图，尝试刷新
+    if (this.state.bgImage == "") {
+      this.checkAndRefresh();
+    }
+  }
+
+  /**
+   * 检查并刷新背景
+   * @param force 强制刷新（忽略时间限制）
+   */
+  public checkAndRefresh(force: boolean = false) {
+    // 1. 如果有固定壁纸，不跑随机逻辑
+    const manualBg = uni.getStorageSync('theme_background_image');
+    if (manualBg != null && (manualBg as string).length > 0) {
+      this.state.bgImage = manualBg as string;
+      return;
+    }
+
+    // 2. 检查时间间隔 (60秒)
+    const now = Date.now();
+    if (!force && this.state.bgImage != "" && (now - this.state.lastUpdateTime < 60 * 1000)) {
+      return;
+    }
+
+    // 3. 下载
+    this.downloadNewImage();
+  }
+
+  /**
+   * 切换风格
+   */
+  public setStyle(newStyle: string) {
+    this.state.bgStyle = newStyle;
+    uni.setStorageSync('theme_background_style', newStyle);
+    // 切换风格后强制刷新
+    this.checkAndRefresh(true);
+  }
+
+  /**
+   * 设置固定壁纸 (从相册选图)
+   */
+  public setFixedBackground(path: string) {
+    this.state.bgImage = path;
+    uni.setStorageSync('theme_background_image', path);
+  }
+
+  /**
+   * 清除固定壁纸 (恢复随机)
+   */
+  public clearFixedBackground() {
+    uni.removeStorageSync('theme_background_image');
+    // 强制刷新一张新图
+    this.checkAndRefresh(true);
+  }
+
+  // 【修复 2】跨平台 URL 编码封装
+  private encodeStr(str: string): string {
+    // #ifdef APP-ANDROID
+    // 显式调用 Java API，避免使用 encodeURIComponent
+    return java.net.URLEncoder.encode(str, "UTF-8");
+    // #endif
+    
+    // #ifndef APP-ANDROID
+    return encodeURIComponent(str);
+    // #endif
+  }
+
+  private downloadNewImage() {
+	      console.log(`[BackgroundService] Downloading style1: `);
+    const sys = uni.getSystemInfoSync();
+    // 确保转换为整数
+    const w = Math.floor(sys.screenWidth);
+    const h = Math.floor(sys.screenHeight);
+    const seed = Date.now();
+    const style = this.state.bgStyle;
+    
+    let targetUrl = "";
+
+    console.log(`[BackgroundService] Downloading style2: ${style}`);
+
+    // 【修复 3】调用 this.encodeStr 而不是 encodeURIComponent
+	// 【修复 3】调用 this.encodeStr 而不是 encodeURIComponent
+		if (style == "anime") {
+			// const prompt = "anime style scenery, beautiful sky, high quality, masterpiece, 8k wallpaper";
+			// targetUrl = `https://image.pollinations.ai/prompt/${this.encodeStr(prompt)}?width=${w}&height=${h}&nologo=true&seed=${seed}`;
+			// 提示词：新海诚风格，蓝天，云，高质量
+			targetUrl = `https://bing.biturl.top/?resolution=1920&format=image&index=random&mkt=zh-CN&time=${seed}`;
+			// const prompt = "anime style scenery, makoto shinkai style, blue sky, clouds, masterpiece, 8k wallpaper, highly detailed";
+			// targetUrl = `https://image.pollinations.ai/prompt/${this.encodeStr(prompt)}?width=${w}&height=${h}&nologo=true&seed=${seed}`;
+		}
+		// else if (style == "cyberpunk") {
+		// 	// const prompt = "cyberpunk city street, neon lights, night, futuristic, high detail";
+		// 	// targetUrl = `https://image.pollinations.ai/prompt/${this.encodeStr(prompt)}?width=${w}&height=${h}&nologo=true&seed=${seed}`;
+		// 	const prompt = "cyberpunk city, night, neon lights, rain, futuristic, high detail, 8k wallpaper";
+		// 	targetUrl = `https://image.pollinations.ai/prompt/${this.encodeStr(prompt)}?width=${w}&height=${h}&nologo=true&seed=${seed}`;
+		// }
+		// else if (style == "scenery") {
+		// 	targetUrl = `https://loremflickr.com/${w}/${h}/landscape,nature,mountains,forest?lock=${seed}`;
+		// }
+		// else if (style == "people") {
+		// 	targetUrl = `https://loremflickr.com/${w}/${h}/portrait,fashion,model?lock=${seed}`;
+		// }
+		// else if (style == "grayscale") {
+		// 	targetUrl = `https://picsum.photos/${w}/${h}?grayscale&random=${seed}&blur=2`;
+		// }
+		// else {
+		// 	targetUrl = `https://picsum.photos/${w}/${h}?random=${seed}&blur=2`;
+		// }
+
+	
+    uni.downloadFile({
+      url: targetUrl,
+      success: (res) => {
+        if (res.statusCode == 200) {
+          this.state.lastUpdateTime = Date.now();
+          this.state.bgImage = res.tempFilePath;
+        }
+      }
+    });
+  }
+}

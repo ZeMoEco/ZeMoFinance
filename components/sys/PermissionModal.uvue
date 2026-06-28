@@ -1,0 +1,336 @@
+<template>
+  <view v-if="visible" class="perm-mask">
+    <view class="perm-panel" :class="{ 'perm-panel-open': panelOpen }" @touchstart="onPanelTouchStart" @touchmove="onPanelTouchMove" @touchend="onPanelTouchEnd" @touchcancel="onPanelTouchEnd">
+      <!-- Decorator Handle -->
+      <view class="perm-grabber-wrap">
+        <view class="perm-grabber"></view>
+      </view>
+      
+      <!-- Header -->
+      <view class="perm-header">
+        <text class="perm-title">权限申请</text>
+        <view class="perm-close-btn" @click="onClose">
+            <text class="perm-close-icon">✕</text>
+        </view>
+      </view>
+      
+      <!-- Description -->
+      <view class="perm-desc-box">
+        <text class="perm-desc-text">Zemo 需要以下权限来保证番茄钟与提醒功能的正常运行。</text>
+      </view>
+      
+      <!-- List -->
+      <view class="perm-list">
+        <view v-for="item in states" :key="item.key" class="perm-item">
+          <!-- Icon placeholder or status indicator could go here -->
+          <view class="perm-item-content">
+            <text class="perm-item-title">{{ getLabel(item.key).title }}</text>
+            <text class="perm-item-sub">{{ getLabel(item.key).desc }}</text>
+          </view>
+          
+          <view class="perm-item-action">
+            <view v-if="item.granted" class="perm-status-ok">
+                <text class="perm-status-text">已开启</text>
+            </view>
+            <button v-else class="perm-action-btn" @click="onRequest(item.key)">
+                去开启
+            </button>
+          </view>
+        </view>
+      </view>
+      
+      <!-- Footer -->
+      <view class="perm-footer">
+        <button class="perm-main-btn" @click="onClose">我了解了</button>
+      </view> 
+    </view>
+  </view>
+</template>
+
+<script lang="uts">
+import { Permission, type PermissionKey, type PermissionState } from '@/services/sys/Permission.uts'
+
+type PermissionLabel = { title: string; desc: string }
+
+export default {
+  name: 'PermissionModal',
+  emits: ['update:show', 'close'],
+  props: {
+    show: { type: Boolean, default: false },
+  permissions: {
+    type: Array,
+    default: function (): PermissionKey[] {
+      return ['overlay', 'notification', 'exactAlarm'] as PermissionKey[]
+    }
+  }
+  },
+  data() {
+    return {
+      visible: false,
+	  states: [] as PermissionState[],
+    panelOpen: false,
+	  dragStartY: -1,
+	  dragCurrentY: -1
+    }
+  },
+  watch: {
+    show(val: boolean) {
+    if (val) {
+      this.startOpen()
+      this.refresh()
+    } else {
+      this.startClose()
+    }
+    }
+  },
+  mounted() {
+    if (this.show) {
+      this.startOpen()
+      this.refresh()
+    }
+  },
+  methods: {
+    startOpen() {
+      this.visible = true
+      this.panelOpen = false
+      // 下一帧再打开，触发从下往上的过渡
+      setTimeout(() => {
+        this.panelOpen = true
+      }, 16)
+    },
+    startClose() {
+      if (!this.visible) return
+      this.panelOpen = false
+      // 等过渡结束再隐藏
+      setTimeout(() => {
+        this.visible = false
+      }, 240)
+    },
+    getLabel(key: PermissionKey): PermissionLabel {
+      switch (key) {
+        case 'overlay': return { title: '悬浮窗权限', desc: '用于后台/锁屏显示提醒界面' }
+        case 'notification': return { title: '消息通知权限', desc: '用于显示通知提醒' }
+        case 'exactAlarm': return { title: '精确闹钟/重要任务提醒', desc: '用于准时触发提醒闹钟' }
+        case 'backgroundPopup': return { title: '后台弹出界面', desc: '用于从后台拉起提醒界面' }
+        case 'autoStart': return { title: '自启动/后台运行', desc: '用于保证APP在后台持续运行' }
+      }
+      return { title: '未知权限', desc: '该功能需要额外权限' }
+    },
+    async refresh() {
+		const keys = (this.permissions as any) as PermissionKey[]
+		this.states = Permission.statuses(keys)
+    },
+    async onRequest(key: PermissionKey) {
+      await Permission.ensure(key)
+      this.refresh()
+    },
+    onPanelTouchStart(e: TouchEvent) {
+      try {
+        const y = e.touches[0].clientY as number
+        this.dragStartY = y
+        this.dragCurrentY = y
+      } catch (_e) {
+        this.dragStartY = -1
+        this.dragCurrentY = -1
+      }
+    },
+    onPanelTouchMove(e: TouchEvent) {
+      try {
+        if (this.dragStartY < 0) return
+        this.dragCurrentY = e.touches[0].clientY as number
+      } catch (_e) { }
+    },
+    onPanelTouchEnd(_e: TouchEvent) {
+      try {
+        if (this.dragStartY < 0) return
+        const endY = this.dragCurrentY
+        const delta = endY - this.dragStartY
+        this.dragStartY = -1
+        this.dragCurrentY = -1
+        if (delta > 80) this.onClose()
+      } catch (_e) {
+        this.dragStartY = -1
+        this.dragCurrentY = -1
+      }
+    },
+    onClose() {
+    // 由 v-model 控制 show，先通知外部，再执行关闭过渡（兜底）
+    this.$emit('update:show', false)
+    this.$emit('close')
+    this.startClose()
+    }
+  }
+}
+</script>
+
+<style scoped>
+.perm-mask { 
+    position: fixed; 
+    left: 0; 
+    top: 0; 
+    right: 0; 
+    bottom: 0; 
+    background-color: rgba(0,0,0,0.6); 
+    display: flex; 
+    flex-direction: column;
+    justify-content: flex-end; 
+    align-items: center; 
+    z-index: 10000;
+}
+.perm-panel { 
+    width: 100%; 
+    background-color: #ffffff; 
+    border-top-left-radius: 32rpx; 
+    border-top-right-radius: 32rpx; 
+    padding: 20rpx 40rpx 60rpx 40rpx; 
+    /* Important: Handles safe area at bottom */
+    padding-bottom: 60px; /* Fallback for calc env */
+    
+    transform: translateY(100%); 
+    transition-property: transform;
+    transition-duration: 0.3s;
+    transition-timing-function: cubic-bezier(0.25, 1, 0.5, 1);
+}
+.perm-panel-open { 
+    transform: translateY(0); 
+}
+
+.perm-grabber-wrap { 
+    width: 100%; 
+    height: 30rpx;
+    display: flex; 
+    justify-content: center; 
+    align-items: center;
+    margin-bottom: 10rpx;
+}
+.perm-grabber { 
+    width: 80rpx; 
+    height: 8rpx; 
+    border-radius: 100rpx; 
+    background-color: #E0E0E0; 
+}
+
+.perm-header { 
+    display: flex; 
+    flex-direction: row;
+    align-items: center; 
+    justify-content: space-between; 
+    margin-bottom: 30rpx; 
+}
+.perm-title { 
+    font-size: 40rpx; 
+    font-weight: bold; 
+    color: #1A1A1A; 
+}
+.perm-close-btn {
+    width: 60rpx;
+    height: 60rpx;
+    background-color: #F5F5F5;
+    border-radius: 30rpx;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+.perm-close-icon { 
+    font-size: 28rpx; 
+    color: #666666; 
+    font-weight: bold;
+}
+
+.perm-desc-box {
+    margin-bottom: 40rpx;
+}
+.perm-desc-text { 
+    color: #666666; 
+    font-size: 28rpx; 
+    line-height: 1.6; 
+}
+
+.perm-list { 
+    display: flex;
+    flex-direction: column;
+}
+
+.perm-item { 
+    display: flex; 
+    flex-direction: row;
+    justify-content: space-between; 
+    align-items: center; 
+    padding: 30rpx 0; 
+    border-bottom-width: 1px;
+    border-bottom-style: solid;
+    border-bottom-color: #F0F0F0;
+}
+/* Last item no border */
+/* .perm-item:last-child { border-bottom: none; } */
+
+.perm-item-content { 
+    flex: 1; 
+    display: flex; 
+    flex-direction: column; 
+    justify-content: center;
+    margin-right: 20rpx;
+}
+.perm-item-title { 
+    font-size: 32rpx; 
+    color: #1A1A1A; 
+    font-weight: bold; 
+    margin-bottom: 8rpx; 
+}
+.perm-item-sub { 
+    font-size: 24rpx; 
+    color: #999999; 
+}
+
+.perm-item-action { 
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+}
+.perm-status-ok { 
+    background-color: #F0F9EB; 
+    padding: 10rpx 20rpx;
+    border-radius: 12rpx;
+}
+.perm-status-text {
+    color: #67C23A;
+    font-size: 24rpx;
+    font-weight: bold;
+}
+
+.perm-action-btn { 
+    /* Overriding default button styles */
+    background-color: #1A1A1A; 
+    color: #FFFFFF; 
+    border-radius: 40rpx; 
+    padding: 0 30rpx;
+    height: 64rpx;
+    line-height: 64rpx;
+    font-size: 26rpx; 
+    font-weight: bold;
+    margin: 0; 
+    border-width: 0;
+}
+
+.perm-footer { 
+    margin-top: 50rpx; 
+}
+.perm-main-btn { 
+    width: 100%; 
+    height: 96rpx;
+    line-height: 96rpx;
+    background-color: #000000; 
+    color: #FFFFFF; 
+    border-radius: 24rpx; 
+    font-size: 32rpx; 
+    font-weight: bold; 
+    border-width: 0;
+}
+/* Adding active state for buttons */
+.perm-main-btn:active {
+    opacity: 0.8;
+}
+.perm-action-btn:active {
+    opacity: 0.8;
+}
+</style>

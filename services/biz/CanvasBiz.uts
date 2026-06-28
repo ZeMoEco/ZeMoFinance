@@ -1,0 +1,104 @@
+import { TaskBiz, CreateTaskPayload, TaskItem } from './TaskBiz.uts';
+import { EdgeService } from '../graph/EdgeService.uts';
+import { NodeService } from '../graph/NodeService.uts';
+import { AppStore } from '../store/appStore.uts';
+import { MaskEdgeType, RelationalEdgeType } from '../../utils/types/index.uts';
+
+/**
+ * 无限画布业务逻辑 (CanvasBiz)
+ * 【核心职能】：对接无限画布 (Vision) 相关页面，处理组件容器的拓扑编排、拖拽坐标计算与空间关系挂载。
+ */
+export class CanvasBiz {
+  private static readonly POSITION_FLUSH_DEBOUNCE_MS: number = 140;
+  private static positionFlushTimerId: number = -1;
+  private static pendingPositionMasks = new Map<string, string>();
+
+  private static schedulePositionFlush(): void {
+    if (this.positionFlushTimerId != -1) {
+      clearTimeout(this.positionFlushTimerId as number);
+      this.positionFlushTimerId = -1;
+    }
+
+    this.positionFlushTimerId = (setTimeout(() => {
+      this.positionFlushTimerId = -1;
+      void this.flushPendingNodePositionsAsync();
+    }, this.POSITION_FLUSH_DEBOUNCE_MS) as any) as number;
+  }
+
+  private static async persistPositionMaskAsync(nodeId: string, props: string): Promise<boolean> {
+    return await EdgeService.setMaskAsync(nodeId, MaskEdgeType.HasPosition, props);
+  }
+
+  public static async flushPendingNodePositionsAsync(): Promise<boolean> {
+    if (this.pendingPositionMasks.size == 0) return true;
+
+    const pending = new Map<string, string>();
+    const nodeIds = [] as string[];
+    this.pendingPositionMasks.forEach((props, nodeId) => {
+      pending.set(nodeId, props);
+      nodeIds.push(nodeId);
+    });
+    this.pendingPositionMasks.clear();
+
+    let allOk = true;
+    for (let i = 0; i < nodeIds.length; i++) {
+      const nodeId = nodeIds[i];
+      const props = pending.get(nodeId) ?? '';
+      const ok = await this.persistPositionMaskAsync(nodeId, props);
+      if (!ok) {
+        allOk = false;
+        this.pendingPositionMasks.set(nodeId, props);
+      }
+    }
+
+    return allOk;
+  }
+  
+  /**
+   * 在画布上创建新任务并初始化坐标
+   */
+  public static async createTaskOnCanvas(payload: CreateTaskPayload, x: number, y: number): Promise<TaskItem | null> {
+    // 1. 调用最新创建的 TaskBiz 接口创建任务实体
+    const item = await TaskBiz.createTaskItem(payload);
+    if (item == null) return null;
+    
+    // 2. 初始化节点的画布坐标面具
+    this.updateNodePosition(item.node.id, x, y);
+    void this.flushPendingNodePositionsAsync();
+    
+    return item;
+  }
+
+  /**
+   * 更新节点画布坐标位置
+   */
+  public static updateNodePosition(nodeId: string, x: number, y: number): boolean {
+    if (nodeId == null || nodeId == '') return false;
+
+    const props = JSON.stringify({ x: x, y: y });
+    this.pendingPositionMasks.set(nodeId, props);
+
+    // 触发 UI 重绘（立即）
+    AppStore.setNodeMask(nodeId, MaskEdgeType.HasPosition, props);
+
+    // 落盘防抖批量化
+    this.schedulePositionFlush();
+    return true;
+  }
+
+  public static async createConnectionAsync(sourceId: string, targetId: string): Promise<boolean> {
+    if (sourceId == null || sourceId == '' || targetId == null || targetId == '') return false;
+    if (sourceId == targetId) return false;
+
+    const cleared = await EdgeService.removeIncomingRelationEdgesAsync(targetId, [
+      RelationalEdgeType.ContainsTaskTree,
+      RelationalEdgeType.Contains
+    ]);
+    if (!cleared) return false;
+
+    const edge = await EdgeService.createEdgeAsync(sourceId, targetId, RelationalEdgeType.ContainsTaskTree);
+    return edge != null;
+  }
+
+}
+

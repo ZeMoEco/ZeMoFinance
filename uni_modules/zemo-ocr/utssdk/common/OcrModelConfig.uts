@@ -1,0 +1,28 @@
+const _ROOT_BASE = uni.env.USER_DATA_PATH.replace(/\/+$/, '')
+const RUNTIME_ROOT_DIR = `${_ROOT_BASE}/zemo`
+const RUNTIME_ASSETS_DIR = `${RUNTIME_ROOT_DIR}/assets`
+
+export class OcrModelConfig {
+	static readonly DEFAULT_ENGINE: string = 'native'
+	static readonly PPOCRV6_ENGINE: string = 'ppocrv6'
+
+	static readonly DET_ASSET_DIR: string = '/uni_modules/zemo-ocr/static/model-ocr/ch_PP-OCRv4_det_infer'
+	static readonly REC_ASSET_DIR: string = '/uni_modules/zemo-ocr/static/model-ocr/ch_PP-OCRv4_rec_infer'
+
+	static readonly DET_RUNTIME_DIR: string = `${RUNTIME_ASSETS_DIR}/ai/ch_PP-OCRv4_det_infer`
+	static readonly REC_RUNTIME_DIR: string = `${RUNTIME_ASSETS_DIR}/ai/ch_PP-OCRv4_rec_infer`
+
+	static readonly REC_CONFIG_PATH: string = `${OcrModelConfig.REC_RUNTIME_DIR}/config.json`
+	static readonly DICT_ASSET_PATH: string = '/uni_modules/zemo-ocr/static/model-ocr/ppocr_keys_v1.txt'
+	static readonly DICT_RUNTIME_PATH: string = `${RUNTIME_ASSETS_DIR}/ai/ppocr_keys_v1.txt`
+
+	static readonly PPOCRV6_RUNTIME_ROOT_DIR: string = `${RUNTIME_ASSETS_DIR}/ai/ppocrv6`
+	static readonly PPOCRV6_DET_RUNTIME_DIR: string = `${OcrModelConfig.PPOCRV6_RUNTIME_ROOT_DIR}/det`
+	static readonly PPOCRV6_REC_RUNTIME_DIR: string = `${OcrModelConfig.PPOCRV6_RUNTIME_ROOT_DIR}/rec`
+	static readonly PPOCRV6_DICT_RUNTIME_PATH: string = `${OcrModelConfig.PPOCRV6_RUNTIME_ROOT_DIR}/ppocr_keys_v1.txt`
+	static readonly PPOCRV6_DICT_YAML_RUNTIME_PATH: string = `${OcrModelConfig.PPOCRV6_RUNTIME_ROOT_DIR}/inference.yml`
+	static readonly PPOCRV6_MANIFEST_PATH: string = `${OcrModelConfig.PPOCRV6_RUNTIME_ROOT_DIR}/manifest.json`
+
+	static readonly PPOCRV6_DET_ASSET_DIR: string = '/uni_modules/zemo-ocr/static/model-ocr/PP-OCRv6_det_infer'
+	static readonly PPOCRV6_REC_ASSET_DIR: string = '/uni_modules/zemo-ocr/static/model-ocr/PP-OCRv6_rec_infer'
+}

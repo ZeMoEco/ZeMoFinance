@@ -1,0 +1,87 @@
+import { Log, LogAction, LogOwnerType } from '../../utils/types/index.uts';
+import { DB } from '@/utils/DB/DB.uts';
+import { genId } from '@/utils/common/id.uts';
+
+export type LogInsertOptions = {
+  id?: string | null
+  properties?: string | null
+  entityVersion?: number | null
+  syncEventId?: string | null
+}
+
+/**
+ * 动态时序服务 (LogService)
+ * 【核心职责】：记录流逝的时间与操作痕迹，管控系统的时间轴回放。
+ * 【约束】：所有的强记录必须处于强事务（Transaction）之下，与本体修改同生共死。
+ */
+export class LogService {
+
+  private static mapRowToLog(row: Map<string, any | null>): Log {
+    const ownerType = row.get('owner_type')?.toString() ?? 'node';
+    const ownerId = row.get('owner_id')?.toString() ?? '';
+    return {
+      id: row.get('id')?.toString() ?? '',
+      owner_type: ownerType,
+      owner_id: ownerId,
+      action: row.get('action')?.toString() ?? '',
+      text: row.get('text')?.toString() ?? '',
+      parent_log_id: row.get('parent_log_id')?.toString() ?? null,
+      properties: row.get('properties')?.toString() ?? null,
+      timestamp: parseInt(row.get('timestamp')?.toString() ?? '0'),
+      created_at: parseInt(row.get('created_at')?.toString() ?? '0'),
+      updated_at: parseInt(row.get('updated_at')?.toString() ?? '0'),
+      is_deleted: parseInt(row.get('is_deleted')?.toString() ?? '0'),
+    } as Log;
+  }
+
+  public static async recordLogAsync(nodeId: string, action: LogAction, text: string, options: LogInsertOptions | null = null): Promise<Log | null> {
+    return await this.recordOwnedLogAsync(LogOwnerType.Node, nodeId, action, text, options);
+  }
+
+  public static async recordOwnedLogAsync(ownerType: LogOwnerType | string, ownerId: string, action: LogAction | string, text: string, options: LogInsertOptions | null = null): Promise<Log | null> {
+    const now = Date.now();
+    const id = options?.id == null || options.id.toString().trim() == '' ? genId('log') : options.id.toString().trim();
+    const actionStr = action.toString();
+    const ownerTypeStr = ownerType.toString();
+    const entityVersion = options?.entityVersion == null ? 1 : parseInt(options.entityVersion.toString());
+    const syncEventId = options?.syncEventId == null || options.syncEventId.toString().trim() == '' ? null : options.syncEventId.toString().trim();
+    const properties = options?.properties == null ? null : options.properties.toString();
+    const ok = await DB.exec(
+      `INSERT INTO logs (id, owner_type, owner_id, action, text, timestamp, created_at, updated_at, properties, entity_version, last_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, ownerTypeStr, ownerId, actionStr, text, now, now, now, properties, entityVersion, syncEventId]
+    );
+    if (!ok) return null;
+    return {
+      id,
+      owner_type: ownerTypeStr,
+      owner_id: ownerId,
+      action: actionStr,
+      text: text,
+      properties,
+      timestamp: now,
+      created_at: now,
+      updated_at: now,
+    } as Log;
+  }
+
+  public static async getNodeLogsAsync(nodeId: string): Promise<Log[]> {
+    return await this.getOwnerLogsAsync(LogOwnerType.Node, nodeId);
+  }
+
+  public static async getOwnerLogsAsync(ownerType: LogOwnerType | string, ownerId: string): Promise<Log[]> {
+    const ownerTypeStr = ownerType.toString();
+    const rows = await DB.query(
+      `SELECT * FROM logs WHERE owner_type = ? AND owner_id = ? ORDER BY created_at DESC`,
+      [ownerTypeStr, ownerId]
+    );
+    return rows.map((r) => this.mapRowToLog(r));
+  }
+
+  public static async getGlobalTimelineAsync(limit: number = 50, offset: number = 0): Promise<Log[]> {
+    const rows = await DB.query(
+      `SELECT * FROM logs ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+      [limit, offset]
+    );
+    return rows.map((r) => this.mapRowToLog(r));
+  }
+}

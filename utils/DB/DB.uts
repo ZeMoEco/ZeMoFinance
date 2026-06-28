@@ -1,0 +1,1240 @@
+// utils/db/db.uts
+
+// #ifdef APP-ANDROID
+import SQLiteDatabase from 'android.database.sqlite.SQLiteDatabase'
+import Cursor from 'android.database.Cursor'
+import UTSAndroid from 'io.dcloud.uts.UTSAndroid'
+// #endif
+
+// #ifdef APP-HARMONY
+import relationalStore from '@ohos.data.relationalStore'
+// #endif
+
+import { getCurrentAppId, getCurrentDbName } from '../app/AppRuntime.uts'
+import { LOCAL_SYNC_DIRTY_EVENT } from '../constant.uts'
+
+export type SqlValue = string | number | boolean | null
+export type SqlArgs = Array<SqlValue>
+export type Row = Map<string, any | null>
+
+export type MergeByUpdatedAtOptions = {
+  primaryKey?: string
+  updatedAtColumn?: string
+}
+
+export type ColumnDef = {
+  name: string
+  type: string
+  notNull?: boolean
+  primaryKey?: boolean
+  autoIncrement?: boolean
+  unique?: boolean
+  default?: string | number | boolean | null
+}
+
+export type IndexDef = {
+  name: string
+  columns: string[]
+  unique?: boolean
+}
+
+export type TableDef = {
+  name: string
+  columns: ColumnDef[]
+  indexes?: IndexDef[]
+}
+
+export type ModuleSchema = {
+  name: string
+  tables: TableDef[]
+}
+
+type DriverKind = 'android' | 'harmony' | 'ios' | 'unknown'
+
+interface ISqlDriver {
+  kind: DriverKind
+  init(context: any | null, dbName: string): Promise<boolean>
+  getDatabasePath(): string
+  exec(sql: string, args?: SqlArgs | null): Promise<boolean>
+  query(sql: string, args?: SqlArgs | null): Promise<Row[]>
+  beginTransaction(): Promise<void>
+  setTransactionSuccessful(): Promise<void>
+  endTransaction(): Promise<void>
+  close(): void
+}
+
+function createSyncMetadataColumns(): ColumnDef[] {
+  return [
+    { name: 'origin_app_id', type: 'TEXT', notNull: true, default: getCurrentAppId() },
+    { name: 'entity_version', type: 'INTEGER', notNull: true, default: 1 },
+    { name: 'tombstone_at', type: 'INTEGER' },
+    { name: 'last_event_id', type: 'TEXT' },
+  ]
+}
+
+function withSyncMetadata(columns: ColumnDef[]): ColumnDef[] {
+  const out = [] as ColumnDef[]
+  for (let i = 0; i < columns.length; i++) {
+    out.push(columns[i])
+  }
+  const extras = createSyncMetadataColumns()
+  for (let i = 0; i < extras.length; i++) {
+    out.push(extras[i])
+  }
+  return out
+}
+
+class AndroidSqliteDriver implements ISqlDriver {
+  kind: DriverKind = 'android'
+  private dbName: string = 'ZeMo.db'
+  private db: SQLiteDatabase | null = null
+  private transactionSuccess: boolean = false
+
+  async init(context: any | null, dbName: string): Promise<boolean> {
+    this.dbName = dbName
+    try {
+      const appContext = UTSAndroid.getAppContext()
+      if (appContext == null) return false
+      const dbPath = appContext.getDatabasePath(this.dbName).getAbsolutePath()
+      this.db = SQLiteDatabase.openOrCreateDatabase(dbPath, null)
+      return this.db != null && this.db!.isOpen()
+    } catch (e) {
+      console.error(`[DB] Android init error: ${e}`)
+      return false
+    }
+  }
+
+  getDatabasePath(): string {
+    try {
+      const context = UTSAndroid.getAppContext()
+      if (context == null) return ''
+      return context.getDatabasePath(this.dbName).getAbsolutePath()
+    } catch (_e) {
+      return ''
+    }
+  }
+
+  async exec(sql: string, args: SqlArgs | null): Promise<boolean> {
+    if (this.db == null || !this.db!.isOpen()) return false
+    try {
+      const safeArgs = DB.normalizeArgs(args)
+      if (safeArgs.length > 0) this.db!.execSQL(sql, safeArgs.toTypedArray())
+      else this.db!.execSQL(sql)
+      return true
+    } catch (e) {
+      console.error(`[DB] Android exec error: ${e} | SQL: ${sql}`)
+      return false
+    }
+  }
+
+  async query(sql: string, args: SqlArgs | null): Promise<Row[]> {
+    const result: Row[] = []
+    if (this.db == null || !this.db!.isOpen()) return result
+    let cursor: Cursor | null = null
+    try {
+      const safeArgs: Array<any | null> = DB.normalizeArgs(args)
+      const strArgs: Array<string> = []
+      for (let i = 0; i < safeArgs.length; i++) {
+        const item: any | null = safeArgs[i]
+        strArgs.push(item != null ? item.toString() : '')
+      }
+      cursor = this.db!.rawQuery(sql, strArgs.length > 0 ? strArgs.toTypedArray() : null)
+      if (cursor != null && cursor.moveToFirst()) {
+        const colCount = cursor.getColumnCount()
+        do {
+          const row = new Map<string, any | null>()
+          for (let i = 0; i < colCount; i++) {
+            const idx = i.toInt()
+            const name = cursor.getColumnName(idx)
+            const type = cursor.getType(idx)
+            if (type == Cursor.FIELD_TYPE_NULL) row.set(name, null)
+            else if (type == Cursor.FIELD_TYPE_INTEGER) row.set(name, cursor.getLong(idx))
+            else if (type == Cursor.FIELD_TYPE_FLOAT) row.set(name, cursor.getDouble(idx))
+            else row.set(name, cursor.getString(idx))
+          }
+          result.push(row)
+        } while (cursor.moveToNext())
+      }
+    } catch (e) {
+      console.error(`[DB] Android query error: ${e} | SQL: ${sql}`)
+    } finally {
+      if (cursor != null) cursor.close()
+    }
+    return result
+  }
+
+  async beginTransaction(): Promise<void> {
+    this.transactionSuccess = false
+    if (this.db != null && this.db!.isOpen()) this.db!.beginTransaction()
+  }
+
+  async setTransactionSuccessful(): Promise<void> {
+    this.transactionSuccess = true
+    if (this.db != null && this.db!.isOpen()) this.db!.setTransactionSuccessful()
+  }
+
+  async endTransaction(): Promise<void> {
+    if (this.db != null && this.db!.isOpen()) this.db!.endTransaction()
+    this.transactionSuccess = false
+  }
+
+  close(): void {
+    if (this.db != null) {
+      try {
+        if (this.db!.isOpen()) this.db!.close()
+      } catch (_e) {}
+    }
+    this.db = null
+  }
+}
+
+class UnknownDriver implements ISqlDriver {
+  kind: DriverKind = 'unknown'
+
+  async init(context: any | null, _dbName: string): Promise<boolean> {
+    console.error('[DB] Unsupported platform')
+    return false
+  }
+
+  getDatabasePath(): string {
+    return ''
+  }
+
+  async exec(_sql: string, _args: SqlArgs | null): Promise<boolean> {
+    return false
+  }
+
+  async query(_sql: string, _args: SqlArgs | null): Promise<Row[]> {
+    return []
+  }
+
+  async beginTransaction(): Promise<void> {}
+  async setTransactionSuccessful(): Promise<void> {}
+  async endTransaction(): Promise<void> {}
+  close(): void {}
+}
+
+class HarmonyRdbDriver implements ISqlDriver {
+  kind: DriverKind = 'harmony'
+  private dbName: string = 'ZeMo.db'
+  private store: relationalStore.RdbStore | null = null
+  private transactionSuccess: boolean = false
+  private ctx: any | null = null
+
+  async init(context: any | null, dbName: string): Promise<boolean> {
+    this.dbName = dbName
+    if (context == null) {
+      console.error('[DB] Harmony init requires UIAbilityContext')
+      return false
+    }
+    try {
+      this.ctx = context as any
+      const config: relationalStore.StoreConfig = {
+        name: this.dbName,
+        securityLevel: relationalStore.SecurityLevel.S1,
+      }
+      this.store = await relationalStore.getRdbStore(this.ctx, config)
+      return this.store != null
+    } catch (e) {
+      const err = e as any
+      console.error(`[DB] Harmony init error: ${err.code} - ${err.message}`)
+      return false
+    }
+  }
+
+  getDatabasePath(): string {
+    try {
+      if (this.ctx == null) return ''
+      return `${this.ctx.databaseDir}/rdb/${this.dbName}`
+    } catch (_e) {
+      return ''
+    }
+  }
+
+  async exec(sql: string, args: SqlArgs | null): Promise<boolean> {
+    if (this.store == null) return false
+    try {
+      const safeArgs = DB.normalizeArgs(args)
+      if (safeArgs.length > 0) await this.store!.executeSql(sql, safeArgs as Array<any>)
+      else await this.store!.executeSql(sql)
+      return true
+    } catch (e) {
+      const err = e as any
+      if (sql.includes('ADD COLUMN') && err.code == 14800021) return true
+      console.error(`[DB] Harmony exec error: ${err.code} - ${err.message} | SQL: ${sql}`)
+      return false
+    }
+  }
+
+  async query(sql: string, args: SqlArgs | null): Promise<Row[]> {
+    const result: Row[] = []
+    if (this.store == null) return result
+    let rs: relationalStore.ResultSet | null = null
+    try {
+      const safeArgs = DB.normalizeArgs(args)
+      if (safeArgs.length > 0) rs = await this.store!.querySql(sql, safeArgs as Array<any>)
+      else rs = await this.store!.querySql(sql)
+      if (rs != null && rs.rowCount > 0) {
+        const colCount = rs.columnCount
+        const colNames = rs.columnNames
+        while (rs.goToNextRow()) {
+          const row = new Map<string, any | null>()
+          for (let i = 0; i < colCount; i++) {
+            const name = colNames[i]
+            if (rs.isColumnNull(i)) row.set(name, null)
+            else row.set(name, rs.getString(i))
+          }
+          result.push(row)
+        }
+      }
+    } catch (e) {
+      const err = e as any
+      console.error(`[DB] Harmony query error: ${err.code} - ${err.message} | SQL: ${sql}`)
+    } finally {
+      if (rs != null) rs.close()
+    }
+    return result
+  }
+
+  async beginTransaction(): Promise<void> {
+    this.transactionSuccess = false
+    if (this.store != null) this.store!.beginTransaction()
+  }
+
+  async setTransactionSuccessful(): Promise<void> {
+    this.transactionSuccess = true
+  }
+
+  async endTransaction(): Promise<void> {
+    if (this.store != null) {
+      if (this.transactionSuccess) this.store!.commit()
+      else this.store!.rollBack()
+    }
+    this.transactionSuccess = false
+  }
+
+  close(): void {
+    this.store = null
+    this.ctx = null
+    this.transactionSuccess = false
+  }
+}
+
+class PlusSqliteDriver implements ISqlDriver {
+  kind: DriverKind = 'ios'
+  private dbName: string = 'ZeMo.db'
+  private transactionSuccess: boolean = false
+  private opened: boolean = false
+  private dbPath: string = ''
+
+ async init(context: any | null, dbName: string): Promise<boolean> {
+    this.dbName = dbName
+    try {
+      const g: any = globalThis as any
+      const plusAny = g != null ? g.plus : null
+      if (plusAny == null || plusAny.sqlite == null) {
+        console.error('[DB] iOS sqlite driver not available (plus.sqlite missing)')
+        return false
+      }
+      const basePath = (uni as any).env != null ? (uni as any).env.USER_DATA_PATH : ''
+      this.dbPath = basePath ? `${basePath}/${this.dbName}` : this.dbName
+      return await new Promise<boolean>((resolve) => {
+        plusAny.sqlite.openDatabase({
+          name: this.dbName,
+          path: this.dbPath,
+          success: () => {
+            this.opened = true
+            resolve(true)
+          },
+          fail: (e: any) => {
+            console.error(`[DB] iOS openDatabase fail: ${JSON.stringify(e)}`)
+            this.opened = false
+            resolve(false)
+          },
+        })
+      })
+    } catch (e) {
+      console.error(`[DB] iOS init error: ${e}`)
+      return false
+    }
+  }
+
+  getDatabasePath(): string {
+    return this.dbPath
+  }
+
+  async exec(sql: string, args: SqlArgs | null): Promise<boolean> {
+    try {
+      const g: any = globalThis as any
+      const plusAny = g != null ? g.plus : null
+      if (plusAny == null || plusAny.sqlite == null || !this.opened) return false
+      const rendered = DB.renderSql(sql, args)
+      return await new Promise<boolean>((resolve) => {
+        plusAny.sqlite.executeSql({
+          name: this.dbName,
+          sql: rendered,
+          success: () => resolve(true),
+          fail: (e: any) => {
+            console.error(`[DB] iOS exec fail: ${JSON.stringify(e)} | SQL: ${rendered}`)
+            resolve(false)
+          },
+        })
+      })
+    } catch (e) {
+      console.error(`[DB] iOS exec error: ${e}`)
+      return false
+    }
+  }
+
+  async query(sql: string, args: SqlArgs | null): Promise<Row[]> {
+    const result: Row[] = []
+    try {
+      const g: any = globalThis as any
+      const plusAny = g != null ? g.plus : null
+      if (plusAny == null || plusAny.sqlite == null || !this.opened) return result
+      const rendered = DB.renderSql(sql, args)
+      const rows = await new Promise<any[]>((resolve) => {
+        plusAny.sqlite.selectSql({
+          name: this.dbName,
+          sql: rendered,
+          success: (data: any[]) => resolve(data ?? []),
+          fail: (e: any) => {
+            console.error(`[DB] iOS query fail: ${JSON.stringify(e)} | SQL: ${rendered}`)
+            resolve([])
+          },
+        })
+      })
+      for (let i = 0; i < rows.length; i++) {
+        const obj = rows[i] as any
+        const row = new Map<string, any | null>()
+        try {
+          if (obj != null && obj instanceof Map) {
+            ;(obj as Map<string, any | null>).forEach((value: any | null, key: string) => {
+              row.set(key, value ?? null)
+            })
+          }
+        } catch (_e) {}
+        result.push(row)
+      }
+    } catch (e) {
+      console.error(`[DB] iOS query error: ${e}`)
+    }
+    return result
+  }
+
+  async beginTransaction(): Promise<void> {
+    this.transactionSuccess = false
+    await this.exec('BEGIN')
+  }
+
+  async setTransactionSuccessful(): Promise<void> {
+    this.transactionSuccess = true
+  }
+
+  async endTransaction(): Promise<void> {
+    if (this.transactionSuccess) await this.exec('COMMIT')
+    else await this.exec('ROLLBACK')
+    this.transactionSuccess = false
+  }
+
+  close(): void {
+    try {
+      const g: any = globalThis as any
+      const plusAny = g != null ? g.plus : null
+      if (plusAny != null && plusAny.sqlite != null && this.opened) {
+        plusAny.sqlite.closeDatabase({ name: this.dbName })
+      }
+    } catch (_e) {}
+    this.opened = false
+  }
+}
+
+export class DB {
+  private static _dbName: string = 'ZeMo.db'
+  private static _driver: ISqlDriver | null = null
+  private static _inited: boolean = false
+  private static _lastInitContext: any | null = null
+  private static _txDepth: number = 0
+  private static _activeTransactionCount: number = 0
+  private static _transactionMarkedSuccessful: boolean = false
+  private static _pendingLocalSyncDirtyEvent: boolean = false
+
+  static get schema(): ModuleSchema[] {
+    return [
+    {
+      name: 'zemo_core',
+      tables: [
+        {
+          name: 'nodes',
+          columns: withSyncMetadata([
+            { name: 'id', type: 'TEXT', primaryKey: true },
+            { name: 'type', type: 'TEXT', notNull: true },
+            { name: 'status', type: 'TEXT' },
+            { name: 'content', type: 'TEXT' },
+            { name: 'properties', type: 'TEXT' },
+            { name: 'due_at', type: 'INTEGER' },
+            { name: 'completed_at', type: 'INTEGER' },
+            { name: 'created_at', type: 'INTEGER', notNull: true },
+            { name: 'updated_at', type: 'INTEGER', notNull: true },
+            { name: 'is_deleted', type: 'INTEGER', notNull: true, default: 0 },
+          ]),
+          indexes: [
+            { name: 'idx_nodes_type_deleted_created', columns: ['type', 'is_deleted', 'created_at'] },
+            { name: 'idx_nodes_updated_at', columns: ['updated_at'] },
+            { name: 'idx_nodes_due_at', columns: ['due_at'] }
+          ],
+        },
+        {
+          name: 'edges',
+          columns: withSyncMetadata([
+            { name: 'id', type: 'TEXT', primaryKey: true },
+            { name: 'source_id', type: 'TEXT', notNull: true },
+            { name: 'target_id', type: 'TEXT', notNull: true },
+            { name: 'relation_type', type: 'TEXT', notNull: true },
+            { name: 'context_key', type: 'TEXT' },
+            { name: 'status', type: 'TEXT', notNull: true, default: 'todo' },
+            { name: 'secondary_category', type: 'TEXT' },
+            { name: 'rank', type: 'TEXT', notNull: true, default: '500' },
+            { name: 'properties', type: 'TEXT' },
+            { name: 'created_at', type: 'INTEGER', notNull: true },
+            { name: 'updated_at', type: 'INTEGER', notNull: true, default: 0 },
+            { name: 'is_deleted', type: 'INTEGER', notNull: true, default: 0 },
+          ]),
+          indexes: [
+            { name: 'idx_edges_source_relation_deleted', columns: ['source_id', 'relation_type', 'is_deleted'] },
+            { name: 'idx_edges_relation_status_category_deleted', columns: ['relation_type', 'status', 'secondary_category', 'is_deleted'] },
+            { name: 'idx_edges_source_relation_rank', columns: ['source_id', 'relation_type', 'is_deleted', 'rank'] },
+            { name: 'idx_edges_target_relation', columns: ['target_id', 'relation_type', 'is_deleted'] },
+            { name: 'idx_edges_unique_relation', columns: ['source_id', 'target_id', 'relation_type'], unique: true }
+          ],
+        },
+        {
+          name: 'users',
+          columns: withSyncMetadata([
+            { name: 'id', type: 'INTEGER', primaryKey: true, autoIncrement: true },
+            { name: 'username', type: 'TEXT', notNull: true },
+            { name: 'avatar', type: 'TEXT' },
+            { name: 'xp', type: 'INTEGER', notNull: true, default: 0 },
+            { name: 'level', type: 'INTEGER', notNull: true, default: 1 },
+            { name: 'coins', type: 'INTEGER', notNull: true, default: 0 },
+            { name: 'created_at', type: 'INTEGER', notNull: true },
+            { name: 'updated_at', type: 'INTEGER', notNull: true },
+          ]),
+        },
+        {
+          name: 'accounts',
+          columns: withSyncMetadata([
+            { name: 'id', type: 'TEXT', primaryKey: true },
+            { name: 'user_id', type: 'INTEGER', notNull: true, default: 1 },
+            { name: 'name', type: 'TEXT', notNull: true },
+            { name: 'type', type: 'TEXT', notNull: true },
+            { name: 'balance', type: 'REAL', notNull: true, default: 0.0 },
+            { name: 'currency', type: 'TEXT', notNull: true, default: 'CNY' },
+            { name: 'category', type: 'TEXT', notNull: true, default: 'cash' },
+            { name: 'card_no', type: 'TEXT' },
+            { name: 'properties', type: 'TEXT' },
+            { name: 'created_at', type: 'INTEGER', notNull: true },
+            { name: 'updated_at', type: 'INTEGER', notNull: true, default: 0 },
+            { name: 'is_deleted', type: 'INTEGER', notNull: true, default: 0 },
+          ]),
+          indexes: [
+            { name: 'idx_accounts_user', columns: ['user_id', 'is_deleted'] },
+            { name: 'idx_accounts_name', columns: ['name'] }
+          ],
+        },
+        {
+          name: 'transactions',
+          columns: withSyncMetadata([
+            { name: 'id', type: 'TEXT', primaryKey: true },
+            { name: 'account_id', type: 'TEXT', notNull: true },
+            { name: 'amount', type: 'REAL', notNull: true },
+            { name: 'type', type: 'TEXT', notNull: true },
+            { name: 'category', type: 'TEXT' },
+            { name: 'description', type: 'TEXT' },
+            { name: 'location', type: 'TEXT' },
+            { name: 'transaction_time', type: 'INTEGER', notNull: true },
+            { name: 'created_at', type: 'INTEGER', notNull: true },
+            { name: 'updated_at', type: 'INTEGER', notNull: true, default: 0 },
+            { name: 'balance_snapshot', type: 'REAL', default: 0.0 },
+            { name: 'source_node_id', type: 'TEXT' },
+            { name: 'item_node_id', type: 'TEXT' },
+            { name: 'location_node_id', type: 'TEXT' },
+            { name: 'properties', type: 'TEXT' },
+            { name: 'is_deleted', type: 'INTEGER', notNull: true, default: 0 },
+          ]),
+          indexes: [
+            { name: 'idx_transactions_account_time', columns: ['account_id', 'transaction_time'] },
+            { name: 'idx_transactions_time', columns: ['transaction_time'] }
+          ],
+        },
+        {
+          name: 'logs',
+          columns: withSyncMetadata([
+            { name: 'id', type: 'TEXT', primaryKey: true },
+            { name: 'owner_type', type: 'TEXT', notNull: true, default: 'node' },
+            { name: 'owner_id', type: 'TEXT', notNull: true },
+            { name: 'action', type: 'TEXT', notNull: true },
+            { name: 'text', type: 'TEXT' },
+            { name: 'parent_log_id', type: 'TEXT' },
+            { name: 'sync_block_id', type: 'TEXT' },
+            { name: 'source_log_id', type: 'TEXT' },
+            { name: 'timestamp', type: 'INTEGER', notNull: true, default: 0 },
+            { name: 'created_at', type: 'INTEGER', notNull: true },
+            { name: 'updated_at', type: 'INTEGER', notNull: true, default: 0 },
+            { name: 'properties', type: 'TEXT' },
+            { name: 'is_deleted', type: 'INTEGER', notNull: true, default: 0 },
+          ]),
+          indexes: [
+            { name: 'idx_logs_owner_created', columns: ['owner_type', 'owner_id', 'created_at', 'is_deleted'] },
+            { name: 'idx_logs_time', columns: ['created_at'] },
+            { name: 'idx_logs_sync_block_id', columns: ['sync_block_id'] },
+            { name: 'idx_logs_source_log_id', columns: ['source_log_id'] }
+          ],
+        },
+        {
+          name: 'attachments',
+          columns: withSyncMetadata([
+            { name: 'id', type: 'TEXT', primaryKey: true },
+            { name: 'node_id', type: 'TEXT', notNull: true },
+            { name: 'file_name', type: 'TEXT' },
+            { name: 'file_path', type: 'TEXT', notNull: true },
+            { name: 'file_type', type: 'TEXT', notNull: true },
+            { name: 'file_hash', type: 'TEXT' },
+            { name: 'file_size', type: 'INTEGER', default: 0 },
+            { name: 'created_at', type: 'INTEGER', notNull: true },
+            { name: 'updated_at', type: 'INTEGER', notNull: true, default: 0 },
+            { name: 'is_deleted', type: 'INTEGER', notNull: true, default: 0 },
+          ]),
+          indexes: [
+            { name: 'idx_attachments_node_created', columns: ['node_id', 'created_at'] },
+            { name: 'idx_attachments_hash', columns: ['file_hash'] }
+          ],
+        },
+        {
+          name: 'user_kv',
+          columns: withSyncMetadata([
+            { name: 'user_id', type: 'INTEGER', notNull: true, default: 0 },
+            { name: 'k', type: 'TEXT', notNull: true },
+            { name: 'v', type: 'TEXT' },
+            { name: 'updated_at', type: 'INTEGER', notNull: true, default: 0 },
+          ]),
+          indexes: [
+            { name: 'idx_user_kv_user_k', columns: ['user_id', 'k'], unique: true },
+            { name: 'idx_user_kv_updated', columns: ['updated_at'] }
+          ],
+        }
+      ]
+    }
+    ]
+  }
+
+  private static readonly viewSqls: string[] = [
+    `CREATE VIEW IF NOT EXISTS vw_timeline_feed AS
+SELECT
+    'log' AS source_type,
+    l.id AS source_id,
+    l.owner_id AS entity_id,
+    COALESCE(l.text, '') AS content,
+  CAST(COALESCE(NULLIF(l.timestamp, 0), l.created_at) AS INTEGER) AS created_at,
+    NULL AS amount,
+    NULL AS txn_type
+FROM logs l
+WHERE l.is_deleted = 0
+UNION ALL
+SELECT
+    'transaction' AS source_type,
+    t.id AS source_id,
+    t.account_id AS entity_id,
+    COALESCE(t.description, t.category, '') AS content,
+  CAST(COALESCE(t.transaction_time, t.created_at) AS INTEGER) AS created_at,
+    t.amount AS amount,
+    t.type AS txn_type
+FROM transactions t
+WHERE t.is_deleted = 0
+UNION ALL
+SELECT
+    'task_done' AS source_type,
+    n.id AS source_id,
+    n.id AS entity_id,
+    COALESCE(n.content, '') AS content,
+  CAST(COALESCE(n.completed_at, n.updated_at, n.created_at) AS INTEGER) AS created_at,
+    NULL AS amount,
+    NULL AS txn_type
+FROM nodes n
+WHERE n.is_deleted = 0
+  AND (
+      lower(COALESCE(n.status, '')) IN ('done', 'completed')
+      OR (lower(COALESCE(n.status, '')) = 'archived' AND COALESCE(n.completed_at, 0) > 0)
+      OR n.properties LIKE '%"status":"done"%'
+      OR n.properties LIKE '%"status":"completed"%'
+  )`
+  ]
+
+  static async init(context: any | null = null, dbName: string = getCurrentDbName()): Promise<boolean> {
+    if (DB._inited && DB._driver != null && DB._dbName == dbName) return true
+
+    if (context != null) {
+      DB._lastInitContext = context
+    }
+
+    DB._dbName = dbName
+    if (DB._driver == null) DB._driver = DB.createDriver()
+    const initContext = context != null ? context : DB._lastInitContext
+    DB._inited = await DB._driver!.init(initContext, DB._dbName)
+    if (DB._inited) {
+      await DB.exec('PRAGMA foreign_keys = ON')
+      if (DB._driver!.kind == 'android') {
+        await DB.query('PRAGMA busy_timeout = 5000')
+      } else {
+        await DB.exec('PRAGMA busy_timeout = 5000')
+      }
+    }
+    return DB._inited
+  }
+
+  static get isReady(): boolean {
+    return DB._inited && DB._driver != null
+  }
+
+  static getDatabasePath(): string {
+    if (DB._driver == null) return ''
+    return DB._driver.getDatabasePath()
+  }
+
+  static close(): void {
+    if (DB._driver != null) DB._driver.close()
+    DB._driver = null
+    DB._inited = false
+    DB._txDepth = 0
+    DB._activeTransactionCount = 0
+    DB._transactionMarkedSuccessful = false
+    DB._pendingLocalSyncDirtyEvent = false
+  }
+
+  private static shouldNotifyLocalSyncDirty(sql: string): boolean {
+    const normalized = (sql ?? '').toString().trim().toUpperCase()
+    if (normalized == '') return false
+    return normalized.startsWith('INSERT')
+      || normalized.startsWith('UPDATE')
+      || normalized.startsWith('DELETE')
+      || normalized.startsWith('REPLACE')
+  }
+
+  private static emitLocalSyncDirty(): void {
+    try {
+      uni.$emit(LOCAL_SYNC_DIRTY_EVENT)
+    } catch (_e) {}
+  }
+
+  private static handleSuccessfulMutation(sql: string): void {
+    if (!DB.shouldNotifyLocalSyncDirty(sql)) return
+    if (DB._activeTransactionCount > 0) {
+      DB._pendingLocalSyncDirtyEvent = true
+      return
+    }
+    DB.emitLocalSyncDirty()
+  }
+
+  static async exec(sql: string, args: SqlArgs | null = null): Promise<boolean> {
+    if (DB._driver == null) return false
+    const ok = await DB._driver.exec(sql, args ?? null)
+    if (ok) DB.handleSuccessfulMutation(sql)
+    return ok
+  }
+
+  static async query(sql: string, args: SqlArgs | null = null): Promise<Row[]> {
+    if (DB._driver == null) return []
+    return await DB._driver.query(sql, args ?? null)
+  }
+
+  private static joinStrings(items: string[], sep: string): string {
+    let out = ''
+    for (let i = 0; i < items.length; i++) {
+      if (i > 0) out += sep
+      out += items[i]
+    }
+    return out
+  }
+
+  static async beginTransaction(): Promise<void> {
+    if (DB._driver == null) return
+    DB._activeTransactionCount += 1
+    if (DB._activeTransactionCount == 1) {
+      DB._transactionMarkedSuccessful = false
+      DB._pendingLocalSyncDirtyEvent = false
+    }
+    try {
+      await DB._driver.beginTransaction()
+    } catch (e) {
+      DB._activeTransactionCount = Math.max(0, DB._activeTransactionCount - 1)
+      throw e
+    }
+  }
+
+  static async setTransactionSuccessful(): Promise<void> {
+    if (DB._driver == null) return
+    DB._transactionMarkedSuccessful = true
+    await DB._driver.setTransactionSuccessful()
+  }
+
+  static async endTransaction(): Promise<void> {
+    if (DB._driver == null) return
+    let shouldEmit = false
+    try {
+      await DB._driver.endTransaction()
+    } finally {
+      if (DB._activeTransactionCount > 0) DB._activeTransactionCount -= 1
+      if (DB._activeTransactionCount == 0) {
+        shouldEmit = DB._transactionMarkedSuccessful && DB._pendingLocalSyncDirtyEvent
+        DB._transactionMarkedSuccessful = false
+        DB._pendingLocalSyncDirtyEvent = false
+      }
+    }
+    if (shouldEmit) DB.emitLocalSyncDirty()
+  }
+
+  static async tx<T>(fn: () => Promise<T>): Promise<T> {
+    if (DB._txDepth > 0) {
+      DB._txDepth += 1
+      try {
+        return await fn()
+      } finally {
+        DB._txDepth -= 1
+      }
+    }
+
+    DB._txDepth = 1
+    await DB.beginTransaction()
+    try {
+      const res = await fn()
+      await DB.setTransactionSuccessful()
+      return res
+    } finally {
+      try {
+        await DB.endTransaction()
+      } finally {
+        DB._txDepth = 0
+      }
+    }
+  }
+
+  static async ensureSchema(modules: ModuleSchema[] = DB.schema): Promise<boolean> {
+    if (!DB.isReady) return false
+    for (let m = 0; m < modules.length; m++) {
+      const moduleSchema = modules[m]
+      for (let t = 0; t < moduleSchema.tables.length; t++) {
+        const table = moduleSchema.tables[t]
+        const ok = await DB.ensureTable(table)
+        if (!ok) return false
+      }
+    }
+    const normalized = await DB.backfillGraphRefactorColumns()
+    if (!normalized) return false
+    const syncBackfillOk = await DB.backfillSyncMetadataColumns()
+    if (!syncBackfillOk) return false
+    const accountCategoryOk = await DB.backfillAccountCategoryColumns()
+    if (!accountCategoryOk) return false
+    return await DB.ensureViews()
+  }
+
+  static async rebuildTimelineFeedView(): Promise<boolean> {
+    if (!DB.isReady) return false
+    return await DB.ensureViews()
+  }
+
+  static async insert(table: string, row: Row): Promise<boolean> {
+    const columns: Array<string> = []
+    const args: SqlArgs = []
+    row.forEach((value: any | null, key: string) => {
+      columns.push(key)
+      args.push(value as any)
+    })
+    if (columns.length == 0) return true
+
+    let cols = ''
+    let placeholders = ''
+    for (let i = 0; i < columns.length; i++) {
+      if (i > 0) {
+        cols += ','
+        placeholders += ','
+      }
+      cols += columns[i]
+      placeholders += '?'
+    }
+    return await DB.exec(`INSERT INTO ${table} (${cols}) VALUES (${placeholders})`, args)
+  }
+
+  static async upsertReplace(table: string, row: Row): Promise<boolean> {
+    const columns: Array<string> = []
+    const args: SqlArgs = []
+    row.forEach((value: any | null, key: string) => {
+      columns.push(key)
+      args.push(value as any)
+    })
+    if (columns.length == 0) return true
+
+    let cols = ''
+    let placeholders = ''
+    for (let i = 0; i < columns.length; i++) {
+      if (i > 0) {
+        cols += ','
+        placeholders += ','
+      }
+      cols += columns[i]
+      placeholders += '?'
+    }
+    return await DB.exec(`INSERT OR REPLACE INTO ${table} (${cols}) VALUES (${placeholders})`, args)
+  }
+
+  static async update(table: string, row: Row, whereSql: string, whereArgs: SqlArgs | null = null): Promise<boolean> {
+    const columns: Array<string> = []
+    const args: SqlArgs = []
+    row.forEach((value: any | null, key: string) => {
+      columns.push(key)
+      args.push(value as any)
+    })
+    if (columns.length == 0) return true
+
+    let setSql = ''
+    for (let i = 0; i < columns.length; i++) {
+      if (i > 0) setSql += ','
+      setSql += `${columns[i]}=?`
+    }
+
+    const whereSafe = DB.normalizeArgs(whereArgs)
+    for (let i = 0; i < whereSafe.length; i++) {
+      args.push(whereSafe[i] as any)
+    }
+    return await DB.exec(`UPDATE ${table} SET ${setSql} WHERE ${whereSql}`, args)
+  }
+
+  static async delete(table: string, whereSql: string, whereArgs: SqlArgs | null = null): Promise<boolean> {
+    return await DB.exec(`DELETE FROM ${table} WHERE ${whereSql}`, whereArgs)
+  }
+
+  static async getMaxTimestamp(table: string, tsColumn: string = 'updated_at'): Promise<number> {
+    const rows = await DB.query(`SELECT MAX(${tsColumn}) as max_ts FROM ${table}`)
+    if (rows.length == 0) return 0
+    const v = rows[0].get('max_ts')
+    if (v == null) return 0
+    const n = parseInt(v.toString())
+    return isNaN(n) ? 0 : n
+  }
+
+  static async mergeByUpdatedAt(
+    table: string,
+    incomingRows: Row[],
+    opts: MergeByUpdatedAtOptions | null = null,
+  ): Promise<number> {
+    const primaryKey = opts?.primaryKey ?? 'id'
+    const updatedAtColumn = opts?.updatedAtColumn ?? 'updated_at'
+    if (incomingRows.length == 0) return 0
+
+    const ids: SqlArgs = []
+    for (let i = 0; i < incomingRows.length; i++) {
+      const idVal = incomingRows[i].get(primaryKey)
+      if (idVal != null) ids.push(idVal as any)
+    }
+    if (ids.length == 0) return 0
+
+    let placeholders = ''
+    for (let i = 0; i < ids.length; i++) {
+      if (i > 0) placeholders += ','
+      placeholders += '?'
+    }
+    const localRows = await DB.query(
+      `SELECT ${primaryKey} as pk, ${updatedAtColumn} as ts FROM ${table} WHERE ${primaryKey} IN (${placeholders})`,
+      ids,
+    )
+
+    const localTs = new Map<string, number>()
+    for (let i = 0; i < localRows.length; i++) {
+      const pk = localRows[i].get('pk')
+      const ts = localRows[i].get('ts')
+      if (pk == null) continue
+      const n = ts == null ? 0 : parseInt(ts.toString())
+      localTs.set(pk.toString(), isNaN(n) ? 0 : n)
+    }
+
+    let applied = 0
+    await DB.tx(async () => {
+      for (let i = 0; i < incomingRows.length; i++) {
+        const row = incomingRows[i]
+        const pkVal = row.get(primaryKey)
+        if (pkVal == null) continue
+        const incomingTsRaw = row.get(updatedAtColumn)
+        const incomingTs = incomingTsRaw == null ? 0 : parseInt(incomingTsRaw.toString())
+        const currentTs = localTs.get(pkVal.toString()) ?? 0
+        if (incomingTs > currentTs) {
+          const ok = await DB.upsertReplace(table, row)
+          if (ok) applied++
+        }
+      }
+    })
+    return applied
+  }
+
+  private static createDriver(): ISqlDriver {
+    // #ifdef APP-ANDROID
+    return new AndroidSqliteDriver()
+    // #endif
+
+    // #ifdef APP-HARMONY
+    return new HarmonyRdbDriver()
+    // #endif
+
+    // #ifdef APP-IOS
+    return new PlusSqliteDriver()
+    // #endif
+
+    return new UnknownDriver()
+  }
+
+  private static async ensureTable(table: TableDef): Promise<boolean> {
+    const createSql = DB.buildCreateTableSql(table)
+    const created = await DB.exec(createSql)
+    if (!created) return false
+
+    const existingCols = await DB.getExistingColumns(table.name)
+    for (let i = 0; i < table.columns.length; i++) {
+      const col = table.columns[i]
+      if (existingCols.has(col.name)) continue
+      const alter = `ALTER TABLE ${table.name} ADD COLUMN ${DB.buildColumnSql(col, false)}`
+      const ok = await DB.exec(alter)
+      if (!ok) {
+        // Handle concurrent migration runs gracefully: if another flow already added
+        // this column, treat the failed ALTER as success.
+        const afterCols = await DB.getExistingColumns(table.name)
+        if (!afterCols.has(col.name)) return false
+      }
+      existingCols.add(col.name)
+    }
+
+    if (table.indexes != null) {
+      for (let i = 0; i < table.indexes.length; i++) {
+        const idx = table.indexes[i]
+        // Optimization: Use null coalescing to safely unbox Boolean? -> Boolean
+        const isUnique = idx.unique ?? false
+        const unique = isUnique ? 'UNIQUE ' : ''
+        const cols = DB.joinStrings(idx.columns, ',')
+        const ok = await DB.exec(`CREATE ${unique}INDEX IF NOT EXISTS ${idx.name} ON ${table.name} (${cols})`)
+        if (!ok) return false
+      }
+    }
+    return true
+  }
+
+  private static async ensureViews(): Promise<boolean> {
+    const dropped = await DB.exec('DROP VIEW IF EXISTS vw_timeline_feed')
+    if (!dropped) return false
+    for (let i = 0; i < DB.viewSqls.length; i++) {
+      const ok = await DB.exec(DB.viewSqls[i])
+      if (!ok) return false
+    }
+    return true
+  }
+
+  private static async backfillGraphRefactorColumns(): Promise<boolean> {
+    const normalizeEdgeStatus = await DB.exec(
+      `UPDATE edges
+       SET status = 'todo'
+       WHERE status IS NULL OR status = ''`,
+    )
+    if (!normalizeEdgeStatus) return false
+
+    // Normalize strict owner fields for phase-1 schema.
+    const normalizeOwnerType = await DB.exec(
+      `UPDATE logs
+       SET owner_type = 'node'
+       WHERE owner_type IS NULL OR owner_type = ''`,
+    )
+    if (!normalizeOwnerType) return false
+
+    const normalizeOwnerId = await DB.exec(
+      `UPDATE logs
+       SET owner_id = ''
+       WHERE owner_id IS NULL`,
+    )
+    if (!normalizeOwnerId) return false
+
+    return true
+  }
+
+  private static async backfillSyncMetadataColumns(): Promise<boolean> {
+    const tables = ['nodes', 'edges', 'users', 'accounts', 'transactions', 'logs', 'attachments', 'user_kv']
+    for (let i = 0; i < tables.length; i++) {
+      const table = tables[i]
+      const originOk = await DB.exec(
+        `UPDATE ${table}
+         SET origin_app_id = ?
+         WHERE origin_app_id IS NULL OR TRIM(origin_app_id) = ''`,
+        [getCurrentAppId()],
+      )
+      if (!originOk) return false
+
+      const versionOk = await DB.exec(
+        `UPDATE ${table}
+         SET entity_version = 1
+         WHERE entity_version IS NULL OR CAST(entity_version AS INTEGER) < 1`,
+      )
+      if (!versionOk) return false
+
+      const normalizeLastEventOk = await DB.exec(
+        `UPDATE ${table}
+         SET last_event_id = NULL
+         WHERE last_event_id = ''`,
+      )
+      if (!normalizeLastEventOk) return false
+    }
+
+    const deletedTables = ['nodes', 'edges', 'accounts', 'transactions', 'logs', 'attachments']
+    for (let i = 0; i < deletedTables.length; i++) {
+      const table = deletedTables[i]
+      const tombstoneOk = await DB.exec(
+        `UPDATE ${table}
+         SET tombstone_at = COALESCE(tombstone_at, updated_at, created_at, CAST(strftime('%s','now') AS INTEGER) * 1000)
+         WHERE COALESCE(is_deleted, 0) != 0 AND tombstone_at IS NULL`,
+      )
+      if (!tombstoneOk) return false
+    }
+
+    return true
+  }
+
+  private static async backfillAccountCategoryColumns(): Promise<boolean> {
+    const categoryOk = await DB.exec(
+      `UPDATE accounts
+       SET category = CASE
+         WHEN INSTR(COALESCE(properties, ''), '"category":"investment"') > 0 OR INSTR(COALESCE(properties, ''), '"category": "investment"') > 0 THEN 'investment'
+         WHEN INSTR(COALESCE(properties, ''), '"category":"credit"') > 0 OR INSTR(COALESCE(properties, ''), '"category": "credit"') > 0 THEN 'credit'
+         WHEN INSTR(COALESCE(properties, ''), '"category":"heavy"') > 0 OR INSTR(COALESCE(properties, ''), '"category": "heavy"') > 0 THEN 'heavy'
+         WHEN (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%信用%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%信贷%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%贷款%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%欠款%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%负债%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%授信%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%借呗%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%花呗%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%白条%' THEN 'credit'
+         WHEN (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%基金%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%股票%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%投资%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%理财%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%证券%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%持仓%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%ETF%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%账户现金%' THEN 'investment'
+         WHEN (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%重资产%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%固定资产%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%房%'
+           OR (COALESCE(type, '') || ' ' || COALESCE(name, '') || ' ' || COALESCE(properties, '')) LIKE '%车%' THEN 'heavy'
+         ELSE 'cash'
+       END
+       WHERE category IS NULL OR TRIM(category) = '' OR category NOT IN ('cash', 'investment', 'credit', 'heavy')`,
+    )
+    if (!categoryOk) return false
+
+    return await DB.exec(
+      `UPDATE accounts
+       SET properties = CASE
+         WHEN properties IS NULL OR TRIM(properties) = '' THEN '{"category":"' || category || '"}'
+         ELSE properties
+       END
+       WHERE properties IS NULL OR TRIM(properties) = ''`,
+    )
+  }
+
+  private static async getExistingColumns(tableName: string): Promise<Set<string>> {
+    const set = new Set<string>()
+    const rows = await DB.query(`PRAGMA table_info(${tableName})`)
+    for (let i = 0; i < rows.length; i++) {
+      const name = rows[i].get('name')
+      if (name != null) set.add(name.toString())
+    }
+    return set
+  }
+
+  private static buildCreateTableSql(table: TableDef): string {
+    const parts: string[] = []
+    for (let i = 0; i < table.columns.length; i++) {
+      parts.push(DB.buildColumnSql(table.columns[i], true))
+    }
+    return `CREATE TABLE IF NOT EXISTS ${table.name} (${DB.joinStrings(parts, ', ')})`
+  }
+
+  private static buildColumnSql(col: ColumnDef, allowPrimaryKey: boolean): string {
+    const out: string[] = []
+    out.push(col.name)
+    out.push(col.type)
+    
+    // Optimization: Fix identity equality warning using null coalescing (?? false)
+    if (allowPrimaryKey && (col.primaryKey ?? false)) out.push('PRIMARY KEY')
+    if (allowPrimaryKey && (col.autoIncrement ?? false)) out.push('AUTOINCREMENT')
+    if (col.notNull ?? false) out.push('NOT NULL')
+    if (col.unique ?? false) out.push('UNIQUE')
+    
+    const dv = col.default
+    if (dv != null) out.push(`DEFAULT ${DB.literal(dv)}`)
+    return DB.joinStrings(out, ' ')
+  }
+
+  static normalizeArgs(args: SqlArgs | null): Array<any | null> {
+    const safe: Array<any | null> = []
+    if (args == null) return safe
+    for (let i = 0; i < args.length; i++) {
+      const v = args[i]
+      if (v == null) safe.push(null)
+      else if (v === true) safe.push(1)
+      else if (v === false) safe.push(0)
+      else safe.push(v)
+    }
+    return safe
+  }
+
+  private static literal(v: any | null): string {
+    if (v == null) return 'NULL'
+    if (v === true) return '1'
+    if (v === false) return '0'
+
+    const raw = v.toString()
+    const n = parseFloat(raw)
+    if (!isNaN(n) && raw.trim() == n.toString()) return n.toString()
+
+    const s = raw.replace(/'/g, "''")
+    return `'${s}'`
+  }
+
+    static renderSql(sql: string, args: SqlArgs | null): string {
+      const safeArgs = DB.normalizeArgs(args)
+      if (safeArgs.length == 0) return sql
+  
+      const buffer: string[] = []
+      let lastIndex = 0
+      let argIndex = 0
+  
+      for (let i = 0; i < sql.length; i++) {
+        // 修复与优化：
+        // 1. sql[i] 是 Char，使用 toString() 确保与 "?" (String) 比较的安全性
+        // 2. 使用 substring 批量处理字符串，避免了 'Char' 到 'String' 的逐个转换错误
+        if (sql[i].toString() == '?' && argIndex < safeArgs.length) {
+          // 将上一个 ? 到当前 ? 之间的静态 SQL 片段加入 buffer
+          if (i > lastIndex) {
+            buffer.push(sql.substring(lastIndex, i))
+          }
+          // 加入替换后的参数值
+          buffer.push(DB.literal(safeArgs[argIndex]))
+          
+          argIndex++
+          lastIndex = i + 1
+        }
+      }
+      
+      // 将最后一个 ? 之后的剩余 SQL 片段加入 buffer
+      if (lastIndex < sql.length) {
+        buffer.push(sql.substring(lastIndex))
+      }
+  
+      return buffer.join('')
+    }
+}

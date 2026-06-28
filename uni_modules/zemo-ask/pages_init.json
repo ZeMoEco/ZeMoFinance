@@ -1,0 +1,10 @@
+{
+  "pages": [
+    {
+      "path": "uni_modules/zemo-ask/pages/setting/index"
+    },
+    {
+      "path": "uni_modules/zemo-ask/pages/desk-pet-float/index"
+    }
+  ]
+}

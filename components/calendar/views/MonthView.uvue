@@ -1,0 +1,153 @@
+<template>
+	<view class="month-view">
+		<view class="week-header">
+			<text class="week-day">日</text>
+			<text class="week-day">一</text>
+			<text class="week-day">二</text>
+			<text class="week-day">三</text>
+			<text class="week-day">四</text>
+			<text class="week-day">五</text>
+			<text class="week-day">六</text>
+		</view>
+
+		<view class="month-rows" :style="monthRowsStyle">
+			<view class="week-row" v-for="(row, rowIdx) in typedMonthRows" :key="'wk-'+rowIdx" :style="weekRowStyleBy(rowIdx)">
+				<view class="day-cell" v-for="(cell, colIdx) in row" :key="'d-'+rowIdx+'-'+colIdx"
+					:id="cellIdBy(cell)" :data-date="cell.dateStr" :style="dayCellStyleBy(cell)" @click="$emit('selectCell', cell)">
+					<text class="day-num" :style="dayNumStyleBy(cell)">{{ cellDayLabelBy(cell) }}</text>
+
+					<scroll-view class="task-list" scroll-y="true">
+						<text class="task-item task-item-pending" v-for="(t, idx) in pendingTasksBy(cell)" :key="'p-'+rowIdx+'-'+colIdx+'-'+idx">{{ t }}</text>
+						<text class="task-item task-item-done" v-for="(t, idx) in tasksBy(cell)" :key="'t-'+rowIdx+'-'+colIdx+'-'+idx">{{ t }}</text>
+					</scroll-view>
+
+					<text class="day-balance" v-if="cellHasBalanceBy(cell)" :class="cellBalanceBy(cell) > 0 ? 'income-text' : 'expense-text'">
+						{{ cellBalanceBy(cell) > 0 ? '+' : '' }}{{ cellBalanceBy(cell) }}
+					</text>
+				</view>
+
+				<view v-if="rowIdx < typedMonthRows.length - 1" class="resize-handle"
+					@touchstart="$emit('resizeStart', rowIdx, $event)" @touchmove="$emit('resizeMove', $event)" @touchend="$emit('resizeEnd')" @touchcancel="$emit('resizeEnd')">
+					<view class="resize-bar"></view>
+				</view>
+			</view>
+		</view>
+	</view>
+</template>
+
+<script lang="uts">
+	import type { DateCellLike } from '@/services/biz/CalendarBiz.uts'
+	type PendingTitle = string
+
+	export default {
+		name: 'MonthView',
+		emits: ['selectCell', 'resizeStart', 'resizeMove', 'resizeEnd'],
+		props: {
+			monthRows: { type: Array, default: () => [] },
+			monthRowsStyle: { type: String, default: '' },
+			weekRowStyle: { type: Function, default: (_rowIdx: number): string => '' },
+			cellId: { type: Function, default: (_cell: DateCellLike): string => '' },
+			dayCellStyle: { type: Function, default: (_cell: DateCellLike): string => '' },
+			dayNumStyle: { type: Function, default: (_cell: DateCellLike): string => '' },
+			cellDayLabel: { type: Function, default: (_cell: DateCellLike): string => '' },
+			pendingTasksForCell: { type: Function, default: (_cell: DateCellLike): PendingTitle[] => [] },
+			tasksForCell: { type: Function, default: (_cell: DateCellLike): string[] => [] },
+			cellHasBalance: { type: Function, default: (_cell: DateCellLike): boolean => false },
+			cellBalance: { type: Function, default: (_cell: DateCellLike): number => 0 },
+		},
+		computed: {
+			typedMonthRows(): DateCellLike[][] {
+				return this.monthRows as DateCellLike[][]
+			},
+		},
+		methods: {
+			pendingTitleOf(item: any): string {
+				if (item == null) return ''
+				try {
+					// already a string
+					const s = item as string
+					if (s != null && s != '') return s
+				} catch (_e) {}
+				try {
+					// UTSJSONObject-like
+					const obj = item as UTSJSONObject
+					const v = obj.get('title')
+					if (v != null) {
+						const ts = v.toString()
+						if (ts != '') return ts
+					}
+				} catch (_e2) {}
+				try {
+					// map-like
+					const m = item as Map<string, any | null>
+					const v = m.get('title')
+					if (v != null) {
+						const vs = v.toString()
+						if (vs != '') return vs
+					}
+				} catch (_e3) {}
+				try {
+					const s2 = item.toString()
+					return (s2 != '[object Object]' ? s2 : '')
+				} catch (_e4) {}
+				return ''
+			},
+
+			weekRowStyleBy(rowIdx: number): string {
+				const fn = this.weekRowStyle as ((i: number) => string)
+				return fn != null ? fn(rowIdx) : ''
+			},
+			cellIdBy(cell: DateCellLike): string {
+				const fn = this.cellId as ((c: DateCellLike) => string)
+				return fn != null ? fn(cell) : ''
+			},
+			dayCellStyleBy(cell: DateCellLike): string {
+				const fn = this.dayCellStyle as ((c: DateCellLike) => string)
+				return fn != null ? fn(cell) : ''
+			},
+			dayNumStyleBy(cell: DateCellLike): string {
+				const fn = this.dayNumStyle as ((c: DateCellLike) => string)
+				return fn != null ? fn(cell) : ''
+			},
+			cellDayLabelBy(cell: DateCellLike): string {
+				const fn = this.cellDayLabel as ((c: DateCellLike) => string)
+				return fn != null ? fn(cell) : ''
+			},
+			pendingTasksBy(cell: DateCellLike): PendingTitle[] {
+				const fn = this.pendingTasksForCell as ((c: DateCellLike) => any[])
+				const raw = fn != null ? fn(cell) : ([] as any[])
+				// fast path: already string[]
+				try {
+					return raw as PendingTitle[]
+				} catch (_e) {}
+				const out: PendingTitle[] = []
+				for (let i = 0; i < raw.length; i++) {
+					const s = this.pendingTitleOf(raw[i])
+					if (s != '') out.push(s)
+				}
+				return out
+			},
+			tasksBy(cell: DateCellLike): string[] {
+				const fn = this.tasksForCell as ((c: DateCellLike) => string[])
+				return fn != null ? fn(cell) : ([] as string[])
+			},
+			cellHasBalanceBy(cell: DateCellLike): boolean {
+				const fn = this.cellHasBalance as ((c: DateCellLike) => boolean)
+				return fn != null ? fn(cell) : false
+			},
+			cellBalanceBy(cell: DateCellLike): number {
+				const fn = this.cellBalance as ((c: DateCellLike) => number)
+				return fn != null ? fn(cell) : 0
+			},
+			noopCell(_c: DateCellLike) {},
+		}
+	}
+</script>
+
+<style>
+	.month-view {
+		flex: 1;
+		flex-direction: column;
+		min-height: 0;
+	}
+</style>

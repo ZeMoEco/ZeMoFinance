@@ -1,0 +1,109 @@
+import { Attachment } from '../../utils/types/index.uts';
+import { DB } from '@/utils/DB/DB.uts';
+import { genId } from '@/utils/common/id.uts';
+
+export type AttachmentInsertOptions = {
+  id?: string | null
+  entityVersion?: number | null
+  syncEventId?: string | null
+}
+
+export class AttachmentService {
+
+  private static mapRowToAttachment(row: Map<string, any | null>): Attachment {
+    return {
+      id: row.get('id')?.toString() ?? '',
+      node_id: row.get('node_id')?.toString() ?? '',
+      file_name: row.get('file_name')?.toString() ?? '',
+      file_path: row.get('file_path')?.toString() ?? '',
+      file_type: row.get('file_type')?.toString() ?? 'document',
+      file_size: parseInt(row.get('file_size')?.toString() ?? '0'),
+      created_at: parseInt(row.get('created_at')?.toString() ?? '0')
+    } as Attachment;
+  }
+  private static inferFileType(filePath: string, explicitType: string | null = null): string {
+    if (explicitType != null && explicitType != '') return explicitType;
+    const lower = filePath.toLowerCase();
+    if (
+      lower.endsWith('.jpg') ||
+      lower.endsWith('.jpeg') ||
+      lower.endsWith('.png') ||
+      lower.endsWith('.gif') ||
+      lower.endsWith('.webp') ||
+      lower.endsWith('.bmp')
+    ) {
+      return 'image';
+    }
+    if (
+      lower.endsWith('.mp4') ||
+      lower.endsWith('.mov') ||
+      lower.endsWith('.mkv') ||
+      lower.endsWith('.avi') ||
+      lower.endsWith('.webm')
+    ) {
+      return 'video';
+    }
+    return 'document';
+  }
+
+  public static async mountAttachmentAsync(
+    nodeId: string,
+    fileName: string,
+    filePath: string,
+    fileSize: number,
+    fileType: string = 'document',
+    options: AttachmentInsertOptions | null = null
+  ): Promise<Attachment | null> {
+    const now = Date.now();
+    const id = options?.id == null || options.id.toString().trim() == '' ? genId('att') : options.id.toString().trim();
+    const entityVersion = options?.entityVersion == null ? 1 : parseInt(options.entityVersion.toString());
+    const syncEventId = options?.syncEventId == null || options.syncEventId.toString().trim() == '' ? null : options.syncEventId.toString().trim();
+    const finalType = this.inferFileType(filePath, fileType);
+    const ok = await DB.exec(
+      `INSERT INTO attachments (id, node_id, file_name, file_path, file_type, file_size, created_at, updated_at, is_deleted, entity_version, last_event_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+      [id, nodeId, fileName, filePath, finalType, fileSize, now, now, entityVersion, syncEventId]
+    );
+    if (!ok) return null;
+    return {
+      id,
+      node_id: nodeId,
+      file_name: fileName,
+      file_path: filePath,
+      file_type: finalType,
+      file_size: fileSize,
+      created_at: now
+    } as Attachment;
+  }
+
+  public static async getNodeAttachmentsAsync(nodeId: string): Promise<Attachment[]> {
+    const rows = await DB.query(
+      `SELECT * FROM attachments WHERE node_id = ? AND COALESCE(is_deleted, 0) = 0 ORDER BY created_at ASC`,
+      [nodeId]
+    );
+    return rows.map((r) => this.mapRowToAttachment(r));
+  }
+
+  public static async deleteAttachmentAsync(attachmentId: string): Promise<boolean> {
+    const now = Date.now();
+    return await DB.exec(
+      `UPDATE attachments
+       SET is_deleted = 1,
+           updated_at = ?,
+           tombstone_at = COALESCE(tombstone_at, ?)
+       WHERE id = ? AND COALESCE(is_deleted, 0) = 0`,
+      [now, now, attachmentId]
+    );
+  }
+
+  public static async gcOrphanFilesAsync(): Promise<void> {
+    const rows = await DB.query(
+      `SELECT a.id FROM attachments a
+       LEFT JOIN nodes n ON a.node_id = n.id
+       WHERE n.id IS NULL AND COALESCE(a.is_deleted, 0) = 0`
+    );
+    for (let i = 0; i < rows.length; i++) {
+      const id = rows[i].get('id')?.toString() ?? '';
+      if (id != '') await this.deleteAttachmentAsync(id);
+    }
+  }
+}

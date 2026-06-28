@@ -1,0 +1,195 @@
+// uni_modules/zemo-rpa/services/RpaService.uts
+import { DB, SqlArgs } from '@/utils/DB/DB.uts';
+import { SkillGroup, SkillSubGroup, RpaServiceBridge } from '@/uni_modules/zemo-rpa';
+
+type RpaInitData = {
+    name: string
+    subs: string[]
+}
+
+export class RpaService {
+    private static _initialized = false;
+    
+    // 初始化数据库表
+    static async init() {
+        if (RpaService._initialized) return;
+        
+        try {
+            // 1. RPA Groups (Categories)
+            // id is text (UUID) or AutoIncrement. Let's use INTEGER AI for simplicity and map to string
+            await DB.exec(`
+                CREATE TABLE IF NOT EXISTS rpa_groups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    parent_id INTEGER DEFAULT NULL,
+                    description TEXT,
+                    icon TEXT,
+                    sort_order INTEGER DEFAULT 0,
+                    created_at INTEGER,
+                    updated_at INTEGER
+                )
+            `);
+            
+            // 2. RPA Items (Skills/Tools)
+            await DB.exec(`
+                CREATE TABLE IF NOT EXISTS rpa_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id INTEGER NOT NULL,
+                    type TEXT DEFAULT 'skill', -- 'skill', 'tool', 'action'
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    content TEXT, -- JSON payload or script path
+                    config TEXT, -- JSON configuration
+                    created_at INTEGER,
+                    updated_at INTEGER,
+                    FOREIGN KEY(group_id) REFERENCES rpa_groups(id) ON DELETE CASCADE
+                )
+            `);
+            
+            console.log("[RpaService] Tables Initialized");
+            RpaService._initialized = true;
+
+            // 将真实 DB 实现注入到 utssdk 内的 RpaService stub
+            RpaServiceBridge.setSaveCallback(async (groupId : string, name : string, description : string, content : string, type : string, config : string) : Promise<string> => {
+                return await RpaService.createItem(groupId, name, description, content, type, config);
+            });
+        } catch (e) {
+            console.error("[RpaService] Init failed", e);
+        }
+    }
+    
+    // --- Groups API ---
+    
+    static async getGroups() : Promise<SkillGroup[]> {
+        await RpaService.init();
+        
+        // Fetch all groups
+        const sql = "SELECT * FROM rpa_groups ORDER BY sort_order ASC, created_at ASC";
+        const res = await DB.query(sql);
+        
+        const allGroups = res.map((row): Map<string, any | null> => row);
+        
+        // Separate Parents and Children
+        const parents = allGroups.filter((r) => r.get('parent_id') == null);
+        const children = allGroups.filter((r) => r.get('parent_id') != null);
+        
+        const result: SkillGroup[] = [];
+        
+        parents.forEach((p) => {
+            const pid = parseInt(p.get('id')?.toString() ?? "0");
+            const pName = p.get('name')?.toString() ?? "";
+            
+            const subs: SkillSubGroup[] = [];
+            
+            children.forEach((c) => {
+                const cPid = parseInt(c.get('parent_id')?.toString() ?? "0");
+                if (cPid == pid) {
+                     subs.push({
+                        id: c.get('id')?.toString() ?? "",
+                        name: c.get('name')?.toString() ?? ""
+                     });
+                }
+            });
+            
+            result.push({
+                id: pid.toString(),
+                name: pName,
+                subGroups: subs
+            });
+        });
+        
+        return result;
+    }
+    
+    static async createGroup(name: string, parentId: string | null = null) : Promise<string> {
+        await RpaService.init();
+        const now = Date.now();
+        const sql = "INSERT INTO rpa_groups (name, parent_id, created_at, updated_at) VALUES (?, ?, ?, ?)";
+        const pid = parentId != null ? parseInt(parentId) : null;
+        
+        const args: SqlArgs = [name, pid, now, now];
+        const success = await DB.exec(sql, args);
+        if (success) {
+            const res = await DB.query("SELECT last_insert_rowid() as id");
+            if (res.length > 0) {
+                return res[0].get("id")?.toString() ?? "";
+            }
+        }
+        return "";
+    }
+    
+    static async deleteGroup(id: string) : Promise<boolean> {
+        await RpaService.init();
+        // Database ON DELETE CASCADE should handle children if configured, 
+        // but manually cleaning up is safer in some SQLite versions/configs
+        const pid = parseInt(id);
+        await DB.exec("DELETE FROM rpa_items WHERE group_id = ?", [pid]);
+        await DB.exec("DELETE FROM rpa_groups WHERE parent_id = ?", [pid]);
+        return await DB.exec("DELETE FROM rpa_groups WHERE id = ?", [pid]);
+    }
+
+    // --- Items API ---
+    static async createItem(
+        groupId: string,
+        name: string,
+        description: string,
+        content: string,
+        type: string = 'skill',
+        config: string = ''
+    ): Promise<string> {
+        await RpaService.init();
+        const gid = parseInt(groupId);
+        if (isNaN(gid) || gid <= 0) {
+            console.warn("[RpaService] createItem invalid groupId", groupId);
+            return "";
+        }
+
+        const now = Date.now();
+        const sql = "INSERT INTO rpa_items (group_id, type, name, description, content, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+        const args: SqlArgs = [gid, type, name, description, content, config, now, now];
+        const ok = await DB.exec(sql, args);
+        if (!ok) return "";
+
+        const res = await DB.query("SELECT last_insert_rowid() as id");
+        if (res.length > 0) {
+            return res[0].get("id")?.toString() ?? "";
+        }
+        return "";
+    }
+
+    static async getItems(groupId: string): Promise<Map<string, any | null>[]> {
+        await RpaService.init();
+        const gid = parseInt(groupId);
+        if (isNaN(gid) || gid <= 0) return [];
+        return await DB.query("SELECT * FROM rpa_items WHERE group_id = ? ORDER BY created_at DESC", [gid]);
+    }
+
+    static async getItemById(id: string): Promise<Map<string, any | null> | null> {
+        await RpaService.init();
+        const iid = parseInt(id);
+        if (isNaN(iid) || iid <= 0) return null;
+        const res = await DB.query("SELECT * FROM rpa_items WHERE id = ? LIMIT 1", [iid]);
+        if (res.length > 0) return res[0];
+        return null;
+    }
+    
+    // --- Init Defaults ---
+    static async ensureDefaults() {
+        const groups = await RpaService.getGroups();
+        if (groups.length > 0) return;
+        
+        const defaults = [
+            { name: "ZeMo 泽墨", subs: ["General", "Testing"] } as RpaInitData,
+            { name: "出行", subs: ["Taxi", "Hotel"] } as RpaInitData,
+            { name: "闲职", subs: ["Browsing"] } as RpaInitData
+        ];
+        
+        for (let i=0; i < defaults.length; i++) {
+            const g = defaults[i];
+            const pid = await RpaService.createGroup(g.name);
+            for (let j=0; j < g.subs.length; j++) {
+                await RpaService.createGroup(g.subs[j], pid);
+            }
+        }
+    }
+}

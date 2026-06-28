@@ -1,0 +1,296 @@
+import { FileHelper } from '../common/utils.uts'
+import { OcrModelConfig } from '../common/OcrModelConfig.uts'
+import { Recognize, RecognizeOptions, OcrSuccess, OcrFail, OcrItem, OcrErrorCode } from '../interface.uts'
+
+// #ifdef APP-ANDROID
+import File from "java.io.File"
+import FileInputStream from "java.io.FileInputStream"
+import InputStreamReader from "java.io.InputStreamReader"
+import BufferedReader from "java.io.BufferedReader"
+import UTSAndroid from "io.dcloud.uts.UTSAndroid"
+import { ZemoOcrEngine } from "./src/ZemoOcrEngine.uts"
+import { ZemoOcrOnnxEngine } from "./src/ZemoOcrOnnxEngine.uts"
+
+let gNativeEngine: ZemoOcrEngine | null = null;
+let gPpOcrV6Engine: ZemoOcrEngine | null = null;
+let gPpOcrV6OnnxEngine: ZemoOcrOnnxEngine | null = null;
+
+function getEngine(usePpOcrV6: boolean): ZemoOcrEngine {
+    if (usePpOcrV6) {
+        if (gPpOcrV6Engine == null) {
+            gPpOcrV6Engine = new ZemoOcrEngine();
+        }
+        return gPpOcrV6Engine!;
+    }
+    if (gNativeEngine == null) {
+        gNativeEngine = new ZemoOcrEngine();
+    }
+    return gNativeEngine!;
+}
+
+function getOnnxEngine(): ZemoOcrOnnxEngine {
+    if (gPpOcrV6OnnxEngine == null) {
+        gPpOcrV6OnnxEngine = new ZemoOcrOnnxEngine();
+    }
+    return gPpOcrV6OnnxEngine!;
+}
+
+async function resolvePath(path: string): Promise<string> {
+    return UTSAndroid.convert2AbsFullPath(path);
+}
+
+let isNativeLoading = false;
+let isPpOcrV6Loading = false;
+let isPpOcrV6OnnxLoading = false;
+
+async function hasPpOcrV6OnnxModel(): Promise<boolean> {
+    const detModelAbs = await resolvePath(`${OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR}/model.onnx`);
+    const recModelAbs = await resolvePath(`${OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR}/model.onnx`);
+    return new File(detModelAbs).exists() && new File(recModelAbs).exists();
+}
+
+async function ensureAndLoadDict(dictRuntimePath: string): Promise<UTSArray<string>> {
+    const slashIdx = dictRuntimePath.lastIndexOf('/');
+    if (slashIdx > 0) {
+        await FileHelper.ensureDir(dictRuntimePath.substring(0, slashIdx));
+    }
+    const dictPath = await resolvePath(dictRuntimePath);
+    const dictFile = new File(dictPath);
+
+    if (dictFile.exists() && dictFile.length() < 100) {
+        console.log("ZemoOcr: Deleting empty/corrupt dict file");
+        dictFile.delete();
+    }
+
+    if (!dictFile.exists()) {
+        const srcDict = await resolvePath(OcrModelConfig.DICT_ASSET_PATH);
+        console.log("ZemoOcr: Copying dict from " + srcDict + " to " + dictPath);
+        await FileHelper.copyFile(srcDict, dictRuntimePath);
+    }
+
+    if (!dictFile.exists()) {
+        throw new Error("OCR dict file missing: " + dictPath);
+    }
+
+    const dict = new UTSArray<string>();
+    try {
+        const fis = new FileInputStream(dictPath);
+        const isr = new InputStreamReader(fis, "UTF-8");
+        const br = new BufferedReader(isr);
+
+        let line = br.readLine();
+        while (line != null) {
+            const charStr = line.replace("\r", "");
+            if (charStr.length > 0) dict.push(charStr);
+            line = br.readLine();
+        }
+        br.close();
+        dict.push(" ");
+        console.log("ZemoOcr: Dict loaded size: " + dict.length);
+    } catch (e: any) {
+        console.error("ZemoOcr: Dict read failed", e);
+    }
+
+    if (dict.length <= 1) {
+        throw new Error("OCR dict is empty: " + dictPath);
+    }
+    return dict;
+}
+
+async function initEngine(usePpOcrV6: boolean): Promise<void> {
+    const engine = getEngine(usePpOcrV6);
+    if (engine.isInitialized()) return;
+    
+    if (usePpOcrV6 ? isPpOcrV6Loading : isNativeLoading) {
+            while(usePpOcrV6 ? isPpOcrV6Loading : isNativeLoading) {
+                await new Promise((r) => { setTimeout(() => { r(null) }, 100) });
+                if (engine.isInitialized()) return; 
+            }
+    }
+    if (usePpOcrV6) {
+        isPpOcrV6Loading = true;
+    } else {
+        isNativeLoading = true;
+    }
+
+    try {
+        // Resolve absolute paths
+        const detRuntimeDir = usePpOcrV6 ? OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR : OcrModelConfig.DET_RUNTIME_DIR;
+        const recRuntimeDir = usePpOcrV6 ? OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR : OcrModelConfig.REC_RUNTIME_DIR;
+        const dictRuntimePath = usePpOcrV6 ? OcrModelConfig.PPOCRV6_DICT_RUNTIME_PATH : OcrModelConfig.DICT_RUNTIME_PATH;
+        const detAssetDir = usePpOcrV6 ? OcrModelConfig.PPOCRV6_DET_ASSET_DIR : OcrModelConfig.DET_ASSET_DIR;
+        const recAssetDir = usePpOcrV6 ? OcrModelConfig.PPOCRV6_REC_ASSET_DIR : OcrModelConfig.REC_ASSET_DIR;
+
+        const detRuntimeAbs = await resolvePath(detRuntimeDir);
+        const recRuntimeAbs = await resolvePath(recRuntimeDir);
+
+        // Unzip Models
+        await FileHelper.ensureDir(detRuntimeDir);
+        await FileHelper.ensureDir(recRuntimeDir);
+
+        const detMarker = new File(`${detRuntimeAbs}/model.nb`);
+        if (!detMarker.exists()) {
+            const src = await resolvePath(detAssetDir);
+            const srcMarker = new File(`${src}/model.nb`);
+            if (srcMarker.exists()) {
+                await FileHelper.copyDir(src, detRuntimeDir);
+            }
+        }
+        const recMarker = new File(`${recRuntimeAbs}/model.nb`);
+        if (!recMarker.exists()) {
+            const src = await resolvePath(recAssetDir);
+            const srcMarker = new File(`${src}/model.nb`);
+            if (srcMarker.exists()) {
+                await FileHelper.copyDir(src, recRuntimeDir);
+            }
+        }
+
+        const dict = await ensureAndLoadDict(dictRuntimePath);
+        
+        // Pass to Native
+        
+        engine.init(
+            detRuntimeAbs,
+            recRuntimeAbs,
+            dict
+        );
+
+    } catch (e: any)  {
+            console.error("Init Error", e);
+            throw e;
+    } finally {
+        if (usePpOcrV6) {
+            isPpOcrV6Loading = false;
+        } else {
+            isNativeLoading = false;
+        }
+    }
+}
+
+async function initPpOcrV6OnnxEngine(): Promise<void> {
+    const engine = getOnnxEngine();
+    if (engine.isInitialized()) return;
+
+    if (isPpOcrV6OnnxLoading) {
+        while (isPpOcrV6OnnxLoading) {
+            await new Promise((r) => { setTimeout(() => { r(null) }, 100) });
+            if (engine.isInitialized()) return;
+        }
+    }
+    isPpOcrV6OnnxLoading = true;
+
+    try {
+        const detModelAbs = await resolvePath(`${OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR}/model.onnx`);
+        const recModelAbs = await resolvePath(`${OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR}/model.onnx`);
+        const detModel = new File(detModelAbs);
+        const recModel = new File(recModelAbs);
+        if (!detModel.exists() || !recModel.exists()) {
+            throw new Error("PP-OCRv6 ONNX model missing");
+        }
+
+        const dict = await ensureAndLoadDict(OcrModelConfig.PPOCRV6_DICT_RUNTIME_PATH);
+        engine.init(detModelAbs, recModelAbs, dict);
+    } catch (e: any) {
+        console.error("ONNX Init Error", e);
+        throw e;
+    } finally {
+        isPpOcrV6OnnxLoading = false;
+    }
+}
+// #endif
+
+function recognizeWithEngine(options: RecognizeOptions, usePpOcrV6: boolean): void {
+    // #ifdef APP-ANDROID
+    const task = async () => {
+        try {
+            const imagePath = options.imagePath;
+            if (imagePath == "") {
+                const err = new UniError("zemo-ocs", 900001, "Path is empty");
+                options.fail?.(err);
+                options.complete?.(err);
+                return;
+            }
+
+            const absPath = await resolvePath(imagePath);
+            const f = new File(absPath);
+            if (!f.exists()) {
+                 const err = new UniError("zemo-ocs", 900001, `File not found: ${absPath}`);
+                 options.fail?.(err);
+                 options.complete?.(err);
+                 return;
+            }
+
+            let nativeRes: any;
+            const hasOnnx = usePpOcrV6 && await hasPpOcrV6OnnxModel();
+            if (hasOnnx) {
+                const detModelAbs = await resolvePath(`${OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR}/model.onnx`);
+                const recModelAbs = await resolvePath(`${OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR}/model.onnx`);
+                console.log(`[ZemoOcr][Android] using PP-OCRv6 ONNX Runtime, det=${detModelAbs}, rec=${recModelAbs}, image=${absPath}`);
+                await initPpOcrV6OnnxEngine();
+                nativeRes = getOnnxEngine().recognize(absPath);
+            } else {
+                const detDir = await resolvePath(usePpOcrV6 ? OcrModelConfig.PPOCRV6_DET_RUNTIME_DIR : OcrModelConfig.DET_RUNTIME_DIR);
+                const recDir = await resolvePath(usePpOcrV6 ? OcrModelConfig.PPOCRV6_REC_RUNTIME_DIR : OcrModelConfig.REC_RUNTIME_DIR);
+                if (usePpOcrV6) {
+                    console.log(`[ZemoOcr][Android] using PP-OCRv6 Paddle Lite, detDir=${detDir}, recDir=${recDir}, image=${absPath}`);
+                } else {
+                    console.log(`[ZemoOcr][Android] using native bundled OCR model, backend=PaddleLite, detDir=${detDir}, recDir=${recDir}, image=${absPath}`);
+                }
+                await initEngine(usePpOcrV6);
+                nativeRes = getEngine(usePpOcrV6).recognize(absPath);
+            }
+            
+            if (!nativeRes.ok) {
+                const err = new UniError("zemo-ocs", 900002, nativeRes.message);
+                options.fail?.(err);
+                options.complete?.(err);
+                return;
+            }
+            
+            const items: OcrItem[] = [];
+            
+            // nativeRes.items returns NativeOcrItem[] (UTS Array)
+            const nativeItems = nativeRes.items;
+            
+            for(let i = 0; i < nativeItems.length; i++) {
+                const item = nativeItems[i];
+                items.push({
+                    text: item.text,
+                    confidence: item.confidence,
+                    box: {
+                        left: item.box.left,
+                        top: item.box.top,
+                        right: item.box.right,
+                        bottom: item.box.bottom
+                    }
+                });
+            }
+            
+            const res: OcrSuccess = { items: items, fullText: nativeRes.fullText };
+            options.success?.(res);
+            options.complete?.(res);
+
+        } catch (e: any) {
+            console.error("OCR Recognize Error", e);
+            const err = new UniError("zemo-ocs", 900002, `OCR Error: ${e.message}`);
+            options.fail?.(err);
+            options.complete?.(err);
+        }
+    };
+    task();
+    // #endif
+
+    // #ifndef APP-ANDROID
+    const err = new UniError("zemo-ocs", 900001, "Platform not supported");
+    options.fail?.(err);
+    options.complete?.(err);
+    // #endif
+}
+
+export const recognize: Recognize = function(options: RecognizeOptions) {
+    recognizeWithEngine(options, false);
+}
+
+export const recognizePpOcrV6: Recognize = function(options: RecognizeOptions) {
+    recognizeWithEngine(options, true);
+}

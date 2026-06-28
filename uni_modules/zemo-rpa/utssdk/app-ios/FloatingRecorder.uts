@@ -1,0 +1,50 @@
+// uni_modules/zemo-rpa/utssdk/app-ios/FloatingRecorder.uts
+// #ifdef APP-IOS
+import { UIView, UIButton, UIWindow, UIColor, UIScreen, UIControl, UIEvent } from 'UIKit';
+
+export class FloatingRecorder {
+    private static isRecording = false;
+    private static overlayButton: UIButton | null = null;
+    
+    static show(context: any) {
+        if (FloatingRecorder.overlayButton != null) return;
+        
+        // Find main window
+        const window = UIApplication.sharedApplication.keyWindow;
+        if (window == null) return;
+        
+        const btn = new UIButton();
+        btn.setTitle("REC", 0); // UIControlState.normal
+        btn.backgroundColor = UIColor.redColor();
+        btn.frame = { x: 20, y: 100, width: 60, height: 60 };
+        btn.layer.cornerRadius = 30;
+        
+        // Add action
+        // In UTS for iOS, adding target/action might require specific syntax or block based handlers if available,
+        // or subclassing. 
+        // For simplicity in this logical representation:
+        // btn.addTargetActionForControlEvents(..., "toggleRecording", ...); 
+        // Since UTS/Swift interop for selectors is tricky, let's assume we can attach a closure if supported or use a tap gesture recognizer equivalent.
+        
+        // Simulating tap via simple property if wrapper supports (or this is just a placeholder for native impl)
+        // For now, let's just log.
+        
+        window.addSubview(btn);
+        FloatingRecorder.overlayButton = btn;
+        console.log("[FloatingRecorder-iOS] Floating button shown (simulated)");
+    }
+    
+    static hide() {
+        if (FloatingRecorder.overlayButton != null) {
+            FloatingRecorder.overlayButton!.removeFromSuperview();
+            FloatingRecorder.overlayButton = null;
+        }
+        FloatingRecorder.isRecording = false;
+    }
+    
+    static toggleRecording() {
+        FloatingRecorder.isRecording = !FloatingRecorder.isRecording;
+        console.log("[FloatingRecorder-iOS] Recording: " + FloatingRecorder.isRecording);
+    }
+}
+// #endif

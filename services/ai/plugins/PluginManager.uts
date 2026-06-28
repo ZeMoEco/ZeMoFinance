@@ -1,0 +1,741 @@
+import { DBManager } from '@/utils/DBManager.uts';
+import { FunctionCallingService } from '../FunctionCallingService.uts';
+import { JSEngine } from '../engine/JSEngine.uts';
+// #ifdef APP-ANDROID
+import { UTSAndroid } from 'io.dcloud.uts';
+import { UTSJSONObject } from 'io.dcloud.uts';
+// #endif
+// #ifndef APP-ANDROID
+// Dummy type or usage avoidance to prevent compile error in non-android if imported conditionally
+// However, since we can't export a dummy type with same name easily if it conflicts, 
+// we will just ensure usage is guarded.
+// #endif
+
+export type Skill = {
+    id: string;
+    name: string;
+    code: string;
+    config_schema: string;
+    type: string;
+}
+
+export class PluginManager {
+    static readonly PLUGINS_DIR = uni.env.USER_DATA_PATH + "/ai_plugins";
+    static readonly TABLE_NAME = "ai_dynamic_plugins";
+    static readonly SKILLS_TABLE_NAME = "skills";
+    
+    static async init() {
+        // Ensure directory exists
+        const fs = uni.getFileSystemManager();
+        try {
+            fs.accessSync(PluginManager.PLUGINS_DIR);
+        } catch (e) {
+            fs.mkdirSync(PluginManager.PLUGINS_DIR, true);
+        }
+
+        // Init Table
+        const sql = `CREATE TABLE IF NOT EXISTS ${PluginManager.TABLE_NAME} (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            manifest_json TEXT,
+            file_path TEXT,
+            enabled INTEGER DEFAULT 1,
+            updated_at INTEGER
+        )`;
+        await DBManager.getInstance().executeSql(sql);
+        
+        // Init Skills Table
+        const skillSql = `CREATE TABLE IF NOT EXISTS ${PluginManager.SKILLS_TABLE_NAME} (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            code TEXT,
+            config_schema TEXT,
+            type TEXT
+        )`;
+        await DBManager.getInstance().executeSql(skillSql);
+        
+        // Mock Echo Skill
+        const echoId = "skill.echo";
+        const checkSql = `SELECT id FROM ${PluginManager.SKILLS_TABLE_NAME} WHERE id = ?`;
+        const res = await DBManager.getInstance().selectSql(checkSql, [echoId]);
+        if (res.length == 0) {
+            const insertSql = `INSERT INTO ${PluginManager.SKILLS_TABLE_NAME} (id, name, code, config_schema, type) VALUES (?, ?, ?, ?, ?)`;
+            await DBManager.getInstance().executeSql(insertSql, [
+                echoId, 
+                "Echo Agent", 
+                "return 'Echo: ' + (input.content || input.title || 'No Content');",
+                "{}", 
+                "script"
+            ]);
+        }
+        
+        // Sync to AI Engine
+        await PluginManager.syncToAI();
+    }
+
+    static async executeSkill(skillId: string, input: any): Promise<string> {
+        // 1. Get Skill
+        const skills = await PluginManager.getAllSkills();
+        const skill = skills.find((s): boolean => s.id == skillId);
+        
+        if (skill == null) {
+            return "Error: Skill '" + skillId + "' not found.";
+        }
+
+        return new Promise<string>((resolve, reject) => {
+            const inputJson = JSON.stringify(input);
+            const requestId = "req_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
+            
+            const engine = JSEngine.getInstance();
+            
+            // Result Listener
+            let listener: (msg: any) => void = (msg:any) => {};
+            listener = (msg: any) => {
+                 // #ifdef APP-ANDROID
+                 if (msg instanceof UTSJSONObject) {
+                     const m = msg as UTSJSONObject;
+                     if (m.getString("requestId") == requestId) {
+                          engine.offMessage("skill_response", listener);
+                          if (m.getBoolean("success") == true) {
+                              resolve(m.getString("result") ?? "");
+                          } else {
+                              resolve("Error: " + m.getString("error"));
+                          }
+                     }
+                 }
+                 // #endif
+                 // #ifndef APP-ANDROID
+                 // Use basic object access
+                 const m2 = msg as any;
+                 if (m2['requestId'] == requestId) {
+                     engine.offMessage("skill_response", listener);
+                     if (m2['success'] === true) {
+                         resolve(m2['result'] as string);
+                     } else {
+                         resolve("Error: " + m2['error']);
+                     }
+                 }
+                 // #endif
+            };
+            
+            engine.onMessage("skill_response", listener);
+
+            // Execute script
+            const script = `
+                (async function() {
+                    const input = ${inputJson};
+                    try {
+                        const userFunc = async (input) => {
+                            ${skill.code}
+                        };
+                        
+                        const res = await userFunc(input);
+                        const output = (typeof res === 'object') ? JSON.stringify(res) : String(res);
+                        
+                        window.native.postMessage({
+                            type: "skill_response",
+                            requestId: "${requestId}",
+                            success: true,
+                            result: output
+                        });
+                        
+                    } catch(e) {
+                        window.native.postMessage({
+                            type: "skill_response",
+                            requestId: "${requestId}",
+                            success: false,
+                            error: e.toString()
+                        });
+                    }
+                })();
+            `;
+            
+            engine.evaluate(script);
+            
+            // Timeout
+            setTimeout(() => {
+               // Cleanup to prevent memory leak
+               engine.offMessage("skill_response", listener);
+               // resolve("Error: Timeout"); // Need flag to check if resolved? Promise ensures once.
+            }, 15000);
+        });
+    }
+
+    /**
+     * Install a plugin package.
+     * Supports:
+     * 1. .js file (Single file with embedded manifest)
+     * 2. .zip package (Contains manifest.json, index.js, and optional .wasm files)
+     */
+    static async installPlugin(tempFilePath: string): Promise<boolean> {
+        const fs = uni.getFileSystemManager();
+        
+        // Check if Zip
+        // We lack a precise "isZip" check, so we try to detect extension or signature if possible.
+        // For simplicity, let's assume if it doesn't end in .js, or valid content fails, we try zip.
+        // Actually, detecting by extension is safer for now.
+        const isZip = tempFilePath.endsWith(".zip") || !tempFilePath.endsWith(".js");
+
+        if (isZip) {
+            return await PluginManager.installFromZip(tempFilePath);
+        } else {
+            return await PluginManager.installSingleFile(tempFilePath);
+        }
+    }
+
+    /**
+     * Import a skill from a URL
+     */
+    static async importSkill(url: string): Promise<boolean> {
+         return new Promise<boolean>((resolve, reject) => {
+             uni.request({
+                 url: url,
+                 method: 'GET',
+                 success: (res) => {
+                     if (res.statusCode >= 200 && res.statusCode < 300) {
+                         try {
+                             let data: Skill | null = null;
+                             const resData = res.data;
+                             
+                             // Robust parsing without typeof to avoid compiler issues
+                             try {
+                                 const s = JSON.stringify(resData);
+                                 if (s.startsWith('"')) {
+                                     // resData was a string (e.g. '{"id":...}'), so stringify added quotes.
+                                     // Unwrap the string first.
+                                     const inner = JSON.parse(s) as string;
+                                     data = JSON.parse(inner) as Skill;
+                                 } else {
+                                     // resData was an object, s is the JSON representation.
+                                     data = JSON.parse(s) as Skill;
+                                 }
+                             } catch (e) {
+                                 console.error("Failed to parse skill data", e);
+                             }
+                             
+                             if (data == null) {
+                                 console.error("Invalid skill data: Parse failed");
+                                 resolve(false);
+                                 return;
+                             }
+                             
+                             const id = data.id;
+                             const code = data.code;
+                             
+                             if (id == null || code == null) {
+                                  console.error("Invalid skill data: Missing id or code");
+                                  resolve(false);
+                                  return;
+                             }
+                             
+                             const name = data.name ?? 'Unknown';
+                             let config_schema: any = data.config_schema;
+                             const type = data.type ?? 'script';
+                             
+                             // Handle config_schema
+                             let schemaStr = "{}";
+                             try {
+                                 const csStr = JSON.stringify(config_schema);
+                                 if (csStr.startsWith('"')) {
+                                      // It was a string
+                                      schemaStr = JSON.parse(csStr) as string;
+                                 } else {
+                                      // It was an object
+                                      schemaStr = csStr;
+                                 }
+                             } catch(_e) {
+                                 schemaStr = "{}";
+                             }
+
+                             const sql = `INSERT OR REPLACE INTO ${PluginManager.SKILLS_TABLE_NAME} (id, name, code, config_schema, type) VALUES (?, ?, ?, ?, ?)`;
+                             DBManager.getInstance().executeSql(sql, [id, name, code, schemaStr, type]).then((r) => resolve(r)).catch((e)=>{
+                                 console.error("DB Insert Error", e);
+                                 resolve(false);
+                             });
+
+                         } catch (e) {
+                             console.error("Skill import parsing error", e);
+                             resolve(false);
+                         }
+                     } else {
+                         resolve(false);
+                     }
+                 },
+                 fail: (err) => {
+                     console.error("Download skill failed", err);
+                     resolve(false);
+                 }
+             });
+        });
+    }
+
+    static async getAllSkills(): Promise<Skill[]> {
+        const sql = `SELECT * FROM ${PluginManager.SKILLS_TABLE_NAME}`;
+        const res = await DBManager.getInstance().selectSql(sql);
+        const skills: Skill[] = [];
+        res.forEach((item) => {
+             const s: Skill = {
+                 id: (item.get("id") ?? "") as string,
+                 name: (item.get("name") ?? "") as string,
+                 code: (item.get("code") ?? "") as string,
+                 config_schema: (item.get("config_schema") ?? "{}") as string,
+                 type: (item.get("type") ?? "script") as string
+             };
+             skills.push(s);
+        });
+        return skills;
+    }
+
+    private static async installFromZip(zipPath: string): Promise<boolean> {
+         const fs = uni.getFileSystemManager();
+         // Temp dir for extraction
+         const extractDir = `${uni.env.USER_DATA_PATH}/temp_extract_${Date.now()}`;
+         
+         return new Promise((resolve) => {
+             fs.unzip({
+                 zipFilePath: zipPath,
+                 targetPath: extractDir,
+                 success: () => {
+                     (async () => {
+                        try {
+                            // 1. Read manifest.json
+                            const manifestPath = `${extractDir}/manifest.json`;
+                         // Check existence
+                         try { fs.accessSync(manifestPath); } catch(e) {
+                             console.error("No manifest.json in zip");
+                             resolve(false); return;
+                         }
+
+                         const jsonStr = fs.readFileSync(manifestPath, "utf-8") as string;
+                         
+                         // #ifdef APP-ANDROID
+                         const manifest = JSON.parse(jsonStr) as UTSJSONObject;
+                         const id = manifest.getString("id");
+                         const funcs = manifest.getArray("functions");
+                         const name = (manifest.getString("name") ?? "Unknown");
+                         // #endif
+                         // #ifndef APP-ANDROID
+                         const manifest = JSON.parse(jsonStr) as any;
+                         const id = manifest['id'] as string;
+                         const funcs = manifest['functions'];
+                         const name = (manifest['name'] ?? "Unknown") as string;
+                         // #endif
+
+                         if (id == null || funcs == null) {
+                             console.error("Invalid manifest.json");
+                             resolve(false); return;
+                         }
+
+                         // 2. Move plugin folder to final destination
+                         // Structure: /ai_plugins/{id}/...
+                         const targetDir = `${PluginManager.PLUGINS_DIR}/${id}`;
+                         
+                         // Clean old dir if exists
+                         // fs.rmdirSync(targetDir, {recursive: true}); // UTS might lack recursive rm yet
+                         // Workaround: Re-create is fine if overwrite works, but ensuring clean slate is better.
+                         try { fs.rmdirSync(targetDir, true); } catch(e){}
+                         fs.mkdirSync(targetDir, true);
+
+                         // Move all files from extractDir to targetDir
+                         // recursive copy is needed.
+                         PluginManager.copyDir(extractDir, targetDir);
+
+                         // 3. Determine Entry Point
+                         let entryFile = "index.js";
+                         const customIndex = `${targetDir}/index.js`;
+                         let hasCustomIndex = false;
+                         try {
+                             fs.accessSync(customIndex);
+                             hasCustomIndex = true;
+                         } catch(e) { hasCustomIndex = false; }
+
+                         if (!hasCustomIndex) {
+                             // Use Generic Wrapper if no index.js provided
+                             // We copy the generic wrapper to the plugin dir
+                             const genericPath = uni.env.USER_DATA_PATH + "/static/plugin-template/generic-wasm-wrapper.js"; 
+                             // Note: In real app, standard file copy from assets might need ensuring file exists.
+                             // Simulating content for now to avoid dependency on "static" folder runtime copy issues.
+                             const genericContent = `
+(async function() {
+    const wasmName = "${name.replace(/[^a-zA-Z0-9]/g, '')}Core";
+    const bridge = {
+        result: (res) => window.native.postMessage({
+            type: 'plugin_response', requestId: window.__REQUEST_ID__, success: true, 
+            result: typeof res === 'string' ? res : JSON.stringify(res)
+        }),
+        error: (err) => window.native.postMessage({
+            type: 'plugin_response', requestId: window.__REQUEST_ID__, success: false, error: err.toString()
+        })
+    };
+    try {
+        await window.native.loadWasm(wasmName, "core.wasm");
+        const module = window[wasmName];
+        if (!module) throw new Error("WASM load failed");
+        
+        const funcName = window.__FUNC_NAME__;
+        if (typeof module[funcName] !== 'function') throw new Error("Method not found: " + funcName);
+        
+        // Naive Call (No args support for pure Generic)
+        const res = module[funcName]();
+        bridge.result(res);
+    } catch(e) { bridge.error(e); }
+})();`;
+                             fs.writeFileSync(`${targetDir}/index.js`, genericContent, "utf-8");
+                         }
+                         
+                         const finalEntryPath = `${targetDir}/index.js`;
+
+                         // 4. Record to DB
+                         const db = DBManager.getInstance();
+                         await db.executeSql(`DELETE FROM ${PluginManager.TABLE_NAME} WHERE id = ?`, [id]);
+                         await db.executeSql(
+                            `INSERT INTO ${PluginManager.TABLE_NAME} (id, name, manifest_json, file_path, updated_at) VALUES (?, ?, ?, ?, ?)`,
+                            [id, name, jsonStr, finalEntryPath, Date.now()]
+                         );
+
+                         console.log(`[PluginManager] Installed Package: ${name}`);
+                         await PluginManager.syncToAI();
+                         
+                         // Cleanup Temp
+                         try { fs.rmdirSync(extractDir, true); } catch(e){}
+                         resolve(true);
+
+                     } catch(e) {
+                         console.error("Install Zip Logic Error", e);
+                         resolve(false);
+                     }
+                 })();
+                 },
+                 fail: (err) => {
+                     console.error("Unzip failed", err);
+                     resolve(false);
+                 }
+             });
+         });
+    }
+
+    // Recursive Copy Helper
+    private static copyDir(src: string, dest: string) {
+        const fs = uni.getFileSystemManager();
+        const files = fs.readdirSync(src) as string[];
+        files.forEach(file => {
+            const srcPath = src + "/" + file;
+            const destPath = dest + "/" + file;
+            const stat = fs.statSync(srcPath, false); // recursive=false
+            let isDir = false;
+            try {
+                const s = stat as any;
+                // 1. Try UTSJSONObject check (Platform specific)
+                if (s instanceof UTSJSONObject) {
+                     const mode = s.getString("mode");
+                     if (mode != null && (mode.includes("d") || mode.includes("directory"))) isDir = true;
+                     const typeProp = s.getString("type");
+                     if (typeProp == "directory") isDir = true;
+                }
+                // Note: Standard 'isDirectory()' calls on 'any' are removed to prevent compiler errors.
+                // We rely on UTSJSONObject structure for this platform logic.
+            } catch(e) {}
+
+            if (isDir) {
+                fs.mkdirSync(destPath, true);
+                PluginManager.copyDir(srcPath, destPath);
+            } else {
+                fs.copyFileSync(srcPath, destPath);
+            }
+        });
+    }
+
+    private static async installSingleFile(tempFilePath: string): Promise<boolean> {
+        const fs = uni.getFileSystemManager();
+        try {
+            // 1. Read Content
+            // strict encoding might be needed; assuming utf8
+            const content = fs.readFileSync(tempFilePath, "utf-8") as string;
+            
+            // 2. Parse Manifest via Regex (Zero-Run Parsing)
+            const regex = /\/\* @MANIFEST_START([\s\S]*?)@MANIFEST_END \*\//;
+            const match = content.match(regex);
+            
+            if (match == null || match.length < 2) {
+                console.error("[PluginManager] No manifest found in " + tempFilePath);
+                return false;
+            }
+            
+            const jsonStr = match[1]!!.trim();
+            
+            // #ifdef APP-ANDROID
+            const jsonAny = JSON.parse(jsonStr);
+            const manifest = jsonAny as UTSJSONObject;
+            const id = manifest.getString("id"); 
+            const funcs = manifest.getArray("functions");
+            const name = (manifest.getString("name") ?? "Unknown") as string;
+            // #endif
+            // #ifndef APP-ANDROID
+            const manifest = JSON.parse(jsonStr) as any;
+            const id = manifest['id'] as string;
+            const funcs = manifest['functions'];
+            const name = (manifest['name'] ?? "Unknown") as string;
+            // #endif
+            
+            if (id == null || funcs == null) {
+                console.error("[PluginManager] Invalid manifest format.");
+                return false;
+            }
+            
+            // 3. Move/Save File to Private Sandbox
+            // For single file, we create a folder too to unify structure
+            // /ai_plugins/{id}/index.js
+            const targetDir = `${PluginManager.PLUGINS_DIR}/${id}`;
+            try { fs.mkdirSync(targetDir, true); } catch(e){}
+            
+            const targetPath = `${targetDir}/index.js`;
+            fs.copyFileSync(tempFilePath, targetPath);
+
+            // 4. Save Metadata to DB
+            const db = DBManager.getInstance();
+            // Upsert logic
+            await db.executeSql(`DELETE FROM ${PluginManager.TABLE_NAME} WHERE id = ?`, [id]);
+            await db.executeSql(
+                `INSERT INTO ${PluginManager.TABLE_NAME} (id, name, manifest_json, file_path, updated_at) VALUES (?, ?, ?, ?, ?)`,
+                [id, name, jsonStr, targetPath, Date.now()]
+            );
+
+            console.log(`[PluginManager] Installed: ${name} (${id})`);
+            
+            // 5. Sync
+            await PluginManager.syncToAI();
+            
+            return true;
+        } catch (e) {
+            console.error("[PluginManager] Install failed", e);
+            return false;
+        }
+    }
+
+    /**
+     * Download and install a plugin from a URL.
+     */
+    static installPluginFromUrl(url: string): Promise<boolean> {
+        return new Promise((resolve, reject) => {
+             uni.downloadFile({
+                 url: url,
+                 success: (res) => {
+                     if (res.statusCode === 200) {
+                         PluginManager.installPlugin(res.tempFilePath).then((success) => {
+                             resolve(success);
+                         });
+                     } else {
+                         console.error(`[PluginManager] Download failed with status ${res.statusCode}`);
+                         resolve(false);
+                     }
+                 },
+                 fail: (err) => {
+                     console.error(`[PluginManager] Download failed: ${JSON.stringify(err)}`);
+                     resolve(false);
+                 }
+             });
+        });
+    }
+
+    /**
+     * Sync all enabled plugins to the FunctionCallingService
+     */
+    static async syncToAI() {
+        const db = DBManager.getInstance();
+        const rows = await db.selectSql(`SELECT manifest_json from ${PluginManager.TABLE_NAME} WHERE enabled = 1`);
+        
+        const allFuncs: any[] = [];
+        rows.forEach(row => {
+            const jsonStr = row.get("manifest_json") as string;
+            try {
+                const jsonAny = JSON.parse(jsonStr);
+                const manifest = jsonAny as UTSJSONObject;
+                const id = manifest.getString("id");
+                const funcs = manifest.getArray("functions");
+
+                if (id != null && funcs != null) {
+                        // Iterate safely using standard index loop to avoid type inference issues
+                        for (let i = 0; i < funcs.length; i++) {
+                            const fn = funcs[i];
+                            // Check if it is a JSONObject
+                            if (fn instanceof UTSJSONObject) {
+                                const fnObj = fn as UTSJSONObject;
+                                const fnName = fnObj.getString("name");
+                                fnObj.set("implementation", `js:${id}:${fnName}`);
+                                allFuncs.push(fnObj);
+                            }
+                        }
+                }
+            } catch(e) {}
+        });
+
+        // Register batch
+        FunctionCallingService.registerBatch(JSON.stringify(allFuncs));
+        console.log(`[PluginManager] Synced ${allFuncs.length} dynamic skills to AI.`);
+    }
+
+    /**
+     * Called by AIAgentExecutor when a "js:..." function is triggered
+     */
+    static async execute(pluginId: string, funcName: string, params: Map<string, any | null>): Promise<string> {
+        // 1. Get File Path
+        const db = DBManager.getInstance();
+        const rows = await db.selectSql(`SELECT file_path FROM ${PluginManager.TABLE_NAME} WHERE id = ?`, [pluginId]);
+        if (rows.length == 0) return "Error: Plugin not found";
+        
+        const filePath = rows[0].get("file_path") as string;
+        
+        // 2. Load Script Content
+        const fs = uni.getFileSystemManager();
+        let scriptContent = "";
+        try {
+            scriptContent = fs.readFileSync(filePath, "utf-8") as string;
+        } catch(e) { return "Error: Could not read script file: " + e; }
+
+        // 3. Inject Parameters
+        const paramsObj = new UTSJSONObject();
+        params.forEach((value, key) => {
+            paramsObj.set(key, value);
+        });
+        const paramsJson = JSON.stringify(paramsObj);
+        
+        // 4. Calculate Base Dir for WASM loading
+        // Assumes plugins are flat in PLUGINS_DIR or subfolders
+        // But installPlugin logic puts them as ${id}.js directly in PLUGINS_DIR currently.
+        // To support "Sidecar" WASM, we should probably allow plugins to be folders.
+        // For now, let's assume the .wasm file is next to the .js file.
+        const pluginDir = filePath.substring(0, filePath.lastIndexOf("/") + 1);
+
+        // 5. Execute
+        return await PluginManager.runWithEngine(scriptContent, funcName, paramsJson, pluginDir, pluginId);
+    }
+    
+    /**
+     * JS Engine Bridge
+     * Uses Centralized JSEngine Service with Async Support (Promisified)
+     */
+    private static async runWithEngine(scriptCode: string, funcName: string, paramsJson: string, pluginDir: string, pluginId: string): Promise<string> {
+        // Ensure Engine is ready
+        const engine = JSEngine.getInstance();
+        engine.init();
+        
+        // Generate a unique Request ID
+        const requestId = "req_" + Date.now() + "_" + Math.floor(Math.random() * 1000);
+        
+        return new Promise<string>((resolve, reject) => {
+            // 1. Setup temporary listener
+            // Define the handler
+            const handler = (data: any) => {
+                const msg = data as UTSJSONObject;
+                
+                // >>>> Sys Call: Load WASM <<<<
+                if (msg.getString("type") == "sys_load_wasm") {
+                     const wasmName = msg.getString("name") ?? "unknown";
+                     const relPath = msg.getString("path") ?? "";
+                     const importsObj = msg.getString("imports") ?? null;
+                     
+                     if (relPath != "") {
+                         const absPath = pluginDir + relPath;
+                         console.log(`[PluginManager] Loading Sidecar WA: ${absPath}`);
+                         engine.loadWasm(wasmName, absPath, importsObj).then(startSuccess => {
+                             // Notify JS that load is done (resume await)
+                             engine.evaluate(`
+                                if (window.__wasm_resolvers && window.__wasm_resolvers['${wasmName}']) {
+                                    window.__wasm_resolvers['${wasmName}'](${startSuccess});
+                                    delete window.__wasm_resolvers['${wasmName}'];
+                                }
+                             `);
+                         });
+                     }
+                     return;
+                }
+
+                // Normal Response
+                if (msg.getString("requestId") == requestId) {
+                    if (msg.getBoolean("success") == true) {
+                       resolve(msg.getString("result") ?? "");
+                    } else {
+                       const errMap = new UTSJSONObject();
+                       errMap.set("error", msg.getString("error"));
+                       resolve(JSON.stringify(errMap));
+                    }
+                }
+            };
+            
+            // Register listeners
+            engine.onMessage("plugin_response", handler);
+            engine.onMessage("sys_load_wasm", handler);
+            
+            // 2. Wrap code with "Native Loader" Polyfill
+            const wrappedCode = `
+               (async function() {
+                   // Global Context Injection
+                   window.__PLUGIN_ID__ = "${pluginId}";
+                   window.__REQUEST_ID__ = "${requestId}";
+                   window.__FUNC_NAME__ = "${funcName}";
+                   window.__PARAMS__ = ${paramsJson};
+                   
+                   // A. Inject Native Loader Helper
+                   window.__wasm_resolvers = {};
+                   
+                   window.native.loadWasm = function(name, path, importsName) {
+                       return new Promise((res) => {
+                           window.__wasm_resolvers[name] = res;
+                           window.native.postMessage({
+                               type: "sys_load_wasm",
+                               name: name,
+                               path: path,
+                               imports: importsName
+                           });
+                       });
+                   };
+
+                   try {
+                       // B. Inject Plugin Code
+                       ${scriptCode}
+                       
+                       // C. Call Target Function (Support Async/Promise)
+                       // If the scriptCode is a Self-Executing Bundle (like Generic Wrapper), 
+                       // it might handle execution itself.
+                       // We need to detect if we should manually call the function or wait.
+                       
+                       // Heuristic: If scriptCode contains "plugin_response", it handles itself.
+                       // Otherwise we call it.
+                       // Note: Logic computed in Native/UTS to avoid quote escaping issues in generated JS
+                       const shouldAutoCall = ${!scriptCode.includes("plugin_response")};
+                       
+                       if (shouldAutoCall) {
+                           // Legacy/Standard Mode: index.js defines functions, we call them
+                            const res = await ${funcName}(${paramsJson});
+                            const output = (typeof res === 'string') ? res : JSON.stringify(res);
+                            window.native.postMessage({
+                                type: "plugin_response",
+                                requestId: "${requestId}",
+                                success: true,
+                                result: output
+                            });
+                       }
+                       
+                   } catch(e) {
+                       window.native.postMessage({
+                           type: "plugin_response",
+                           requestId: "${requestId}",
+                           success: false,
+                           error: e.toString()
+                       });
+                   }
+               })();
+            `;
+            
+            // 3. Execute with timeout safety
+            engine.evaluate(wrappedCode);
+            
+            // Timeout after 30s (WASM might be slow)
+            setTimeout(() => {
+                const toMap = new UTSJSONObject();
+                toMap.set("error", "Execution Timeout");
+                resolve(JSON.stringify(toMap));
+            }, 30000);
+        });
+    }
+}

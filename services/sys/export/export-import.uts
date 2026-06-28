@@ -1,0 +1,2984 @@
+import { BackupService } from './BackupService.uts'
+
+import { DB } from '@/utils/DB/DB.uts'
+
+import type { SqlArgs, SqlValue } from '@/utils/DB/DB.uts'
+
+import { DBInit } from '@/utils/DB/DBInit.uts'
+
+import { FileUtil } from '@/utils/file/file.uts'
+
+import {
+
+  EXPORT_DB_PREFIX,
+
+  EXPORT_FULL_PREFIX,
+
+  FULL_EXPORT_IMAGES_SUBDIR,
+
+  FULL_EXPORT_MUSIC_SUBDIR,
+
+  FULL_EXPORT_VIDEOS_SUBDIR,
+
+  FULL_EXPORT_NOTE_DOCS_SUBDIR,
+
+  FULL_EXPORT_STORAGE_SUBDIR,
+
+  RUNTIME_DB_EXPORT_DIR,
+
+  RUNTIME_FULL_EXPORT_DIR,
+
+  RUNTIME_IMAGES_DIR,
+
+  RUNTIME_MUSIC_DIR,
+
+  RUNTIME_VIDEOS_DIR,
+
+  RUNTIME_NOTE_DOCS_DIR
+
+} from '@/utils/constant.uts'
+
+import { SYNC_DEVICE_ID_KEY } from '@/utils/constant.uts'
+
+import { formatDateForFile, joinPath } from '@/utils/common/tools.uts'
+
+import { ZipUtil } from '@/utils/zip/zip.uts'
+import { getCurrentDbName } from '@/utils/app/AppRuntime.uts'
+
+// #ifdef APP-HARMONY
+import fs from '@ohos.file.fs'
+import relationalStore from '@ohos.data.relationalStore'
+import common from '@ohos.app.ability.common'
+import { BusinessError } from '@ohos.base'
+declare function getContext(component?: any): any
+// #endif
+
+function __f__(level: string, tag: string, message: any, detail: any | null = null): void {
+  try {
+    const g: any = globalThis as any
+    const nativeTrace = g != null ? g.__f__ : null
+    if (nativeTrace != null && nativeTrace !== __f__) {
+      nativeTrace(level, tag, message, detail)
+      return
+    }
+  } catch (_e0) {}
+
+  if (level == 'error') {
+    if (detail != null) {
+      console.error(tag, message, detail)
+    } else {
+      console.error(tag, message)
+    }
+    return
+  }
+
+  if (detail != null) {
+    console.log(tag, message, detail)
+  } else {
+    console.log(tag, message)
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+export type ExportResult = {
+
+  ok: boolean
+
+  mode: 'db_only' | 'full'
+
+  path?: string
+
+  message?: string
+
+  artifactFormat?: string
+
+}
+
+export type ExportPackageWindowMode = 'all' | 'before_cutoff' | 'since_cutoff'
+
+export type ExportPackageOptions = {
+
+  packagePrefix: string
+
+  windowMode: ExportPackageWindowMode
+
+  cutoffMs?: number | null
+
+}
+
+
+
+export class ExportImportService {
+
+  private static _lastHarmonyExportSeedPath: string = ''
+
+  /**
+
+   * 纯数据库导出：复�?ZeMo.db 到沙箱可写目录�?
+
+   * 返回导出文件路径�?
+
+   */
+
+  static async exportDbOnly(createHarmonySeed: boolean = false, preferPhysicalOutput: boolean = false): Promise<ExportResult> {
+
+    try {
+
+      await FileUtil.ensureRuntimeDirs()
+
+
+
+      // 复用现有 BackupService 的“关闭DB+复制DB”能力：
+
+      // �?BackupService 会导出到 Downloads/filesDir，不符合我们目录规范�?
+
+      // 这里直接走最稳妥的“取 DB 物理路径 + copy”�?
+
+
+
+      // [Fix]: Sync Storage to DB user_kv before export
+
+      try {
+
+        const keys = [
+
+          'vision_saved_groups',
+
+          'vision_saved_connections',
+
+          'vision_group_view_states',
+
+          'vision_deleted_auto_groups',
+
+          'vision_limit_view_state'
+
+        ];
+
+        for(let i=0; i<keys.length; i++) {
+
+            const val = uni.getStorageSync(keys[i]);
+
+            if (val != null && (val as string) !== '') {
+
+                await DB.exec('INSERT OR REPLACE INTO user_kv (user_id, k, v, updated_at) VALUES (?, ?, ?, ?)', [0, keys[i], val as string, Date.now()]);
+
+            }
+
+        }
+
+      } catch (_e0) {
+
+        __f__('error','at services/export/export-import.uts:71','Storage sync prior to DB export failed', _e0);
+
+      }
+
+
+
+      // [Fix]: Sync Storage to DB user_kv before export
+
+      try {
+
+        const keys = [
+
+          'vision_saved_groups',
+
+          'vision_saved_connections',
+
+          'vision_group_view_states',
+
+          'vision_deleted_auto_groups',
+
+          'vision_limit_view_state'
+
+        ];
+
+        for(let i=0; i<keys.length; i++) {
+
+            const val = uni.getStorageSync(keys[i]);
+
+            if (val != null && (val as string) !== '') {
+
+                await DB.exec('INSERT OR REPLACE INTO user_kv (user_id, k, v, updated_at) VALUES (?, ?, ?, ?)', [0, keys[i], val as string, Date.now()]);
+
+            }
+
+        }
+
+      } catch (_e0) {
+
+        __f__('error','at services/export/export-import.uts:90','Storage sync prior to DB export failed', _e0);
+
+      }
+
+
+      const time = formatDateForFile(new Date())
+
+      let destPath = joinPath(RUNTIME_DB_EXPORT_DIR, `${EXPORT_DB_PREFIX}${time}.db`)
+
+      // #ifdef APP-HARMONY
+      if (preferPhysicalOutput) {
+        destPath = ExportImportService.buildHarmonyPhysicalDbExportPath(`${EXPORT_DB_PREFIX}${time}.db`)
+      }
+      // #endif
+
+
+
+      const srcPath = await ExportImportService.getCurrentDbFilePath()
+
+      if (srcPath == null || srcPath.length == 0) {
+
+        await DBInit.run(null)
+
+        return { ok: false, mode: 'db_only', message: '无法获取数据库文件路径 ' }
+
+      }
+
+
+      DB.close()
+
+      ExportImportService.clearHarmonyExportSeedPath()
+
+      // #ifdef APP-HARMONY
+      if (preferPhysicalOutput) {
+        const copied = ExportImportService.copyHarmonyBinaryFile(srcPath, destPath)
+        await DBInit.run(null)
+        if (!copied) {
+          return { ok: false, mode: 'db_only', message: '导出物理数据库快照失败' }
+        }
+        return { ok: true, mode: 'db_only', path: destPath }
+      }
+
+      if (createHarmonySeed) {
+        const seedPath = ExportImportService.buildHarmonyExportSeedPath(srcPath)
+        if (seedPath != '' && ExportImportService.copyHarmonyBinaryFile(srcPath, seedPath)) {
+          ExportImportService._lastHarmonyExportSeedPath = seedPath
+        } else {
+          __f__('log','at services/export/export-import.uts:109',`[ExportImportService] exportDbOnly seed copy failed src=${srcPath} seed=${seedPath}`)
+        }
+      }
+      // #endif
+
+
+
+      await FileUtil.copyFile(srcPath, destPath, { overwrite: true })
+
+      await DBInit.run(null)
+
+
+
+      return { ok: true, mode: 'db_only', path: destPath }
+
+    } catch (e) {
+
+      __f__('error','at services/export/export-import.uts:109',`[ExportImportService] exportDbOnly error: ${e}`)
+
+      return { ok: false, mode: 'db_only', message: (e as Error).message }
+
+    }
+
+  }
+
+  static async exportPackageZip(options: ExportPackageOptions): Promise<ExportResult> {
+
+    let packageFolder = ''
+
+    let filteredDbPath = ''
+
+    let zipPath = ''
+
+    let returnedPath = ''
+
+    try {
+
+      await FileUtil.ensureRuntimeDirs()
+
+      const windowMode = options.windowMode ?? 'all'
+
+      const cutoffMs = options.cutoffMs == null ? 0 : parseInt(options.cutoffMs.toString())
+
+      const safePrefixRaw = (options.packagePrefix ?? 'sync_package').toString().trim()
+
+      const safePrefix = safePrefixRaw == '' ? 'sync_package' : safePrefixRaw.replace(/[^a-zA-Z0-9_-]/g, '_')
+
+  const useHarmonyPhysicalWorkDir = ExportImportService.shouldUseHarmonyPhysicalPackageWorkDir()
+
+  const dbRes = await ExportImportService.exportDbWindow(windowMode, cutoffMs, useHarmonyPhysicalWorkDir)
+
+      if (!dbRes.ok || dbRes.path == null || dbRes.path.toString().trim() == '') {
+
+        return { ok: false, mode: 'full', message: dbRes.message ?? '导出包数据库失败' }
+
+      }
+
+      filteredDbPath = dbRes.path.toString()
+
+      if (useHarmonyPhysicalWorkDir) {
+        returnedPath = filteredDbPath
+        return { ok: true, mode: 'full', path: filteredDbPath, artifactFormat: 'db', message: 'Harmony raw db package' }
+      }
+
+      const time = formatDateForFile(new Date())
+
+      packageFolder = useHarmonyPhysicalWorkDir
+        ? ExportImportService.buildHarmonyPhysicalPackageFolder(`${safePrefix}_${time}`)
+        : joinPath(RUNTIME_FULL_EXPORT_DIR, `${safePrefix}_${time}`)
+
+      if (!useHarmonyPhysicalWorkDir) {
+        await FileUtil.ensureDir(packageFolder)
+      }
+
+      await FileUtil.copyFile(filteredDbPath, joinPath(packageFolder, getCurrentDbName()), { overwrite: true })
+
+      await FileUtil.copyDir(RUNTIME_IMAGES_DIR, joinPath(packageFolder, FULL_EXPORT_IMAGES_SUBDIR), { overwrite: true })
+
+      await FileUtil.copyDir(RUNTIME_MUSIC_DIR, joinPath(packageFolder, FULL_EXPORT_MUSIC_SUBDIR), { overwrite: true })
+
+      await FileUtil.copyDir(RUNTIME_VIDEOS_DIR, joinPath(packageFolder, FULL_EXPORT_VIDEOS_SUBDIR), { overwrite: true })
+
+      await FileUtil.copyDir(RUNTIME_NOTE_DOCS_DIR, joinPath(packageFolder, FULL_EXPORT_NOTE_DOCS_SUBDIR), { overwrite: true })
+
+      zipPath = `${packageFolder}.zip`
+
+      const zipOk = await ZipUtil.zipFolder(packageFolder, zipPath)
+
+      if (!zipOk) {
+
+        return { ok: false, mode: 'full', message: useHarmonyPhysicalWorkDir ? 'Harmony 平台同步包 ZIP 打包失败或未实现' : '打包同步包失败' }
+
+      }
+
+  returnedPath = zipPath
+  return { ok: true, mode: 'full', path: zipPath, artifactFormat: 'zip' }
+
+    } catch (e) {
+
+      __f__('error','at services/export/export-import.uts:177',`[ExportImportService] exportPackageZip error: ${e}`)
+
+      return { ok: false, mode: 'full', message: (e as Error).message }
+
+    } finally {
+
+      if (filteredDbPath != '') {
+
+        if (filteredDbPath != returnedPath) {
+          await ExportImportService.cleanupExportWorkPath(filteredDbPath)
+        }
+
+      }
+
+      if (packageFolder != '') {
+
+        await ExportImportService.cleanupExportWorkPath(packageFolder)
+
+      }
+
+    }
+
+  }
+
+  static async getMaxEntityChangeTime(cutoffMs: number = 0): Promise<number> {
+
+    if (!DB.isReady) return 0
+
+    try {
+
+      const tables = await ExportImportService.listUserTables()
+
+      let maxChangedAt = 0
+
+      for (let i = 0; i < tables.length; i++) {
+
+        const table = tables[i]
+
+        if (table.startsWith('sqlite_')) continue
+
+        const columns = await ExportImportService.getTableColumns(table, '')
+
+        const changeExpr = ExportImportService.buildEffectiveChangeExpr(columns)
+
+        if (changeExpr == '') continue
+
+        let sql = `SELECT MAX(${changeExpr}) AS max_ts FROM ${table}`
+
+        const args = [] as SqlArgs
+
+        const whereParts = [] as string[]
+
+        if (cutoffMs > 0) {
+
+          whereParts.push(`${changeExpr} >= ?`)
+
+          args.push(cutoffMs)
+
+        }
+
+        if (table == 'user_kv') {
+
+          whereParts.push(`COALESCE(k, '') != ?`)
+
+          args.push(SYNC_DEVICE_ID_KEY)
+
+        }
+
+        if (whereParts.length > 0) {
+
+          sql += ` WHERE ${whereParts.join(' AND ')}`
+
+        }
+
+        const rows = await DB.query(sql, args)
+
+        if (rows.length == 0) continue
+
+        const raw = rows[0].get('max_ts')
+
+        const ts = raw == null ? 0 : parseInt(raw.toString())
+
+        if (!isNaN(ts) && ts > maxChangedAt) maxChangedAt = ts
+
+      }
+
+      return maxChangedAt
+
+    } catch (_e) {
+
+      return 0
+
+    }
+
+  }
+
+  static async getMaxEntityChangeTimeBefore(cutoffMs: number): Promise<number> {
+
+    if (!DB.isReady || cutoffMs <= 0) return 0
+
+    try {
+
+      const tables = await ExportImportService.listUserTables()
+
+      let maxChangedAt = 0
+
+      for (let i = 0; i < tables.length; i++) {
+
+        const table = tables[i]
+
+        if (table.startsWith('sqlite_')) continue
+
+        const columns = await ExportImportService.getTableColumns(table, '')
+
+        const changeExpr = ExportImportService.buildEffectiveChangeExpr(columns)
+
+        if (changeExpr == '') continue
+
+        let sql = `SELECT MAX(${changeExpr}) AS max_ts FROM ${table}`
+
+        const args = [] as SqlArgs
+
+        const whereParts = [] as string[]
+
+        whereParts.push(`${changeExpr} < ?`)
+
+        args.push(cutoffMs)
+
+        if (table == 'user_kv') {
+
+          whereParts.push(`COALESCE(k, '') != ?`)
+
+          args.push(SYNC_DEVICE_ID_KEY)
+
+        }
+
+        sql += ` WHERE ${whereParts.join(' AND ')}`
+
+        const rows = await DB.query(sql, args)
+
+        if (rows.length == 0) continue
+
+        const raw = rows[0].get('max_ts')
+
+        const ts = raw == null ? 0 : parseInt(raw.toString())
+
+        if (!isNaN(ts) && ts > maxChangedAt) maxChangedAt = ts
+
+      }
+
+      return maxChangedAt
+
+    } catch (_e) {
+
+      return 0
+
+    }
+
+  }
+
+  private static async exportDbWindow(windowMode: ExportPackageWindowMode, cutoffMs: number, preferPhysicalOutput: boolean = false): Promise<ExportResult> {
+
+    const base = await ExportImportService.exportDbOnly(windowMode != 'all' && !preferPhysicalOutput, preferPhysicalOutput)
+
+    if (!base.ok || base.path == null || base.path.toString().trim() == '') return base
+
+    if (windowMode == 'all') return base
+
+    const ok = await ExportImportService.filterExportedDbWindow(base.path.toString(), windowMode, cutoffMs)
+
+    if (ok) return base
+
+    await FileUtil.removeFile(base.path.toString())
+
+    return { ok: false, mode: 'db_only', message: '裁剪同步数据库失败' }
+
+  }
+
+  private static async filterExportedDbWindow(exportedDbPath: string, windowMode: ExportPackageWindowMode, cutoffMs: number): Promise<boolean> {
+
+    if (windowMode == 'all') return true
+
+    if (cutoffMs <= 0) return true
+
+    // #ifdef APP-HARMONY
+    return await ExportImportService.filterHarmonyExportedDbWindow(exportedDbPath, windowMode, cutoffMs)
+    // #endif
+
+    let attached = false
+    let attachDbPath = exportedDbPath
+    let shouldPersistAttachDb = false
+    let shouldCleanupAttachDb = false
+
+    const attachAlias = 'zemo_pkg'
+
+    const detachSql = `DETACH DATABASE ${attachAlias}`
+
+    try {
+
+      const attachTarget = await ExportImportService.prepareAttachDbPath(exportedDbPath)
+      attachDbPath = attachTarget.path
+      shouldPersistAttachDb = attachTarget.persistBack
+      shouldCleanupAttachDb = attachTarget.persistBack
+
+      __f__('log','at services/export/export-import.uts:446',`[ExportImportService] filterExportedDbWindow attach source=${exportedDbPath} seed=${attachTarget.seedPath} target=${attachDbPath} persistBack=${shouldPersistAttachDb}`)
+
+      const attachSql = `ATTACH DATABASE '${attachDbPath.replace(/'/g, "''")}' AS ${attachAlias}`
+
+      await DB.beginTransaction()
+
+      const attachedOk = await DB.exec(attachSql)
+
+      if (!attachedOk) throw new Error('attach package db failed')
+
+      attached = true
+
+      const tables = await ExportImportService.listUserTables()
+
+      for (let i = 0; i < tables.length; i++) {
+
+        const table = tables[i]
+
+        if (table.startsWith('sqlite_')) continue
+
+        const columns = await ExportImportService.getTableColumns(table, attachAlias)
+
+        const deletePlan = ExportImportService.buildWindowDeletePlan(attachAlias, table, columns, windowMode, cutoffMs)
+
+        if (deletePlan.sql != '') {
+
+          const deleteOk = await DB.exec(deletePlan.sql, deletePlan.args)
+
+          if (!deleteOk) throw new Error(`filter package table failed: ${table}`)
+
+        }
+
+        if (table == 'user_kv') {
+
+          const sanitizeOk = await DB.exec(`DELETE FROM ${attachAlias}.user_kv WHERE COALESCE(k, '') = ?`, [SYNC_DEVICE_ID_KEY])
+
+          if (!sanitizeOk) throw new Error('sanitize package user_kv failed')
+
+        }
+
+      }
+
+      const detachOk = await DB.exec(detachSql)
+
+      if (!detachOk) throw new Error('detach package db failed')
+
+      attached = false
+
+      if (shouldPersistAttachDb) {
+        const persistOk = await ExportImportService.persistAttachDbPath(attachDbPath, exportedDbPath)
+        if (!persistOk) throw new Error('persist package db failed')
+      }
+
+      await DB.setTransactionSuccessful()
+
+      return true
+
+    } catch (e) {
+
+      __f__('error','at services/export/export-import.uts:281',`[ExportImportService] filterExportedDbWindow error: ${e}`)
+
+      return false
+
+    } finally {
+
+      if (attached) {
+
+        try { await DB.exec(detachSql) } catch (_e0) {}
+
+      }
+
+      if (shouldCleanupAttachDb) {
+        ExportImportService.cleanupAttachDbPath(attachDbPath, exportedDbPath)
+      }
+
+      await DB.endTransaction()
+
+    }
+
+  }
+
+  private static async filterHarmonyExportedDbWindow(exportedDbPath: string, windowMode: ExportPackageWindowMode, cutoffMs: number): Promise<boolean> {
+
+    let workDbPath = exportedDbPath
+    let shouldPersistWorkDb = false
+    let shouldCleanupWorkDb = false
+    let tempStore: relationalStore.RdbStore | null = null
+    let committed = false
+
+    try {
+
+      const attachTarget = await ExportImportService.prepareAttachDbPath(exportedDbPath)
+      workDbPath = attachTarget.path
+      shouldPersistWorkDb = attachTarget.persistBack
+      shouldCleanupWorkDb = attachTarget.persistBack
+
+      __f__('log','at services/export/export-import.uts:446',`[ExportImportService] filter window source=${exportedDbPath} seed=${attachTarget.seedPath} workDb=${workDbPath} persistBack=${shouldPersistWorkDb}`)
+
+      tempStore = await ExportImportService.openHarmonyTempStore(workDbPath)
+      if (tempStore == null) throw new Error('open package temp db failed')
+
+      tempStore.beginTransaction()
+
+      const tables = await ExportImportService.listHarmonyStoreTables(tempStore)
+
+      for (let i = 0; i < tables.length; i++) {
+
+        const table = tables[i]
+
+        if (table.startsWith('sqlite_')) continue
+
+        const columns = await ExportImportService.getHarmonyStoreTableColumns(tempStore, table)
+
+        const deletePlan = ExportImportService.buildWindowDeletePlan(table, columns, windowMode, cutoffMs)
+
+        if (deletePlan.sql != '') {
+
+          const deleteOk = await ExportImportService.execHarmonyStore(tempStore, deletePlan.sql, deletePlan.args)
+
+          if (!deleteOk) throw new Error(`filter package table failed: ${table}`)
+
+        }
+
+        if (table == 'user_kv') {
+
+          const sanitizeOk = await ExportImportService.execHarmonyStore(tempStore, 'DELETE FROM user_kv WHERE COALESCE(k, "") = ?', [SYNC_DEVICE_ID_KEY])
+
+          if (!sanitizeOk) throw new Error('sanitize package user_kv failed')
+
+        }
+
+      }
+
+      tempStore.commit()
+      committed = true
+
+      if (shouldPersistWorkDb) {
+        const persistOk = await ExportImportService.persistAttachDbPath(workDbPath, exportedDbPath)
+        if (!persistOk) throw new Error('persist package db failed')
+      }
+
+      return true
+
+    } catch (e) {
+
+      __f__('error','at services/export/export-import.uts:281',`[ExportImportService] filterHarmonyExportedDbWindow error: ${e}`)
+
+      return false
+
+    } finally {
+
+      try {
+        if (tempStore != null && !committed) tempStore.rollBack()
+      } catch (_e0) {}
+
+      try {
+        const closable = tempStore as any
+        if (closable != null && closable.close != null) closable.close()
+      } catch (_e1) {}
+
+      if (shouldCleanupWorkDb) {
+        ExportImportService.cleanupAttachDbPath(workDbPath, exportedDbPath)
+      }
+
+    }
+
+  }
+
+  private static buildWindowDeletePlan(tableRef: string, columns: Set<string>, windowMode: ExportPackageWindowMode, cutoffMs: number): { sql: string, args: SqlArgs } {
+
+    const args = [] as SqlArgs
+
+    const changeExpr = ExportImportService.buildEffectiveChangeExpr(columns)
+
+    if (changeExpr == '') {
+
+      if (windowMode == 'since_cutoff') {
+
+        return { sql: `DELETE FROM ${tableRef}`, args }
+
+      }
+
+      return { sql: '', args }
+
+    }
+
+    const comparator = windowMode == 'before_cutoff' ? '>=' : '<'
+
+    args.push(cutoffMs)
+
+    return {
+
+      sql: `DELETE FROM ${tableRef} WHERE ${changeExpr} ${comparator} ?`,
+
+      args,
+
+    }
+
+  }
+
+  private static buildEffectiveChangeExpr(columns: Set<string>): string {
+
+    const hasCreatedAt = columns.has('created_at')
+
+    const hasUpdatedAt = columns.has('updated_at')
+
+    const hasTombstoneAt = columns.has('tombstone_at')
+
+    if (!hasCreatedAt && !hasUpdatedAt && !hasTombstoneAt) return ''
+
+    const parts = [] as string[]
+
+    if (hasTombstoneAt) parts.push(`NULLIF(CAST(tombstone_at AS INTEGER), 0)`)
+
+    if (hasUpdatedAt) parts.push(`NULLIF(CAST(updated_at AS INTEGER), 0)`)
+
+    if (hasCreatedAt) parts.push(`NULLIF(CAST(created_at AS INTEGER), 0)`)
+
+    parts.push('0')
+
+    return `COALESCE(${parts.join(', ')})`
+
+  }
+
+  private static async getTableColumns(table: string, attachAlias: string = ''): Promise<Set<string>> {
+
+    const prefix = attachAlias == '' ? '' : `${attachAlias}.`
+
+    const rows = await DB.query(`PRAGMA ${prefix}table_info(${table})`)
+
+    const set = new Set<string>()
+
+    for (let i = 0; i < rows.length; i++) {
+
+      const nameVal = rows[i].get('name')
+
+      const name = nameVal == null ? '' : nameVal.toString()
+
+      if (name != '') set.add(name)
+
+    }
+
+    return set
+
+  }
+
+  private static async openHarmonyTempStore(dbPath: string): Promise<relationalStore.RdbStore | null> {
+
+    try {
+      const normalizedPath = (dbPath ?? '').toString().trim().replace(/\\/g, '/')
+      const fileNameStart = normalizedPath.lastIndexOf('/')
+      if (normalizedPath == '' || fileNameStart < 0 || fileNameStart >= normalizedPath.length - 1) return null
+      const ctx = getContext() as common.UIAbilityContext
+      const storeConfig: relationalStore.StoreConfig = {
+        name: normalizedPath.substring(fileNameStart + 1),
+        securityLevel: relationalStore.SecurityLevel.S1,
+      }
+      return await relationalStore.getRdbStore(ctx, storeConfig)
+    } catch (e) {
+      const err = e as BusinessError
+      __f__('error','at services/export/export-import.uts:340',`[ExportImportService] openHarmonyTempStore error code=${err.code} message=${err.message} path=${dbPath}`)
+      return null
+    }
+
+  }
+
+  private static async execHarmonyStore(store: relationalStore.RdbStore, sql: string, args: SqlArgs | null = null): Promise<boolean> {
+
+    try {
+      const safeArgs = DB.normalizeArgs(args)
+      if (safeArgs.length > 0) await store.executeSql(sql, safeArgs as Array<any>)
+      else await store.executeSql(sql)
+      return true
+    } catch (e) {
+      const err = e as BusinessError
+      __f__('error','at services/export/export-import.uts:351',`[ExportImportService] execHarmonyStore error code=${err.code} message=${err.message} sql=${sql}`)
+      return false
+    }
+
+  }
+
+  private static async queryHarmonyStore(store: relationalStore.RdbStore, sql: string, args: SqlArgs | null = null): Promise<Array<Map<string, any | null>>> {
+
+    const result = [] as Array<Map<string, any | null>>
+    let rs: relationalStore.ResultSet | null = null
+    try {
+      const safeArgs = DB.normalizeArgs(args)
+      if (safeArgs.length > 0) rs = await store.querySql(sql, safeArgs as Array<any>)
+      else rs = await store.querySql(sql)
+      if (rs != null && rs.rowCount > 0) {
+        const colCount = rs.columnCount
+        const colNames = rs.columnNames
+        while (rs.goToNextRow()) {
+          const row = new Map<string, any | null>()
+          for (let i = 0; i < colCount; i++) {
+            const name = colNames[i]
+            if (rs.isColumnNull(i)) row.set(name, null)
+            else row.set(name, rs.getString(i))
+          }
+          result.push(row)
+        }
+      }
+    } catch (e) {
+      const err = e as BusinessError
+      __f__('error','at services/export/export-import.uts:372',`[ExportImportService] queryHarmonyStore error code=${err.code} message=${err.message} sql=${sql}`)
+    } finally {
+      if (rs != null) rs.close()
+    }
+    return result
+
+  }
+
+  private static async listHarmonyStoreTables(store: relationalStore.RdbStore): Promise<string[]> {
+
+    const rows = await ExportImportService.queryHarmonyStore(store, `SELECT name FROM sqlite_master WHERE type='table' ORDER BY name ASC`)
+    const tables = [] as string[]
+    for (let i = 0; i < rows.length; i++) {
+      const nameVal = rows[i].get('name')
+      const name = nameVal == null ? '' : nameVal.toString()
+      if (name != '') tables.push(name)
+    }
+    return tables
+
+  }
+
+  private static async getHarmonyStoreTableColumns(store: relationalStore.RdbStore, table: string): Promise<Set<string>> {
+
+    const rows = await ExportImportService.queryHarmonyStore(store, `PRAGMA table_info(${table})`)
+    const set = new Set<string>()
+    for (let i = 0; i < rows.length; i++) {
+      const nameVal = rows[i].get('name')
+      const name = nameVal == null ? '' : nameVal.toString()
+      if (name != '') set.add(name)
+    }
+    return set
+
+  }
+
+
+
+  /**
+
+   * 纯数据库导入（增量合并，不覆盖原数据）�?
+
+   * Android：ATTACH + INSERT OR IGNORE�?
+
+   * Harmony：将导入库拷贝到 rdb 目录并以新名字打开，再逐表插入�?
+
+   */
+
+  static async importDbOnly(importDbPath: string, context: any | null = null): Promise<ExportResult> {
+
+    try {
+
+      await FileUtil.ensureRuntimeDirs()
+
+
+
+      // 确保当前库已初始�?
+
+      await DBInit.run(context)
+
+
+
+      const ok = await ExportImportService.mergeDatabase(importDbPath, context)
+
+      if (!ok) return { ok: false, mode: 'db_only', message: '增量合并失败' }
+
+      const schemaOk = await DB.ensureSchema()
+      if (!schemaOk) return { ok: false, mode: 'db_only', message: '导入后数据库迁移失败' }
+
+
+
+      return { ok: true, mode: 'db_only', message: '导入完成（增量合并）' }
+
+    } catch (e) {
+
+      __f__('error','at services/export/export-import.uts:131',`[ExportImportService] importDbOnly error: ${e}`)
+
+      return { ok: false, mode: 'db_only', message: (e as Error).message }
+
+    }
+
+  }
+
+
+
+  /**
+
+   * 完整导出（数据库 + 资源）�?
+
+   * 资源目录来自 RUNTIME_ASSETS_DIR（用户上�?缓存的图片与音频）�?
+
+   * Android 优先打包 zip；其他平台暂返回导出目录路径（可后续补齐 zip 实现）�?
+
+   */
+
+  static async exportFull(): Promise<ExportResult> {
+
+    try {
+
+      await FileUtil.ensureRuntimeDirs()
+
+
+
+      const time = formatDateForFile(new Date())
+
+      const exportFolder = joinPath(RUNTIME_FULL_EXPORT_DIR, `${EXPORT_FULL_PREFIX}${time}`)
+
+      await FileUtil.ensureDir(exportFolder)
+
+
+
+      // 1) 导出 DB
+
+      const dbRes = await ExportImportService.exportDbOnly()
+
+      if (!dbRes.ok || dbRes.path == null) return { ok: false, mode: 'full', message: dbRes.message ?? '导出DB失败' }
+
+      const dbDest = joinPath(exportFolder, getCurrentDbName())
+
+      await FileUtil.copyFile(dbRes.path, dbDest, { overwrite: true })
+
+
+
+      // 2) 复制资源（当前模板不做强绑定扫描，直接复制整�?runtime assets�?
+
+      // 这里保持“数据库只存路径”，资源仍在独立目录�?
+
+      // 只导�?images/, music/, videos/, note_docs/，避免把 db_export/full_export 自己再导出导致递归膨胀�?
+
+      await FileUtil.copyDir(RUNTIME_IMAGES_DIR, joinPath(exportFolder, FULL_EXPORT_IMAGES_SUBDIR), { overwrite: true })
+
+      await FileUtil.copyDir(RUNTIME_MUSIC_DIR, joinPath(exportFolder, FULL_EXPORT_MUSIC_SUBDIR), { overwrite: true })
+
+      await FileUtil.copyDir(RUNTIME_VIDEOS_DIR, joinPath(exportFolder, FULL_EXPORT_VIDEOS_SUBDIR), { overwrite: true })
+
+      await FileUtil.copyDir(RUNTIME_NOTE_DOCS_DIR, joinPath(exportFolder, FULL_EXPORT_NOTE_DOCS_SUBDIR), { overwrite: true })
+
+
+
+      // 3) zip（若支持�?
+
+      const zipPath = `${exportFolder}.zip`
+
+      const zipOk = await ZipUtil.zipFolder(exportFolder, zipPath)
+
+      if (zipOk) {
+
+        return { ok: true, mode: 'full', path: zipPath }
+
+      }
+
+
+
+      return { ok: true, mode: 'full', path: exportFolder, message: '当前平台未实现 zip，已导出目录' }
+
+    } catch (e) {
+
+      __f__('error','at services/export/export-import.uts:172',`[ExportImportService] exportFull error: ${e}`)
+
+      return { ok: false, mode: 'full', message: (e as Error).message }
+
+    }
+
+  }
+
+
+
+  /**
+
+   * 完整恢复（覆盖式）：
+
+   * - DB：直接覆盖当�?ZeMo.db（复�?BackupService.restoreDatabase�?
+
+   * - 资源：覆�?runtime images/music
+
+   * 支持�?
+
+   * - Android: 传入 zip 路径会先解压
+
+   * - 传入目录：直接读取目�?
+
+   */
+
+  static async restoreFullReplace(path: string, context: any | null = null): Promise<ExportResult> {
+
+    try {
+
+      await FileUtil.ensureRuntimeDirs()
+
+
+
+
+
+      if (path.toLowerCase().endsWith('.zip')) {
+
+        const time = formatDateForFile(new Date())
+
+        const destFolder = joinPath(RUNTIME_FULL_EXPORT_DIR, `restore_${time}`)
+
+        const unzipOk = await ZipUtil.unzipFile(path, destFolder)
+
+        if (!unzipOk) return { ok: false, mode: 'full', message: '解压失败（zip文件可能损坏）' }
+
+        return await ExportImportService.restoreFullReplaceFromFolder(destFolder, context)
+
+      }
+
+
+
+
+
+      return await ExportImportService.restoreFullReplaceFromFolder(path, context)
+
+    } catch (e) {
+
+      __f__('error','at services/export/export-import.uts:201',`[ExportImportService] restoreFullReplace error: ${e}`)
+
+      return { ok: false, mode: 'full', message: (e as Error).message }
+
+    }
+
+  }
+
+
+
+  private static async restoreFullReplaceFromFolder(folderPath: string, context: any | null = null): Promise<ExportResult> {
+
+    // 1) DB 覆盖
+
+    const dbPath = joinPath(folderPath, getCurrentDbName())
+
+    const dbExists = await FileUtil.exists(dbPath)
+
+    if (!dbExists) return { ok: false, mode: 'full', message: '未找到目录内的ZeMo.db' }
+
+
+
+    const restoreMsg = await BackupService.restoreDatabase(dbPath, null)
+
+    if (!restoreMsg.toString().startsWith('恢复成功')) {
+
+      return { ok: false, mode: 'full', message: restoreMsg }
+
+    }
+
+
+
+    // 2) 资源覆盖
+
+    const importImagesDir = joinPath(folderPath, FULL_EXPORT_IMAGES_SUBDIR)
+
+    const importMusicDir = joinPath(folderPath, FULL_EXPORT_MUSIC_SUBDIR)
+
+    const importVideosDir = joinPath(folderPath, FULL_EXPORT_VIDEOS_SUBDIR)
+
+    const importDocsDir = joinPath(folderPath, FULL_EXPORT_NOTE_DOCS_SUBDIR)
+
+
+
+    const imagesExists = await FileUtil.exists(importImagesDir)
+
+    if (imagesExists) {
+
+      await FileUtil.copyDir(importImagesDir, RUNTIME_IMAGES_DIR, { overwrite: true })
+
+    }
+
+
+
+    const musicExists = await FileUtil.exists(importMusicDir)
+
+    if (musicExists) {
+
+      await FileUtil.copyDir(importMusicDir, RUNTIME_MUSIC_DIR, { overwrite: true })
+
+    }
+
+
+
+    const videosExists = await FileUtil.exists(importVideosDir)
+
+    if (videosExists) {
+
+      await FileUtil.copyDir(importVideosDir, RUNTIME_VIDEOS_DIR, { overwrite: true })
+
+    }
+
+
+
+    const docsExists = await FileUtil.exists(importDocsDir)
+
+    if (docsExists) {
+
+        await FileUtil.copyDir(importDocsDir, RUNTIME_NOTE_DOCS_DIR, { overwrite: true })
+
+    }
+
+
+
+    return { ok: true, mode: 'full', message: '还原完成（直接覆盖）' }
+
+    }
+
+
+
+
+
+    static async importFull(path: string, context: any | null = null): Promise<ExportResult> {
+
+      try {
+
+
+
+
+
+      // Allow passing a zip directly (exportFull on Android prefers zip).
+
+      // [Fix]: Handle both local paths (file://...) and temp paths (.tmp). 
+
+      // If the file exists and is likely the downloaded backup, try unzip logic.
+
+      const isZip = path.toLowerCase().endsWith('.zip') || path.toLowerCase().endsWith('.tmp')
+
+      
+
+      if (isZip) {
+
+        // Double check it is a file not a directory
+
+        const isDir = await FileUtil.isDir(path)
+
+        if (!isDir) {
+
+            __f__('log','at services/export/export-import.uts:260',`[ExportImportService] Treating path as ZIP: ${path}`)
+
+            const time = formatDateForFile(new Date())
+
+            const destFolder = joinPath(RUNTIME_FULL_EXPORT_DIR, `import_${time}`)
+
+            await FileUtil.ensureDir(destFolder)
+
+            
+
+            // Try unzip
+
+            // Optimize: for .tmp files, prefer native rename or direct usage (but ZipFile might need extension)
+
+            // But we'll stick to logic: Rename/Copy to .zip to be safe
+
+            let zipPath = path
+
+            let renamed = false
+
+            
+
+            if (!path.toLowerCase().endsWith('.zip')) {
+
+                zipPath = path + '.zip'
+
+              await FileUtil.copyFile(path, zipPath, { overwrite: true })
+
+              renamed = true
+
+            }
+
+            
+
+            const unzipOk = await ZipUtil.unzipFile(zipPath, destFolder)
+
+            if (!unzipOk) return { ok: false, mode: 'full', message: '解压失败（文件可能损坏）' }
+
+            
+
+            // Cleanup temp rename if created
+
+            if (renamed && zipPath != path) {
+
+                try{ await FileUtil.removeFile(zipPath) } catch(_e){}
+
+            }
+
+            
+
+            return await ExportImportService.importFull(destFolder, context)
+
+        }
+
+      }
+
+
+
+
+
+      // 简化：要求传入目录
+
+      // [Fix]: Intelligent folder detection (handle nested unzip folders)
+
+      let effectivePath = path
+
+      let dbPath = joinPath(effectivePath, getCurrentDbName())
+
+      let dbExists = await FileUtil.exists(dbPath)
+
+      
+
+      if (!dbExists) {
+
+        // [Fix]: Robust nested folder detection (Recursive)
+
+        // Only going 2 levels deep to avoid performance hit
+
+        __f__('log','at services/export/export-import.uts:312',`[ExportImportService] DB not at root. Scanning subfolders of: ${effectivePath}`)
+
+        
+
+        
+
+        
+
+        const foundFolder = await ExportImportService.findDb(effectivePath, 0)
+
+        if (foundFolder != null) {
+
+            effectivePath = foundFolder
+
+            dbPath = joinPath(effectivePath, getCurrentDbName())
+
+            dbExists = true
+
+            __f__('log','at services/export/export-import.uts:321',`[ExportImportService] Found DB in subfolder: ${effectivePath}`)
+
+        }
+
+      }
+
+
+
+      if (!dbExists) {
+
+        // Log details about "effectivePath" to see what we actually extracted
+
+        const list = await FileUtil.listDirRecursive(path) // Assume we need a tool or just simple list
+
+        // Simple list of root for message
+
+        const listRoot = await FileUtil.readDir(path)
+
+        __f__('error','at services/export/export-import.uts:330',`[ExportImportService] Import failed. Root list: ${JSON.stringify(listRoot)}`)
+
+        return { ok: false, mode: 'full', message: '未找到 ZeMo.db。请检查备份文件。' }
+
+      }
+
+
+
+      const dbRes = await ExportImportService.importDbOnly(dbPath, context)
+
+      if (!dbRes.ok) return { ok: false, mode: 'full', message: dbRes.message ?? '导入DB失败' }
+
+
+
+      // 复制资源：按“存在则跳过”策略复制导出目录内的资源到 runtime�?
+
+      const importImagesDir = joinPath(effectivePath, FULL_EXPORT_IMAGES_SUBDIR)
+
+      const importMusicDir = joinPath(effectivePath, FULL_EXPORT_MUSIC_SUBDIR)
+
+      const importVideosDir = joinPath(effectivePath, FULL_EXPORT_VIDEOS_SUBDIR)
+
+      const importDocsDir = joinPath(effectivePath, FULL_EXPORT_NOTE_DOCS_SUBDIR)
+
+
+
+      const imagesExists = await FileUtil.exists(importImagesDir)
+
+      if (imagesExists) {
+
+        await FileUtil.copyDir(importImagesDir, RUNTIME_IMAGES_DIR, { overwrite: false })
+
+      }
+
+
+
+      const musicExists = await FileUtil.exists(importMusicDir)
+
+      if (musicExists) {
+
+        await FileUtil.copyDir(importMusicDir, RUNTIME_MUSIC_DIR, { overwrite: false })
+
+      }
+
+      
+
+      const videosExists = await FileUtil.exists(importVideosDir)
+
+      if (videosExists) {
+
+        await FileUtil.copyDir(importVideosDir, RUNTIME_VIDEOS_DIR, { overwrite: false })
+
+      }
+
+
+
+      const docsExists = await FileUtil.exists(importDocsDir)
+
+      if (docsExists) {
+
+        await FileUtil.copyDir(importDocsDir, RUNTIME_NOTE_DOCS_DIR, { overwrite: false })
+
+      }
+
+
+
+      return { ok: true, mode: 'full', message: '完整导入完成' }
+
+    } catch (e) {
+
+      __f__('error','at services/export/export-import.uts:365',`[ExportImportService] importFull error: ${e}`)
+
+      return { ok: false, mode: 'full', message: (e as Error).message }
+
+    }
+
+  }
+
+
+
+  
+
+  private static async findDb(dir: string, depth: number): Promise<string | null> { if (depth > 2) return null; const items = await FileUtil.readDir(dir); if (items.includes(getCurrentDbName())) return dir; for (let i = 0; i < items.length; i++) { const name = items[i]; if (name.startsWith('.') || name == '__MACOSX') continue; const sub = joinPath(dir, name); const isDir = await FileUtil.isDir(sub); if (isDir) { const found = await ExportImportService.findDb(sub, depth + 1); if (found != null) return found; } } return null; }
+
+  private static async getCurrentDbFilePath(context: any | null = null): Promise<string | null> {
+
+    try {
+
+      const dbPath = DB.getDatabasePath()
+
+      if (dbPath != null && dbPath.toString().trim() != '') return dbPath.toString()
+
+    } catch (_e0) {}
+
+    // #ifdef APP-ANDROID
+    try {
+
+      const ctx = io.dcloud.uts.UTSAndroid.getAppContext()
+
+      if (ctx == null) return null
+
+      const dbFile = ctx.getDatabasePath(getCurrentDbName())
+
+      return dbFile.getAbsolutePath().toString()
+
+    } catch (_) {
+
+      return null
+
+    }
+    // #endif
+
+    return null
+
+  }
+
+  private static async prepareAttachDbPath(exportedDbPath: string): Promise<{ path: string, persistBack: boolean, seedPath: string }> {
+
+    const directPath = ExportImportService.resolveAttachDbPath(exportedDbPath)
+
+    if (directPath != exportedDbPath) {
+      return { path: directPath, persistBack: false, seedPath: exportedDbPath }
+    }
+
+    // #ifdef APP-HARMONY
+    if (exportedDbPath.indexOf('unifile://') == 0) {
+      const reservedSeedPath = ExportImportService.getReservedHarmonyExportSeedPath()
+      if (reservedSeedPath != '') {
+        return { path: reservedSeedPath, persistBack: true, seedPath: reservedSeedPath }
+      }
+
+      const seedDbPath = ExportImportService.getHarmonyAttachSeedDbPath()
+      const slash = seedDbPath.lastIndexOf('/')
+      if (slash > 0) {
+        const tempAttachPath = `${seedDbPath.substring(0, slash)}/zemo_pkg_attach_${Date.now()}.db`
+        const copied = ExportImportService.copyHarmonyBinaryFile(seedDbPath, tempAttachPath)
+        if (copied) {
+          return { path: tempAttachPath, persistBack: true, seedPath: seedDbPath }
+        }
+      }
+    }
+    // #endif
+
+    return { path: directPath, persistBack: false, seedPath: exportedDbPath }
+
+  }
+
+  private static shouldUseHarmonyPhysicalPackageWorkDir(): boolean {
+
+    // #ifdef APP-HARMONY
+    return true
+    // #endif
+
+    return false
+
+  }
+
+  private static buildHarmonyPhysicalDbExportPath(fileName: string): string {
+
+    // #ifdef APP-HARMONY
+    const dir = ExportImportService.buildHarmonyPhysicalWorkDir('db_export')
+    if (dir != '') return `${dir}/${fileName}`
+    // #endif
+
+    return joinPath(RUNTIME_DB_EXPORT_DIR, fileName)
+
+  }
+
+  private static buildHarmonyPhysicalPackageFolder(folderName: string): string {
+
+    // #ifdef APP-HARMONY
+    const dir = ExportImportService.buildHarmonyPhysicalWorkDir('full_export')
+    if (dir != '') {
+      const folderPath = `${dir}/${folderName}`
+      ExportImportService.ensureHarmonyPhysicalDir(folderPath)
+      return folderPath
+    }
+    // #endif
+
+    return joinPath(RUNTIME_FULL_EXPORT_DIR, folderName)
+
+  }
+
+  private static buildHarmonyPhysicalWorkDir(childDir: string): string {
+
+    // #ifdef APP-HARMONY
+    let baseDir = ''
+    try {
+      const ctx = getContext() as common.UIAbilityContext
+      baseDir = ((ctx.filesDir ?? '') as string).toString().replace(/\\/g, '/').replace(/\/+$/, '')
+    } catch (_e0) {}
+
+    if (baseDir == '') {
+      try {
+        const dbPath = (DB.getDatabasePath() ?? '').toString().replace(/\\/g, '/')
+        const slash = dbPath.lastIndexOf('/')
+        if (slash > 0) baseDir = dbPath.substring(0, slash)
+      } catch (_e1) {}
+    }
+
+    if (baseDir == '') return ''
+
+    const rootDir = `${baseDir}/zemo_sync_work`
+    if (!ExportImportService.ensureHarmonyPhysicalDir(rootDir)) return ''
+
+    const safeChildDir = (childDir ?? '').toString().replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '')
+    if (safeChildDir == '') return rootDir
+
+    const fullDir = `${rootDir}/${safeChildDir}`
+    if (!ExportImportService.ensureHarmonyPhysicalDir(fullDir)) return ''
+    return fullDir
+    // #endif
+
+    return ''
+
+  }
+
+  private static ensureHarmonyPhysicalDir(dirPath: string): boolean {
+
+    // #ifdef APP-HARMONY
+    const normalized = (dirPath ?? '').toString().trim().replace(/\\/g, '/')
+    if (normalized == '') return false
+    try {
+      fs.mkdirSync(normalized, true)
+      return true
+    } catch (_e0) {
+      try {
+        return fs.accessSync(normalized)
+      } catch (_e1) {
+        return false
+      }
+    }
+    // #endif
+
+    return false
+
+  }
+
+  private static async cleanupExportWorkPath(path: string): Promise<void> {
+
+    const normalized = (path ?? '').toString().trim()
+    if (normalized == '') return
+
+    // #ifdef APP-HARMONY
+    if (normalized.indexOf('://') < 0) {
+      try {
+        const stat = fs.statSync(normalized)
+        if (stat.isDirectory != null && stat.isDirectory()) {
+          fs.rmdirSync(normalized, true)
+          return
+        }
+      } catch (_e0) {}
+
+      try {
+        if (fs.accessSync(normalized)) fs.unlinkSync(normalized)
+      } catch (_e1) {}
+      return
+    }
+    // #endif
+
+    await FileUtil.removeFile(normalized)
+    await FileUtil.removeDir(normalized)
+
+  }
+
+  static async cleanupPackageArtifact(path: string): Promise<void> {
+    await ExportImportService.cleanupExportWorkPath(path)
+  }
+
+  private static buildHarmonyExportSeedPath(srcPath: string): string {
+
+    // #ifdef APP-HARMONY
+    const normalized = (srcPath ?? '').toString().replace(/\\/g, '/')
+    const slash = normalized.lastIndexOf('/')
+    if (slash > 0) return `${normalized.substring(0, slash)}/zemo_pkg_seed_${Date.now()}.db`
+    // #endif
+
+    return ''
+
+  }
+
+  private static getReservedHarmonyExportSeedPath(): string {
+
+    // #ifdef APP-HARMONY
+    const seedPath = (ExportImportService._lastHarmonyExportSeedPath ?? '').toString().trim()
+    if (seedPath == '') return ''
+    try {
+      if (fs.accessSync(seedPath)) return seedPath
+    } catch (_e0) {}
+    ExportImportService._lastHarmonyExportSeedPath = ''
+    // #endif
+
+    return ''
+
+  }
+
+  private static clearHarmonyExportSeedPath(): void {
+
+    // #ifdef APP-HARMONY
+    const seedPath = (ExportImportService._lastHarmonyExportSeedPath ?? '').toString().trim()
+    ExportImportService._lastHarmonyExportSeedPath = ''
+    if (seedPath == '') return
+    try {
+      if (fs.accessSync(seedPath)) fs.unlinkSync(seedPath)
+    } catch (_e0) {}
+    // #endif
+
+  }
+
+  private static getHarmonyAttachSeedDbPath(): string {
+
+    // #ifdef APP-HARMONY
+    try {
+      const runtimeDbPath = (DB.getDatabasePath() ?? '').toString().replace(/\\/g, '/')
+      if (runtimeDbPath != '') return runtimeDbPath
+    } catch (_e0) {}
+
+    try {
+      const ctx = getContext() as common.UIAbilityContext
+      const databaseDir = (ctx.databaseDir ?? '').toString().replace(/\\/g, '/').replace(/\/+$/, '')
+      if (databaseDir != '') return `${databaseDir}/rdb/${getCurrentDbName()}`
+    } catch (_e1) {}
+    // #endif
+
+    return ''
+
+  }
+
+  private static async persistAttachDbPath(attachDbPath: string, exportedDbPath: string): Promise<boolean> {
+
+    if (attachDbPath == exportedDbPath) return true
+
+    // #ifdef APP-HARMONY
+    try { await FileUtil.removeFile(exportedDbPath) } catch (_e0) {}
+
+    try {
+      fs.copyFileSync(attachDbPath, exportedDbPath)
+      if (await FileUtil.exists(exportedDbPath)) return true
+    } catch (_e1) {}
+
+    try {
+      await FileUtil.copyFile(attachDbPath, exportedDbPath, { overwrite: true })
+      if (await FileUtil.exists(exportedDbPath)) return true
+    } catch (_e2) {}
+
+    const attachBytes = ExportImportService.readHarmonyBinaryFile(attachDbPath)
+    if (attachBytes != null) {
+      const writeOk = await FileUtil.writeBinaryFile(exportedDbPath, attachBytes)
+      if (writeOk && await FileUtil.exists(exportedDbPath)) return true
+    }
+
+    let destExists = false
+    try {
+      destExists = await FileUtil.exists(exportedDbPath)
+    } catch (_e3) {}
+    __f__('error','at services/export/export-import.uts:1089',`[ExportImportService] persistAttachDbPath failed src=${attachDbPath} dest=${exportedDbPath} destExists=${destExists}`)
+    return false
+    // #endif
+
+    return true
+
+  }
+
+  private static cleanupAttachDbPath(attachDbPath: string, exportedDbPath: string): void {
+
+    if (attachDbPath == '' || attachDbPath == exportedDbPath) return
+
+    // #ifdef APP-HARMONY
+    ExportImportService.cleanupHarmonyDbArtifacts(attachDbPath)
+    if (ExportImportService._lastHarmonyExportSeedPath == attachDbPath) {
+      ExportImportService._lastHarmonyExportSeedPath = ''
+    }
+    // #endif
+
+  }
+
+  private static resolveAttachDbPath(path: string): string {
+
+    const rawPath = (path ?? '').toString().trim()
+
+    if (rawPath == '') return rawPath
+
+    // #ifdef APP-HARMONY
+    if (rawPath.indexOf('unifile://usr/') == 0) {
+      try {
+        const ctx = getContext() as common.UIAbilityContext
+        const baseDir = (ctx.filesDir ?? '').toString().replace(/\\/g, '/').replace(/\/+$/, '')
+        const relativePath = rawPath.substring('unifile://usr/'.length).replace(/^\/+/, '')
+        if (baseDir != '' && relativePath != '') {
+          const resolvedPath = `${baseDir}/${relativePath}`
+          try {
+            if (fs.accessSync(resolvedPath)) return resolvedPath
+          } catch (_e0) {}
+        }
+      } catch (_e1) {}
+    }
+    // #endif
+
+    return rawPath
+
+  }
+
+  private static cleanupHarmonyDbArtifacts(dbPath: string): void {
+
+    // #ifdef APP-HARMONY
+    const normalized = (dbPath ?? '').toString().trim()
+    if (normalized == '') return
+    const artifacts = [normalized, `${normalized}-wal`, `${normalized}-shm`]
+    for (let i = 0; i < artifacts.length; i++) {
+      try {
+        if (fs.accessSync(artifacts[i])) fs.unlinkSync(artifacts[i])
+      } catch (_e0) {}
+    }
+    // #endif
+
+  }
+
+  private static readHarmonyBinaryFile(filePath: string): ArrayBuffer | null {
+
+    // #ifdef APP-HARMONY
+    let file: any | null = null
+    try {
+      if (!fs.accessSync(filePath)) return null
+      file = fs.openSync(filePath, fs.OpenMode.READ_ONLY)
+      const stat = fs.statSync(file.fd)
+      const size = parseInt(stat.size.toString())
+      const out = new ArrayBuffer(size)
+      if (size > 0) fs.readSync(file.fd, out)
+      return out
+    } catch (_e0) {
+      return null
+    } finally {
+      try {
+        if (file != null) fs.closeSync(file)
+      } catch (_e1) {}
+    }
+    // #endif
+
+    return null
+
+  }
+
+  private static copyHarmonyBinaryFile(srcPath: string, destPath: string): boolean {
+
+    // #ifdef APP-HARMONY
+    try {
+      if (srcPath == '' || destPath == '') return false
+      if (!fs.accessSync(srcPath)) return false
+      try {
+        if (fs.accessSync(destPath)) fs.unlinkSync(destPath)
+      } catch (_e0) {}
+      fs.copyFileSync(srcPath, destPath)
+      return fs.accessSync(destPath)
+    } catch (_e1) {
+      return false
+    }
+    // #endif
+
+    return false
+
+  }
+
+  private static writeHarmonyBinaryFile(filePath: string, data: ArrayBuffer): boolean {
+
+    // #ifdef APP-HARMONY
+    let file: any | null = null
+    try {
+      file = fs.openSync(filePath, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC)
+      fs.writeSync(file.fd, data)
+      return true
+    } catch (_e0) {
+      return false
+    } finally {
+      try {
+        if (file != null) fs.closeSync(file)
+      } catch (_e1) {}
+    }
+    // #endif
+
+    return false
+
+  }
+
+
+
+
+  private static async mergeDatabase(importDbPath: string, context: any | null = null): Promise<boolean> {
+
+    // const db = DB
+
+
+    // #ifdef APP-HARMONY
+    return await ExportImportService.mergeHarmonyDatabase(importDbPath, context)
+    // #endif
+
+
+    // Android：ATTACH + INSERT OR IGNORE
+
+
+
+    try {
+
+      let absPath = importDbPath
+
+      // #ifdef APP-ANDROID
+      try {
+
+          // Convert unifile:// to absolute path for SQLite ATTACH
+
+          if (absPath.startsWith('unifile://')) {
+
+              absPath = io.dcloud.uts.UTSAndroid.convert2AbsFullPath(absPath)
+
+          }
+
+      } catch(_e) {}
+      // #endif
+
+      
+
+      const attachSql = `ATTACH DATABASE '${absPath.replace(/'/g, "''")}' AS zemo_import`
+
+      const detachSql = `DETACH DATABASE zemo_import`
+
+
+
+      await DB.beginTransaction()
+
+      const attached = await DB.exec(attachSql)
+
+      if (!attached) throw new Error('ATTACH failed')
+
+
+
+      const tables = await ExportImportService.listUserTables()
+
+      for (const t of tables) {
+
+        // 跳过 sqlite 系统�?
+
+        if (t.startsWith('sqlite_')) continue
+
+
+
+        // user_kv: merge by updated_at (do not use INSERT OR IGNORE)
+
+        if (t == 'user_kv') {
+
+          await ExportImportService.mergeUserKvFromAttached()
+
+          continue
+
+        }
+
+        // 仅合�?import 库里存在的表
+
+          const existsArgs: SqlArgs = [t]
+
+        const existsInImport = await DB.query(`SELECT name FROM zemo_import.sqlite_master WHERE type='table' AND name=?`, existsArgs)
+
+        if (existsInImport.length === 0) continue
+
+
+
+        // 列名对齐 + 主键 + updated_at
+
+        const cols = await DB.query(`PRAGMA table_info(${t})`)
+        const importCols = await DB.query(`PRAGMA zemo_import.table_info(${t})`)
+        const importColSet = new Set<string>()
+        for (let i = 0; i < importCols.length; i++) {
+          const importNameVal = importCols[i].get('name')
+          const importName = importNameVal == null ? '' : importNameVal.toString()
+          if (importName != '') importColSet.add(importName)
+        }
+
+        const colNames: string[] = []
+        const mergedColNames: string[] = []
+
+        const pkCols: string[] = []
+
+        let hasUpdatedAt = false
+
+        for (let i = 0; i < cols.length; i++) {
+
+          const nameVal = cols[i].get('name')
+
+          const nameStr = nameVal != null ? nameVal.toString() : ''
+
+          if (nameStr.length > 0) {
+
+            colNames.push(nameStr)
+            if (importColSet.has(nameStr)) mergedColNames.push(nameStr)
+
+            if (nameStr == 'updated_at') hasUpdatedAt = true
+
+          }
+
+          const pkVal = cols[i].get('pk')
+
+          const pkN = pkVal == null ? 0 : parseInt(pkVal.toString())
+
+          if (!isNaN(pkN) && pkN > 0 && nameStr.length > 0) pkCols.push(nameStr)
+
+        }
+
+        if (colNames.length === 0) continue
+        if (mergedColNames.length === 0) continue
+
+        const colList = mergedColNames.join(',')
+
+
+
+        // Always insert missing rows
+
+        await DB.exec(`INSERT OR IGNORE INTO ${t} (${colList}) SELECT ${colList} FROM zemo_import.${t}`)
+
+
+
+        // Incremental update: if table has updated_at + primary key(s), update rows when incoming newer.
+
+        if (hasUpdatedAt && importColSet.has('updated_at') && pkCols.length > 0) {
+
+          let allPkInImport = true
+          for (let i = 0; i < pkCols.length; i++) {
+            if (!importColSet.has(pkCols[i])) {
+              allPkInImport = false
+              break
+            }
+          }
+          if (!allPkInImport) continue
+
+          // Build join condition: t.pk = s.pk AND ...
+
+          const condParts: string[] = []
+
+          for (let i = 0; i < pkCols.length; i++) {
+
+            const k = pkCols[i]
+
+            condParts.push(`t.${k} = s.${k}`)
+
+          }
+
+          const cond = condParts.join(' AND ')
+
+
+
+          // Build SET clause for all columns (including updated_at)
+
+          const setParts: string[] = []
+
+          for (let i = 0; i < mergedColNames.length; i++) {
+
+            const c = mergedColNames[i]
+            if (pkCols.indexOf(c) >= 0) continue
+
+            setParts.push(`${c} = (SELECT s.${c} FROM zemo_import.${t} s WHERE ${cond} LIMIT 1)`)
+
+          }
+          if (setParts.length == 0) continue
+
+          const setClause = setParts.join(', ')
+
+
+
+          // Only update when incoming updated_at is newer
+
+          const updateSql = `UPDATE ${t} AS t SET ${setClause} WHERE EXISTS (SELECT 1 FROM zemo_import.${t} s WHERE ${cond} AND CAST(COALESCE(s.updated_at, 0) AS INTEGER) > CAST(COALESCE(t.updated_at, 0) AS INTEGER))`
+
+          await DB.exec(updateSql)
+
+        }
+
+      }
+
+
+
+      // [修复] 处理任务详情图片路径（绝对路径替换）
+
+      try {
+
+        const rows = await DB.query("SELECT id, json_extract(properties, '\$.media_paths') as media_paths FROM nodes WHERE type = 'log' AND json_extract(properties, '\$.media_paths') LIKE '%/assets/images/%'");
+
+        for (let i = 0; i < rows.length; i++) {
+
+          const row = rows[i];
+
+          const id = row.get("id");
+
+          const oldPathsJson = row.get("media_paths") as string | null;
+
+          if (id != null && oldPathsJson != null && oldPathsJson.includes('/assets/images/')) {
+
+            const reg = new RegExp('"([^"]*?)/assets/images/', 'g');
+
+            const newPathsJson = oldPathsJson.replace(reg, '"' + RUNTIME_IMAGES_DIR + '/');
+
+            if (newPathsJson != oldPathsJson) {
+                await DB.exec("UPDATE nodes SET properties = json_set(properties, '\$.media_paths', json(?)) WHERE id = ? AND type = 'log'", [newPathsJson, id]);
+            }
+          }
+        }
+      } catch (_ep) {}
+
+
+
+      await DB.exec(detachSql)
+
+      await DB.setTransactionSuccessful()
+
+      // [Fix]: Sync DB user_kv back to Storage after import ends
+
+      try {
+
+        const keys = [
+
+          'vision_saved_groups',
+
+          'vision_saved_connections',
+
+          'vision_group_view_states',
+
+          'vision_deleted_auto_groups',
+
+          'vision_limit_view_state'
+
+        ];
+
+        const placeholders = keys.map(_ => '?').join(',');
+
+        const rows = await DB.query(`SELECT k, v FROM user_kv WHERE k IN (${placeholders})`, keys as any[] as SqlValue[]);
+
+        for (let i=0; i<rows.length; i++) {
+
+           const row = rows[i];
+
+           const k = row.get('k');
+
+           const v = row.get('v');
+
+           if (k != null && v != null) {
+
+               uni.setStorageSync(k.toString(), v.toString());
+
+           }
+
+        }
+
+      } catch (_e1) {
+
+        __f__('error','at services/export/export-import.uts:518','Storage sync from DB after import failed', _e1);
+
+      }
+
+      // [Fix]: Sync DB user_kv back to Storage after import ends
+
+      try {
+
+        const keys = [
+
+          'vision_saved_groups',
+
+          'vision_saved_connections',
+
+          'vision_group_view_states',
+
+          'vision_deleted_auto_groups',
+
+          'vision_limit_view_state'
+
+        ];
+
+        const placeholders = keys.map(_ => '?').join(',');
+
+        const rows = await DB.query(`SELECT k, v FROM user_kv WHERE k IN (${placeholders})`, keys as any[] as SqlValue[]);
+
+        for (let i=0; i<rows.length; i++) {
+
+           const row = rows[i];
+
+           const k = row.get('k');
+
+           const v = row.get('v');
+
+           if (k != null && v != null) {
+
+               uni.setStorageSync(k.toString(), v.toString());
+
+           }
+
+        }
+
+      } catch (_e1) {
+
+        __f__('error','at services/export/export-import.uts:540','Storage sync from DB after import failed', _e1);
+
+      }
+
+      return true
+
+    } catch (e) {
+
+      __f__('error','at services/export/export-import.uts:544',`[ExportImportService] mergeDatabase android error: ${e}`)
+
+      return false
+
+    } finally {
+
+      await DB.endTransaction()
+
+    }
+
+
+
+
+
+    // Harmony：拷贝到 rdb 目录 + 打开临时 store，再逐表 INSERT OR IGNORE�?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  }
+
+  private static async mergeHarmonyDatabase(importDbPath: string, _context: any | null = null): Promise<boolean> {
+
+    let tempImportDbPath = ''
+    let importStore: relationalStore.RdbStore | null = null
+    let committed = false
+
+    try {
+
+      tempImportDbPath = await ExportImportService.prepareHarmonyImportDbPath(importDbPath)
+      if (tempImportDbPath == '') throw new Error('prepare harmony import db failed')
+
+      importStore = await ExportImportService.openHarmonyTempStore(tempImportDbPath)
+      if (importStore == null) throw new Error('open harmony import db failed')
+
+      await DB.beginTransaction()
+
+      const tables = await ExportImportService.listUserTables()
+
+      for (let i = 0; i < tables.length; i++) {
+
+        const table = tables[i]
+        if (table.startsWith('sqlite_')) continue
+
+        const existsInImport = await ExportImportService.queryHarmonyStore(importStore, `SELECT name FROM sqlite_master WHERE type='table' AND name=?`, [table])
+        if (existsInImport.length == 0) continue
+
+        if (table == 'user_kv') {
+          await ExportImportService.mergeUserKvFromHarmony(importStore)
+          continue
+        }
+
+        const liveMeta = await ExportImportService.describeLiveTable(table)
+        if (liveMeta.colNames.length == 0) continue
+
+        const importColumns = await ExportImportService.getHarmonyStoreTableColumns(importStore, table)
+        const mergedColumns = [] as string[]
+        for (let c = 0; c < liveMeta.colNames.length; c++) {
+          const column = liveMeta.colNames[c]
+          if (importColumns.has(column)) mergedColumns.push(column)
+        }
+        if (mergedColumns.length == 0) continue
+
+        const sourceRows = await ExportImportService.queryHarmonyStore(importStore, `SELECT ${mergedColumns.join(',')} FROM ${table}`)
+        const placeholders = mergedColumns.map(_ => '?').join(', ')
+
+        for (let r = 0; r < sourceRows.length; r++) {
+
+          const sourceRow = sourceRows[r]
+          const insertArgs = [] as SqlArgs
+          for (let c = 0; c < mergedColumns.length; c++) {
+            insertArgs.push(sourceRow.get(mergedColumns[c]) as SqlValue)
+          }
+
+          if (liveMeta.pkCols.length == 0) {
+            const insertOk = await DB.exec(`INSERT OR IGNORE INTO ${table} (${mergedColumns.join(',')}) VALUES (${placeholders})`, insertArgs)
+            if (!insertOk) throw new Error(`insert import row failed: ${table}`)
+            continue
+          }
+
+          const whereParts = [] as string[]
+          const whereArgs = [] as SqlArgs
+          let missingPk = false
+
+          for (let p = 0; p < liveMeta.pkCols.length; p++) {
+            const pk = liveMeta.pkCols[p]
+            if (!importColumns.has(pk)) {
+              missingPk = true
+              break
+            }
+            whereParts.push(`${pk} = ?`)
+            whereArgs.push(sourceRow.get(pk) as SqlValue)
+          }
+
+          if (missingPk || whereParts.length == 0) continue
+
+          const localRows = await DB.query(`SELECT updated_at FROM ${table} WHERE ${whereParts.join(' AND ')} LIMIT 1`, whereArgs)
+          if (localRows.length == 0) {
+            const insertOk = await DB.exec(`INSERT OR IGNORE INTO ${table} (${mergedColumns.join(',')}) VALUES (${placeholders})`, insertArgs)
+            if (!insertOk) throw new Error(`insert missing row failed: ${table}`)
+            continue
+          }
+
+          if (!liveMeta.hasUpdatedAt || mergedColumns.indexOf('updated_at') < 0) continue
+
+          const sourceUpdatedAtRaw = sourceRow.get('updated_at')
+          const localUpdatedAtRaw = localRows[0].get('updated_at')
+          const sourceUpdatedAt = sourceUpdatedAtRaw == null ? 0 : parseInt(sourceUpdatedAtRaw.toString())
+          const localUpdatedAt = localUpdatedAtRaw == null ? 0 : parseInt(localUpdatedAtRaw.toString())
+
+          if (sourceUpdatedAt <= localUpdatedAt) continue
+
+          const setColumns = [] as string[]
+          const updateArgs = [] as SqlArgs
+          for (let c = 0; c < mergedColumns.length; c++) {
+            const column = mergedColumns[c]
+            if (liveMeta.pkCols.indexOf(column) >= 0) continue
+            setColumns.push(`${column} = ?`)
+            updateArgs.push(sourceRow.get(column) as SqlValue)
+          }
+          if (setColumns.length == 0) continue
+
+          for (let a = 0; a < whereArgs.length; a++) updateArgs.push(whereArgs[a])
+          const updateOk = await DB.exec(`UPDATE ${table} SET ${setColumns.join(', ')} WHERE ${whereParts.join(' AND ')}`, updateArgs)
+          if (!updateOk) throw new Error(`update newer row failed: ${table}`)
+
+        }
+
+      }
+
+      try {
+
+        const rows = await DB.query("SELECT id, json_extract(properties, '$.media_paths') as media_paths FROM nodes WHERE type = 'log' AND json_extract(properties, '$.media_paths') LIKE '%/assets/images/%'")
+
+        for (let i = 0; i < rows.length; i++) {
+
+          const row = rows[i]
+          const id = row.get('id')
+          const oldPathsJson = row.get('media_paths') as string | null
+
+          if (id != null && oldPathsJson != null && oldPathsJson.includes('/assets/images/')) {
+
+            const reg = new RegExp('"([^"]*?)/assets/images/', 'g')
+            const newPathsJson = oldPathsJson.replace(reg, '"' + RUNTIME_IMAGES_DIR + '/')
+
+            if (newPathsJson != oldPathsJson) {
+              await DB.exec("UPDATE nodes SET properties = json_set(properties, '$.media_paths', json(?)) WHERE id = ? AND type = 'log'", [newPathsJson, id as SqlValue])
+            }
+          }
+        }
+      } catch (_ep) {}
+
+      await DB.setTransactionSuccessful()
+      committed = true
+      await ExportImportService.syncStorageFromDbAfterImport('at services/export/export-import.uts:540')
+
+      return true
+
+    } catch (e) {
+
+      __f__('error','at services/export/export-import.uts:544',`[ExportImportService] mergeHarmonyDatabase error: ${e}`)
+
+      return false
+
+    } finally {
+
+      try {
+        const closable = importStore as any
+        if (closable != null && closable.close != null) closable.close()
+      } catch (_e0) {}
+
+      await DB.endTransaction()
+
+      if (tempImportDbPath != '') {
+        ExportImportService.cleanupHarmonyDbArtifacts(tempImportDbPath)
+      }
+
+    }
+
+  }
+
+  private static async prepareHarmonyImportDbPath(importDbPath: string): Promise<string> {
+
+    const sourcePath = (importDbPath ?? '').toString().trim()
+    if (sourcePath == '') return ''
+
+    const liveDbPath = ExportImportService.getHarmonyAttachSeedDbPath()
+    const slash = liveDbPath.lastIndexOf('/')
+    if (slash <= 0) return ''
+
+    const tempImportDbPath = `${liveDbPath.substring(0, slash)}/zemo_import_${Date.now()}.db`
+    ExportImportService.cleanupHarmonyDbArtifacts(tempImportDbPath)
+
+    if (sourcePath.indexOf('://') < 0 && ExportImportService.copyHarmonyBinaryFile(sourcePath, tempImportDbPath)) {
+      return tempImportDbPath
+    }
+
+    const importBytes = await FileUtil.readBinaryFile(sourcePath)
+    if (importBytes == null) return ''
+    if (!ExportImportService.writeHarmonyBinaryFile(tempImportDbPath, importBytes)) return ''
+    return tempImportDbPath
+
+  }
+
+  private static async describeLiveTable(table: string): Promise<{ colNames: string[], pkCols: string[], hasUpdatedAt: boolean }> {
+
+    const cols = await DB.query(`PRAGMA table_info(${table})`)
+    const colNames = [] as string[]
+    const pkCols = [] as string[]
+    let hasUpdatedAt = false
+
+    for (let i = 0; i < cols.length; i++) {
+
+      const nameVal = cols[i].get('name')
+      const nameStr = nameVal != null ? nameVal.toString() : ''
+      if (nameStr == '') continue
+
+      colNames.push(nameStr)
+      if (nameStr == 'updated_at') hasUpdatedAt = true
+
+      const pkVal = cols[i].get('pk')
+      const pkN = pkVal == null ? 0 : parseInt(pkVal.toString())
+      if (!isNaN(pkN) && pkN > 0) pkCols.push(nameStr)
+
+    }
+
+    return { colNames, pkCols, hasUpdatedAt }
+
+  }
+
+  private static async syncStorageFromDbAfterImport(logTag: string): Promise<void> {
+
+    try {
+
+      const keys = [
+
+        'vision_saved_groups',
+
+        'vision_saved_connections',
+
+        'vision_group_view_states',
+
+        'vision_deleted_auto_groups',
+
+        'vision_limit_view_state'
+
+      ]
+
+      const placeholders = keys.map(_ => '?').join(',')
+
+      const rows = await DB.query(`SELECT k, v FROM user_kv WHERE k IN (${placeholders})`, keys as any[] as SqlValue[])
+
+      for (let i = 0; i < rows.length; i++) {
+
+        const row = rows[i]
+        const k = row.get('k')
+        const v = row.get('v')
+
+        if (k != null && v != null) {
+          uni.setStorageSync(k.toString(), v.toString())
+        }
+
+      }
+
+    } catch (_e1) {
+
+      __f__('error',logTag,'Storage sync from DB after import failed', _e1)
+
+    }
+
+  }
+
+
+
+  private static async mergeUserKvFromAttached(): Promise<void> {
+
+    try {
+
+      const rows = await DB.query('SELECT user_id, k, v, updated_at FROM zemo_import.user_kv')
+
+      for (let i = 0; i < rows.length; i++) {
+
+        const userIdRaw = rows[i].get('user_id')
+
+        const kRaw = rows[i].get('k')
+
+        const vRaw = rows[i].get('v')
+
+        const tsRaw = rows[i].get('updated_at')
+
+
+
+        const userId = userIdRaw == null ? 0 : parseInt(userIdRaw.toString())
+
+        const k = kRaw == null ? '' : kRaw.toString()
+
+        if (k.length == 0) continue
+
+        const incomingTs = tsRaw == null ? 0 : parseInt(tsRaw.toString())
+
+        const v = vRaw == null ? null : vRaw.toString()
+
+
+
+        const localRows = await DB.query('SELECT updated_at FROM user_kv WHERE user_id = ? AND k = ? LIMIT 1', [userId, k])
+
+        let localTs = 0
+
+        if (localRows.length > 0) {
+
+          const localTsRaw = localRows[0].get('updated_at')
+
+          localTs = localTsRaw == null ? 0 : parseInt(localTsRaw.toString())
+
+        }
+
+
+
+        if (incomingTs > localTs) {
+
+          const args: SqlArgs = [userId, k, v, incomingTs]
+
+          await DB.exec('INSERT OR REPLACE INTO user_kv (user_id, k, v, updated_at) VALUES (?, ?, ?, ?)', args)
+
+        }
+
+      }
+
+    } catch (e) {
+
+      __f__('error','at services/export/export-import.uts:794',`[ExportImportService] mergeUserKvFromAttached error: ${e}`)
+
+    }
+
+  }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  private static async mergeUserKvFromHarmony(importStore: relationalStore.RdbStore): Promise<void> {
+
+    try {
+
+      const rows = await ExportImportService.queryHarmonyStore(importStore, 'SELECT user_id, k, v, updated_at FROM user_kv')
+
+      for (let i = 0; i < rows.length; i++) {
+
+        const userIdRaw = rows[i].get('user_id')
+        const kRaw = rows[i].get('k')
+        const vRaw = rows[i].get('v')
+        const tsRaw = rows[i].get('updated_at')
+
+        const userId = userIdRaw == null ? 0 : parseInt(userIdRaw.toString())
+        const k = kRaw == null ? '' : kRaw.toString()
+        if (k.length == 0) continue
+
+        const incomingTs = tsRaw == null ? 0 : parseInt(tsRaw.toString())
+        const v = vRaw == null ? null : vRaw.toString()
+
+        const localRows = await DB.query('SELECT updated_at FROM user_kv WHERE user_id = ? AND k = ? LIMIT 1', [userId, k])
+        let localTs = 0
+
+        if (localRows.length > 0) {
+          const localTsRaw = localRows[0].get('updated_at')
+          localTs = localTsRaw == null ? 0 : parseInt(localTsRaw.toString())
+        }
+
+        if (incomingTs > localTs) {
+          const args: SqlArgs = [userId, k, v, incomingTs]
+          await DB.exec('INSERT OR REPLACE INTO user_kv (user_id, k, v, updated_at) VALUES (?, ?, ?, ?)', args)
+        }
+
+      }
+
+    } catch (e) {
+
+      __f__('error','at services/export/export-import.uts:794',`[ExportImportService] mergeUserKvFromHarmony error: ${e}`)
+
+    }
+
+  }
+
+
+
+
+
+  private static async listUserTables(): Promise<string[]> {
+
+    const rows = await DB.query("SELECT name FROM sqlite_master WHERE type='table'")
+
+    const out: string[] = []
+
+    for (let i = 0; i < rows.length; i++) {
+
+      const nameVal = rows[i].get('name')
+
+      const nameStr = nameVal != null ? nameVal.toString() : ''
+
+      if (nameStr.length > 0) out.push(nameStr)
+
+    }
+
+    return out
+
+  }
+
+}

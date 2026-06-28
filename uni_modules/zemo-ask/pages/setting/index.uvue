@@ -1,0 +1,711 @@
+<template>
+	<view class="page">
+		<GlobalBackground />
+		<scroll-view class="container" scroll-y="true">
+			<view class="header">
+				<text class="page-title">桌宠与悬浮助手</text>
+				<text class="page-subtitle">管理桌面宠物、快捷气泡与全局背景</text>
+			</view>
+
+			<view class="card">
+				<view class="card-header">
+					<view class="card-heading">
+						<text class="card-title">悬浮宠物</text>
+						<text class="card-subtitle">控制桌宠显示、画中画资产卡片和吸附行为</text>
+					</view>
+					<view class="status-pill" :class="isPetEnabled ? 'status-on' : 'status-off'">
+						<text class="status-text">{{ isPetEnabled ? '已启用' : '已关闭' }}</text>
+					</view>
+				</view>
+
+				<view class="setting-item">
+					<view class="setting-left">
+						<text class="setting-label">启用桌面宠物</text>
+						<text class="setting-desc">打开后在系统悬浮窗中显示桌宠</text>
+					</view>
+					<switch :checked="isPetEnabled" @change="togglePetEnabled" color="#0d6e6e" />
+				</view>
+
+				<view class="setting-item">
+					<view class="setting-left">
+						<text class="setting-label">使用画中画实现</text>
+						<text class="setting-desc">以系统画中画展示实时资产卡片</text>
+					</view>
+					<switch :checked="isPipMode" @change="togglePipMode" color="#0d6e6e" />
+				</view>
+
+				<view class="setting-item" @click="changePipMetric">
+					<view class="setting-left">
+						<text class="setting-label">画中画卡片内容</text>
+						<text class="setting-desc">当前：{{ pipMetricLabel }}</text>
+					</view>
+					<text class="arrow">></text>
+				</view>
+
+				<view class="setting-item">
+					<view class="setting-left">
+						<text class="setting-label">智能吸附边缘</text>
+						<text class="setting-desc">拖动后自动贴近屏幕边缘</text>
+					</view>
+					<switch :checked="isAutoSide" @change="toggleAutoSide" color="#0d6e6e" />
+				</view>
+
+				<view class="setting-item setting-item-last" @click="changeLottie">
+					<view class="setting-left">
+						<text class="setting-label">Lottie 动画外观</text>
+						<text class="setting-desc">当前：{{ currentLottieName }}</text>
+					</view>
+					<text class="arrow">></text>
+				</view>
+			</view>
+
+			<view class="card">
+				<view class="card-header">
+					<view class="card-heading">
+						<text class="card-title">侧边快捷气泡</text>
+						<text class="card-subtitle">长按拖到侧边后，滑出并放手执行</text>
+					</view>
+					<text class="text-action" @click="resetQuickActions">恢复默认</text>
+				</view>
+
+				<view v-for="(action, index) in quickActions" :key="action.id" class="quick-action-row">
+					<view class="quick-action-main" @click="editQuickAction(index)">
+						<text class="quick-action-title">{{ action.title }}</text>
+						<text class="quick-action-link">{{ action.link }}</text>
+					</view>
+					<text class="delete-link" @click="removeQuickAction(index)">删除</text>
+				</view>
+
+				<button class="btn-outline quick-add-btn" @click="addQuickAction">添加快捷功能</button>
+			</view>
+
+			<view class="card">
+				<view class="card-header">
+					<view class="card-heading">
+						<text class="card-title">全局背景</text>
+						<text class="card-subtitle">与 ZeMo 主应用一致，影响使用全局背景组件的页面</text>
+					</view>
+					<view class="status-pill" :class="hasFixedBackground ? 'status-on' : 'status-off'">
+						<text class="status-text">{{ hasFixedBackground ? '固定图' : '随机图' }}</text>
+					</view>
+				</view>
+
+				<view class="background-preview">
+					<image v-if="backgroundImage != ''" :src="backgroundImage" class="preview-image" mode="aspectFill" />
+					<view v-else class="preview-empty">
+						<text class="preview-empty-text">等待随机壁纸</text>
+					</view>
+				</view>
+
+				<view class="setting-item">
+					<view class="setting-left">
+						<text class="setting-label">随机壁纸风格</text>
+						<text class="setting-desc">当前：动漫风景</text>
+					</view>
+					<view class="style-chip style-chip-active" @click="changeStyle('anime')">
+						<text class="style-chip-text">动漫</text>
+					</view>
+				</view>
+
+				<view class="setting-block">
+					<text class="setting-label">面板不透明度：{{ transparencyPercent }}%</text>
+					<slider class="custom-slider" :value="transparencyPercent" @change="onTransparencyChange" :min="10" :max="100" activeColor="#0d6e6e" backgroundColor="#d6dee4" :block-size="22" />
+				</view>
+
+				<view class="action-row">
+					<button class="btn-primary" @click="chooseBackground">从相册选图</button>
+					<button class="btn-outline" @click="clearBackground">恢复随机壁纸</button>
+				</view>
+			</view>
+
+			<view class="bottom-space"></view>
+		</scroll-view>
+	</view>
+</template>
+
+<script lang="uts">
+	import GlobalBackground from "@/components/GlobalBackground.uvue";
+	import { BackgroundService } from "@/services/sys/BackgroundService.uts";
+	import { FinancePipSnapshotService } from "@/services/sys/FinancePipSnapshotService.uts";
+	import { showFloatWindow, hideFloatWindow } from '@/uni_modules/zemo-ask';
+
+	type PetQuickAction = {
+		id: string,
+		title: string,
+		link: string
+	}
+
+	export default {
+		components: { GlobalBackground },
+		data() {
+			return {
+				isAutoSide: true as boolean,
+				isPetEnabled: false as boolean,
+				isPipMode: false as boolean,
+				pipMetricMode: 'net_worth' as string,
+				currentLottieName: "lottie.json" as string,
+				quickActions: [] as PetQuickAction[],
+				transparency: 0.3 as number,
+				hasFixedBackground: false as boolean
+			}
+		},
+		onLoad() {
+			BackgroundService.getInstance().init();
+			this.loadSettings();
+		},
+		onShow() {
+			BackgroundService.getInstance().checkAndRefresh();
+			this.loadSettings();
+		},
+		computed: {
+			backgroundImage() : string {
+				return BackgroundService.getInstance().state.bgImage;
+			},
+			transparencyPercent() : number {
+				let value = Math.floor(this.transparency * 100);
+				if (value < 10) value = 10;
+				if (value > 100) value = 100;
+				return value;
+			},
+			pipMetricLabel() : string {
+				if (this.pipMetricMode == 'cash') return '资金账户';
+				if (this.pipMetricMode == 'investment') return '理财资产';
+				if (this.pipMetricMode == 'credit') return '信贷负债';
+				if (this.pipMetricMode == 'heavy') return '重资产';
+				if (this.pipMetricMode == 'today_expense') return '今日消耗';
+				if (this.pipMetricMode == 'calendar_month') return '日历金额';
+				return '净资产';
+			}
+		},
+		methods: {
+			loadSettings() {
+				const petEnabled = uni.getStorageSync('desktop_pet_enabled');
+				this.isPetEnabled = petEnabled != null && petEnabled.toString() == '1';
+
+				const petPipMode = uni.getStorageSync('desktop_pet_pip_mode');
+				this.isPipMode = petPipMode != null && petPipMode.toString() == '1';
+
+				const petPipMetric = uni.getStorageSync('desktop_pet_pip_metric');
+				if (petPipMetric != null && this.isValidPipMetric(petPipMetric.toString())) {
+					this.pipMetricMode = petPipMetric.toString();
+				}
+
+				const petAutoSide = uni.getStorageSync('desktop_pet_auto_side');
+				this.isAutoSide = petAutoSide != null ? petAutoSide.toString() == '1' : true;
+
+				const petLottieName = uni.getStorageSync('desktop_pet_lottie_name');
+				this.currentLottieName = petLottieName != null && petLottieName.toString() != '' ? petLottieName.toString() : "lottie.json";
+
+				const savedTrans = uni.getStorageSync('theme_transparency');
+				if (savedTrans != null && savedTrans.toString() != '') {
+					const f = parseFloat(savedTrans.toString());
+					if (!isNaN(f)) this.transparency = f;
+				}
+
+				const fixedBg = uni.getStorageSync('theme_background_image');
+				this.hasFixedBackground = fixedBg != null && fixedBg.toString() != '';
+
+				this.loadQuickActions();
+			},
+
+			restartDeskPetIfNeeded() {
+				// #ifdef APP-HARMONY
+				if (!this.isPetEnabled) return;
+				hideFloatWindow();
+				setTimeout(() => {
+					showFloatWindow();
+				}, 300);
+				// #endif
+			},
+
+			togglePetEnabled(e : UniSwitchChangeEvent) {
+				this.isPetEnabled = e.detail.value;
+				uni.setStorageSync('desktop_pet_enabled', this.isPetEnabled ? '1' : '0');
+
+				if (this.isPetEnabled) {
+					// #ifdef APP-HARMONY
+					showFloatWindow();
+					// #endif
+					uni.showToast({ title: this.isPipMode ? "已开启画中画桌宠" : "已开启桌面宠物", icon: 'none' });
+				} else {
+					// #ifdef APP-HARMONY
+					hideFloatWindow();
+					// #endif
+					uni.showToast({ title: "已关闭桌面宠物", icon: 'none' });
+				}
+			},
+
+			togglePipMode(e : UniSwitchChangeEvent) {
+				this.isPipMode = e.detail.value;
+				uni.setStorageSync('desktop_pet_pip_mode', this.isPipMode ? '1' : '0');
+				if (this.isPipMode) void FinancePipSnapshotService.syncSnapshot();
+				this.restartDeskPetIfNeeded();
+				uni.showToast({
+					title: this.isPipMode ? "已切换为画中画实现" : "已切换为悬浮窗实现",
+					icon: 'none'
+				});
+			},
+
+			isValidPipMetric(mode : string) : boolean {
+				return mode == 'net_worth' || mode == 'cash' || mode == 'investment' || mode == 'credit' || mode == 'heavy' || mode == 'today_expense' || mode == 'calendar_month';
+			},
+
+			changePipMetric() {
+				const keys = ['net_worth', 'cash', 'investment', 'credit', 'heavy', 'today_expense', 'calendar_month'] as string[];
+				uni.showActionSheet({
+					itemList: ['净资产', '资金账户', '理财资产', '信贷负债', '重资产', '今日消耗', '日历金额'],
+					success: (res) => {
+						if (res.tapIndex < 0 || res.tapIndex >= keys.length) return;
+						this.pipMetricMode = keys[res.tapIndex];
+						uni.setStorageSync('desktop_pet_pip_metric', this.pipMetricMode);
+						void FinancePipSnapshotService.syncSnapshot();
+						if (this.isPipMode) this.restartDeskPetIfNeeded();
+					}
+				});
+			},
+
+			toggleAutoSide(e : UniSwitchChangeEvent) {
+				this.isAutoSide = e.detail.value;
+				uni.setStorageSync('desktop_pet_auto_side', this.isAutoSide ? '1' : '0');
+			},
+
+			changeLottie() {
+				uni.showActionSheet({
+					itemList: ['默认气泡', '赛博朋克', '导入新动画(*.json)'],
+					success: (res) => {
+						if (res.tapIndex == 2) {
+							this.importLottieFile();
+						} else {
+							this.currentLottieName = res.tapIndex == 0 ? "默认气泡" : "赛博朋克";
+							uni.setStorageSync('desktop_pet_lottie_name', this.currentLottieName);
+							this.restartDeskPetIfNeeded();
+						}
+					}
+				});
+			},
+
+			importLottieFile() {
+				// #ifdef APP-HARMONY
+				try {
+					const picker = requireNapi('@ohos.file.picker');
+					const options = new picker.DocumentSelectOptions();
+					options.maxSelectNumber = 1;
+					options.fileSuffixFilters = ['.json'];
+					const documentPicker = new picker.DocumentViewPicker();
+					documentPicker.select(options).then((result : string[]) => {
+						if (result != null && result.length > 0) {
+							const selectedPath = result[0];
+							this.currentLottieName = "自定义动画.json";
+							uni.setStorageSync('desktop_pet_lottie_path', selectedPath);
+							uni.setStorageSync('desktop_pet_lottie_name', "自定义动画.json");
+							this.restartDeskPetIfNeeded();
+							uni.showToast({ title: "自定义 Lottie 导入成功", icon: "success" });
+						}
+					}).catch((err : any) => {
+						console.error("Select file error: " + err);
+					});
+				} catch (e) {
+					uni.showToast({ title: "选择器权限异常", icon: "none" });
+				}
+				// #endif
+				// #ifndef APP-HARMONY
+				uni.showToast({ title: "仅原生鸿蒙支持导入 Lottie 文件", icon: "none" });
+				// #endif
+			},
+
+			defaultQuickActions() : PetQuickAction[] {
+				return [{ id: 'finance_record', title: '记一笔', link: 'zemo://finance/record' } as PetQuickAction] as PetQuickAction[];
+			},
+
+			loadQuickActions() {
+				const raw = uni.getStorageSync('desktop_pet_quick_actions');
+				if (raw == null || raw.toString().trim() == '') {
+					this.quickActions = this.defaultQuickActions();
+					return;
+				}
+				try {
+					const parsed = JSON.parse(raw.toString()) as PetQuickAction[];
+					const normalized = this.normalizeQuickActions(parsed);
+					this.quickActions = normalized.length > 0 ? normalized : this.defaultQuickActions();
+				} catch (_e) {
+					this.quickActions = this.defaultQuickActions();
+				}
+			},
+
+			normalizeQuickActions(actions : PetQuickAction[]) : PetQuickAction[] {
+				const list = [] as PetQuickAction[];
+				if (actions == null) return list;
+				for (let i = 0; i < actions.length && list.length < 4; i++) {
+					const item = actions[i];
+					if (item == null) continue;
+					const title = item.title != null ? item.title.toString().trim() : '';
+					const link = item.link != null ? item.link.toString().trim() : '';
+					if (title == '' || link == '') continue;
+					let id = item.id != null ? item.id.toString().trim() : '';
+					if (id == '') id = 'quick_' + i.toString();
+					list.push({ id: id, title: title, link: link } as PetQuickAction);
+				}
+				return list;
+			},
+
+			saveQuickActions() {
+				this.quickActions = this.normalizeQuickActions(this.quickActions);
+				if (this.quickActions.length == 0) this.quickActions = this.defaultQuickActions();
+				uni.setStorageSync('desktop_pet_quick_actions', JSON.stringify(this.quickActions));
+			},
+
+			parseQuickActionInput(input : string, fallback : PetQuickAction) : PetQuickAction | null {
+				const raw = input.trim();
+				const splitIndex = raw.indexOf('|');
+				if (splitIndex <= 0 || splitIndex >= raw.length - 1) return null;
+				const title = raw.substring(0, splitIndex).trim();
+				const link = raw.substring(splitIndex + 1).trim();
+				if (title == '' || link == '') return null;
+				let id = fallback.id;
+				if (id == '') id = 'quick_' + Date.now().toString();
+				return { id: id, title: title, link: link } as PetQuickAction;
+			},
+
+			editQuickAction(index : number) {
+				if (index < 0 || index >= this.quickActions.length) return;
+				const current = this.quickActions[index];
+				uni.showModal({
+					title: '编辑快捷功能',
+					editable: true,
+					placeholderText: '名称|Deep Link，例如：记一笔|zemo://finance/record',
+					content: current.title + '|' + current.link,
+					success: (res) => {
+						const content = res.content;
+						if (!res.confirm || content == null) return;
+						const next = this.parseQuickActionInput(content.toString(), current);
+						if (next == null) {
+							uni.showToast({ title: '格式应为 名称|Deep Link', icon: 'none' });
+							return;
+						}
+						this.quickActions.splice(index, 1, next);
+						this.saveQuickActions();
+						uni.showToast({ title: '快捷功能已保存', icon: 'success' });
+					}
+				});
+			},
+
+			addQuickAction() {
+				if (this.quickActions.length >= 4) {
+					uni.showToast({ title: '最多设置 4 个快捷功能', icon: 'none' });
+					return;
+				}
+				const fallback = { id: 'quick_' + Date.now().toString(), title: '', link: '' } as PetQuickAction;
+				uni.showModal({
+					title: '添加快捷功能',
+					editable: true,
+					placeholderText: '名称|Deep Link，例如：记一笔|zemo://finance/record',
+					success: (res) => {
+						const content = res.content;
+						if (!res.confirm || content == null) return;
+						const next = this.parseQuickActionInput(content.toString(), fallback);
+						if (next == null) {
+							uni.showToast({ title: '格式应为 名称|Deep Link', icon: 'none' });
+							return;
+						}
+						this.quickActions.push(next);
+						this.saveQuickActions();
+						uni.showToast({ title: '快捷功能已添加', icon: 'success' });
+					}
+				});
+			},
+
+			removeQuickAction(index : number) {
+				if (index < 0 || index >= this.quickActions.length) return;
+				this.quickActions.splice(index, 1);
+				this.saveQuickActions();
+			},
+
+			resetQuickActions() {
+				this.quickActions = this.defaultQuickActions();
+				this.saveQuickActions();
+				uni.showToast({ title: '已恢复默认快捷功能', icon: 'success' });
+			},
+
+			changeStyle(style : string) {
+				BackgroundService.getInstance().setStyle(style);
+				uni.showToast({ title: '随机壁纸风格已更新', icon: 'none' });
+			},
+
+			onTransparencyChange(e : UniSliderChangeEvent) {
+				let value = parseInt(e.detail.value.toString());
+				if (isNaN(value)) value = 30;
+				if (value < 10) value = 10;
+				if (value > 100) value = 100;
+				this.transparency = value / 100;
+				uni.setStorageSync('theme_transparency', this.transparency);
+				uni.showToast({ title: '透明度已保存', icon: 'none' });
+			},
+
+			chooseBackground() {
+				uni.chooseImage({
+					count: 1,
+					sourceType: ['album'],
+					success: (res) => {
+						if (res.tempFilePaths == null || res.tempFilePaths.length == 0) return;
+						const tempPath = res.tempFilePaths[0];
+						BackgroundService.getInstance().setFixedBackground(tempPath);
+						this.hasFixedBackground = true;
+						uni.showToast({ title: '全局背景已更新', icon: 'success' });
+					}
+				});
+			},
+
+			clearBackground() {
+				this.hasFixedBackground = false;
+				BackgroundService.getInstance().clearFixedBackground();
+				uni.showToast({ title: '已恢复随机壁纸', icon: 'none' });
+			}
+		}
+	}
+</script>
+
+<style scoped>
+	.page {
+		width: 100%;
+		height: 100%;
+		background-color: transparent;
+	}
+
+	.container {
+		height: 100%;
+		padding: 18px;
+		background-color: transparent;
+	}
+
+	.header {
+		margin-top: 20px;
+		margin-bottom: 16px;
+	}
+
+	.page-title {
+		font-size: 26px;
+		font-weight: bold;
+		color: #173638;
+	}
+
+	.page-subtitle {
+		font-size: 13px;
+		color: #5f7476;
+		margin-top: 8px;
+	}
+
+	.card {
+		background-color: rgba(255, 255, 255, 0.76);
+		border-radius: 18px;
+		padding: 18px;
+		margin-bottom: 14px;
+		border-width: 1px;
+		border-color: rgba(255, 255, 255, 0.74);
+		box-shadow: 0 10px 26px rgba(28, 54, 66, 0.12);
+	}
+
+	.card-header {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: flex-start;
+		margin-bottom: 12px;
+	}
+
+	.card-heading {
+		flex: 1;
+		padding-right: 10px;
+	}
+
+	.card-title {
+		font-size: 18px;
+		font-weight: bold;
+		color: #173638;
+	}
+
+	.card-subtitle {
+		font-size: 12px;
+		color: #6d7f82;
+		margin-top: 5px;
+	}
+
+	.status-pill {
+		padding: 5px 10px;
+		border-radius: 12px;
+	}
+
+	.status-on {
+		background-color: rgba(13, 110, 110, 0.12);
+	}
+
+	.status-off {
+		background-color: rgba(105, 120, 124, 0.12);
+	}
+
+	.status-text {
+		font-size: 12px;
+		color: #0d6e6e;
+		font-weight: bold;
+	}
+
+	.setting-item {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+		padding: 13px 0;
+		border-bottom-width: 1px;
+		border-bottom-color: rgba(210, 220, 224, 0.82);
+	}
+
+	.setting-item-last {
+		border-bottom-width: 0;
+	}
+
+	.setting-left {
+		flex: 1;
+		padding-right: 12px;
+	}
+
+	.setting-label {
+		font-size: 15px;
+		color: #173638;
+		font-weight: bold;
+	}
+
+	.setting-desc {
+		font-size: 12px;
+		color: #6d7f82;
+		margin-top: 5px;
+	}
+
+	.arrow {
+		font-size: 26px;
+		color: #567174;
+	}
+
+	.text-action {
+		font-size: 12px;
+		color: #0d6e6e;
+		font-weight: bold;
+		padding-top: 3px;
+	}
+
+	.quick-action-row {
+		flex-direction: row;
+		justify-content: space-between;
+		align-items: center;
+		padding: 12px 0;
+		border-bottom-width: 1px;
+		border-bottom-color: rgba(210, 220, 224, 0.82);
+	}
+
+	.quick-action-main {
+		flex: 1;
+		padding-right: 12px;
+	}
+
+	.quick-action-title {
+		font-size: 15px;
+		font-weight: bold;
+		color: #173638;
+	}
+
+	.quick-action-link {
+		font-size: 11px;
+		color: #6d7f82;
+		margin-top: 4px;
+	}
+
+	.delete-link {
+		color: #d24b4b;
+		font-size: 13px;
+	}
+
+	.background-preview {
+		height: 150px;
+		border-radius: 14px;
+		overflow: hidden;
+		background-color: #0f2024;
+		margin-bottom: 10px;
+	}
+
+	.preview-image {
+		width: 100%;
+		height: 150px;
+	}
+
+	.preview-empty {
+		height: 150px;
+		justify-content: center;
+		align-items: center;
+		background-color: #173638;
+	}
+
+	.preview-empty-text {
+		color: #ffffff;
+		font-size: 13px;
+	}
+
+	.style-chip {
+		padding: 7px 12px;
+		border-radius: 14px;
+		background-color: rgba(13, 110, 110, 0.1);
+	}
+
+	.style-chip-active {
+		background-color: rgba(13, 110, 110, 0.18);
+		border-width: 1px;
+		border-color: rgba(13, 110, 110, 0.34);
+	}
+
+	.style-chip-text {
+		font-size: 13px;
+		color: #0d6e6e;
+		font-weight: bold;
+	}
+
+	.setting-block {
+		padding: 13px 0;
+	}
+
+	.custom-slider {
+		margin-top: 10px;
+	}
+
+	.action-row {
+		flex-direction: row;
+		margin-top: 8px;
+	}
+
+	.btn-primary,
+	.btn-outline {
+		flex: 1;
+		height: 42px;
+		line-height: 42px;
+		font-size: 14px;
+		border-radius: 14px;
+		margin: 0;
+	}
+
+	.btn-primary {
+		background-color: #0d6e6e;
+		color: #ffffff;
+		border-width: 0;
+		margin-right: 10px;
+	}
+
+	.btn-outline {
+		background-color: rgba(255, 255, 255, 0.42);
+		color: #0d6e6e;
+		border-width: 1px;
+		border-color: rgba(13, 110, 110, 0.32);
+	}
+
+	.quick-add-btn {
+		width: 100%;
+		margin-top: 12px;
+	}
+
+	.bottom-space {
+		height: 40px;
+	}
+</style>
